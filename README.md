@@ -1,4 +1,4 @@
-# graphbuff
+# GraphBuff
 
 A graph database engine written in Rust and queried with **Cypher**.
 
