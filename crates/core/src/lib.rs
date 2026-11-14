@@ -15,6 +15,7 @@
 //! Later stages (persistent storage, GPU-accelerated execution) plug in by providing
 //! additional [`GraphStore`] implementations, without touching the Cypher front end.
 
+pub mod clock;
 mod codec;
 pub mod csr;
 mod error;

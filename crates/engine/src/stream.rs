@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use std::cmp::Ordering;
 use std::ops::Bound;
-use std::time::Instant;
+use graphbuff_core::clock::Instant;
 
 use graphbuff_core::{
     Adjacency, Direction, Error, IndexEntity, NodeId, Path, RelId, Result, Scan, Value, ValueRange,

@@ -2,7 +2,6 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use graphbuff_core::temporal::{BetweenUnit, NANOS_PER_SECOND, Temporal, TemporalKind};
 use graphbuff_core::{Error, Point, Result, Value};
@@ -55,7 +54,7 @@ fn str_fn(name: &str, v: &Value, f: impl Fn(&str) -> String) -> Result<Value> {
 
 thread_local! {
     static RNG: Cell<u64> = Cell::new(
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1,
+        graphbuff_core::clock::unix_time().map(|d| d.as_nanos() as u64).unwrap_or(0x9E37_79B9_7F4A_7C15) | 1,
     );
 }
 
@@ -422,10 +421,7 @@ impl Executor<'_> {
             "e" => Ok(Value::Float(std::f64::consts::E)),
             "rand" => Ok(Value::Float(next_random())),
             "timestamp" => Ok(Value::Int(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
+                graphbuff_core::clock::unix_time().map(|d| d.as_millis() as i64).unwrap_or(0),
             )),
 
             _ => Err(Error::Semantic(format!("unknown function '{name}'"))),

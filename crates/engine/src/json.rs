@@ -1,10 +1,15 @@
-//! A small JSON reader and writer (RFC 8259), enough for the HTTP API.
+//! A small JSON reader and writer (RFC 8259), and the JSON form of query results and
+//! errors: the one the HTTP API of `graphbuff-server` sends.
 //!
 //! Parsing produces [`Json`]; numbers keep whether they were written as integers, so
 //! `1` becomes a Cypher INTEGER and `1.0` a FLOAT. Writing goes straight to a `String`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
+
+use crate::{
+    Error, NodeData, PathData, PlanDescription, Point, QueryResult, QueryStats, RelData, ResultValue, Value,
+};
 
 /// Nesting limit for arrays and objects, so hostile input cannot overflow the stack.
 const MAX_DEPTH: usize = 128;
@@ -308,6 +313,303 @@ pub fn write_float(out: &mut String, f: f64) {
         // exponent, both valid JSON.
         let _ = write!(out, "{f:?}");
     }
+}
+
+// ---- query parameters ---------------------------------------------------------------------
+
+/// The Cypher value a JSON value stands for, as a query parameter.
+pub fn to_value(j: Json) -> Value {
+    match j {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(b),
+        Json::Int(i) => Value::Int(i),
+        Json::Float(f) => Value::Float(f),
+        Json::String(s) => Value::String(s),
+        Json::Array(items) => Value::List(items.into_iter().map(to_value).collect()),
+        Json::Object(m) => Value::Map(m.into_iter().map(|(k, v)| (k, to_value(v))).collect()),
+    }
+}
+
+// ---- errors -------------------------------------------------------------------------------
+
+/// The name of the kind of `e`: the `"code"` of its JSON form.
+pub fn error_code(e: &Error) -> &'static str {
+    match e {
+        Error::Syntax { .. } => "SyntaxError",
+        Error::Semantic(_) => "SemanticError",
+        Error::Type(_) => "TypeError",
+        Error::Runtime(_) => "RuntimeError",
+        Error::Unsupported(_) => "Unsupported",
+        Error::Constraint(_) => "ConstraintError",
+        Error::Storage(_) => "StorageError",
+        Error::TransactionTooLarge(_) => "TransactionTooLarge",
+        Error::Timeout(_) => "Timeout",
+        Error::Cancelled(_) => "Cancelled",
+        Error::Forbidden(_) => "Forbidden",
+    }
+}
+
+/// `{"error": {"code": "...", "message": "..."}}`.
+pub fn encode_error_message(code: &str, message: &str) -> String {
+    let mut body = String::from(r#"{"error":{"code":"#);
+    write_str(&mut body, code);
+    body.push_str(r#","message":"#);
+    write_str(&mut body, message);
+    body.push_str("}}");
+    body
+}
+
+/// An engine error as `{"error": {"code": "...", "message": "..."}}`; a syntax error also
+/// has `"offset"`, the byte of the query text where it was detected.
+pub fn encode_error(e: &Error) -> String {
+    match e {
+        Error::Syntax { message, offset } => {
+            let mut body = String::from(r#"{"error":{"code":"SyntaxError","message":"#);
+            write_str(&mut body, message);
+            let _ = write!(body, r#","offset":{offset}}}}}"#);
+            body
+        }
+        Error::Semantic(m)
+        | Error::Type(m)
+        | Error::Runtime(m)
+        | Error::Unsupported(m)
+        | Error::Constraint(m)
+        | Error::Storage(m)
+        | Error::TransactionTooLarge(m)
+        | Error::Timeout(m)
+        | Error::Cancelled(m)
+        | Error::Forbidden(m) => encode_error_message(error_code(e), m),
+    }
+}
+
+// ---- results ------------------------------------------------------------------------------
+
+/// A query result as `{"columns": [...], "rows": [[...]], "stats": {...}}`, with
+/// `"plan"` for `EXPLAIN` and `PROFILE`.
+pub fn encode_result(r: &QueryResult) -> String {
+    let mut out = String::with_capacity(64 + r.rows.len() * 32);
+    out.push_str(r#"{"columns":["#);
+    for (i, c) in r.columns.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(&mut out, c);
+    }
+    out.push_str(r#"],"rows":["#);
+    for (i, row) in r.rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        for (j, v) in row.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            write_result_value(&mut out, v);
+        }
+        out.push(']');
+    }
+    out.push_str(r#"],"stats":"#);
+    write_stats(&mut out, &r.stats);
+    if let Some(plan) = &r.plan {
+        out.push_str(r#","plan":"#);
+        write_plan(&mut out, plan);
+    }
+    out.push('}');
+    out
+}
+
+/// `{"profiled": bool, "lines": [{"depth", "operator", "estimatedRows", "rows", "timeMs"}]}`;
+/// numbers that were not estimated or measured are `null`.
+fn write_plan(out: &mut String, plan: &PlanDescription) {
+    let _ = write!(out, r#"{{"profiled":{},"lines":["#, plan.profiled);
+    let num = |out: &mut String, v: Option<f64>| match v {
+        Some(v) if v.is_finite() => write_float(out, v),
+        _ => out.push_str("null"),
+    };
+    for (i, l) in plan.lines.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{{"depth":{},"operator":"#, l.depth);
+        write_str(out, &l.operator);
+        out.push_str(r#","estimatedRows":"#);
+        num(out, l.estimated_rows);
+        out.push_str(r#","rows":"#);
+        match l.rows {
+            Some(r) => {
+                let _ = write!(out, "{r}");
+            }
+            None => out.push_str("null"),
+        }
+        out.push_str(r#","timeMs":"#);
+        num(out, l.time.map(|t| t.as_secs_f64() * 1e3));
+        out.push('}');
+    }
+    out.push_str("]}");
+}
+
+fn write_stats(out: &mut String, s: &QueryStats) {
+    let _ = write!(
+        out,
+        concat!(
+            r#"{{"nodesCreated":{},"nodesDeleted":{},"relationshipsCreated":{},"#,
+            r#""relationshipsDeleted":{},"propertiesSet":{},"labelsAdded":{},"#,
+            r#""labelsRemoved":{},"indexesAdded":{},"indexesRemoved":{},"#,
+            r#""constraintsAdded":{},"constraintsRemoved":{},"#,
+            r#""systemUpdates":{},"containsUpdates":{}}}"#
+        ),
+        s.nodes_created,
+        s.nodes_deleted,
+        s.relationships_created,
+        s.relationships_deleted,
+        s.properties_set,
+        s.labels_added,
+        s.labels_removed,
+        s.indexes_added,
+        s.indexes_removed,
+        s.constraints_added,
+        s.constraints_removed,
+        s.system_updates,
+        s.contains_updates()
+    );
+}
+
+/// Property values (scalars and lists) as plain JSON.
+fn write_value(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Float(f) => write_float(out, *f),
+        Value::String(s) => write_str(out, s),
+        Value::List(items) => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, x);
+            }
+            out.push(']');
+        }
+        Value::Map(m) => write_props(out, m),
+        // Not storable as properties; never part of a materialized result's properties.
+        Value::Node(id) => {
+            let _ = write!(out, r#"{{"$type":"node","id":{id}}}"#);
+        }
+        Value::Rel(id) => {
+            let _ = write!(out, r#"{{"$type":"relationship","id":{id}}}"#);
+        }
+        Value::Path(_) => out.push_str("null"),
+        Value::Temporal(t) => write_str(out, &t.to_string()),
+        Value::Point(p) => write_point(out, p),
+    }
+}
+
+fn write_props(out: &mut String, m: &BTreeMap<String, Value>) {
+    out.push('{');
+    for (i, (k, v)) in m.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(out, k);
+        out.push(':');
+        write_value(out, v);
+    }
+    out.push('}');
+}
+
+fn write_node(out: &mut String, n: &NodeData) {
+    let _ = write!(out, r#"{{"$type":"node","id":{},"labels":["#, n.id);
+    for (i, l) in n.labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(out, l);
+    }
+    out.push_str(r#"],"properties":"#);
+    write_props(out, &n.properties);
+    out.push('}');
+}
+
+fn write_rel(out: &mut String, r: &RelData) {
+    let _ = write!(out, r#"{{"$type":"relationship","id":{},"type":"#, r.id);
+    write_str(out, &r.rel_type);
+    let _ = write!(out, r#","start":{},"end":{},"properties":"#, r.start, r.end);
+    write_props(out, &r.properties);
+    out.push('}');
+}
+
+fn write_path(out: &mut String, p: &PathData) {
+    out.push_str(r#"{"$type":"path","nodes":["#);
+    for (i, n) in p.nodes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_node(out, n);
+    }
+    out.push_str(r#"],"relationships":["#);
+    for (i, r) in p.relationships.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_rel(out, r);
+    }
+    out.push_str("]}");
+}
+
+fn write_result_value(out: &mut String, v: &ResultValue) {
+    match v {
+        ResultValue::Null => out.push_str("null"),
+        ResultValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        ResultValue::Int(i) => {
+            let _ = write!(out, "{i}");
+        }
+        ResultValue::Float(f) => write_float(out, *f),
+        ResultValue::String(s) => write_str(out, s),
+        ResultValue::List(items) => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_result_value(out, x);
+            }
+            out.push(']');
+        }
+        ResultValue::Map(m) => {
+            out.push('{');
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_str(out, k);
+                out.push(':');
+                write_result_value(out, v);
+            }
+            out.push('}');
+        }
+        ResultValue::Node(n) => write_node(out, n),
+        ResultValue::Relationship(r) => write_rel(out, r),
+        ResultValue::Path(p) => write_path(out, p),
+        ResultValue::Temporal(t) => write_str(out, &t.to_string()),
+        ResultValue::Point(p) => write_point(out, p),
+    }
+}
+
+/// A point as `{"$type":"point","crs":"cartesian","srid":7203,"x":1.0,"y":2.0}` (and `"z"`).
+fn write_point(out: &mut String, p: &Point) {
+    out.push_str(r#"{"$type":"point","crs":"#);
+    write_str(out, p.crs().name());
+    let _ = write!(out, r#","srid":{}"#, p.crs().srid());
+    for (name, c) in ["x", "y", "z"].iter().zip(p.coords()) {
+        let _ = write!(out, r#","{name}":"#);
+        write_float(out, *c);
+    }
+    out.push('}');
 }
 
 #[cfg(test)]

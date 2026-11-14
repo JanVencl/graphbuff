@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>graphbuff in the browser</title>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1b1f24; }
+  h1 { font-size: 1.3rem; }
+  textarea, input { width: 100%; box-sizing: border-box; font: 14px/1.4 ui-monospace, Consolas, monospace; padding: .5rem; }
+  textarea { height: 8rem; }
+  label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }
+  button { font: inherit; padding: .35rem .8rem; margin: .5rem .35rem 0 0; cursor: pointer; }
+  #status, #info { color: #57606a; }
+  #error { color: #b42318; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; }
+  table { border-collapse: collapse; margin-top: .75rem; width: 100%; }
+  th, td { border: 1px solid #d0d7de; padding: .3rem .55rem; text-align: left; vertical-align: top; font: 13px/1.4 ui-monospace, Consolas, monospace; }
+  th { background: #f3f5f7; }
+  #selftest td.ok { color: #1a7f37; } #selftest td.bad { color: #b42318; }
+</style>
+</head>
+<body>
+<h1>graphbuff in the browser</h1>
+<p id="status">Loading the engine…</p>
+
+<label for="query">Cypher</label>
+<textarea id="query" spellcheck="false">MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
+RETURN p.name AS actor, r.role AS role, m.title AS movie
+ORDER BY actor, movie</textarea>
+<label for="params">Parameters (JSON object, optional)</label>
+<input id="params" spellcheck="false" placeholder='{"name": "Keanu Reeves"}'>
+<div>
+  <button id="run" disabled>Run (Ctrl+Enter)</button>
+  <button id="reset" disabled>Reset database</button>
+  <button id="test" disabled>Run self-test</button>
+</div>
+<div id="examples"></div>
+
+<p id="info"></p>
+<p id="error"></p>
+<div id="result"></div>
+<div id="selftest"></div>
+
+<script type="module">
+import { loadGraphbuff } from "./graphbuff.js";
+
+const $ = (id) => document.getElementById(id);
+const examples = {
+  "Co-actors of Keanu": `MATCH (k:Person {name: 'Keanu Reeves'})-[:ACTED_IN]->(m)<-[:ACTED_IN]-(co)
+RETURN co.name AS coActor, count(m) AS movies, collect(m.title) AS titles
+ORDER BY movies DESC, coActor`,
+  "Movies per decade": `MATCH (m:Movie)
+RETURN (m.released / 10) * 10 AS decade, count(*) AS movies
+ORDER BY decade`,
+  "Within four hops of Hugo": `MATCH (h:Person {name: 'Hugo Weaving'})-[*1..4]-(other:Person)
+WHERE other <> h
+RETURN DISTINCT other.name AS reachable ORDER BY reachable`,
+  "Whole graph": `MATCH (a)-[r]->(b) RETURN a, r, b`,
+};
+
+const started = performance.now();
+const gb = await loadGraphbuff("graphbuff.wasm");
+let db = gb.open();
+const loadMs = performance.now() - started;
+$("status").textContent = `Engine loaded in ${loadMs.toFixed(1)} ms; the movies graph is in memory.`;
+window.graphbuff = { run: (q, p) => db.run(q, p), loadMs };
+
+function cell(v) {
+  if (v === null) return "null";
+  if (typeof v !== "object") return String(v);
+  if (v.$type === "node") return `(:${v.labels.join(":")} ${JSON.stringify(v.properties)})`;
+  if (v.$type === "relationship") return `[:${v.type} ${JSON.stringify(v.properties)}]`;
+  return JSON.stringify(v);
+}
+
+function table(columns, rows) {
+  const t = document.createElement("table");
+  const head = t.createTHead().insertRow();
+  for (const c of columns) head.appendChild(document.createElement("th")).textContent = c;
+  const body = t.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    for (const v of row) tr.insertCell().textContent = cell(v);
+  }
+  return t;
+}
+
+function run() {
+  $("error").textContent = "";
+  $("info").textContent = "";
+  $("result").replaceChildren();
+  let out, ms;
+  try {
+    const t = performance.now();
+    out = db.run($("query").value, $("params").value);
+    ms = performance.now() - t;
+  } catch (e) {
+    // A trap inside the module: start over with a fresh database.
+    $("error").textContent = `The engine stopped: ${e.message}. The database was reset.`;
+    db = gb.open();
+    return;
+  }
+  if (out.error) {
+    const at = out.error.offset === undefined ? "" : ` (at offset ${out.error.offset})`;
+    $("error").textContent = `${out.error.code}: ${out.error.message}${at}`;
+    return;
+  }
+  const changes = Object.entries(out.stats)
+    .filter(([k, v]) => typeof v === "number" && v > 0)
+    .map(([k, v]) => `${k}: ${v}`);
+  $("info").textContent = [`${out.rows.length} row(s) in ${ms.toFixed(2)} ms`, ...changes].join(" · ");
+  if (out.columns.length) $("result").appendChild(table(out.columns, out.rows));
+}
+
+function selfTest() {
+  const fresh = gb.open();
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const cases = [
+    ["co-actors", examples["Co-actors of Keanu"], null, (r) =>
+      same(r.rows.map(([name, n, titles]) => [name, n, [...titles].sort()]), [
+        ["Carrie-Anne Moss", 2, ["The Matrix", "The Matrix Reloaded"]],
+        ["Hugo Weaving", 1, ["The Matrix"]],
+      ])],
+    ["movies per decade", examples["Movies per decade"], null, (r) => same(r.rows, [[1990, 1], [2000, 1], [2010, 1]])],
+    ["four hops", examples["Within four hops of Hugo"], null, (r) =>
+      same(r.rows, [["Carrie-Anne Moss"], ["Keanu Reeves"], ["Lana Wachowski"]])],
+    ["create", "CREATE (:Movie {title: 'Speed', released: 1994})", null, (r) => r.stats.nodesCreated === 1],
+    ["match sees the create", "MATCH (m:Movie {title: 'Speed'}) RETURN m.released AS y", null, (r) => same(r.rows, [[1994]])],
+    ["params", "MATCH (p:Person) WHERE p.born < $year RETURN p.name AS name ORDER BY name", { year: 1965 },
+      (r) => same(r.rows, [["Hugo Weaving"], ["Keanu Reeves"]])],
+    ["syntax error", "MATCH (n RETURN n", null, (r) => r.error?.code === "SyntaxError" && Number.isInteger(r.error.offset)],
+    ["clock functions", "RETURN timestamp() > 1700000000000 AS t, date().year >= 2024 AS d", null, (r) => same(r.rows, [[true, true]])],
+    ["profile", "PROFILE MATCH (n) RETURN count(n)", null, (r) => r.plan?.profiled === true],
+  ];
+  const rows = [];
+  let passed = 0;
+  for (const [name, query, params, ok] of cases) {
+    let out, good = false, ms = 0;
+    try {
+      const t = performance.now();
+      out = fresh.run(query, params);
+      ms = performance.now() - t;
+      good = !!ok(out);
+    } catch (e) {
+      out = { trap: e.message };
+    }
+    passed += good;
+    rows.push([name, good ? "pass" : "FAIL", ms.toFixed(2), JSON.stringify(out.error ?? out.rows ?? out)]);
+  }
+  fresh.close();
+  const t = table(["case", "result", "ms", "answer"], rows);
+  for (const tr of t.tBodies[0].rows) tr.cells[1].className = tr.cells[1].textContent === "pass" ? "ok" : "bad";
+  const summary = document.createElement("p");
+  summary.id = "selftest-summary";
+  summary.textContent = `Self-test: ${passed} of ${cases.length} passed.`;
+  $("selftest").replaceChildren(summary, t);
+  return { passed, total: cases.length, rows };
+}
+window.graphbuff.selfTest = selfTest;
+
+for (const [name, text] of Object.entries(examples)) {
+  const b = document.createElement("button");
+  b.textContent = name;
+  b.onclick = () => { $("query").value = text; $("params").value = ""; run(); };
+  $("examples").appendChild(b);
+}
+$("run").onclick = run;
+$("reset").onclick = () => { db.close(); db = gb.open(); run(); };
+$("test").onclick = selfTest;
+$("query").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run(); });
+for (const id of ["run", "reset", "test"]) $(id).disabled = false;
+</script>
+</body>
+</html>

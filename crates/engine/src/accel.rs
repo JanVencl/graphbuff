@@ -811,6 +811,11 @@ fn reused_walks(csr: &Csr, passes: &(dyn Fn(usize, u32) -> bool + Sync), hops: &
     // Independent per node: contiguous ranges on threads once there is enough work.
     let threads = if n < 1 << 16 { 1 } else { std::thread::available_parallelism().map_or(1, |t| t.get()) };
     let step = n.div_ceil(threads).max(1);
+    // No threads in a browser.
+    #[cfg(target_arch = "wasm32")]
+    if threads == 1 {
+        return (0..n).map(|x| node(x as u32)).collect();
+    }
     std::thread::scope(|s| {
         let parts: Vec<_> = (0..n)
             .step_by(step)

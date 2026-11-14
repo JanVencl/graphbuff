@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/cli", "crates/server"]
+members = ["crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/cli", "crates/server", "crates/wasm"]
 # The GPU backend pulls in wgpu (and, on Windows with the GNU toolchain, needs extra tools to
 # link; see the README), so a plain `cargo build` / `cargo test` leaves it out. Build it with
 # `-p graphbuff-gpu` or the `gpu` feature of `graphbuff`, `graphbuff-cli` or `graphbuff-server`.
+# The browser build (`crates/wasm`) is for the wasm32-unknown-unknown target; see its README.
 default-members = ["crates/core", "crates/cypher", "crates/engine", "crates/cli", "crates/server"]
 
 [workspace.package]
@@ -22,3 +23,13 @@ graphbuff-gpu = { path = "crates/gpu" }
 # unoptimized; optimized it takes about half a second.
 [profile.dev.package.graphbuff-server]
 opt-level = 3
+
+# The browser module: small rather than fast to compile.
+# cargo build -p graphbuff-wasm --target wasm32-unknown-unknown --profile wasm
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

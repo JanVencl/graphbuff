@@ -6,7 +6,7 @@
 //! of the clauses before it, and a `LIMIT` above an update never skips part of it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Instant;
+use graphbuff_core::clock::Instant;
 
 use graphbuff_core::{
     ConstraintDef, Direction, Error, IndexDef, IndexEntity, NodeId, Path, RelId, Result, Value,

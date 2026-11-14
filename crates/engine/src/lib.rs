@@ -44,6 +44,7 @@ mod result;
 mod stream;
 mod transaction;
 mod interrupt;
+pub mod json;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -369,7 +370,7 @@ impl<S: GraphStore> Database<S> {
             interrupt.check_now()?;
             let mut nap = pause;
             if let Some(d) = interrupt.deadline() {
-                nap = nap.min(d.saturating_duration_since(std::time::Instant::now()));
+                nap = nap.min(d.saturating_duration_since(graphbuff_core::clock::Instant::now()));
             }
             std::thread::sleep(nap);
             pause = (pause * 2).min(std::time::Duration::from_millis(5));

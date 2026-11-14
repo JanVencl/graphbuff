@@ -10,8 +10,9 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use graphbuff_core::clock::Instant;
 use graphbuff_core::{Error, Result};
 
 /// Cancels the queries it was given to, from any thread.

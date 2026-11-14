@@ -63,7 +63,6 @@ mod api;
 mod bolt;
 mod crypto;
 mod http;
-pub mod json;
 mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
@@ -71,6 +70,8 @@ mod tls;
 mod tx;
 pub mod users;
 
+/// The JSON reader and writer, and the JSON form of results and errors.
+pub use graphbuff::json;
 pub use net::TlsConfig;
 pub use users::{Role, Users};
 

@@ -242,9 +242,7 @@ fn check_offset(o: i64) -> Result<i32> {
 
 /// The current date and time in UTC: `(days, nanos of day)`.
 pub fn now_utc() -> (i64, i64) {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let d = crate::clock::unix_time().unwrap_or_default();
     let total = d.as_nanos() as i128;
     (
         total.div_euclid(NANOS_PER_DAY as i128) as i64,
