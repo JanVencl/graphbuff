@@ -1,0 +1,10 @@
+[package]
+name = "graphbuff-cypher"
+description = "Cypher lexer, parser and AST for graphbuff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graphbuff-core.workspace = true

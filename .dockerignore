@@ -1,0 +1,8 @@
+# Only the workspace manifests, crates/ and examples/movies.cypher go into the build.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+!examples
+examples/*
+!examples/movies.cypher

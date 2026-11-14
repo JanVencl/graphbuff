@@ -1,0 +1,6 @@
+/target
+/.idea/
+/.claude/
+/RUST_FILES.md
+test_data/
+__pycache__/

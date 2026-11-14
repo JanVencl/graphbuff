@@ -1,0 +1,12 @@
+[package]
+name = "graphbuff-gpu"
+description = "GPU kernel backend (wgpu) for the graphbuff graph database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graphbuff-core.workspace = true
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "metal"] }

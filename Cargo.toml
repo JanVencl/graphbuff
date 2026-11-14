@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/cli", "crates/server"]
+# The GPU backend pulls in wgpu (and, on Windows with the GNU toolchain, needs extra tools to
+# link; see the README), so a plain `cargo build` / `cargo test` leaves it out. Build it with
+# `-p graphbuff-gpu` or the `gpu` feature of `graphbuff`, `graphbuff-cli` or `graphbuff-server`.
+default-members = ["crates/core", "crates/cypher", "crates/engine", "crates/cli", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.89"
+
+[workspace.dependencies]
+graphbuff-core = { path = "crates/core" }
+graphbuff-cypher = { path = "crates/cypher" }
+graphbuff = { path = "crates/engine" }
+graphbuff-gpu = { path = "crates/gpu" }
+
+# Password hashing (PBKDF2-HMAC-SHA-256, 600,000 rounds) takes about 15 s per login
+# unoptimized; optimized it takes about half a second.
+[profile.dev.package.graphbuff-server]
+opt-level = 3

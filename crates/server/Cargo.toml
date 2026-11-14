@@ -1,0 +1,33 @@
+[package]
+name = "graphbuff-server"
+description = "HTTP/JSON and Bolt server for the graphbuff graph database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "graphbuff-server"
+path = "src/main.rs"
+
+[dependencies]
+graphbuff.workspace = true
+
+[features]
+# HTTPS and Bolt over TLS (`ServerConfig::tls`) with rustls. `tls` uses the ring crypto
+# provider (audited; building it needs a C compiler). `tls-rustcrypto` uses the pure-Rust
+# RustCrypto provider instead (no C compiler; a pre-release). With both, ring is used.
+tls = ["dep:rustls", "rustls/ring"]
+tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
+# `--gpu`: run graph kernels on the GPU (wgpu).
+gpu = ["graphbuff/gpu"]
+
+[dependencies.rustls]
+version = "0.23"
+optional = true
+default-features = false
+features = ["std", "tls12"]
+
+[dependencies.rustls-rustcrypto]
+version = "=0.1.0-pre.0"
+optional = true

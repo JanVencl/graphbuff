@@ -1,0 +1,125 @@
+# Pushing a tag `vX.Y.Z` publishes a release:
+#   * archives of `graphbuff` and `graphbuff-server` for Linux, macOS and Windows,
+#     plus SHA256SUMS, attached to the GitHub release of the tag;
+#   * the image ghcr.io/janvencl/graphbuff, tagged X.Y.Z and latest (amd64 and arm64).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: tag matches the workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+
+  archives:
+    name: ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Statically linked (musl): runs on any x86-64 Linux, whatever its libc.
+          - { name: linux-x86_64,   os: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          - { name: macos-arm64,    os: macos-latest,   target: aarch64-apple-darwin }
+          - { name: macos-x86_64,   os: macos-latest,   target: x86_64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p graphbuff-cli -p graphbuff-server
+      - name: Package
+        shell: bash
+        run: |
+          dir=graphbuff-${GITHUB_REF_NAME#v}-${{ matrix.name }}
+          mkdir -p "$dir" dist
+          cp README.md "$dir/"
+          bin=target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "$bin/graphbuff.exe" "$bin/graphbuff-server.exe" "$dir/"
+            7z a "dist/graphbuff-${{ matrix.name }}.zip" "$dir"
+          else
+            cp "$bin/graphbuff" "$bin/graphbuff-server" "$dir/"
+            tar -czf "dist/graphbuff-${{ matrix.name }}.tar.gz" "$dir"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graphbuff-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: archives
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum graphbuff-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "graphbuff ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+
+  image:
+    name: container image
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/janvencl/graphbuff:${{ steps.version.outputs.version }}
+            ghcr.io/janvencl/graphbuff:latest
+          labels: org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

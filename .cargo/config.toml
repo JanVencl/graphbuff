@@ -1,0 +1,5 @@
+# getrandom (a dependency of the optional `tls` feature) links bcryptprimitives.dll with
+# `raw-dylib` on Windows, which the GNU toolchain can only do with MinGW's dlltool.
+# RtlGenRandom (advapi32) needs no extra tools and is as good a source of randomness.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["--cfg", "getrandom_backend=\"windows_legacy\""]

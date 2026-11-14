@@ -1,0 +1,1552 @@
+//! The Bolt protocol (versions 4.4 and 5.0–5.4), spoken by the Neo4j drivers.
+//!
+//! A connection starts with a handshake: the magic `60 60 B0 17` and four version
+//! proposals, answered with the chosen version. Then messages flow, each a PackStream
+//! structure split into chunks (a big-endian `u16` size, the bytes, and a `00 00` end).
+//!
+//! Every connection has two threads. A reader decodes messages and queues them, so that
+//! a `RESET` can interrupt the statement that is running (it cancels its
+//! [`CancelHandle`]); messages queued before the `RESET` are then answered `IGNORED`. The
+//! connection's own thread runs the messages in order and writes the answers.
+//!
+//! Results are computed by `RUN` and kept until `PULL` or `DISCARD` take them, `n` rows at
+//! a time. An explicit transaction (`BEGIN` … `COMMIT`) is owned by the connection's
+//! thread, which holds the database's write lock until it ends; it is rolled back when
+//! no message arrives for [`crate::ServerConfig::transaction_timeout`], or when the
+//! connection closes.
+
+use std::collections::BTreeMap;
+use std::io::{self, BufWriter, ErrorKind, Read, Write};
+use std::net::SocketAddr;
+
+use crate::net::Stream;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use graphbuff::cypher::ast::{Query, Statement, UserCommand};
+
+use crate::users::{Access, Principal};
+use graphbuff::temporal::{self, NANOS_PER_DAY, NANOS_PER_SECOND};
+use graphbuff::{
+    BoxedStore, CancelHandle, Crs, Error, NodeData, PathData, PlanDescription, Point, QueryOptions, QueryResult,
+    QueryStats, RelData, ResultValue, Temporal, Transaction, Value,
+};
+
+use crate::packstream::{self, PackValue};
+use crate::{POLL, Shared, api};
+
+const MAGIC: [u8; 4] = [0x60, 0x60, 0xB0, 0x17];
+/// The newest Bolt 5 minor version served.
+const MAX_V5_MINOR: u8 = 4;
+
+// Requests.
+const HELLO: u8 = 0x01;
+const GOODBYE: u8 = 0x02;
+const RESET: u8 = 0x0F;
+const RUN: u8 = 0x10;
+const BEGIN: u8 = 0x11;
+const COMMIT: u8 = 0x12;
+const ROLLBACK: u8 = 0x13;
+const DISCARD: u8 = 0x2F;
+const PULL: u8 = 0x3F;
+const TELEMETRY: u8 = 0x54;
+const ROUTE: u8 = 0x66;
+const LOGON: u8 = 0x6A;
+const LOGOFF: u8 = 0x6B;
+
+// Responses.
+const SUCCESS: u8 = 0x70;
+const RECORD: u8 = 0x71;
+const IGNORED: u8 = 0x7E;
+const FAILURE: u8 = 0x7F;
+
+// Value structures.
+const NODE: u8 = 0x4E;
+const RELATIONSHIP: u8 = 0x52;
+const UNBOUND_RELATIONSHIP: u8 = 0x72;
+const PATH: u8 = 0x50;
+const DATE: u8 = 0x44;
+const TIME: u8 = 0x54;
+const LOCAL_TIME: u8 = 0x74;
+const DATE_TIME: u8 = 0x49;
+const DATE_TIME_LEGACY: u8 = 0x46;
+const DATE_TIME_ZONE_ID: u8 = 0x69;
+const DATE_TIME_ZONE_ID_LEGACY: u8 = 0x66;
+const LOCAL_DATE_TIME: u8 = 0x64;
+const DURATION: u8 = 0x45;
+const POINT_2D: u8 = 0x58;
+const POINT_3D: u8 = 0x59;
+
+// Error codes, in Neo4j's `Neo.<classification>.<category>.<title>` form.
+const INVALID: &str = "Neo.ClientError.Request.Invalid";
+const UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
+const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
+const TYPE_ERROR: &str = "Neo.ClientError.Statement.TypeError";
+const NOT_SUPPORTED: &str = "Neo.ClientError.Statement.FeatureNotSupported";
+const DATABASE_NOT_FOUND: &str = "Neo.ClientError.Database.DatabaseNotFound";
+const TIMED_OUT: &str = "Neo.ClientError.Transaction.TransactionTimedOut";
+
+/// The name drivers use for administration commands; with no real database of that
+/// name, it runs database commands only.
+const SYSTEM_DB: &str = "system";
+
+/// Numbers the connections (for `connection_id`) and the bookmarks.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static BOOKMARKS: AtomicU64 = AtomicU64::new(0);
+
+/// The Bolt version a client and the server agreed on.
+fn negotiate(proposals: &[u8]) -> Option<(u8, u8)> {
+    for &[_, range, minor, major] in proposals.as_chunks::<4>().0 {
+        let lowest = minor.saturating_sub(range);
+        match major {
+            5 if lowest <= MAX_V5_MINOR => return Some((5, minor.min(MAX_V5_MINOR))),
+            4 if minor >= 4 && lowest <= 4 => return Some((4, 4)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads exactly `buf.len()` bytes. Read timeouts are retried while `keep_going` says
+/// so; `Ok(false)` means it said stop.
+fn read_full(stream: &mut Stream, buf: &mut [u8], keep_going: &dyn Fn() -> bool) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => filled += n,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if !keep_going() {
+                    return Ok(false);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Serves one Bolt connection until it closes or the server stops.
+pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
+    let started = Instant::now();
+    let mut hello = [0u8; 20];
+    let in_time = || !shared.stop() && started.elapsed() < shared.limits.request;
+    if !matches!(read_full(&mut stream, &mut hello, &in_time), Ok(true)) || hello[..4] != MAGIC {
+        return;
+    }
+    let Some(version) = negotiate(&hello[4..]) else {
+        let _ = stream.write_all(&[0, 0, 0, 0]);
+        return;
+    };
+    if stream.write_all(&[0, 0, version.1, version.0]).is_err() {
+        return;
+    }
+    let (Ok(reader), Ok(writer), Ok(local)) = (stream.try_clone(), stream.try_clone(), stream.local_addr()) else {
+        return;
+    };
+    let control = Control::default();
+    let (queue, inbox) = mpsc::channel();
+    thread::scope(|s| {
+        let control = &control;
+        let read = thread::Builder::new()
+            .name("graphbuff-bolt-read".into())
+            .spawn_scoped(s, move || read_messages(reader, queue, control, shared));
+        if read.is_err() {
+            return;
+        }
+        let mut conn = Conn {
+            shared,
+            out: BufWriter::new(writer),
+            inbox,
+            control,
+            local,
+            version,
+            utc: version.0 >= 5,
+            hello: false,
+            who: None,
+            failed: false,
+            pending_failure: None,
+        };
+        let _ = conn.run();
+        let _ = conn.out.flush();
+        // Wakes the reader, which may be waiting for the client.
+        stream.shutdown();
+    });
+}
+
+// ---- reading ------------------------------------------------------------------------------
+
+/// A message from the reader thread.
+enum Incoming {
+    Message { tag: u8, fields: Vec<PackValue> },
+    /// The client broke the protocol; the connection closes after answering.
+    Bad(String),
+}
+
+/// What the reader shares with the connection's thread, for `RESET`.
+#[derive(Default)]
+struct Control {
+    /// `RESET`s read but not yet handled.
+    resets: AtomicUsize,
+    /// Cancels the statement (or wait to begin) running now.
+    running: Mutex<Option<CancelHandle>>,
+}
+
+impl Control {
+    fn running(&self) -> std::sync::MutexGuard<'_, Option<CancelHandle>> {
+        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn interrupt(&self) {
+        if let Some(c) = self.running().as_ref() {
+            c.cancel();
+        }
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.resets.load(Ordering::SeqCst) > 0
+    }
+}
+
+fn read_messages(mut stream: Stream, queue: Sender<Incoming>, control: &Control, shared: &Shared) {
+    let keep_going = || !shared.stop();
+    let mut message = Vec::new();
+    loop {
+        let mut size = [0u8; 2];
+        if !matches!(read_full(&mut stream, &mut size, &keep_going), Ok(true)) {
+            break;
+        }
+        let n = u16::from_be_bytes(size) as usize;
+        if n == 0 {
+            if message.is_empty() {
+                continue; // a no-op chunk, sent to keep the connection alive
+            }
+            let incoming = match packstream::decode(&message) {
+                Ok(PackValue::Struct { tag, fields }) => {
+                    if tag == RESET {
+                        control.resets.fetch_add(1, Ordering::SeqCst);
+                        control.interrupt();
+                    }
+                    Incoming::Message { tag, fields }
+                }
+                Ok(other) => Incoming::Bad(format!("a message must be a structure, not a {}", other.type_name())),
+                Err(e) => Incoming::Bad(format!("malformed message: {e}")),
+            };
+            message.clear();
+            let bad = matches!(incoming, Incoming::Bad(_));
+            if queue.send(incoming).is_err() || bad {
+                break;
+            }
+            continue;
+        }
+        if message.len() + n > shared.limits.max_body {
+            let _ = queue.send(Incoming::Bad(format!(
+                "a message is larger than {} bytes",
+                shared.limits.max_body
+            )));
+            break;
+        }
+        let start = message.len();
+        message.resize(start + n, 0);
+        if !matches!(read_full(&mut stream, &mut message[start..], &keep_going), Ok(true)) {
+            break;
+        }
+    }
+    // The client left, or the server is stopping: stop what runs for it.
+    control.interrupt();
+}
+
+// ---- the connection -----------------------------------------------------------------------
+
+/// A failure to report: a Neo4j error code and a message.
+struct Failure {
+    code: &'static str,
+    message: String,
+}
+
+impl Failure {
+    fn new(code: &'static str, message: impl Into<String>) -> Failure {
+        Failure {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Failure {
+        Failure::new(INVALID, message)
+    }
+
+    fn from_error(e: &Error) -> Failure {
+        let code = match e {
+            Error::Syntax { .. } => "Neo.ClientError.Statement.SyntaxError",
+            Error::Semantic(_) => "Neo.ClientError.Statement.SemanticError",
+            Error::Type(_) => TYPE_ERROR,
+            Error::Runtime(_) => "Neo.ClientError.Statement.ArgumentError",
+            Error::Unsupported(_) => NOT_SUPPORTED,
+            Error::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
+            Error::Storage(_) => "Neo.DatabaseError.General.UnknownError",
+            Error::TransactionTooLarge(_) => "Neo.ClientError.Transaction.TransactionTooLarge",
+            Error::Timeout(_) => TIMED_OUT,
+            Error::Cancelled(_) => "Neo.ClientError.Transaction.Terminated",
+            Error::Forbidden(_) => FORBIDDEN,
+        };
+        Failure::new(code, e.to_string())
+    }
+}
+
+/// What a message did to the connection.
+enum Flow {
+    Continue,
+    Close,
+}
+
+/// What the connection's thread waits for next.
+enum Event {
+    Message(u8, Vec<PackValue>),
+    /// No message before the deadline.
+    Idle,
+    /// The client left or broke the protocol, or the server is stopping.
+    Close,
+}
+
+/// A result computed by `RUN`, waiting for `PULL` or `DISCARD`.
+struct Pending {
+    rows: std::vec::IntoIter<Vec<ResultValue>>,
+    stats: QueryStats,
+    plan: Option<PlanDescription>,
+    db: String,
+    started: Instant,
+}
+
+impl Pending {
+    fn new(r: QueryResult, db: String, started: Instant) -> (Pending, Vec<String>) {
+        let pending = Pending {
+            rows: r.rows.into_iter(),
+            stats: r.stats,
+            plan: r.plan,
+            db,
+            started,
+        };
+        (pending, r.columns)
+    }
+}
+
+struct Conn<'s> {
+    shared: &'s Shared,
+    out: BufWriter<Stream>,
+    inbox: Receiver<Incoming>,
+    control: &'s Control,
+    local: SocketAddr,
+    version: (u8, u8),
+    /// Whether date-times travel as UTC instants (Bolt 5, or the 4.4 `utc` patch).
+    utc: bool,
+    hello: bool,
+    /// Who logged in; `None` before that.
+    who: Option<Principal>,
+    /// After a failure, messages are ignored until `RESET`.
+    failed: bool,
+    /// A failure to report on the next message (a transaction that timed out).
+    pending_failure: Option<Failure>,
+}
+
+type Fields = Vec<PackValue>;
+type Params = BTreeMap<String, Value>;
+type Extra = BTreeMap<String, PackValue>;
+
+impl Conn<'_> {
+    fn at_least(&self, major: u8, minor: u8) -> bool {
+        self.version >= (major, minor)
+    }
+
+    // ---- writing ----
+
+    fn send(&mut self, tag: u8, fields: Fields) -> io::Result<()> {
+        let mut buf = Vec::new();
+        packstream::encode(&mut buf, &PackValue::Struct { tag, fields });
+        for chunk in buf.chunks(u16::MAX as usize) {
+            self.out.write_all(&(chunk.len() as u16).to_be_bytes())?;
+            self.out.write_all(chunk)?;
+        }
+        self.out.write_all(&[0, 0])
+    }
+
+    fn success(&mut self, meta: BTreeMap<String, PackValue>) -> io::Result<()> {
+        self.send(SUCCESS, vec![PackValue::Map(meta)])
+    }
+
+    fn ignored(&mut self) -> io::Result<()> {
+        self.send(IGNORED, vec![])
+    }
+
+    /// Reports a failure; later messages are ignored until `RESET`.
+    fn fail(&mut self, f: Failure) -> io::Result<()> {
+        self.failed = true;
+        self.send(
+            FAILURE,
+            vec![PackValue::map([("code", PackValue::str(f.code)), ("message", PackValue::String(f.message))])],
+        )
+    }
+
+    // ---- reading ----
+
+    /// The next message, flushing the answers written so far before waiting.
+    fn next(&mut self, deadline: Option<Instant>) -> io::Result<Event> {
+        let incoming = match self.inbox.try_recv() {
+            Ok(m) => m,
+            Err(TryRecvError::Disconnected) => return Ok(Event::Close),
+            Err(TryRecvError::Empty) => {
+                self.out.flush()?;
+                loop {
+                    if self.shared.stop() {
+                        return Ok(Event::Close);
+                    }
+                    let mut wait = POLL;
+                    if let Some(d) = deadline {
+                        let left = d.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Ok(Event::Idle);
+                        }
+                        wait = wait.min(left);
+                    }
+                    match self.inbox.recv_timeout(wait) {
+                        Ok(m) => break m,
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return Ok(Event::Close),
+                    }
+                }
+            }
+        };
+        if self.shared.stop() {
+            return Ok(Event::Close);
+        }
+        match incoming {
+            Incoming::Message { tag, fields } => Ok(Event::Message(tag, fields)),
+            Incoming::Bad(message) => {
+                self.fail(Failure::invalid(message))?;
+                Ok(Event::Close)
+            }
+        }
+    }
+
+    /// Handles a `RESET`: everything before it is forgotten.
+    fn reset(&mut self) -> io::Result<()> {
+        self.control.resets.fetch_sub(1, Ordering::SeqCst);
+        self.failed = false;
+        self.pending_failure = None;
+        self.success(BTreeMap::new())
+    }
+
+    /// Runs `f` so that a `RESET` (or the client leaving, or shutdown) can cancel it.
+    /// `None`: a `RESET` came first, or cancelled it; the message is then ignored.
+    fn interruptible<T>(
+        &self,
+        timeout: Option<Duration>,
+        f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
+    ) -> Option<graphbuff::Result<T>> {
+        let cancel = CancelHandle::new();
+        *self.control.running() = Some(cancel.clone());
+        // Checked after publishing the handle: a RESET read from now on cancels it.
+        let result = if self.control.reset_pending() {
+            None
+        } else {
+            Some(f(&QueryOptions {
+                timeout,
+                cancel: Some(cancel),
+            }))
+        };
+        *self.control.running() = None;
+        match result {
+            Some(Err(Error::Cancelled(_))) if self.control.reset_pending() => None,
+            r => r,
+        }
+    }
+
+    // ---- the message loop ----
+
+    fn run(&mut self) -> io::Result<()> {
+        let mut streaming: Option<Pending> = None;
+        loop {
+            let (tag, fields) = match self.next(None)? {
+                Event::Message(t, f) => (t, f),
+                Event::Idle | Event::Close => return Ok(()),
+            };
+            match tag {
+                GOODBYE => return Ok(()),
+                RESET => {
+                    streaming = None;
+                    self.reset()?;
+                    continue;
+                }
+                _ if self.control.reset_pending() => {
+                    self.ignored()?;
+                    continue;
+                }
+                _ => {}
+            }
+            if !self.hello {
+                if tag != HELLO {
+                    self.fail(Failure::invalid("the first message must be HELLO"))?;
+                    return Ok(());
+                }
+                match self.hello(fields)? {
+                    Flow::Continue => continue,
+                    Flow::Close => return Ok(()),
+                }
+            }
+            if self.failed {
+                self.ignored()?;
+                continue;
+            }
+            if let Some(f) = self.pending_failure.take() {
+                self.fail(f)?;
+                continue;
+            }
+            if self.who.is_none() {
+                if tag == LOGON {
+                    match self.logon(fields)? {
+                        Flow::Continue => continue,
+                        Flow::Close => return Ok(()),
+                    }
+                }
+                self.fail(Failure::new(UNAUTHORIZED, "authenticate with LOGON first"))?;
+                return Ok(());
+            }
+            match tag {
+                RUN if streaming.is_none() => streaming = self.run_autocommit(fields)?,
+                PULL | DISCARD if streaming.is_some() => {
+                    let p = streaming.as_mut().expect("checked");
+                    if self.stream(p, tag == PULL, &fields, true)? {
+                        streaming = None;
+                    }
+                }
+                BEGIN if streaming.is_none() => {
+                    if let Flow::Close = self.begin(fields)? {
+                        return Ok(());
+                    }
+                }
+                ROUTE => self.route(fields)?,
+                TELEMETRY if self.at_least(5, 4) => self.success(BTreeMap::new())?,
+                LOGOFF if self.at_least(5, 1) => {
+                    streaming = None;
+                    self.who = None;
+                    self.success(BTreeMap::new())?;
+                }
+                RUN | BEGIN => self.fail(Failure::invalid("a result is still open: PULL or DISCARD it first"))?,
+                PULL | DISCARD => self.fail(Failure::invalid("there is no result to PULL or DISCARD"))?,
+                COMMIT | ROLLBACK => self.fail(Failure::invalid("there is no open transaction"))?,
+                HELLO | LOGON => self.fail(Failure::invalid("already authenticated"))?,
+                other => self.fail(Failure::invalid(format!("unknown message 0x{other:02X}")))?,
+            }
+        }
+    }
+
+    // ---- authentication ----
+
+    /// Who `auth` (`scheme`, `principal`, `credentials`) logs in as: `basic` with a
+    /// user's name and password, or with the server token as the password (any name);
+    /// `bearer` with the token.
+    fn login(&self, auth: &BTreeMap<String, PackValue>) -> Option<Principal> {
+        let ctx = &self.shared.ctx;
+        if !ctx.auth_required() {
+            return Some(Principal::Open);
+        }
+        let text = |key: &str| match auth.get(key) {
+            Some(PackValue::String(s)) => s.as_str(),
+            _ => "",
+        };
+        match text("scheme") {
+            "basic" => ctx.login(text("principal"), text("credentials")),
+            "bearer" => match &ctx.token {
+                Some(t) if api::same_secret(text("credentials"), t) => Some(Principal::Token),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What the logged-in client may do now.
+    fn access(&self) -> Result<(&Principal, Access), Failure> {
+        let who = self.who.as_ref().ok_or_else(|| Failure::new(UNAUTHORIZED, "not logged in"))?;
+        match self.shared.ctx.access(who) {
+            Some(a) => Ok((who, a)),
+            None => Err(Failure::new(UNAUTHORIZED, "the user no longer exists")),
+        }
+    }
+
+    fn hello(&mut self, fields: Fields) -> io::Result<Flow> {
+        let Some(PackValue::Map(extra)) = fields.into_iter().next() else {
+            self.fail(Failure::invalid("HELLO takes a map"))?;
+            return Ok(Flow::Close);
+        };
+        // From 5.1 the credentials come with LOGON.
+        if !self.at_least(5, 1) {
+            let Some(who) = self.login(&extra) else {
+                self.fail(Failure::new(UNAUTHORIZED, "wrong or missing credentials"))?;
+                return Ok(Flow::Close);
+            };
+            self.who = Some(who);
+        }
+        self.hello = true;
+        let id = CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        let mut meta = BTreeMap::new();
+        // Drivers expect a server agent of the form `Neo4j/x.y.z`.
+        meta.insert(
+            "server".into(),
+            PackValue::String(format!(
+                "Neo4j/{}.{}.0-graphbuff-{}",
+                self.version.0,
+                self.version.1,
+                env!("CARGO_PKG_VERSION")
+            )),
+        );
+        meta.insert("connection_id".into(), PackValue::String(format!("bolt-{id}")));
+        if self.version == (4, 4)
+            && let Some(PackValue::List(patches)) = extra.get("patch_bolt")
+            && patches.contains(&PackValue::str("utc"))
+        {
+            self.utc = true;
+            meta.insert("patch_bolt".into(), PackValue::List(vec![PackValue::str("utc")]));
+        }
+        self.success(meta)?;
+        Ok(Flow::Continue)
+    }
+
+    fn logon(&mut self, fields: Fields) -> io::Result<Flow> {
+        let Some(PackValue::Map(auth)) = fields.into_iter().next() else {
+            self.fail(Failure::invalid("LOGON takes a map"))?;
+            return Ok(Flow::Close);
+        };
+        let Some(who) = self.login(&auth) else {
+            self.fail(Failure::new(UNAUTHORIZED, "wrong or missing credentials"))?;
+            return Ok(Flow::Close);
+        };
+        self.who = Some(who);
+        self.success(BTreeMap::new())?;
+        Ok(Flow::Continue)
+    }
+
+    // ---- statements ----
+
+    /// The database named by an `extra` map's `db` (the default one when missing), and
+    /// whether it exists.
+    fn database_name(&self, extra: &BTreeMap<String, PackValue>) -> Result<String, Failure> {
+        match extra.get("db") {
+            None | Some(PackValue::Null) => Ok(self.shared.ctx.mgr.default_database()),
+            Some(PackValue::String(s)) if s.is_empty() => Ok(self.shared.ctx.mgr.default_database()),
+            Some(PackValue::String(s)) => match self.shared.ctx.mgr.database(s) {
+                Ok(_) => Ok(s.to_ascii_lowercase()),
+                Err(_) if s.eq_ignore_ascii_case(SYSTEM_DB) => Ok(SYSTEM_DB.to_string()),
+                Err(_) => Err(Failure::new(DATABASE_NOT_FOUND, format!("database `{s}` does not exist"))),
+            },
+            Some(other) => Err(Failure::invalid(format!("`db` must be a string, got {}", other.type_name()))),
+        }
+    }
+
+    /// Whether `name` (from [`Self::database_name`]) is the `system` database: there is
+    /// no real database of that name, so it only runs database commands.
+    fn is_system(&self, name: &str) -> bool {
+        name == SYSTEM_DB && self.shared.ctx.mgr.database(name).is_err()
+    }
+
+    /// Checks the parts of an `extra` map that are not supported, and returns the time
+    /// limit it asks for (`tx_timeout`, in milliseconds), capped by the server's.
+    fn time_limit(&self, extra: &BTreeMap<String, PackValue>) -> Result<Option<Duration>, Failure> {
+        if let Some(PackValue::String(_)) = extra.get("imp_user") {
+            return Err(Failure::new(NOT_SUPPORTED, "impersonation (imp_user) is not supported"));
+        }
+        let requested = match extra.get("tx_timeout") {
+            None | Some(PackValue::Null) => None,
+            Some(PackValue::Int(ms)) if *ms > 0 => Some(Duration::from_millis(*ms as u64)),
+            // Zero (or less) means the server's limit, as in Neo4j.
+            Some(PackValue::Int(_)) => None,
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "`tx_timeout` must be an integer, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        Ok(self.shared.ctx.query_options(requested).timeout)
+    }
+
+    /// `RUN`'s fields: the query, its parameters and the extra map.
+    fn run_fields(fields: Fields) -> Result<(String, Params, Extra), Failure> {
+        let mut it = fields.into_iter();
+        let (Some(PackValue::String(query)), params, extra) = (it.next(), it.next(), it.next()) else {
+            return Err(Failure::invalid("RUN takes a query string, a parameter map and a map"));
+        };
+        let params = match params {
+            None | Some(PackValue::Null) => BTreeMap::new(),
+            Some(PackValue::Map(m)) => m
+                .into_iter()
+                .map(|(k, v)| Ok((k, to_value(v)?)))
+                .collect::<Result<_, Failure>>()?,
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "the parameters must be a map, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        let extra = match extra {
+            None | Some(PackValue::Null) => BTreeMap::new(),
+            Some(PackValue::Map(m)) => m,
+            Some(other) => return Err(Failure::invalid(format!("RUN's extra must be a map, got {}", other.type_name()))),
+        };
+        Ok((query, params, extra))
+    }
+
+    /// A `RUN` outside a transaction: the query is its own transaction.
+    fn run_autocommit(&mut self, fields: Fields) -> io::Result<Option<Pending>> {
+        let started = Instant::now();
+        let prepared = Self::run_fields(fields).and_then(|(query, params, extra)| {
+            let db = self.database_name(&extra)?;
+            let timeout = self.time_limit(&extra)?;
+            Ok((query, params, db, timeout))
+        });
+        let (query, params, db, timeout) = match prepared {
+            Ok(v) => v,
+            Err(f) => {
+                self.fail(f)?;
+                return Ok(None);
+            }
+        };
+        let (who, access) = match self.access() {
+            Ok((w, a)) => (w.clone(), a),
+            Err(f) => {
+                self.fail(f)?;
+                return Ok(None);
+            }
+        };
+        let ctx = &self.shared.ctx;
+        let system = self.is_system(&db);
+        let result = self.interruptible(timeout, |options| {
+            let statement = graphbuff::cypher::parse_statement(&query)?;
+            if let Statement::User(cmd) = &statement {
+                return ctx.user_command(&who, access, cmd, &params);
+            }
+            api::authorize(access, &statement)?;
+            let mut session = ctx.mgr.session();
+            if system {
+                system_command(&statement)?;
+            } else {
+                session.use_database(&db)?;
+            }
+            session.execute_with_options(&query, &params, options)
+        });
+        match result {
+            None => {
+                self.ignored()?;
+                Ok(None)
+            }
+            Some(Err(e)) => {
+                self.fail(Failure::from_error(&e))?;
+                Ok(None)
+            }
+            Some(Ok(r)) => {
+                let (pending, columns) = Pending::new(r, db, started);
+                self.success(run_success(columns, started, None))?;
+                Ok(Some(pending))
+            }
+        }
+    }
+
+    /// `PULL` (or `DISCARD`, without sending the rows) `n` rows of `p`. Returns whether
+    /// the result is used up.
+    fn stream(
+        &mut self,
+        p: &mut Pending,
+        send_rows: bool,
+        fields: &[PackValue],
+        autocommit: bool,
+    ) -> io::Result<bool> {
+        let n = match fields.first() {
+            Some(PackValue::Map(m)) => match m.get("n") {
+                Some(PackValue::Int(-1)) => usize::MAX,
+                Some(PackValue::Int(n)) if *n > 0 => *n as usize,
+                _ => {
+                    self.fail(Failure::invalid("`n` must be a positive number of rows, or -1 for all"))?;
+                    return Ok(false);
+                }
+            },
+            _ => {
+                self.fail(Failure::invalid("PULL and DISCARD take a map"))?;
+                return Ok(false);
+            }
+        };
+        let enc = Encoder {
+            element_ids: self.version.0 >= 5,
+            utc: self.utc,
+        };
+        for row in p.rows.by_ref().take(n) {
+            if send_rows {
+                let values = row.iter().map(|v| enc.result(v)).collect();
+                self.send(RECORD, vec![PackValue::List(values)])?;
+            }
+        }
+        if p.rows.len() > 0 {
+            self.success(BTreeMap::from([("has_more".into(), PackValue::Bool(true))]))?;
+            return Ok(false);
+        }
+        let mut meta = BTreeMap::new();
+        if autocommit {
+            meta.insert("bookmark".into(), PackValue::String(new_bookmark()));
+        }
+        // Neo4j's query types: "s" for schema or system changes alone.
+        let s = &p.stats;
+        let schema = s.system_updates + s.indexes_added + s.indexes_removed + s.constraints_added + s.constraints_removed;
+        let data = s.nodes_created
+            + s.nodes_deleted
+            + s.relationships_created
+            + s.relationships_deleted
+            + s.properties_set
+            + s.labels_added
+            + s.labels_removed;
+        let kind = if schema > 0 && data == 0 {
+            "s"
+        } else if p.stats.contains_updates() {
+            "rw"
+        } else {
+            "r"
+        };
+        meta.insert("type".into(), PackValue::str(kind));
+        meta.insert("t_last".into(), PackValue::Int(p.started.elapsed().as_millis() as i64));
+        meta.insert("db".into(), PackValue::String(p.db.clone()));
+        if p.stats.contains_updates() {
+            meta.insert("stats".into(), stats(&p.stats));
+        }
+        if let Some(plan) = &p.plan {
+            let key = if plan.profiled { "profile" } else { "plan" };
+            meta.insert(key.into(), plan_tree(plan));
+        }
+        self.success(meta)?;
+        Ok(true)
+    }
+
+    // ---- explicit transactions ----
+
+    fn begin(&mut self, fields: Fields) -> io::Result<Flow> {
+        let extra = match fields.into_iter().next() {
+            None | Some(PackValue::Null) => BTreeMap::new(),
+            Some(PackValue::Map(m)) => m,
+            Some(other) => {
+                self.fail(Failure::invalid(format!("BEGIN takes a map, got {}", other.type_name())))?;
+                return Ok(Flow::Continue);
+            }
+        };
+        let prepared = self.database_name(&extra).and_then(|name| {
+            let (_, access) = self.access()?;
+            api::check(access, Access::Read, "a transaction").map_err(|e| Failure::from_error(&e))?;
+            let limit = self.time_limit(&extra)?;
+            if self.is_system(&name) {
+                return Ok((name, limit, None));
+            }
+            let db = self
+                .shared
+                .ctx
+                .mgr
+                .database(&name)
+                .map_err(|e| Failure::new(DATABASE_NOT_FOUND, e.to_string()))?;
+            Ok((name, limit, Some(db)))
+        });
+        let (name, limit, db) = match prepared {
+            Ok(v) => v,
+            Err(f) => {
+                self.fail(f)?;
+                return Ok(Flow::Continue);
+            }
+        };
+        let deadline = limit.map(|l| Instant::now() + l);
+        let Some(db) = db else {
+            // A `system` transaction: each database command takes effect when it runs.
+            self.success(BTreeMap::new())?;
+            return self.transaction(None, &name, deadline);
+        };
+        match self.interruptible(limit, |options| db.begin_with_options(options)) {
+            None => {
+                self.ignored()?;
+                Ok(Flow::Continue)
+            }
+            Some(Err(e)) => {
+                self.fail(Failure::from_error(&e))?;
+                Ok(Flow::Continue)
+            }
+            Some(Ok(tx)) => {
+                self.success(BTreeMap::new())?;
+                self.transaction(Some(tx), &name, deadline)
+            }
+        }
+    }
+
+    /// Serves messages inside a transaction until it ends. `None` is a transaction on
+    /// the `system` database, which runs database commands at once, outside any store
+    /// transaction: committing it does nothing more and rolling it back undoes nothing.
+    fn transaction(
+        &mut self,
+        mut tx: Option<Transaction<'_, BoxedStore>>,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<Flow> {
+        let mut results: Vec<Option<Pending>> = Vec::new();
+        let idle = self.shared.ctx.txs.timeout();
+        loop {
+            let (tag, fields) = match self.next(Some(Instant::now() + idle))? {
+                Event::Message(t, f) => (t, f),
+                Event::Close => return Ok(Flow::Close),
+                Event::Idle => {
+                    if let Some(tx) = tx {
+                        tx.rollback();
+                    }
+                    self.pending_failure = Some(Failure::new(
+                        TIMED_OUT,
+                        format!(
+                            "the transaction was rolled back after {} ms without a message",
+                            idle.as_millis()
+                        ),
+                    ));
+                    return Ok(Flow::Continue);
+                }
+            };
+            match tag {
+                GOODBYE => return Ok(Flow::Close),
+                RESET => {
+                    if let Some(tx) = tx {
+                        tx.rollback();
+                    }
+                    self.reset()?;
+                    return Ok(Flow::Continue);
+                }
+                _ if self.control.reset_pending() => self.ignored()?,
+                RUN => {
+                    let started = Instant::now();
+                    let prepared = Self::run_fields(fields).and_then(|(text, params, _)| {
+                        let (_, access) = self.access()?;
+                        let statement = match tx {
+                            Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
+                                let (needed, what) = api::authorize_query(&q);
+                                api::check(access, needed, what)?;
+                                Ok(TxStatement::Query(q))
+                            }),
+                            None => graphbuff::cypher::parse_statement(&text).and_then(|s| {
+                                api::authorize(access, &s)?;
+                                system_command(&s)?;
+                                Ok(match s {
+                                    Statement::User(cmd) => TxStatement::User(cmd),
+                                    _ => TxStatement::System(text),
+                                })
+                            }),
+                        };
+                        Ok((statement.map_err(|e| Failure::from_error(&e))?, params, access))
+                    });
+                    let (query, params, access) = match prepared {
+                        Ok(v) => v,
+                        Err(f) => {
+                            self.fail(f)?;
+                            return Ok(Flow::Continue);
+                        }
+                    };
+                    let mut timeout = self.shared.ctx.query_timeout;
+                    if let Some(d) = deadline {
+                        let left = d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+                        timeout = Some(timeout.map_or(left, |t| t.min(left)));
+                    }
+                    let ctx = &self.shared.ctx;
+                    let who = self.who.clone().unwrap_or(Principal::Open);
+                    let run = |options: &QueryOptions| match (&mut tx, &query) {
+                        (Some(tx), TxStatement::Query(q)) => tx.execute_query_with_options(q, &params, options),
+                        (_, TxStatement::System(text)) => ctx.mgr.session().execute_with_options(text, &params, options),
+                        (_, TxStatement::User(cmd)) => ctx.user_command(&who, access, cmd, &params),
+                        (None, TxStatement::Query(_)) => unreachable!("system transactions only take database commands"),
+                    };
+                    match self.interruptible(timeout, run) {
+                        None => self.ignored()?,
+                        Some(Err(e)) => {
+                            self.fail(Failure::from_error(&e))?;
+                            return Ok(Flow::Continue);
+                        }
+                        Some(Ok(r)) => {
+                            let qid = results.len() as i64;
+                            let (pending, columns) = Pending::new(r, name.to_string(), started);
+                            results.push(Some(pending));
+                            self.success(run_success(columns, started, Some(qid)))?;
+                        }
+                    }
+                }
+                PULL | DISCARD => {
+                    let qid = match fields.first() {
+                        Some(PackValue::Map(m)) => match m.get("qid") {
+                            None | Some(PackValue::Int(-1)) => results.len() as i64 - 1,
+                            Some(PackValue::Int(q)) => *q,
+                            Some(_) => -2,
+                        },
+                        _ => -2,
+                    };
+                    let slot = usize::try_from(qid).ok().and_then(|q| results.get_mut(q));
+                    let Some(Some(mut p)) = slot.map(Option::take) else {
+                        self.fail(Failure::invalid(format!("there is no open result with qid {qid}")))?;
+                        return Ok(Flow::Continue);
+                    };
+                    if !self.stream(&mut p, tag == PULL, &fields, false)? {
+                        if self.failed {
+                            return Ok(Flow::Continue);
+                        }
+                        results[qid as usize] = Some(p);
+                    }
+                }
+                COMMIT => {
+                    match tx.map_or(Ok(()), |tx| tx.commit()) {
+                        Ok(()) => {
+                            let bookmark = PackValue::String(new_bookmark());
+                            self.success(BTreeMap::from([("bookmark".into(), bookmark)]))?;
+                        }
+                        Err(e) => self.fail(Failure::from_error(&e))?,
+                    }
+                    return Ok(Flow::Continue);
+                }
+                ROLLBACK => {
+                    if let Some(tx) = tx {
+                        tx.rollback();
+                    }
+                    self.success(BTreeMap::new())?;
+                    return Ok(Flow::Continue);
+                }
+                TELEMETRY if self.at_least(5, 4) => self.success(BTreeMap::new())?,
+                BEGIN => {
+                    self.fail(Failure::invalid("a transaction is already open"))?;
+                    return Ok(Flow::Continue);
+                }
+                other => {
+                    self.fail(Failure::invalid(format!(
+                        "message 0x{other:02X} is not allowed in a transaction"
+                    )))?;
+                    return Ok(Flow::Continue);
+                }
+            }
+        }
+    }
+
+    // ---- routing ----
+
+    /// `ROUTE`: this server is the only member, and serves every role.
+    fn route(&mut self, fields: Fields) -> io::Result<()> {
+        let mut it = fields.into_iter();
+        let routing = it.next();
+        let _bookmarks = it.next();
+        let db = match it.next() {
+            Some(PackValue::Map(extra)) => extra,
+            Some(PackValue::String(s)) => BTreeMap::from([("db".to_string(), PackValue::String(s))]),
+            _ => BTreeMap::new(),
+        };
+        if let Some(PackValue::String(_)) = db.get("imp_user") {
+            return self.fail(Failure::new(NOT_SUPPORTED, "impersonation (imp_user) is not supported"));
+        }
+        let name = match self.database_name(&db) {
+            Ok(n) => n,
+            Err(f) => return self.fail(f),
+        };
+        // The address the client used, if it said; else the one it connected to.
+        let address = match &routing {
+            Some(PackValue::Map(m)) => match m.get("address") {
+                Some(PackValue::String(a)) if !a.is_empty() => a.clone(),
+                _ => self.local.to_string(),
+            },
+            _ => self.local.to_string(),
+        };
+        let servers = ["WRITE", "READ", "ROUTE"]
+            .into_iter()
+            .map(|role| {
+                PackValue::map([
+                    ("addresses", PackValue::List(vec![PackValue::String(address.clone())])),
+                    ("role", PackValue::str(role)),
+                ])
+            })
+            .collect();
+        let table = PackValue::map([
+            ("ttl", PackValue::Int(300)),
+            ("db", PackValue::String(name)),
+            ("servers", PackValue::List(servers)),
+        ]);
+        self.success(BTreeMap::from([("rt".into(), table)]))
+    }
+}
+
+/// A statement in a Bolt transaction.
+enum TxStatement {
+    Query(Query),
+    /// A database command, on the `system` database.
+    System(String),
+    /// A user command, on the `system` database.
+    User(UserCommand),
+}
+
+/// Checks that `stmt` is a database or user command, the only statements the `system`
+/// database runs.
+fn system_command(stmt: &Statement) -> Result<(), Error> {
+    match stmt {
+        Statement::Database(_) | Statement::User(_) => Ok(()),
+        _ => Err(Error::Unsupported(
+            "the system database only runs database and user commands (CREATE DATABASE, CREATE USER, …)".into(),
+        )),
+    }
+}
+
+/// The element id of a node, as `elementId()` returns it.
+fn node_element_id(id: u64) -> String {
+    format!("n:{id}")
+}
+
+/// The element id of a relationship, as `elementId()` returns it.
+fn rel_element_id(id: u64) -> String {
+    format!("r:{id}")
+}
+
+fn new_bookmark() -> String {
+    format!("graphbuff:{}", BOOKMARKS.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+fn run_success(columns: Vec<String>, started: Instant, qid: Option<i64>) -> BTreeMap<String, PackValue> {
+    let mut meta = BTreeMap::new();
+    meta.insert(
+        "fields".into(),
+        PackValue::List(columns.into_iter().map(PackValue::String).collect()),
+    );
+    meta.insert("t_first".into(), PackValue::Int(started.elapsed().as_millis() as i64));
+    if let Some(q) = qid {
+        meta.insert("qid".into(), PackValue::Int(q));
+    }
+    meta
+}
+
+/// The counters that are not zero, under Neo4j's names.
+fn stats(s: &QueryStats) -> PackValue {
+    let counters = [
+        ("nodes-created", s.nodes_created),
+        ("nodes-deleted", s.nodes_deleted),
+        ("relationships-created", s.relationships_created),
+        ("relationships-deleted", s.relationships_deleted),
+        ("properties-set", s.properties_set),
+        ("labels-added", s.labels_added),
+        ("labels-removed", s.labels_removed),
+        ("indexes-added", s.indexes_added),
+        ("indexes-removed", s.indexes_removed),
+        ("constraints-added", s.constraints_added),
+        ("constraints-removed", s.constraints_removed),
+        ("system-updates", s.system_updates),
+    ];
+    let mut m: BTreeMap<String, PackValue> = counters
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| (k.to_string(), PackValue::Int(n as i64)))
+        .collect();
+    m.insert("contains-updates".into(), PackValue::Bool(s.contains_updates()));
+    PackValue::Map(m)
+}
+
+/// A plan as Neo4j's nested map: `operatorType`, `arguments`, `identifiers`, `children`,
+/// and for `PROFILE` the `rows` and `time` (nanoseconds) of each operator.
+fn plan_tree(plan: &PlanDescription) -> PackValue {
+    fn node(plan: &PlanDescription, i: &mut usize) -> PackValue {
+        let line = &plan.lines[*i];
+        *i += 1;
+        let (op, details) = line.operator.split_once(' ').unwrap_or((&line.operator, ""));
+        let mut args = BTreeMap::new();
+        if !details.is_empty() {
+            args.insert("Details".to_string(), PackValue::str(details));
+        }
+        if let Some(e) = line.estimated_rows {
+            args.insert("EstimatedRows".to_string(), PackValue::Float(e));
+        }
+        let mut m = BTreeMap::new();
+        m.insert("operatorType".to_string(), PackValue::str(op));
+        m.insert("identifiers".to_string(), PackValue::List(vec![]));
+        if plan.profiled {
+            let rows = line.rows.unwrap_or(0) as i64;
+            let time = line.time.map_or(0, |t| t.as_nanos() as i64);
+            m.insert("rows".to_string(), PackValue::Int(rows));
+            m.insert("dbHits".to_string(), PackValue::Int(0));
+            m.insert("time".to_string(), PackValue::Int(time));
+            args.insert("Rows".to_string(), PackValue::Int(rows));
+            args.insert("Time".to_string(), PackValue::Int(time));
+        }
+        m.insert("arguments".to_string(), PackValue::Map(args));
+        let mut children = Vec::new();
+        while *i < plan.lines.len() && plan.lines[*i].depth == line.depth + 1 {
+            children.push(node(plan, i));
+        }
+        m.insert("children".to_string(), PackValue::List(children));
+        PackValue::Map(m)
+    }
+    if plan.lines.is_empty() {
+        return PackValue::Map(BTreeMap::new());
+    }
+    node(plan, &mut 0)
+}
+
+// ---- values -------------------------------------------------------------------------------
+
+/// Encodes result values for one protocol version.
+struct Encoder {
+    /// Bolt 5: nodes and relationships carry string element ids too.
+    element_ids: bool,
+    /// Date-times as UTC instants (`I`), not local seconds (`F`).
+    utc: bool,
+}
+
+fn structure(tag: u8, fields: Vec<PackValue>) -> PackValue {
+    PackValue::Struct { tag, fields }
+}
+
+impl Encoder {
+    fn result(&self, v: &ResultValue) -> PackValue {
+        match v {
+            ResultValue::Null => PackValue::Null,
+            ResultValue::Bool(b) => PackValue::Bool(*b),
+            ResultValue::Int(i) => PackValue::Int(*i),
+            ResultValue::Float(f) => PackValue::Float(*f),
+            ResultValue::String(s) => PackValue::String(s.clone()),
+            ResultValue::List(items) => PackValue::List(items.iter().map(|x| self.result(x)).collect()),
+            ResultValue::Map(m) => PackValue::Map(m.iter().map(|(k, x)| (k.clone(), self.result(x))).collect()),
+            ResultValue::Node(n) => self.node(n),
+            ResultValue::Relationship(r) => self.relationship(r),
+            ResultValue::Path(p) => self.path(p),
+            ResultValue::Temporal(t) => self.temporal(t),
+            ResultValue::Point(p) => point(p),
+        }
+    }
+
+    fn value(&self, v: &Value) -> PackValue {
+        match v {
+            Value::Null => PackValue::Null,
+            Value::Bool(b) => PackValue::Bool(*b),
+            Value::Int(i) => PackValue::Int(*i),
+            Value::Float(f) => PackValue::Float(*f),
+            Value::String(s) => PackValue::String(s.clone()),
+            Value::List(items) => PackValue::List(items.iter().map(|x| self.value(x)).collect()),
+            Value::Map(m) => self.props(m),
+            Value::Temporal(t) => self.temporal(t),
+            Value::Point(p) => point(p),
+            // Not storable as properties, so never part of a materialized result's.
+            Value::Node(_) | Value::Rel(_) | Value::Path(_) => PackValue::Null,
+        }
+    }
+
+    fn props(&self, m: &BTreeMap<String, Value>) -> PackValue {
+        PackValue::Map(m.iter().map(|(k, x)| (k.clone(), self.value(x))).collect())
+    }
+
+    fn node(&self, n: &NodeData) -> PackValue {
+        let mut fields = vec![
+            PackValue::Int(n.id.0 as i64),
+            PackValue::List(n.labels.iter().cloned().map(PackValue::String).collect()),
+            self.props(&n.properties),
+        ];
+        if self.element_ids {
+            fields.push(PackValue::String(node_element_id(n.id.0)));
+        }
+        structure(NODE, fields)
+    }
+
+    fn relationship(&self, r: &RelData) -> PackValue {
+        let mut fields = vec![
+            PackValue::Int(r.id.0 as i64),
+            PackValue::Int(r.start.0 as i64),
+            PackValue::Int(r.end.0 as i64),
+            PackValue::String(r.rel_type.clone()),
+            self.props(&r.properties),
+        ];
+        if self.element_ids {
+            fields.push(PackValue::String(rel_element_id(r.id.0)));
+            fields.push(PackValue::String(node_element_id(r.start.0)));
+            fields.push(PackValue::String(node_element_id(r.end.0)));
+        }
+        structure(RELATIONSHIP, fields)
+    }
+
+    /// A path as its distinct nodes, distinct relationships (without endpoints) and a
+    /// sequence of indices: for each step, the relationship (1-based, negative when
+    /// walked against its direction) and the node it leads to.
+    fn path(&self, p: &PathData) -> PackValue {
+        let mut nodes: Vec<&NodeData> = Vec::new();
+        let mut rels: Vec<&RelData> = Vec::new();
+        let mut indices = Vec::new();
+        if let Some(first) = p.nodes.first() {
+            nodes.push(first);
+        }
+        for (i, r) in p.relationships.iter().enumerate() {
+            let (Some(from), Some(to)) = (p.nodes.get(i), p.nodes.get(i + 1)) else {
+                break;
+            };
+            let ri = match rels.iter().position(|x| x.id == r.id) {
+                Some(k) => k as i64 + 1,
+                None => {
+                    rels.push(r);
+                    rels.len() as i64
+                }
+            };
+            let forward = r.start == from.id && r.end == to.id;
+            indices.push(PackValue::Int(if forward { ri } else { -ri }));
+            let ni = match nodes.iter().position(|m| m.id == to.id) {
+                Some(k) => k as i64,
+                None => {
+                    nodes.push(to);
+                    nodes.len() as i64 - 1
+                }
+            };
+            indices.push(PackValue::Int(ni));
+        }
+        let rels = rels
+            .into_iter()
+            .map(|r| {
+                let mut fields = vec![
+                    PackValue::Int(r.id.0 as i64),
+                    PackValue::String(r.rel_type.clone()),
+                    self.props(&r.properties),
+                ];
+                if self.element_ids {
+                    fields.push(PackValue::String(rel_element_id(r.id.0)));
+                }
+                structure(UNBOUND_RELATIONSHIP, fields)
+            })
+            .collect();
+        structure(
+            PATH,
+            vec![
+                PackValue::List(nodes.into_iter().map(|n| self.node(n)).collect()),
+                PackValue::List(rels),
+                PackValue::List(indices),
+            ],
+        )
+    }
+
+    fn temporal(&self, t: &Temporal) -> PackValue {
+        let split = |ns: i128| {
+            (
+                PackValue::Int(ns.div_euclid(NANOS_PER_SECOND as i128) as i64),
+                PackValue::Int(ns.rem_euclid(NANOS_PER_SECOND as i128) as i64),
+            )
+        };
+        let local = |days: i64, nanos: i64| days as i128 * NANOS_PER_DAY as i128 + nanos as i128;
+        match *t {
+            Temporal::Date(d) => structure(DATE, vec![PackValue::Int(d)]),
+            Temporal::LocalTime(n) => structure(LOCAL_TIME, vec![PackValue::Int(n)]),
+            Temporal::Time { nanos, offset } => {
+                structure(TIME, vec![PackValue::Int(nanos), PackValue::Int(offset as i64)])
+            }
+            Temporal::LocalDateTime { days, nanos } => {
+                let (s, n) = split(local(days, nanos));
+                structure(LOCAL_DATE_TIME, vec![s, n])
+            }
+            Temporal::DateTime { days, nanos, offset } => {
+                let mut ns = local(days, nanos);
+                let tag = if self.utc {
+                    ns -= offset as i128 * NANOS_PER_SECOND as i128;
+                    DATE_TIME
+                } else {
+                    DATE_TIME_LEGACY
+                };
+                let (s, n) = split(ns);
+                structure(tag, vec![s, n, PackValue::Int(offset as i64)])
+            }
+            Temporal::Duration(d) => structure(
+                DURATION,
+                vec![
+                    PackValue::Int(d.months),
+                    PackValue::Int(d.days),
+                    PackValue::Int(d.seconds),
+                    PackValue::Int(d.nanos as i64),
+                ],
+            ),
+        }
+    }
+}
+
+fn point(p: &Point) -> PackValue {
+    let mut fields = vec![PackValue::Int(p.crs().srid())];
+    fields.extend(p.coords().iter().map(|c| PackValue::Float(*c)));
+    structure(if fields.len() == 4 { POINT_3D } else { POINT_2D }, fields)
+}
+
+/// A parameter value sent by a client.
+fn to_value(v: PackValue) -> Result<Value, Failure> {
+    Ok(match v {
+        PackValue::Null => Value::Null,
+        PackValue::Bool(b) => Value::Bool(b),
+        PackValue::Int(i) => Value::Int(i),
+        PackValue::Float(f) => Value::Float(f),
+        PackValue::String(s) => Value::String(s),
+        PackValue::Bytes(_) => {
+            return Err(Failure::new(NOT_SUPPORTED, "byte array parameters are not supported"));
+        }
+        PackValue::List(items) => Value::List(items.into_iter().map(to_value).collect::<Result<_, _>>()?),
+        PackValue::Map(m) => Value::Map(
+            m.into_iter()
+                .map(|(k, x)| Ok((k, to_value(x)?)))
+                .collect::<Result<_, Failure>>()?,
+        ),
+        PackValue::Struct { tag, fields } => structure_value(tag, &fields)?,
+    })
+}
+
+fn structure_value(tag: u8, fields: &[PackValue]) -> Result<Value, Failure> {
+    let bad = |what: &str| Failure::new(TYPE_ERROR, format!("invalid {what} parameter"));
+    let ints = |n: usize, what: &str| -> Result<Vec<i64>, Failure> {
+        if fields.len() != n {
+            return Err(bad(what));
+        }
+        fields
+            .iter()
+            .map(|f| match f {
+                PackValue::Int(i) => Ok(*i),
+                _ => Err(bad(what)),
+            })
+            .collect()
+    };
+    let check_offset = |o: i64, what: &str| -> Result<i32, Failure> {
+        if o.abs() <= 18 * 3600 { Ok(o as i32) } else { Err(bad(what)) }
+    };
+    // Days and time of day from nanoseconds since the epoch, with the year in range.
+    let local = |ns: i128, what: &str| -> Result<(i64, i64), Failure> {
+        let days = i64::try_from(ns.div_euclid(NANOS_PER_DAY as i128)).map_err(|_| bad(what))?;
+        check_days(days).ok_or_else(|| bad(what))?;
+        Ok((days, ns.rem_euclid(NANOS_PER_DAY as i128) as i64))
+    };
+    let epoch = |s: i64, n: i64| s as i128 * NANOS_PER_SECOND as i128 + n as i128;
+    let t = match tag {
+        DATE => {
+            let v = ints(1, "date")?;
+            Temporal::Date(check_days(v[0]).ok_or_else(|| bad("date"))?)
+        }
+        LOCAL_TIME => {
+            let v = ints(1, "local time")?;
+            Temporal::LocalTime(time_of_day(v[0]).ok_or_else(|| bad("local time"))?)
+        }
+        TIME => {
+            let v = ints(2, "time")?;
+            Temporal::Time {
+                nanos: time_of_day(v[0]).ok_or_else(|| bad("time"))?,
+                offset: check_offset(v[1], "time")?,
+            }
+        }
+        LOCAL_DATE_TIME => {
+            let v = ints(2, "local date-time")?;
+            let (days, nanos) = local(epoch(v[0], v[1]), "local date-time")?;
+            Temporal::LocalDateTime { days, nanos }
+        }
+        DATE_TIME | DATE_TIME_LEGACY => {
+            let v = ints(3, "date-time")?;
+            let offset = check_offset(v[2], "date-time")?;
+            let mut ns = epoch(v[0], v[1]);
+            if tag == DATE_TIME {
+                ns += offset as i128 * NANOS_PER_SECOND as i128; // UTC to local
+            }
+            let (days, nanos) = local(ns, "date-time")?;
+            Temporal::DateTime { days, nanos, offset }
+        }
+        DURATION => {
+            let v = ints(4, "duration")?;
+            let d = temporal::Duration::from_nanos(v[0], v[1], epoch(v[2], v[3])).map_err(|_| bad("duration"))?;
+            Temporal::Duration(d)
+        }
+        DATE_TIME_ZONE_ID | DATE_TIME_ZONE_ID_LEGACY => {
+            return Err(Failure::new(NOT_SUPPORTED, "named time zones are not supported; use an offset"));
+        }
+        POINT_2D | POINT_3D => {
+            let dims = if tag == POINT_2D { 2 } else { 3 };
+            let (Some(PackValue::Int(srid)), coords) = (fields.first(), &fields[1.min(fields.len())..]) else {
+                return Err(bad("point"));
+            };
+            let coords: Vec<f64> = coords
+                .iter()
+                .map(|c| match c {
+                    PackValue::Float(f) => Ok(*f),
+                    PackValue::Int(i) => Ok(*i as f64),
+                    _ => Err(bad("point")),
+                })
+                .collect::<Result<_, _>>()?;
+            let crs = Crs::from_srid(*srid).filter(|c| c.dims() == dims).ok_or_else(|| bad("point"))?;
+            if coords.len() != dims {
+                return Err(bad("point"));
+            }
+            let p = Point::new(crs, &coords).map_err(|e| Failure::from_error(&e))?;
+            return Ok(Value::Point(p));
+        }
+        NODE | RELATIONSHIP | UNBOUND_RELATIONSHIP | PATH => {
+            return Err(Failure::new(TYPE_ERROR, "nodes, relationships and paths cannot be parameters"));
+        }
+        other => return Err(Failure::new(TYPE_ERROR, format!("unknown structure 0x{other:02X} in the parameters"))),
+    };
+    Ok(Value::Temporal(t))
+}
+
+fn time_of_day(nanos: i64) -> Option<i64> {
+    (0..NANOS_PER_DAY).contains(&nanos).then_some(nanos)
+}
+
+/// `days` if its year is within the supported range.
+fn check_days(days: i64) -> Option<i64> {
+    let lowest = temporal::days_from_civil(-temporal::MAX_YEAR, 1, 1);
+    let highest = temporal::days_from_civil(temporal::MAX_YEAR, 12, 31);
+    (lowest..=highest).contains(&days).then_some(days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiates_the_newest_common_version() {
+        let p = |v: &[[u8; 4]]| v.concat();
+        assert_eq!(negotiate(&p(&[[0, 8, 8, 5], [0, 2, 4, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((5, 4)));
+        assert_eq!(negotiate(&p(&[[0, 0, 1, 0xFF], [0, 0, 2, 5], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((5, 2)));
+        assert_eq!(negotiate(&p(&[[0, 0, 4, 4], [0, 0, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((4, 4)));
+        assert_eq!(negotiate(&p(&[[0, 0, 8, 5], [0, 0, 3, 4], [0, 0, 0, 3], [0, 0, 0, 0]])), None);
+        assert_eq!(negotiate(&p(&[[0, 0, 0, 0]; 4])), None);
+    }
+
+    #[test]
+    fn temporals_round_trip() {
+        let values = [
+            Temporal::Date(-719_528),
+            Temporal::LocalTime(3_600_000_000_123),
+            Temporal::Time {
+                nanos: 1,
+                offset: -3600,
+            },
+            Temporal::LocalDateTime {
+                days: -1,
+                nanos: 5,
+            },
+            Temporal::DateTime {
+                days: 20_000,
+                nanos: 3_600 * NANOS_PER_SECOND + 7,
+                offset: 7200,
+            },
+            Temporal::Duration(temporal::Duration::from_nanos(14, -3, -1_500_000_000).unwrap()),
+        ];
+        for utc in [true, false] {
+            let enc = Encoder {
+                element_ids: true,
+                utc,
+            };
+            for t in values {
+                let PackValue::Struct { tag, fields } = enc.temporal(&t) else {
+                    panic!()
+                };
+                let back = structure_value(tag, &fields).unwrap_or_else(|f| panic!("{}", f.message));
+                assert_eq!(back, Value::Temporal(t), "utc={utc}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_temporals_are_refused() {
+        assert!(structure_value(DATE, &[PackValue::Int(i64::MAX)]).is_err());
+        assert!(structure_value(LOCAL_TIME, &[PackValue::Int(NANOS_PER_DAY)]).is_err());
+        assert!(structure_value(TIME, &[PackValue::Int(0), PackValue::Int(19 * 3600)]).is_err());
+        assert!(structure_value(DATE_TIME_ZONE_ID, &[]).is_err());
+    }
+}

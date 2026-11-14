@@ -1,0 +1,20 @@
+[package]
+name = "graphbuff"
+description = "graphbuff graph database engine: Cypher query execution over pluggable graph storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graphbuff-core.workspace = true
+graphbuff-cypher.workspace = true
+graphbuff-gpu = { workspace = true, optional = true }
+
+[features]
+# GPU kernels (`gpu_kernels`, `WgpuKernels`) through wgpu: Vulkan, Direct3D 12 or Metal.
+gpu = ["dep:graphbuff-gpu"]
+
+[[example]]
+name = "gpubench"
+required-features = ["gpu"]
