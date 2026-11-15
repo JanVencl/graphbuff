@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, Error, QueryOptions, QueryResult, Value};
 
@@ -11,6 +11,7 @@ use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statemen
 
 use crate::crypto;
 use crate::http::{Request, Response};
+use crate::log::Log;
 use crate::json::{self, Json, encode_result, to_value, write_str};
 use crate::tx::{Transactions, TxError};
 use crate::users::{self, Access, Principal, Users};
@@ -24,9 +25,40 @@ pub(crate) struct Ctx {
     pub query_timeout: Option<Duration>,
     /// Where backups go; `None` turns the backup and restore endpoints off.
     pub backup_dir: Option<std::path::PathBuf>,
+    pub log: Option<Arc<Log>>,
 }
 
 impl Ctx {
+    /// Logs a finished query: a slow one to the query log, a storage failure as an error.
+    pub(crate) fn finished(
+        &self,
+        protocol: &str,
+        database: &str,
+        who: &Principal,
+        text: &str,
+        elapsed: Duration,
+        error: Option<&Error>,
+    ) {
+        let Some(log) = &self.log else { return };
+        let user = match who {
+            Principal::Open => "-",
+            Principal::Token => "token",
+            Principal::User(name) => name,
+        };
+        log.query(elapsed, protocol, database, user, text);
+        if let Some(e @ Error::Storage(_)) = error {
+            log.error(format_args!("{protocol} query on database {database} failed: {e}"));
+        }
+    }
+
+    /// Logs a failed login from `peer`.
+    pub(crate) fn login_failed(&self, protocol: &str, peer: &str, user: &str) {
+        if let Some(log) = &self.log {
+            let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
+            log.warn(format_args!("failed login ({protocol}) from {peer}{user}"));
+        }
+    }
+
     /// The limits for a query that asked for `requested` milliseconds (if anything).
     pub(crate) fn query_options(&self, requested: Option<Duration>) -> QueryOptions {
         QueryOptions {
@@ -119,7 +151,7 @@ pub(crate) fn check(access: Access, needed: Access, what: &str) -> Result<(), Er
     Err(Error::Forbidden(format!("{what} needs the {role} role (or a stronger one)")))
 }
 
-pub(crate) fn handle(ctx: &Ctx, req: &Request) -> Response {
+pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
     let segments: Vec<String> = req
         .path
         .split('/')
@@ -135,6 +167,7 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request) -> Response {
         match authenticate(ctx, req) {
             Some(who) => who,
             None => {
+                ctx.login_failed("http", peer, &basic_user(req).unwrap_or_default());
                 let challenge = if ctx.users.is_some() {
                     r#"Basic realm="graphbuff", charset="UTF-8""#
                 } else {
@@ -223,6 +256,16 @@ fn authenticate(ctx: &Ctx, req: &Request) -> Option<Principal> {
         return ctx.login(user, password);
     }
     None
+}
+
+/// The user name of `Authorization: Basic …`, for the log.
+fn basic_user(req: &Request) -> Option<String> {
+    let (scheme, value) = req.header("authorization")?.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = String::from_utf8(crypto::base64_decode(value.trim())?).ok()?;
+    Some(decoded.split_once(':')?.0.to_string())
 }
 
 /// The client a request comes from, and what it may do.
@@ -356,7 +399,10 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
             }
         }
     }
-    match session.execute_with_options(&query, &params, &ctx.query_options(timeout)) {
+    let started = Instant::now();
+    let result = session.execute_with_options(&query, &params, &ctx.query_options(timeout));
+    ctx.finished("http", session.current_database(), me.who, &query, started.elapsed(), result.as_ref().err());
+    match result {
         Ok(r) => Response::json(200, encode_result(&r)),
         Err(e) => query_error(&e),
     }
@@ -614,15 +660,22 @@ fn in_transaction(&(ctx, me): &Req, db: Option<&str>, id: &str, req: &Request) -
         Err(m) => return error(400, "BadRequest", &m),
     };
     // Statements rejected here leave the transaction open.
-    let query = match transaction_query(&name, &query, &params) {
+    let parsed = match transaction_query(&name, &query, &params) {
         Ok(q) => q,
         Err(e) => return query_error(&e),
     };
-    let (needed, what) = authorize_query(&query);
+    let (needed, what) = authorize_query(&parsed);
     if let Err(e) = check(me.access, needed, what) {
         return query_error(&e);
     }
-    match ctx.txs.run(me.who, &name, id, query, params, ctx.query_options(timeout).timeout) {
+    let started = Instant::now();
+    let result = ctx.txs.run(me.who, &name, id, parsed, params, ctx.query_options(timeout).timeout);
+    let failure = match &result {
+        Err(TxError::Failed(e)) => Some(e),
+        _ => None,
+    };
+    ctx.finished("http", &name, me.who, &query, started.elapsed(), failure);
+    match result {
         Ok(r) => Response::json(200, encode_result(&r)),
         Err(e) => tx_error(e, true),
     }

@@ -63,6 +63,7 @@ mod api;
 mod bolt;
 mod crypto;
 mod http;
+pub mod log;
 mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
@@ -72,6 +73,7 @@ pub mod users;
 
 /// The JSON reader and writer, and the JSON form of results and errors.
 pub use graphbuff::json;
+pub use log::{Level, Log, LogConfig};
 pub use net::TlsConfig;
 pub use users::{Role, Users};
 
@@ -126,6 +128,9 @@ pub struct ServerConfig {
     /// Where `POST /db/{name}/backup` writes backups and `POST /db/{name}/restore` reads
     /// them, one directory per backup. `None` (the default): both endpoints are off.
     pub backup_dir: Option<std::path::PathBuf>,
+    /// Where events (failed logins, connections, errors) and slow queries are logged.
+    /// `None` (the default): nowhere.
+    pub log: Option<Arc<Log>>,
 }
 
 impl Default for ServerConfig {
@@ -142,6 +147,7 @@ impl Default for ServerConfig {
             bolt: None,
             tls: None,
             backup_dir: None,
+            log: None,
         }
     }
 }
@@ -203,6 +209,7 @@ impl Server {
                 txs: Arc::clone(&txs),
                 query_timeout: config.query_timeout,
                 backup_dir: config.backup_dir,
+                log: config.log,
             },
             tls,
             limits: Limits {
@@ -301,7 +308,18 @@ fn accept_loop(
             break;
         }
         let Ok(stream) = stream else { continue };
+        let name = match protocol {
+            Protocol::Http => "http",
+            Protocol::Bolt => "bolt",
+        };
         if shared.active.load(Ordering::SeqCst) >= shared.max_connections {
+            if let Some(log) = &shared.ctx.log {
+                log.warn(format_args!(
+                    "{name} connection from {} refused: {} connections already open",
+                    peer(&stream),
+                    shared.max_connections
+                ));
+            }
             // A Bolt client sees the connection close during the handshake.
             if let Protocol::Http = protocol {
                 let resp = api::error(503, "Busy", "too many connections; try again later");
@@ -309,6 +327,9 @@ fn accept_loop(
                 let _ = http::write_response(&mut stream, &resp, false);
             }
             continue;
+        }
+        if let Some(log) = &shared.ctx.log {
+            log.debug(format_args!("{name} connection from {}", peer(&stream)));
         }
         shared.active.fetch_add(1, Ordering::SeqCst);
         let s = Arc::clone(&shared);
@@ -332,6 +353,11 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// The client's address, for the log.
+fn peer(stream: &TcpStream) -> String {
+    stream.peer_addr().map_or_else(|_| "unknown".into(), |a| a.to_string())
 }
 
 /// Sets up a new connection: timeouts, then TLS if the server has it.
@@ -359,13 +385,14 @@ fn serve(stream: Stream, shared: &Shared) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
+    let peer = stream.peer_addr().map_or_else(|_| "unknown".into(), |a| a.to_string());
     let mut reader = BufReader::new(stream);
     let stop = || shared.stop.load(Ordering::SeqCst);
     loop {
         match http::read_request(&mut reader, &mut writer, &shared.limits, &stop) {
             Ok(None) => return,
             Ok(Some(req)) => {
-                let resp = api::handle(&shared.ctx, &req);
+                let resp = api::handle(&shared.ctx, &req, &peer);
                 let keep = req.keep_alive && !stop();
                 if http::write_response(&mut writer, &resp, keep).is_err() || !keep {
                     return;

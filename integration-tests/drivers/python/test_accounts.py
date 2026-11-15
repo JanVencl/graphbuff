@@ -49,7 +49,7 @@ def accounts():
         _add_user(users_file, "rita", "ritapw", "reader")
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                       "--users", users_file],
+                       "--users", users_file, "--in-memory"],
                       f"http://127.0.0.1:{http_port}/health")
         yield f"bolt://127.0.0.1:{bolt_port}"
         proc.terminate()
@@ -108,7 +108,7 @@ def test_admins_manage_users(accounts):
 def tls_server():
     import ssl
     http_port, bolt_port = _free_port(), _free_port()
-    args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
+    args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}", "--in-memory",
             "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "ca.pem"))
     try:

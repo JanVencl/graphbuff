@@ -44,6 +44,10 @@ COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot
 WORKDIR /data
 VOLUME /data
+# Databases in the /data volume; logs to standard error (`docker logs`). `--data DIR`,
+# `--in-memory` or `--log-dir DIR` after the image name override these.
+ENV GRAPHBUFF_DATA=/data \
+    GRAPHBUFF_LOG_DIR=-
 # HTTP/JSON and Bolt. The server listens on every interface of the container; which
 # machines can reach it is decided by `docker run -p`.
 EXPOSE 7475 7687

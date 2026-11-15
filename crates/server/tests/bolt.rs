@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use graphbuff::DatabaseManager;
 use graphbuff_server::packstream::{self, PackValue};
-use graphbuff_server::{Server, ServerConfig};
+use graphbuff_server::{Level, Log, LogConfig, Server, ServerConfig};
 
 const HELLO: u8 = 0x01;
 const GOODBYE: u8 = 0x02;
@@ -876,4 +876,48 @@ fn oversized_and_malformed_messages_close_the_connection() {
     b.s.write_all(&[0, 2, 0xC7, 0x00, 0, 0]).unwrap(); // unknown marker
     assert_eq!(b.failure(), "Neo.ClientError.Request.Invalid");
     assert!(b.closed());
+}
+
+#[test]
+fn slow_queries_and_failed_logins_are_logged() {
+    let dir = std::env::temp_dir().join(format!("graphbuff-bolt-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let log = Log::open(LogConfig {
+        dir: Some(dir.clone()),
+        level: Level::Info,
+        slow_query: Some(Duration::ZERO),
+        ..LogConfig::default()
+    })
+    .unwrap();
+    let server = start(ServerConfig {
+        token: Some("s3cret".into()),
+        log: Some(Arc::new(log)),
+        ..ServerConfig::default()
+    });
+    let addr = server.bolt_addr().unwrap();
+
+    let mut b = Bolt::handshake(addr, [V5, NONE, NONE, NONE]);
+    b.send(HELLO, vec![map(&[("user_agent", s("test"))])]);
+    b.success();
+    b.send(LOGON, vec![map(&[("scheme", s("basic")), ("principal", s("mallory")), ("credentials", s("wrong"))])]);
+    assert_eq!(b.failure(), "Neo.ClientError.Security.Unauthorized");
+
+    let mut b = Bolt::open_with(addr, Some("s3cret"));
+    assert_eq!(b.query("RETURN 1 AS autocommit"), vec![vec![PackValue::Int(1)]]);
+    b.send(BEGIN, vec![empty()]);
+    b.success();
+    b.run("CREATE (:Logged)", empty(), empty());
+    b.success();
+    b.send(COMMIT, vec![]);
+    b.success();
+    drop(b);
+    server.shutdown();
+
+    let events = std::fs::read_to_string(dir.join("graphbuff.log")).unwrap();
+    assert!(events.contains("WARN  failed login (bolt) from 127.0.0.1:"), "{events}");
+    assert!(events.contains("as `mallory`"), "{events}");
+    let queries = std::fs::read_to_string(dir.join("query.log")).unwrap();
+    assert!(queries.contains(" bolt graphbuff token RETURN 1 AS autocommit"), "{queries}");
+    assert!(queries.contains(" bolt graphbuff token CREATE (:Logged)"), "{queries}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

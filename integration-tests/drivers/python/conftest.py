@@ -40,7 +40,7 @@ def server():
            "--bind", f"127.0.0.1:{http_port}",
            "--bolt", f"127.0.0.1:{bolt_port}",
            "--token", TOKEN,
-           "--tx-timeout", "5"]
+           "--tx-timeout", "5", "--in-memory"]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.time() + 20
     while True:
