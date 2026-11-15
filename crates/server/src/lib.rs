@@ -63,6 +63,7 @@ mod api;
 mod bolt;
 mod crypto;
 mod http;
+pub mod log;
 mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
@@ -72,6 +73,7 @@ pub mod users;
 
 /// The JSON reader and writer, and the JSON form of results and errors.
 pub use graphbuff::json;
+pub use log::{Level, Log, LogConfig};
 pub use net::TlsConfig;
 pub use users::{Role, Users};
 
@@ -80,9 +82,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use graphbuff::DatabaseManager;
+use graphbuff::{CancelHandle, DatabaseManager};
 
 use api::Ctx;
 use http::{Limits, ReadError};
@@ -126,6 +128,12 @@ pub struct ServerConfig {
     /// Where `POST /db/{name}/backup` writes backups and `POST /db/{name}/restore` reads
     /// them, one directory per backup. `None` (the default): both endpoints are off.
     pub backup_dir: Option<std::path::PathBuf>,
+    /// Where events (failed logins, connections, errors) and slow queries are logged.
+    /// `None` (the default): nowhere.
+    pub log: Option<Arc<Log>>,
+    /// At shutdown, how long queries already running may take to finish before they are
+    /// cancelled (and rolled back). Default: 5 seconds.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for ServerConfig {
@@ -142,13 +150,16 @@ impl Default for ServerConfig {
             bolt: None,
             tls: None,
             backup_dir: None,
+            log: None,
+            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
 
 /// A running server. Dropping it (or calling [`shutdown`](Server::shutdown)) stops
-/// accepting connections, rolls back open transactions, lets requests in progress
-/// finish, and closes idle ones.
+/// accepting connections, rolls back open transactions, closes idle connections, and
+/// gives queries in progress [`ServerConfig::shutdown_grace`] to finish before it cancels
+/// them.
 pub struct Server {
     addr: SocketAddr,
     bolt_addr: Option<SocketAddr>,
@@ -157,6 +168,8 @@ pub struct Server {
     acceptors: Vec<(SocketAddr, JoinHandle<()>)>,
     conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
     txs: Arc<Transactions>,
+    abort: CancelHandle,
+    grace: Duration,
 }
 
 struct Shared {
@@ -195,6 +208,7 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let txs = Transactions::new(config.transaction_timeout);
+        let abort = CancelHandle::new();
         let shared = Arc::new(Shared {
             ctx: Ctx {
                 mgr,
@@ -203,6 +217,8 @@ impl Server {
                 txs: Arc::clone(&txs),
                 query_timeout: config.query_timeout,
                 backup_dir: config.backup_dir,
+                log: config.log,
+                abort: abort.clone(),
             },
             tls,
             limits: Limits {
@@ -221,6 +237,8 @@ impl Server {
             acceptors: Vec::new(),
             conns,
             txs,
+            abort,
+            grace: config.shutdown_grace,
         };
         let listeners = std::iter::once((listener, Protocol::Http)).chain(bolt.map(|b| (b, Protocol::Bolt)));
         for (listener, protocol) in listeners {
@@ -276,6 +294,12 @@ impl Server {
         // writing query, may be waiting for them to release their database.
         self.txs.close();
         let handles = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = Instant::now() + self.grace;
+        while handles.iter().any(|h| !h.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Queries still running now are cancelled; their connections then close.
+        self.abort.cancel();
         for h in handles {
             let _ = h.join();
         }
@@ -301,7 +325,18 @@ fn accept_loop(
             break;
         }
         let Ok(stream) = stream else { continue };
+        let name = match protocol {
+            Protocol::Http => "http",
+            Protocol::Bolt => "bolt",
+        };
         if shared.active.load(Ordering::SeqCst) >= shared.max_connections {
+            if let Some(log) = &shared.ctx.log {
+                log.warn(format_args!(
+                    "{name} connection from {} refused: {} connections already open",
+                    peer(&stream),
+                    shared.max_connections
+                ));
+            }
             // A Bolt client sees the connection close during the handshake.
             if let Protocol::Http = protocol {
                 let resp = api::error(503, "Busy", "too many connections; try again later");
@@ -309,6 +344,9 @@ fn accept_loop(
                 let _ = http::write_response(&mut stream, &resp, false);
             }
             continue;
+        }
+        if let Some(log) = &shared.ctx.log {
+            log.debug(format_args!("{name} connection from {}", peer(&stream)));
         }
         shared.active.fetch_add(1, Ordering::SeqCst);
         let s = Arc::clone(&shared);
@@ -332,6 +370,11 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// The client's address, for the log.
+fn peer(stream: &TcpStream) -> String {
+    stream.peer_addr().map_or_else(|_| "unknown".into(), |a| a.to_string())
 }
 
 /// Sets up a new connection: timeouts, then TLS if the server has it.
@@ -359,13 +402,14 @@ fn serve(stream: Stream, shared: &Shared) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
+    let peer = stream.peer_addr().map_or_else(|_| "unknown".into(), |a| a.to_string());
     let mut reader = BufReader::new(stream);
     let stop = || shared.stop.load(Ordering::SeqCst);
     loop {
         match http::read_request(&mut reader, &mut writer, &shared.limits, &stop) {
             Ok(None) => return,
             Ok(Some(req)) => {
-                let resp = api::handle(&shared.ctx, &req);
+                let resp = api::handle(&shared.ctx, &req, &peer);
                 let keep = req.keep_alive && !stop();
                 if http::write_response(&mut writer, &resp, keep).is_err() || !keep {
                     return;

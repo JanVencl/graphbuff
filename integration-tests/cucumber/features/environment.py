@@ -15,7 +15,7 @@ def start_server(context, args=None):
         context.server_port = 7475
     context.base_url = f"http://127.0.0.1:{context.server_port}"
     
-    cmd = [server_bin, "--bind", f"127.0.0.1:{context.server_port}"]
+    cmd = [server_bin, "--bind", f"127.0.0.1:{context.server_port}", "--in-memory"]
     if args:
         cmd.extend(args)
     

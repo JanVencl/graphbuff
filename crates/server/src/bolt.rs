@@ -151,6 +151,7 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
     let (Ok(reader), Ok(writer), Ok(local)) = (stream.try_clone(), stream.try_clone(), stream.local_addr()) else {
         return;
     };
+    let peer = stream.peer_addr().map_or_else(|_| "unknown".into(), |a| a.to_string());
     let control = Control::default();
     let (queue, inbox) = mpsc::channel();
     thread::scope(|s| {
@@ -167,6 +168,7 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
             inbox,
             control,
             local,
+            peer,
             version,
             utc: version.0 >= 5,
             hello: false,
@@ -261,8 +263,11 @@ fn read_messages(mut stream: Stream, queue: Sender<Incoming>, control: &Control,
             break;
         }
     }
-    // The client left, or the server is stopping: stop what runs for it.
-    control.interrupt();
+    // The client left: stop what runs for it. When the server is stopping instead, the
+    // statement may finish within the shutdown grace period (it is cancelled after).
+    if !shared.stop() {
+        control.interrupt();
+    }
 }
 
 // ---- the connection -----------------------------------------------------------------------
@@ -346,6 +351,8 @@ struct Conn<'s> {
     inbox: Receiver<Incoming>,
     control: &'s Control,
     local: SocketAddr,
+    /// The client's address, for the log.
+    peer: String,
     version: (u8, u8),
     /// Whether date-times travel as UTC instants (Bolt 5, or the 4.4 `utc` patch).
     utc: bool,
@@ -452,7 +459,7 @@ impl Conn<'_> {
         timeout: Option<Duration>,
         f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
     ) -> Option<graphbuff::Result<T>> {
-        let cancel = CancelHandle::new();
+        let cancel = self.shared.ctx.abort.child();
         *self.control.running() = Some(cancel.clone());
         // Checked after publishing the handle: a RESET read from now on cancels it.
         let result = if self.control.reset_pending() {
@@ -563,14 +570,18 @@ impl Conn<'_> {
             Some(PackValue::String(s)) => s.as_str(),
             _ => "",
         };
-        match text("scheme") {
+        let who = match text("scheme") {
             "basic" => ctx.login(text("principal"), text("credentials")),
             "bearer" => match &ctx.token {
                 Some(t) if api::same_secret(text("credentials"), t) => Some(Principal::Token),
                 _ => None,
             },
             _ => None,
+        };
+        if who.is_none() {
+            ctx.login_failed("bolt", &self.peer, text("principal"));
         }
+        who
     }
 
     /// What the logged-in client may do now.
@@ -743,6 +754,9 @@ impl Conn<'_> {
             }
             session.execute_with_options(&query, &params, options)
         });
+        if let Some(r) = &result {
+            ctx.finished("bolt", &db, &who, &query, started.elapsed(), r.as_ref().err());
+        }
         match result {
             None => {
                 self.ignored()?;
@@ -929,6 +943,7 @@ impl Conn<'_> {
                 RUN => {
                     let started = Instant::now();
                     let prepared = Self::run_fields(fields).and_then(|(text, params, _)| {
+                        let source = text.clone();
                         let (_, access) = self.access()?;
                         let statement = match tx {
                             Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
@@ -945,9 +960,9 @@ impl Conn<'_> {
                                 })
                             }),
                         };
-                        Ok((statement.map_err(|e| Failure::from_error(&e))?, params, access))
+                        Ok((statement.map_err(|e| Failure::from_error(&e))?, params, access, source))
                     });
-                    let (query, params, access) = match prepared {
+                    let (query, params, access, source) = match prepared {
                         Ok(v) => v,
                         Err(f) => {
                             self.fail(f)?;
@@ -967,7 +982,12 @@ impl Conn<'_> {
                         (_, TxStatement::User(cmd)) => ctx.user_command(&who, access, cmd, &params),
                         (None, TxStatement::Query(_)) => unreachable!("system transactions only take database commands"),
                     };
-                    match self.interruptible(timeout, run) {
+                    let result = self.interruptible(timeout, run);
+                    if let Some(r) = &result {
+                        let who = self.who.clone().unwrap_or(Principal::Open);
+                        ctx.finished("bolt", name, &who, &source, started.elapsed(), r.as_ref().err());
+                    }
+                    match result {
                         None => self.ignored()?,
                         Some(Err(e)) => {
                             self.fail(Failure::from_error(&e))?;

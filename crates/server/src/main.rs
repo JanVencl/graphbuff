@@ -1,11 +1,14 @@
 //! `graphbuff-server` — serves graphbuff databases over HTTP/JSON and Bolt.
 
+mod signal;
+
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
-use graphbuff_server::{Role, Server, ServerConfig, TlsConfig, Users};
+use graphbuff_server::{Level, Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
 
 const USAGE: &str = "\
 usage: graphbuff-server [options]
@@ -17,7 +20,12 @@ Options:
                        to accept other machines, together with --token)
   --bolt ADDR          also serve the Bolt protocol (Neo4j drivers) on ADDR, such as
                        127.0.0.1:7687; the token, if set, is the password (any user name)
-  --data DIR           keep databases durably in DIR; without it they live in memory
+  --data DIR           keep databases durably in DIR (also: env GRAPHBUFF_DATA); default:
+                         Linux    $XDG_DATA_HOME/graphbuff (~/.local/share/graphbuff),
+                                  /var/lib/graphbuff when run as root
+                         macOS    ~/Library/Application Support/graphbuff
+                         Windows  %LOCALAPPDATA%\\graphbuff
+  --in-memory          keep databases in memory only; they are lost when the server stops
   --demo NAME          start with a demo graph loaded into the default database (unless
                        it already holds data); NAME: movies
   --persistent         with --data: new databases use disk-resident paged storage
@@ -34,11 +42,21 @@ Options:
   --tx-timeout SECS    roll back a transaction after SECS without a request (default 60)
   --query-timeout MS   stop (and roll back) a query that runs longer than MS milliseconds
                        (default: no limit; a request may ask for less with \"timeoutMs\")
+  --shutdown-timeout SECS
+                       on SIGTERM or Ctrl-C, how long running queries may take to finish
+                       before they are cancelled (default 5); then durable databases are
+                       checkpointed and the server exits
   --import-dir DIR     let LOAD CSV read files in DIR (off by default)
   --backup-dir DIR     let admins back up databases into DIR and restore from it
                        (off by default)
   --gpu                run graph kernels (multi-hop counts, algo.* procedures) on the
                        GPU (needs the `gpu` build feature)
+  --log-dir DIR        write graphbuff.log and query.log in DIR (also: env
+                       GRAPHBUFF_LOG_DIR); `-` for standard error; default: DATA/logs,
+                       or standard error with --in-memory
+  --log-level LEVEL    error, warn, info (default) or debug (also every connection);
+                       also: env GRAPHBUFF_LOG_LEVEL
+  --slow-query MS      log queries that take at least MS milliseconds to query.log
   -h, --help           show this help
 
 Endpoints:
@@ -65,6 +83,34 @@ User accounts (--users):
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users FILE ...`, which
   reads new passwords from env GRAPHBUFF_PASSWORD or the first line of standard input.
   Change the file offline only while no server uses it.";
+
+/// Where databases go without --data or GRAPHBUFF_DATA.
+fn default_data_dir() -> Option<PathBuf> {
+    let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if cfg!(windows) {
+        return env("LOCALAPPDATA").map(|d| d.join("graphbuff"));
+    }
+    if cfg!(target_os = "macos") {
+        return env("HOME").map(|h| h.join("Library/Application Support/graphbuff"));
+    }
+    if running_as_root() {
+        return Some("/var/lib/graphbuff".into());
+    }
+    env("XDG_DATA_HOME")
+        .or_else(|| env("HOME").map(|h| h.join(".local/share")))
+        .map(|d| d.join("graphbuff"))
+}
+
+/// Whether the effective user is root (Linux; elsewhere: no).
+fn running_as_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            let uid = s.lines().find(|l| l.starts_with("Uid:"))?.split_whitespace().nth(2)?.to_string();
+            Some(uid == "0")
+        })
+        .unwrap_or(false)
+}
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
@@ -148,6 +194,10 @@ fn main() {
         ..ServerConfig::default()
     };
     let mut data: Option<String> = None;
+    let mut in_memory = false;
+    let mut log_dir: Option<String> = None;
+    let mut log_level: Option<String> = None;
+    let mut slow_query: Option<Duration> = None;
     let mut persistent = false;
     let mut sync = SyncPolicy::EveryCommit;
     let mut import_dir: Option<String> = None;
@@ -166,6 +216,15 @@ fn main() {
             }
             "--bind" => config.bind = value("--bind"),
             "--data" => data = Some(value("--data")),
+            "--in-memory" => in_memory = true,
+            "--log-dir" => log_dir = Some(value("--log-dir")),
+            "--log-level" => log_level = Some(value("--log-level")),
+            "--slow-query" => {
+                let ms: u64 = value("--slow-query")
+                    .parse()
+                    .unwrap_or_else(|_| fail("--slow-query needs a number of milliseconds"));
+                slow_query = Some(Duration::from_millis(ms));
+            }
             "--demo" => demo = Some(value("--demo")),
             "--bolt" => config.bolt = Some(value("--bolt")),
             "--persistent" => persistent = true,
@@ -205,6 +264,12 @@ fn main() {
                     .unwrap_or_else(|| fail("--query-timeout needs a positive number of milliseconds"));
                 config.query_timeout = Some(Duration::from_millis(ms));
             }
+            "--shutdown-timeout" => {
+                let secs: u64 = value("--shutdown-timeout")
+                    .parse()
+                    .unwrap_or_else(|_| fail("--shutdown-timeout needs a number of seconds"));
+                config.shutdown_grace = Duration::from_secs(secs);
+            }
             other => fail(&format!("unknown option `{other}`")),
         }
     }
@@ -214,6 +279,57 @@ fn main() {
     {
         fail(&e.to_string());
     }
+    if in_memory && data.is_some() {
+        fail("--in-memory and --data exclude each other");
+    }
+
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let data: Option<PathBuf> = if in_memory {
+        None
+    } else {
+        Some(match data.or_else(|| env("GRAPHBUFF_DATA")) {
+            Some(d) => d.into(),
+            None => default_data_dir().unwrap_or_else(|| {
+                fail("no default data directory (HOME or LOCALAPPDATA is not set); use --data DIR or --in-memory")
+            }),
+        })
+    };
+    let level = match log_level.or_else(|| env("GRAPHBUFF_LOG_LEVEL")) {
+        Some(l) => Level::parse(&l).unwrap_or_else(|| fail("--log-level needs error, warn, info or debug")),
+        None => Level::Info,
+    };
+    let log_dir = match log_dir.or_else(|| env("GRAPHBUFF_LOG_DIR")) {
+        Some(d) if d == "-" => None,
+        Some(d) => Some(PathBuf::from(d)),
+        None => data.as_ref().map(|d| d.join("logs")),
+    };
+    let log = match Log::open(LogConfig {
+        dir: log_dir.clone(),
+        level,
+        slow_query,
+        ..LogConfig::default()
+    }) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            eprintln!("cannot open the log directory {}: {e}", log_dir.unwrap_or_default().display());
+            std::process::exit(1);
+        }
+    };
+    config.log = Some(Arc::clone(&log));
+    // Problems go to the console and, when the log is a file, to the log too.
+    let warn = |msg: &str| {
+        if log.dir().is_some() {
+            eprintln!("warning: {msg}");
+        }
+        log.warn(msg);
+    };
+    let fatal = |msg: &str| -> ! {
+        if log.dir().is_some() {
+            eprintln!("{msg}");
+        }
+        log.error(msg);
+        std::process::exit(1);
+    };
     config.tls = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => Some(TlsConfig {
             allow_plaintext: tls_plain,
@@ -227,16 +343,13 @@ fn main() {
         match Users::open(file) {
             Ok(u) => {
                 if u.is_empty() && config.token.is_none() {
-                    eprintln!(
-                        "warning: {file} has no users yet, so nobody can log in; add an admin with `graphbuff-server users {file} add NAME admin`, or start with --token"
-                    );
+                    warn(&format!(
+                        "{file} has no users yet, so nobody can log in; add an admin with `graphbuff-server users {file} add NAME admin`, or start with --token"
+                    ));
                 }
                 config.users = Some(Arc::new(u));
             }
-            Err(e) => {
-                eprintln!("cannot open the users file {file}: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fatal(&format!("cannot open the users file {file}: {e}")),
         }
     }
 
@@ -258,19 +371,16 @@ fn main() {
     };
     let mgr = match mgr {
         Ok(m) => Arc::new(m),
-        Err(e) => {
-            eprintln!("cannot open data directory: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => fatal(&format!(
+            "cannot open the data directory {}: {e}",
+            data.as_deref().unwrap_or_else(|| std::path::Path::new("")).display()
+        )),
     };
 
     mgr.set_import_dir(import_dir.map(Into::into));
     let demo = demo.map(|name| match graphbuff::load_demo(&mgr, &name) {
         Ok(d) => (name, d),
-        Err(e) => {
-            eprintln!("cannot load the demo `{name}`: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => fatal(&format!("cannot load the demo `{name}`: {e}")),
     });
     if gpu {
         match graphbuff::gpu_kernels() {
@@ -278,51 +388,95 @@ fn main() {
             Err(e) => fail(&format!("--gpu: {e}")),
         }
     }
-    let server = match Server::start(mgr, config.clone()) {
+    let server = match Server::start(Arc::clone(&mgr), config.clone()) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "cannot listen on {}{}: {e}",
-                config.bind,
-                config.bolt.as_ref().map_or(String::new(), |b| format!(" or {b}"))
-            );
-            std::process::exit(1);
-        }
+        Err(e) => fatal(&format!(
+            "cannot listen on {}{}: {e}",
+            config.bind,
+            config.bolt.as_ref().map_or(String::new(), |b| format!(" or {b}"))
+        )),
     };
     let addr = server.local_addr();
     let auth = config.token.is_some() || config.users.is_some();
     if !addr.ip().is_loopback() && !auth {
-        eprintln!(
-            "warning: listening on {addr} without --token or --users; anyone who can reach this port can read and change every database"
-        );
+        warn(&format!(
+            "listening on {addr} without --token or --users; anyone who can reach this port can read and change every database"
+        ));
     }
     if let Some(bolt) = server.bolt_addr()
         && !bolt.ip().is_loopback()
         && !auth
     {
-        eprintln!(
-            "warning: serving Bolt on {bolt} without --token or --users; anyone who can reach this port can use every database"
-        );
+        warn(&format!(
+            "serving Bolt on {bolt} without --token or --users; anyone who can reach this port can use every database"
+        ));
     }
     let tls = config.tls.is_some();
     if auth && !tls && (!addr.ip().is_loopback() || server.bolt_addr().is_some_and(|b| !b.ip().is_loopback())) {
-        eprintln!("warning: without TLS (--tls-cert, --tls-key), passwords and tokens cross the network in clear text");
+        warn("without TLS (--tls-cert, --tls-key), passwords and tokens cross the network in clear text");
     }
     let (http, bolt) = if tls { ("https", "bolt+s") } else { ("http", "bolt") };
-    println!(
-        "graphbuff-server listening on {http}://{addr}{} ({})",
+    let listening = format!(
+        "graphbuff-server {} listening on {http}://{addr}{} ({})",
+        env!("CARGO_PKG_VERSION"),
         server.bolt_addr().map_or(String::new(), |b| format!(" and {bolt}://{b}")),
         match &data {
-            Some(d) => format!("data in {d}"),
-            None => "in-memory databases".into(),
+            Some(d) => format!("data in {}", d.display()),
+            None => "in-memory databases, lost when the server stops".into(),
         }
     );
+    println!("{listening}");
+    log.info(&listening);
+    let fsync = if sync == SyncPolicy::EveryCommit { "fsync every commit" } else { "no fsync" };
+    log.info(format_args!(
+        "new databases: {}; log: {}; slow-query log: {}; logins: {}",
+        match (&data, persistent) {
+            (None, _) => "in memory".to_string(),
+            (Some(_), true) => format!("persistent, {fsync}"),
+            (Some(_), false) => format!("hybrid, {fsync}"),
+        },
+        log.dir().map_or("standard error".into(), |d| d.display().to_string()),
+        log.slow_query().map_or("off".into(), |d| format!("{} ms", d.as_millis())),
+        match (&config.users, &config.token) {
+            (Some(_), _) => "user accounts",
+            (None, Some(_)) => "token",
+            (None, None) => "none needed",
+        }
+    ));
     if let Some((name, d)) = demo {
         if d.loaded {
             println!("demo `{name}` loaded: {} nodes, {} relationships", d.nodes, d.relationships);
+            log.info(format_args!("demo `{name}` loaded"));
         } else {
             println!("demo `{name}` not loaded: the default database already holds {} nodes", d.nodes);
         }
     }
-    server.wait();
+    signal::install();
+    while !signal::requested() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Stop: no new connections, roll back open transactions, let running queries finish
+    // (or cancel them after the grace period), then checkpoint durable databases.
+    let started = Instant::now();
+    println!("stopping");
+    log.info("stop requested; stopping");
+    server.shutdown();
+    let mut failed = false;
+    for (name, result) in mgr.checkpoint_all() {
+        if let Err(e) = result {
+            failed = true;
+            let msg = format!("checkpoint of database `{name}` failed (its log is kept and replayed on the next start): {e}");
+            if log.dir().is_some() {
+                eprintln!("{msg}");
+            }
+            log.error(msg);
+        }
+    }
+    drop(mgr); // syncs the logs and releases the data directory
+    let stopped = format!("stopped in {} ms", started.elapsed().as_millis());
+    println!("{stopped}");
+    log.info(&stopped);
+    signal::done();
+    std::process::exit(i32::from(failed));
 }

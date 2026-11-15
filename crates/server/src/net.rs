@@ -58,6 +58,10 @@ impl Stream {
         self.tcp().local_addr()
     }
 
+    pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.tcp().peer_addr()
+    }
+
     /// Closes the connection (after a TLS `close_notify`, if it can be sent) without
     /// losing what was written: sends a FIN after it, then
     /// reads and drops what the client still sends (until it closes, for at most `linger`,

@@ -897,6 +897,41 @@ fn shutdown_cancels_running_transaction_statements() {
     assert_eq!((r.status, r.error_code().as_str()), (409, "Cancelled"), "{}", r.body);
 }
 
+#[test]
+fn shutdown_lets_running_queries_finish_within_the_grace_period() {
+    // A query that ends on its own before the grace period passes is not cancelled: this
+    // one ends with its own time limit.
+    let server = start(ServerConfig {
+        shutdown_grace: Duration::from_secs(10),
+        ..ServerConfig::default()
+    });
+    let addr = server.local_addr();
+    Client::connect(addr).rows("/query", "UNWIND range(1, 1000) AS i CREATE (:N)", "{}");
+    let runner = std::thread::spawn(move || Client::connect(addr).request("POST", "/query", Some(&slow_body(Some(600))), &[]));
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    drop(server);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let r = runner.join().unwrap();
+    assert_eq!((r.status, r.error_code().as_str()), (408, "Timeout"), "{}", r.body);
+
+    // One that runs on is cancelled when the grace period ends.
+    let server = start(ServerConfig {
+        shutdown_grace: Duration::from_millis(300),
+        ..ServerConfig::default()
+    });
+    let addr = server.local_addr();
+    Client::connect(addr).rows("/query", "UNWIND range(1, 1000) AS i CREATE (:N)", "{}");
+    let runner = std::thread::spawn(move || Client::connect(addr).request("POST", "/query", Some(&slow_body(None)), &[]));
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    drop(server);
+    assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let r = runner.join().unwrap();
+    assert_eq!((r.status, r.error_code().as_str()), (409, "Cancelled"), "{}", r.body);
+}
+
 // ---- backup, restore and check ----------------------------------------------------------
 
 #[test]

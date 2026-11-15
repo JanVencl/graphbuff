@@ -498,6 +498,21 @@ impl DatabaseManager {
             .collect()
     }
 
+    /// Checkpoints every durable database (see [`Database::checkpoint`]), for example
+    /// before the process exits, so the next start has no log to replay. Each waits for
+    /// the transaction writing to it, if any. Returns each durable database's name and
+    /// outcome; in-memory databases are skipped.
+    pub fn checkpoint_all(&self) -> Vec<(String, Result<()>)> {
+        let dbs: Vec<(String, Arc<Database<BoxedStore>>)> = self
+            .read()
+            .dbs
+            .iter()
+            .filter(|(_, e)| !matches!(e.storage, StorageKind::InMemory))
+            .map(|(name, e)| (name.clone(), Arc::clone(&e.db)))
+            .collect();
+        dbs.into_iter().map(|(name, db)| (name, db.checkpoint())).collect()
+    }
+
     /// Creates database `name` with persistent storage by bulk-importing CSV files
     /// ([`crate::import_csv`]), writing store records directly instead of running Cypher.
     /// `storage: None` uses the manager's default storage if it is persistent, else

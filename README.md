@@ -17,7 +17,8 @@ docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 ghcr.io/janvencl/g
 ```
 
 HTTP/JSON is then on `http://127.0.0.1:7475` and Bolt on `bolt://127.0.0.1:7687`; see
-[Install without Rust](#install-without-rust) for prebuilt binaries and durable data.
+[Install without Rust](#install-without-rust) for prebuilt binaries and
+[Data directory and logs](#data-directory-and-logs) for where the server keeps your data.
 
 From source:
 
@@ -27,7 +28,7 @@ cargo run --release -p graphbuff-cli -- -i examples/movies.cypher  # load a scri
 cargo run --release -p graphbuff-cli -- --data ./data              # durable databases in ./data
 cargo run --release -p graphbuff-cli -- --data ./data --persistent # ... in disk-resident storage
 cargo run --release -p graphbuff-cli -- --demo movies              # shell with the built-in movies graph
-cargo run --release -p graphbuff-server                            # HTTP/JSON server on 127.0.0.1:7475
+cargo run --release -p graphbuff-server                            # HTTP/JSON server on 127.0.0.1:7475, durable
 cargo run --release -p graphbuff-server -- --demo movies           # ... with the built-in movies graph
 cargo run --release -p graphbuff-server -- --bolt 127.0.0.1:7687   # ... plus Bolt for Neo4j drivers
 cargo test --workspace
@@ -61,7 +62,8 @@ curl -s http://127.0.0.1:7475/query -H 'Content-Type: application/json'      -d 
 
 The image `ghcr.io/janvencl/graphbuff` (tags: `latest` and each version, such as `0.1.0`;
 linux/amd64 and linux/arm64) runs `graphbuff-server --bind 0.0.0.0:7475 --bolt 0.0.0.0:7687`
-as an unprivileged user; anything after the image name is added to that command line.
+as an unprivileged user, with its databases in the volume `/data` and its log on standard
+error (`docker logs`); anything after the image name is added to that command line.
 `--demo movies` loads the graph of [examples/movies.cypher](examples/movies.cypher), which
 is compiled into the binary, into the default database (unless it already holds data).
 
@@ -74,12 +76,18 @@ other machines (`-p 7475:7475`), set a token or user accounts:
 docker run --rm -p 7475:7475 -p 7687:7687 -e GRAPHBUFF_TOKEN=s3cret ghcr.io/janvencl/graphbuff
 ```
 
-Data lives in memory unless `--data` is given; `/data` is a volume for it:
+Name the volume to keep the databases when the container is removed (`--rm` above drops
+them with the container):
 
 ```bash
-docker run -d --name graphbuff -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687        -v graphbuff-data:/data ghcr.io/janvencl/graphbuff --data /data
+docker run -d --name graphbuff -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
+       -v graphbuff-data:/data ghcr.io/janvencl/graphbuff
+docker logs -f graphbuff                        # start-up, failed logins, errors
 docker exec -it graphbuff graphbuff --help      # the shell binary is in the image too
 ```
+
+Add `--slow-query 500` to log queries that take 500 ms or more, `--in-memory` for a
+throwaway server, or `-e GRAPHBUFF_LOG_DIR=/data/logs` to write log files into the volume.
 
 Build the image yourself with `docker build -t graphbuff .`.
 
@@ -477,8 +485,9 @@ The MSVC toolchain and other platforms need nothing extra.
 Cypher against graphbuff:
 
 ```bash
-cargo run --release -p graphbuff-server                                  # in-memory, 127.0.0.1:7475
-cargo run --release -p graphbuff-server -- --data ./data --persistent    # durable
+cargo run --release -p graphbuff-server                                  # durable, in the default data directory
+cargo run --release -p graphbuff-server -- --data ./data --persistent    # in ./data, disk-resident storage
+cargo run --release -p graphbuff-server -- --in-memory                   # nothing written to disk
 cargo run --release -p graphbuff-server -- --bind 0.0.0.0:7475 --token s3cret
 cargo run --release -p graphbuff-server -- --demo movies                 # start with the movies demo graph
 ```
@@ -559,6 +568,55 @@ long age = (Long) r.get(0, "age");          // INTEGER -> Long, FLOAT -> Double
 
 With Jackson or Gson in the project, `HttpClient` plus your JSON library is all you need.
 Send `{"query": ..., "params": ...}` and read `columns` / `rows`.
+
+### Data directory and logs
+
+The server keeps its databases on disk. Without `--data DIR` (or env `GRAPHBUFF_DATA`)
+it uses:
+
+| Platform | Data directory |
+|----------|----------------|
+| Linux | `$XDG_DATA_HOME/graphbuff`, usually `~/.local/share/graphbuff`; `/var/lib/graphbuff` when run as root |
+| macOS | `~/Library/Application Support/graphbuff` |
+| Windows | `%LOCALAPPDATA%\graphbuff` |
+| Docker image | `/data` (a volume) |
+
+The start-up line names the directory in use. New databases there use hybrid storage
+(`--persistent`: disk-resident, for graphs larger than RAM). `--in-memory` keeps everything
+in memory and writes nothing; the `graphbuff` shell keeps databases in memory unless it
+gets `--data`. Back up a data directory with `graphbuff backup` (see
+[Backup, restore and consistency checks](#backup-restore-and-consistency-checks)).
+
+Logs go to `DATA/logs` (`--log-dir DIR` or env `GRAPHBUFF_LOG_DIR`; `-` for standard
+error, the default with `--in-memory` and in the Docker image):
+
+* `graphbuff.log`: start-up and settings, failed logins (with the client's address and
+  user name), refused connections and storage errors; with `--log-level debug` also every
+  connection. Levels: `error`, `warn`, `info` (default), `debug`; also env
+  `GRAPHBUFF_LOG_LEVEL`.
+* `query.log`: with `--slow-query MS`, every query that took at least `MS` milliseconds,
+  with its duration, protocol, database and user. Parameters are never logged.
+
+```text
+2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.3.0 listening on http://127.0.0.1:7475 (data in /home/ann/.local/share/graphbuff)
+2026-11-15T18:00:05.004Z WARN  failed login (bolt) from 10.0.0.7:51234 as `admin`
+2026-11-15T18:00:09.871Z SLOW  1532 ms bolt movies alice MATCH (a)-[*..6]->(b) RETURN count(b)
+```
+
+Each file moves to `.1` (older ones to `.2`, …) at 10 MiB; five old files are kept.
+`graphbuff_server::Log` gives an embedded server the same log through `ServerConfig::log`.
+
+### Stopping
+
+SIGTERM or SIGINT (`docker stop`, `systemctl stop`, `kill`, Ctrl-C), or on Windows Ctrl-C,
+Ctrl-Break or closing the console, stops the server cleanly: it stops accepting
+connections, rolls back open explicit transactions, gives queries already running
+`--shutdown-timeout SECS` (default 5) to finish and then cancels (and rolls back) the rest,
+checkpoints every durable database so the next start has no log to replay, and exits 0 (1 if a checkpoint failed; that
+database's log is kept and replayed on the next start). A
+second signal ends it at once; committed data is safe either way, since every commit is in
+the log. An embedded server gets the same steps from `Server::shutdown` (or dropping it),
+with `ServerConfig::shutdown_grace`, followed by `DatabaseManager::checkpoint_all`.
 
 ## Bolt (Neo4j drivers)
 
