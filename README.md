@@ -1,5 +1,4 @@
-# GraphBuff
-
+![GraphBuff logo](graphbuff_github_social.png "GraphBuff")
 A graph database engine written in Rust and queried with **Cypher**.
 
 - **Storage:** in memory, hybrid (in-memory graph with a write-ahead log and snapshots) or
