@@ -1727,7 +1727,41 @@ fn string_functions() {
             ("toStringOrNull([1])", "null"),
         ],
     );
-    assert!(matches!(db.execute("RETURN normalize('a')"), Err(Error::Unsupported(_))));
+}
+
+#[test]
+fn unicode_normalization() {
+    let db = Database::in_memory();
+    check_exprs(
+        &db,
+        &[
+            ("normalize('\\u212B') = '\\u00C5'", "true"),
+            ("normalize('\\u00C5', NFD) = 'A\\u030A'", "true"),
+            ("normalize('A\\u030A', nfc) = '\\u00C5'", "true"),
+            ("normalize('\\uFE64', NFKC)", "\"<\""),
+            ("normalize('\\uFE64', NFC) = '\\uFE64'", "true"),
+            ("normalize('\\uFB01', NFKD)", "\"fi\""),
+            ("normalize('abc', 'NFKD')", "\"abc\""),
+            ("normalize(null)", "null"),
+            ("normalize(null, NFD)", "null"),
+            ("'\\u00C5' IS NORMALIZED", "true"),
+            ("'\\u00C5' IS NFC NORMALIZED", "true"),
+            ("'\\u00C5' IS NFD NORMALIZED", "false"),
+            ("'\\u00C5' IS NOT NFD NORMALIZED", "true"),
+            ("'\\u212B' IS NOT NORMALIZED", "true"),
+            ("'\\uFE64' IS NFKC NORMALIZED", "false"),
+            ("'abc' IS NFKD NORMALIZED AND 'x' IS NOT NULL", "true"),
+            ("null IS NORMALIZED", "null"),
+            ("null IS NOT NFKC NORMALIZED", "null"),
+        ],
+    );
+    let rows = db
+        .execute("WITH 'x' AS NFD RETURN normalize('\\u00C5', NFD) = 'A\\u030A' AS d, NFD")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    for bad in ["RETURN normalize(1)", "RETURN 1 IS NORMALIZED", "RETURN normalize('a', 'NFX')"] {
+        assert!(db.execute(bad).is_err(), "{bad} succeeded");
+    }
 }
 
 #[test]

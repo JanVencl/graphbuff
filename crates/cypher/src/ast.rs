@@ -461,6 +461,11 @@ pub enum Expr {
     AggregateRef(usize),
 }
 
+/// The internal function `s IS [NOT] [form] NORMALIZED` parses to, with the arguments
+/// `s` and the form's name (`'NFC'` when none is given). The space keeps it out of reach
+/// of a function call in a query.
+pub const IS_NORMALIZED: &str = "is normalized";
+
 /// Aggregating function names.
 pub const AGGREGATE_FUNCTIONS: &[&str] = &[
     "count", "sum", "avg", "min", "max", "collect", "stdev", "stdevp", "percentilecont",

@@ -58,13 +58,31 @@ impl Stream {
         self.tcp().local_addr()
     }
 
-    /// Closes the connection (after a TLS `close_notify`, if it can be sent).
-    pub(crate) fn shutdown(&self) {
+    /// Closes the connection (after a TLS `close_notify`, if it can be sent) without
+    /// losing what was written: sends a FIN after it, then
+    /// reads and drops what the client still sends (until it closes, for at most `linger`,
+    /// or while `keep_going`), then closes. Closing a socket with unread input sends a
+    /// reset instead, and a client that gets one may drop the reply still in its own
+    /// receive buffer (Windows does), e.g. the failure for a message that was too large.
+    pub(crate) fn close_gracefully(&self, linger: Duration, keep_going: &dyn Fn() -> bool) {
         #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
         if let Stream::Tls(s) = self {
             s.close_notify();
         }
-        let _ = self.tcp().shutdown(Shutdown::Both);
+        let tcp = self.tcp();
+        if tcp.shutdown(Shutdown::Write).is_ok() {
+            let deadline = Instant::now() + linger;
+            let mut buf = [0u8; 4096];
+            while Instant::now() < deadline && keep_going() {
+                match (&mut &*tcp).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = tcp.shutdown(Shutdown::Both);
     }
 }
 

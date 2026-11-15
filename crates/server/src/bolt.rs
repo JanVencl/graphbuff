@@ -93,6 +93,9 @@ const TIMED_OUT: &str = "Neo.ClientError.Transaction.TransactionTimedOut";
 /// name, it runs database commands only.
 const SYSTEM_DB: &str = "system";
 
+/// How long a closing connection waits for the client to close its side.
+const LINGER: Duration = Duration::from_secs(1);
+
 /// Numbers the connections (for `connection_id`) and the bookmarks.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static BOOKMARKS: AtomicU64 = AtomicU64::new(0);
@@ -173,8 +176,10 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
         };
         let _ = conn.run();
         let _ = conn.out.flush();
-        // Wakes the reader, which may be waiting for the client.
-        stream.shutdown();
+        // The reader stops at its next message (it has no one to send it to), when the
+        // client closes, or when the final shutdown wakes it.
+        drop(conn);
+        stream.close_gracefully(LINGER, &|| !shared.stop());
     });
 }
 

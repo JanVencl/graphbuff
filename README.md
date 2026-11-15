@@ -884,7 +884,7 @@ DROP CONSTRAINT user_id;
   is the shortest path that passes them)
 * **Expressions:** arithmetic, string concatenation, comparison chains, three-valued `AND/OR/XOR/NOT`,
   `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (Java-style regular expressions, whole-string
-  match, flags such as `(?i)`; no lookaround or backreferences), `IS [NOT] NULL`, indexing and slicing, maps, lists,
+  match, flags such as `(?i)`; no lookaround or backreferences), `IS [NOT] NULL`, `IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED`, indexing and slicing, maps, lists,
   `CASE`, list comprehensions, `reduce(acc = init, x IN list | expr)`, `all/any/none/single`, parameters, `EXISTS { … }`, `COUNT { … }` and
   `COLLECT { … }` subqueries (a pattern with an optional `WHERE`, or a full read-only query; they
   see every outer variable)
@@ -894,7 +894,7 @@ DROP CONSTRAINT user_id;
   `relationships`, `length`, `size`, `degree`, `head`, `last`, `tail`, `range`, `reverse`, `coalesce`, `isEmpty`,
   `toUpper` / `upper`, `toLower` / `lower`, `trim` / `btrim`, `ltrim`, `rtrim` (each with an optional
   string of characters to trim), `replace`, `substring`, `left`, `right`, `split`, `char_length`,
-  `character_length`, `toString`, `toStringOrNull`, `toInteger`, `toFloat`, `toBoolean` (and their
+  `character_length`, `normalize(s [, NFC|NFD|NFKC|NFKD])` (Unicode 17.0), `toString`, `toStringOrNull`, `toInteger`, `toFloat`, `toBoolean` (and their
   `…OrNull` forms), `toIntegerList`, `toFloatList`, `toBooleanList`, `toStringList`, `nullIf`,
   `valueType`, `randomUUID`, `abs`, `sign`, `ceil`, `floor`, `round` (also
   `round(x, precision[, mode])` with `UP`, `DOWN`, `CEILING`, `FLOOR`, `HALF_UP` (default),
@@ -934,8 +934,7 @@ DROP CONSTRAINT user_id;
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship
 constraints, named time zones, `date.truncate` and the other temporal truncation functions,
-spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), `normalize()`
-(it needs Unicode normalization tables), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
+spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).
 
 ## License
