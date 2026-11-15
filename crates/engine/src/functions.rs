@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 
 use graphbuff_core::temporal::{BetweenUnit, NANOS_PER_SECOND, Temporal, TemporalKind};
 use graphbuff_core::{Error, Point, Result, Value};
+use graphbuff_cypher::ast::IS_NORMALIZED;
 
 use crate::context::Executor;
 use crate::ops::{cypher_eq, order_cmp, to_plain_string};
+use crate::unicode::{NormalForm, is_normalized, normalize};
 
 fn arity(name: &str, args: &[Value], min: usize, max: usize) -> Result<()> {
     if args.len() < min || args.len() > max {
@@ -670,10 +672,24 @@ fn extra_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
             arity(name, args, 1, 1)?;
             to_string_or_none(&a0).unwrap_or(Value::Null)
         }
-        "normalize" => {
-            return Err(Error::Unsupported(
-                "normalize() needs Unicode normalization tables, which graphbuff does not include".into(),
-            ));
+        "normalize" | IS_NORMALIZED => {
+            arity(name, args, 1, 2)?;
+            let form = match args.get(1) {
+                None => NormalForm::Nfc,
+                Some(Value::String(f)) => NormalForm::parse(f).ok_or_else(|| {
+                    Error::Runtime(format!("unknown normal form {f:?}; use NFC, NFD, NFKC or NFKD"))
+                })?,
+                Some(o) => return Err(wrong_type(name, o)),
+            };
+            match &a0 {
+                Value::Null => Value::Null,
+                Value::String(s) if name == IS_NORMALIZED => Value::Bool(is_normalized(s, form)),
+                Value::String(s) => Value::String(normalize(s, form)),
+                o if name == IS_NORMALIZED => {
+                    return Err(Error::Type(format!("IS NORMALIZED does not accept {}", o.type_name())));
+                }
+                o => return Err(wrong_type(name, o)),
+            }
         }
 
         // ---- lists -----------------------------------------------------------------

@@ -50,6 +50,13 @@ pub fn parse_expression(src: &str) -> Result<Expr> {
     Ok(e)
 }
 
+/// The Unicode normal form keyword `word` (`NFC`, `NFD`, `NFKC`, `NFKD`, any case), upper-cased.
+fn normal_form(word: &str) -> Option<&'static str> {
+    ["NFC", "NFD", "NFKC", "NFKD"]
+        .into_iter()
+        .find(|f| f.eq_ignore_ascii_case(word))
+}
+
 struct Parser<'a> {
     src: &'a str,
     toks: Vec<Token>,
@@ -1473,6 +1480,25 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_kw("IS") {
                 let negated = self.eat_kw("NOT");
+                // `s IS [NOT] [NFC | NFD | NFKC | NFKD] NORMALIZED`
+                let form = match self.peek() {
+                    Tok::Ident(w) if self.kw_at(1, "NORMALIZED") => normal_form(w),
+                    _ => None,
+                };
+                if form.is_some() {
+                    self.advance();
+                }
+                if form.is_some() || self.is_kw("NORMALIZED") {
+                    self.advance();
+                    let form = Expr::Literal(Value::String(form.unwrap_or("NFC").into()));
+                    let test = Expr::Function {
+                        name: IS_NORMALIZED.into(),
+                        distinct: false,
+                        args: vec![e, form],
+                    };
+                    e = if negated { Expr::Unary(UnaryOp::Not, Box::new(test)) } else { test };
+                    continue;
+                }
                 self.expect_kw("NULL")?;
                 e = Expr::IsNull {
                     expr: Box::new(e),
@@ -1753,6 +1779,13 @@ impl<'a> Parser<'a> {
             if !self.eat(&Tok::RParen) {
                 args = self.parse_expr_list()?;
                 self.expect(Tok::RParen, "')' to close the function call")?;
+            }
+            // `normalize(s, NFKD)`: the normal form is a keyword, not a variable.
+            if lower == "normalize"
+                && let [_, Expr::Var(name)] = args.as_slice()
+                && let Some(f) = normal_form(name)
+            {
+                args[1] = Expr::Literal(Value::String(f.into()));
             }
             return Ok(Expr::Function {
                 name: lower,
