@@ -935,19 +935,26 @@ DROP CONSTRAINT user_id;
 * **Databases** (through a `Session`): `CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {…}]`,
   `DROP DATABASE name [IF EXISTS]`, `SHOW DATABASES`, `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`,
   `USE name`, `USE name <query>`
-* **Patterns:** labels, inline property maps, `$param` maps, directions `-->` `<--` `--`, type alternatives
-  `[:A|B]`, variable length `*`, `*n`, `*min..max`, named paths `p = (…)`, pattern predicates in `WHERE`,
+* **Patterns:** labels, label expressions on nodes (`(n:A|B)`, `(n:A&B)`, `(n:A&!B)`, `(n:%)` for
+  any label, `(n:!%)` for none, parentheses) and relationships (`[:A|B]`, `[:!A]`, `[:%]`; `[:A&B]`
+  matches nothing), also in `WHERE n:A|B` and `WHERE r:T` (a relationship's type is its label;
+  in a list comprehension's `WHERE`, write `(x:A|B)` since `|` starts the mapping),
+  inline property maps, `$param` maps, directions `-->` `<--` `--`, variable length `*`, `*n`, `*min..max`, named paths `p = (…)`, pattern predicates in `WHERE`,
   `shortestPath((a)-[:T*]->(b))` and `allShortestPaths(…)` (a bidirectional breadth-first search;
   `WHERE` conditions on the path or its relationships are applied during the search, so the result
   is the shortest path that passes them)
 * **Expressions:** arithmetic, string concatenation, comparison chains, three-valued `AND/OR/XOR/NOT`,
   `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (Java-style regular expressions, whole-string
   match, flags such as `(?i)`; no lookaround or backreferences), `IS [NOT] NULL`, `IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED`, indexing and slicing, maps, lists,
-  `CASE`, list comprehensions, `reduce(acc = init, x IN list | expr)`, `all/any/none/single`, parameters, `EXISTS { … }`, `COUNT { … }` and
+  `CASE`, list comprehensions, pattern comprehensions (`[(a)-[:KNOWS]->(b) WHERE b.age > 30 | b.name]`,
+  also with a named path), map projections (`n {.name, .*, age: n.born + 1, other}` on nodes,
+  relationships and maps; `null` stays `null`), `reduce(acc = init, x IN list | expr)`, `all/any/none/single`, parameters, `EXISTS { … }`, `COUNT { … }` and
   `COLLECT { … }` subqueries (a pattern with an optional `WHERE`, or a full read-only query; they
   see every outer variable)
 * **Aggregates:** `count`, `count(*)`, `sum`, `avg`, `min`, `max`, `collect`, `stdev`, `stdevp`,
-  `percentileCont`, `percentileDisc` (with `DISTINCT`), implicit grouping
+  `percentileCont`, `percentileDisc` (with `DISTINCT`), implicit grouping: by the items without
+  aggregates, and by the variables an aggregating item uses outside its aggregates (`RETURN
+  p {.name, friends: collect(f.name)}` gives a row per `p`)
 * **Functions:** `id`, `elementId`, `labels`, `type`, `keys`, `properties`, `startNode`, `endNode`, `nodes`,
   `relationships`, `length`, `size`, `degree`, `head`, `last`, `tail`, `range`, `reverse`, `coalesce`, `isEmpty`,
   `toUpper` / `upper`, `toLower` / `lower`, `trim` / `btrim`, `ltrim`, `rtrim` (each with an optional

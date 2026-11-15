@@ -29,6 +29,10 @@ pub enum Tok {
     Colon,
     Semicolon,
     Pipe,
+    /// `&` (label expressions)
+    Amp,
+    /// `!` on its own (label expressions)
+    Bang,
     Plus,
     PlusEq,
     Minus,
@@ -113,6 +117,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
             '>' if next == Some('=') => (Tok::Ge, 2),
             '>' => (Tok::Gt, 1),
             '!' if next == Some('=') => (Tok::Neq, 2),
+            '!' => (Tok::Bang, 1),
+            '&' => (Tok::Amp, 1),
             '=' if next == Some('~') => (Tok::RegexMatch, 2),
             '=' => (Tok::Eq, 1),
             '\'' | '"' => {

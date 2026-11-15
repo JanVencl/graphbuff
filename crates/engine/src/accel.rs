@@ -397,6 +397,9 @@ fn recognize(q: &SingleQuery, op: &Operator) -> Option<KernelOp> {
     let mut rel_vars: Vec<&str> = Vec::new();
     let mut hops = Vec::new();
     let mut add_node = |n: &NodePattern, vars: &mut Vec<Option<String>>| -> Option<()> {
+        if n.label_expr.is_some() {
+            return None;
+        }
         if let Some(v) = &n.var
             && vars.iter().any(|x| x.as_ref() == Some(v))
         {
@@ -408,7 +411,7 @@ fn recognize(q: &SingleQuery, op: &Operator) -> Option<KernelOp> {
     };
     add_node(&part.start, &mut vars)?;
     for (rel, node) in &part.chain {
-        if rel.length.is_some() || rel.props.is_some() {
+        if rel.length.is_some() || rel.props.is_some() || rel.type_expr.is_some() {
             return None;
         }
         if let Some(v) = &rel.var {

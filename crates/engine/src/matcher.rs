@@ -531,6 +531,11 @@ impl Executor<'_> {
                 return Ok(false);
             }
         }
+        if let Some(e) = &np.label_expr
+            && !e.matches(&store.node_labels(id)?)
+        {
+            return Ok(false);
+        }
         self.props_match(&np.props, scope, st, |k| store.node_property(id, k))
     }
 
@@ -542,6 +547,12 @@ impl Executor<'_> {
         st: &MatchState,
     ) -> Result<bool> {
         let store = self.store();
+        if let Some(e) = &rp.type_expr {
+            let t: Vec<String> = store.relationship_type(id)?.into_iter().collect();
+            if !e.matches(&t) {
+                return Ok(false);
+            }
+        }
         self.props_match(&rp.props, scope, st, |k| store.relationship_property(id, k))
     }
 

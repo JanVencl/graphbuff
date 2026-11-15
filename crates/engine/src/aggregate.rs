@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use graphbuff_core::{Error, Result, Value};
-use graphbuff_cypher::ast::Expr;
+use graphbuff_cypher::ast::{Expr, MapProjectionItem};
 
 use crate::ops::order_cmp;
 
@@ -109,6 +109,19 @@ pub(crate) fn rewrite(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>
             negated: *negated,
         },
         Expr::HasLabels(x, l) => Expr::HasLabels(r(x)?, l.clone()),
+        Expr::HasLabelExpr(x, l) => Expr::HasLabelExpr(r(x)?, l.clone()),
+        Expr::MapProjection { base, items } => Expr::MapProjection {
+            base: r(base)?,
+            items: items
+                .iter()
+                .map(|item| {
+                    Ok(match item {
+                        MapProjectionItem::Entry(k, x) => MapProjectionItem::Entry(k.clone(), *r(x)?),
+                        other => other.clone(),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        },
         Expr::Function {
             name,
             distinct,

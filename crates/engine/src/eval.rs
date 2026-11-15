@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use graphbuff_core::{Error, Result, Value};
 use std::rc::Rc;
 
-use graphbuff_cypher::ast::{BinaryOp, Expr, Quantifier, Query, SubqueryKind, UnaryOp};
+use graphbuff_cypher::ast::{BinaryOp, Expr, MapProjectionItem, Quantifier, Query, SubqueryKind, UnaryOp};
 
 use crate::context::{Env, Executor, Row, Scope};
 use crate::plan::QueryPlan;
@@ -192,11 +192,63 @@ impl Executor<'_> {
                     }
                     Ok(Value::Bool(true))
                 }
+                Value::Rel(id) => {
+                    let t = self.store().relationship_type(id)?;
+                    Ok(Value::Bool(labels.iter().all(|l| t.as_deref() == Some(l.as_str()))))
+                }
                 o => Err(Error::Type(format!(
-                    "label predicates require a node, got {}",
+                    "label predicates require a node or a relationship, got {}",
                     o.type_name()
                 ))),
             },
+            Expr::HasLabelExpr(target, expr) => match self.eval(target, env)? {
+                Value::Null => Ok(Value::Null),
+                Value::Node(id) => Ok(Value::Bool(expr.matches(&self.store().node_labels(id)?))),
+                Value::Rel(id) => {
+                    let t: Vec<String> = self.store().relationship_type(id)?.into_iter().collect();
+                    Ok(Value::Bool(expr.matches(&t)))
+                }
+                o => Err(Error::Type(format!(
+                    "label expressions require a node or a relationship, got {}",
+                    o.type_name()
+                ))),
+            },
+            Expr::MapProjection { base, items } => {
+                let b = self.eval(base, env)?;
+                if b.is_null() {
+                    return Ok(Value::Null);
+                }
+                if !matches!(b, Value::Node(_) | Value::Rel(_) | Value::Map(_)) {
+                    return Err(Error::Type(format!(
+                        "a map projection needs a node, relationship or map, got {}",
+                        b.type_name()
+                    )));
+                }
+                let mut out = BTreeMap::new();
+                for item in items {
+                    match item {
+                        MapProjectionItem::Property(k) => {
+                            out.insert(k.clone(), self.property_of(&b, k)?);
+                        }
+                        MapProjectionItem::AllProperties => {
+                            let all = match &b {
+                                Value::Node(id) => self.store().node_properties(*id)?,
+                                Value::Rel(id) => self.store().relationship_properties(*id)?,
+                                Value::Map(m) => m.clone(),
+                                _ => unreachable!("checked above"),
+                            };
+                            out.extend(all);
+                        }
+                        MapProjectionItem::Entry(k, e) => {
+                            out.insert(k.clone(), self.eval(e, env)?);
+                        }
+                        MapProjectionItem::Var(v) => {
+                            out.insert(v.clone(), self.eval(&Expr::Var(v.clone()), env)?);
+                        }
+                    }
+                }
+                Ok(Value::Map(out))
+            }
             Expr::Function { name, args, .. } if name == "exists" => {
                 if args.len() != 1 {
                     return Err(Error::Semantic(
