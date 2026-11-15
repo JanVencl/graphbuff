@@ -349,3 +349,36 @@ fn single_database_rejects_database_commands() {
     ));
     assert!(matches!(db.execute("USE x"), Err(Error::Unsupported(_))));
 }
+
+#[test]
+fn checkpoint_all_covers_durable_databases() {
+    let dir = TempDir::new("checkpoint-all");
+    {
+        let mgr = DatabaseManager::open(&dir.0).unwrap();
+        let mut s = mgr.session();
+        run(&mut s, "CREATE DATABASE p OPTIONS {storage: 'persistent'}");
+        run(&mut s, "CREATE DATABASE m OPTIONS {storage: 'memory'}");
+        run(&mut s, "CREATE (:A)");
+        s.use_database("p").unwrap();
+        run(&mut s, "CREATE (:B)");
+        let wal = dir.0.join("databases/graphbuff/graph.wal");
+        let before = fs::metadata(&wal).unwrap().len();
+
+        let mut done: Vec<String> = mgr
+            .checkpoint_all()
+            .into_iter()
+            .map(|(name, r)| {
+                r.unwrap_or_else(|e| panic!("{name}: {e}"));
+                name
+            })
+            .collect();
+        done.sort();
+        assert_eq!(done, ["graphbuff", "p"]);
+        assert!(fs::metadata(&wal).unwrap().len() < before);
+    }
+    let mgr = DatabaseManager::open(&dir.0).unwrap();
+    let mut s = mgr.session();
+    assert_eq!(count(&mut s), "1");
+    s.use_database("p").unwrap();
+    assert_eq!(count(&mut s), "1");
+}

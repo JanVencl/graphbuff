@@ -702,7 +702,10 @@ fn timeouts_and_reset_interrupt_queries() {
     b.success();
 
     // RESET stops a running query: its RUN is IGNORED.
-    let server = start(ServerConfig::default());
+    let server = start(ServerConfig {
+        shutdown_grace: Duration::from_millis(300),
+        ..ServerConfig::default()
+    });
     let mut b = Bolt::open(server.bolt_addr().unwrap());
     b.query("UNWIND range(1, 1000) AS i CREATE (:N)");
     b.send(BEGIN, vec![empty()]);
@@ -720,11 +723,12 @@ fn timeouts_and_reset_interrupt_queries() {
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(b.count("T"), 0);
 
-    // Shutdown stops a running query and closes the connection promptly.
+    // Shutdown stops a running query after the grace period and closes the connection.
     b.run(SLOW, empty(), empty());
     std::thread::sleep(Duration::from_millis(200));
     let started = Instant::now();
     drop(server);
+    assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(b.failure(), "Neo.ClientError.Transaction.Terminated");
     assert!(b.closed());

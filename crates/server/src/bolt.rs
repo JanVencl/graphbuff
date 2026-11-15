@@ -263,8 +263,11 @@ fn read_messages(mut stream: Stream, queue: Sender<Incoming>, control: &Control,
             break;
         }
     }
-    // The client left, or the server is stopping: stop what runs for it.
-    control.interrupt();
+    // The client left: stop what runs for it. When the server is stopping instead, the
+    // statement may finish within the shutdown grace period (it is cancelled after).
+    if !shared.stop() {
+        control.interrupt();
+    }
 }
 
 // ---- the connection -----------------------------------------------------------------------
@@ -456,7 +459,7 @@ impl Conn<'_> {
         timeout: Option<Duration>,
         f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
     ) -> Option<graphbuff::Result<T>> {
-        let cancel = CancelHandle::new();
+        let cancel = self.shared.ctx.abort.child();
         *self.control.running() = Some(cancel.clone());
         // Checked after publishing the handle: a RESET read from now on cancels it.
         let result = if self.control.reset_pending() {

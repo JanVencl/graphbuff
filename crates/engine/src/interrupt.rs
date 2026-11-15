@@ -28,21 +28,47 @@ use graphbuff_core::{Error, Result};
 /// assert!(matches!(err, Err(graphbuff::Error::Cancelled(_))));
 /// ```
 #[derive(Clone, Debug, Default)]
-pub struct CancelHandle(Arc<AtomicBool>);
+pub struct CancelHandle(Arc<Flag>);
+
+#[derive(Debug, Default)]
+struct Flag {
+    cancelled: AtomicBool,
+    parent: Option<CancelHandle>,
+}
 
 impl CancelHandle {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A handle that is cancelled on its own, or when this one is: cancelling the
+    /// parent stops every query of its children, cancelling a child stops only its own.
+    ///
+    /// ```
+    /// use graphbuff::CancelHandle;
+    ///
+    /// let all = CancelHandle::new();
+    /// let (a, b) = (all.child(), all.child());
+    /// a.cancel();
+    /// assert!(a.is_cancelled() && !b.is_cancelled() && !all.is_cancelled());
+    /// all.cancel();
+    /// assert!(b.is_cancelled());
+    /// ```
+    pub fn child(&self) -> Self {
+        CancelHandle(Arc::new(Flag {
+            cancelled: AtomicBool::new(false),
+            parent: Some(self.clone()),
+        }))
+    }
+
     /// Asks the queries running with this handle to stop, and makes later queries with
     /// it fail at once. Cannot be undone.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.cancelled.store(true, Ordering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.cancelled.load(Ordering::Relaxed) || self.0.parent.as_ref().is_some_and(CancelHandle::is_cancelled)
     }
 }
 

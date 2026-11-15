@@ -5,7 +5,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use graphbuff::{DatabaseManager, Error, QueryOptions, QueryResult, Value};
+use graphbuff::{CancelHandle, DatabaseManager, Error, QueryOptions, QueryResult, Value};
 
 use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statement};
 
@@ -26,6 +26,9 @@ pub(crate) struct Ctx {
     /// Where backups go; `None` turns the backup and restore endpoints off.
     pub backup_dir: Option<std::path::PathBuf>,
     pub log: Option<Arc<Log>>,
+    /// Cancelled when shutdown stops waiting for queries to finish; every query runs
+    /// with it or a child of it.
+    pub abort: CancelHandle,
 }
 
 impl Ctx {
@@ -66,7 +69,7 @@ impl Ctx {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             },
-            cancel: None,
+            cancel: Some(self.abort.clone()),
         }
     }
 

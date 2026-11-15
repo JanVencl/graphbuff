@@ -606,6 +606,18 @@ error, the default with `--in-memory` and in the Docker image):
 Each file moves to `.1` (older ones to `.2`, …) at 10 MiB; five old files are kept.
 `graphbuff_server::Log` gives an embedded server the same log through `ServerConfig::log`.
 
+### Stopping
+
+SIGTERM or SIGINT (`docker stop`, `systemctl stop`, `kill`, Ctrl-C), or on Windows Ctrl-C,
+Ctrl-Break or closing the console, stops the server cleanly: it stops accepting
+connections, rolls back open explicit transactions, gives queries already running
+`--shutdown-timeout SECS` (default 5) to finish and then cancels (and rolls back) the rest,
+checkpoints every durable database so the next start has no log to replay, and exits 0 (1 if a checkpoint failed; that
+database's log is kept and replayed on the next start). A
+second signal ends it at once; committed data is safe either way, since every commit is in
+the log. An embedded server gets the same steps from `Server::shutdown` (or dropping it),
+with `ServerConfig::shutdown_grace`, followed by `DatabaseManager::checkpoint_all`.
+
 ## Bolt (Neo4j drivers)
 
 With `--bolt ADDR` the server also speaks Bolt 4.4 and 5.0–5.4, the protocol of the

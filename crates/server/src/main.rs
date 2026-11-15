@@ -1,8 +1,10 @@
 //! `graphbuff-server` — serves graphbuff databases over HTTP/JSON and Bolt.
 
+mod signal;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
@@ -40,6 +42,10 @@ Options:
   --tx-timeout SECS    roll back a transaction after SECS without a request (default 60)
   --query-timeout MS   stop (and roll back) a query that runs longer than MS milliseconds
                        (default: no limit; a request may ask for less with \"timeoutMs\")
+  --shutdown-timeout SECS
+                       on SIGTERM or Ctrl-C, how long running queries may take to finish
+                       before they are cancelled (default 5); then durable databases are
+                       checkpointed and the server exits
   --import-dir DIR     let LOAD CSV read files in DIR (off by default)
   --backup-dir DIR     let admins back up databases into DIR and restore from it
                        (off by default)
@@ -258,6 +264,12 @@ fn main() {
                     .unwrap_or_else(|| fail("--query-timeout needs a positive number of milliseconds"));
                 config.query_timeout = Some(Duration::from_millis(ms));
             }
+            "--shutdown-timeout" => {
+                let secs: u64 = value("--shutdown-timeout")
+                    .parse()
+                    .unwrap_or_else(|_| fail("--shutdown-timeout needs a number of seconds"));
+                config.shutdown_grace = Duration::from_secs(secs);
+            }
             other => fail(&format!("unknown option `{other}`")),
         }
     }
@@ -376,7 +388,7 @@ fn main() {
             Err(e) => fail(&format!("--gpu: {e}")),
         }
     }
-    let server = match Server::start(mgr, config.clone()) {
+    let server = match Server::start(Arc::clone(&mgr), config.clone()) {
         Ok(s) => s,
         Err(e) => fatal(&format!(
             "cannot listen on {}{}: {e}",
@@ -439,5 +451,32 @@ fn main() {
             println!("demo `{name}` not loaded: the default database already holds {} nodes", d.nodes);
         }
     }
-    server.wait();
+    signal::install();
+    while !signal::requested() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Stop: no new connections, roll back open transactions, let running queries finish
+    // (or cancel them after the grace period), then checkpoint durable databases.
+    let started = Instant::now();
+    println!("stopping");
+    log.info("stop requested; stopping");
+    server.shutdown();
+    let mut failed = false;
+    for (name, result) in mgr.checkpoint_all() {
+        if let Err(e) = result {
+            failed = true;
+            let msg = format!("checkpoint of database `{name}` failed (its log is kept and replayed on the next start): {e}");
+            if log.dir().is_some() {
+                eprintln!("{msg}");
+            }
+            log.error(msg);
+        }
+    }
+    drop(mgr); // syncs the logs and releases the data directory
+    let stopped = format!("stopped in {} ms", started.elapsed().as_millis());
+    println!("{stopped}");
+    log.info(&stopped);
+    signal::done();
+    std::process::exit(i32::from(failed));
 }

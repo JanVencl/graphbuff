@@ -82,9 +82,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use graphbuff::DatabaseManager;
+use graphbuff::{CancelHandle, DatabaseManager};
 
 use api::Ctx;
 use http::{Limits, ReadError};
@@ -131,6 +131,9 @@ pub struct ServerConfig {
     /// Where events (failed logins, connections, errors) and slow queries are logged.
     /// `None` (the default): nowhere.
     pub log: Option<Arc<Log>>,
+    /// At shutdown, how long queries already running may take to finish before they are
+    /// cancelled (and rolled back). Default: 5 seconds.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for ServerConfig {
@@ -148,13 +151,15 @@ impl Default for ServerConfig {
             tls: None,
             backup_dir: None,
             log: None,
+            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
 
 /// A running server. Dropping it (or calling [`shutdown`](Server::shutdown)) stops
-/// accepting connections, rolls back open transactions, lets requests in progress
-/// finish, and closes idle ones.
+/// accepting connections, rolls back open transactions, closes idle connections, and
+/// gives queries in progress [`ServerConfig::shutdown_grace`] to finish before it cancels
+/// them.
 pub struct Server {
     addr: SocketAddr,
     bolt_addr: Option<SocketAddr>,
@@ -163,6 +168,8 @@ pub struct Server {
     acceptors: Vec<(SocketAddr, JoinHandle<()>)>,
     conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
     txs: Arc<Transactions>,
+    abort: CancelHandle,
+    grace: Duration,
 }
 
 struct Shared {
@@ -201,6 +208,7 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let txs = Transactions::new(config.transaction_timeout);
+        let abort = CancelHandle::new();
         let shared = Arc::new(Shared {
             ctx: Ctx {
                 mgr,
@@ -210,6 +218,7 @@ impl Server {
                 query_timeout: config.query_timeout,
                 backup_dir: config.backup_dir,
                 log: config.log,
+                abort: abort.clone(),
             },
             tls,
             limits: Limits {
@@ -228,6 +237,8 @@ impl Server {
             acceptors: Vec::new(),
             conns,
             txs,
+            abort,
+            grace: config.shutdown_grace,
         };
         let listeners = std::iter::once((listener, Protocol::Http)).chain(bolt.map(|b| (b, Protocol::Bolt)));
         for (listener, protocol) in listeners {
@@ -283,6 +294,12 @@ impl Server {
         // writing query, may be waiting for them to release their database.
         self.txs.close();
         let handles = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = Instant::now() + self.grace;
+        while handles.iter().any(|h| !h.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Queries still running now are cancelled; their connections then close.
+        self.abort.cancel();
         for h in handles {
             let _ = h.join();
         }
