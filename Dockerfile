@@ -38,7 +38,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 LABEL org.opencontainers.image.title="graphbuff" \
       org.opencontainers.image.description="graphbuff graph database: Cypher over HTTP/JSON and Bolt" \
       org.opencontainers.image.source="https://github.com/JanVencl/graphbuff" \
-      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 COPY --from=build /out/bin/ /usr/local/bin/
 COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot

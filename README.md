@@ -937,3 +937,8 @@ constraints, named time zones, `date.truncate` and the other temporal truncation
 spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), `normalize()`
 (it needs Unicode normalization tables), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).
+
+## License
+
+graphbuff is licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE).
