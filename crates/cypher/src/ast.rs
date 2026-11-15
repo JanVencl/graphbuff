@@ -324,9 +324,105 @@ impl PatternPart {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
+    /// Labels the node must have (`:A:B`, `:A&B`). With [`label_expr`](Self::label_expr)
+    /// set, the labels it requires in any case (the planner may scan by them).
     pub labels: Vec<String>,
+    /// A label expression that is more than a conjunction of labels (`:A|B`, `:!A`,
+    /// `:%`); the node must also satisfy it.
+    pub label_expr: Option<LabelExpr>,
     /// A map literal or a parameter.
     pub props: Option<Expr>,
+}
+
+/// A label expression (`A|B`, `A&B`, `!A`, `%`, parentheses). On a relationship, the
+/// relationship's type is its only label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelExpr {
+    Label(String),
+    /// `%`: any label at all.
+    Any,
+    Not(Box<LabelExpr>),
+    And(Vec<LabelExpr>),
+    Or(Vec<LabelExpr>),
+}
+
+impl LabelExpr {
+    /// Whether an entity with `labels` satisfies the expression.
+    pub fn matches(&self, labels: &[impl AsRef<str>]) -> bool {
+        match self {
+            LabelExpr::Label(l) => labels.iter().any(|x| x.as_ref() == l),
+            LabelExpr::Any => !labels.is_empty(),
+            LabelExpr::Not(e) => !e.matches(labels),
+            LabelExpr::And(es) => es.iter().all(|e| e.matches(labels)),
+            LabelExpr::Or(es) => es.iter().any(|e| e.matches(labels)),
+        }
+    }
+
+    /// The labels, if the expression only requires each of them (`A`, `A&B`).
+    pub fn as_conjunction(&self) -> Option<Vec<String>> {
+        match self {
+            LabelExpr::Label(l) => Some(vec![l.clone()]),
+            LabelExpr::And(es) => {
+                let mut out = Vec::new();
+                for e in es {
+                    out.extend(e.as_conjunction()?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// The types, if the expression only allows each of them (`A`, `A|B`).
+    pub fn as_disjunction(&self) -> Option<Vec<String>> {
+        match self {
+            LabelExpr::Label(l) => Some(vec![l.clone()]),
+            LabelExpr::Or(es) => {
+                let mut out = Vec::new();
+                for e in es {
+                    out.extend(e.as_disjunction()?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Labels every match has: the plain labels among the top-level conjuncts.
+    pub fn required(&self) -> Vec<String> {
+        match self {
+            LabelExpr::Label(l) => vec![l.clone()],
+            LabelExpr::And(es) => es.iter().flat_map(LabelExpr::required).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for LabelExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let join = |f: &mut std::fmt::Formatter<'_>, es: &[LabelExpr], sep: &str| {
+            for (i, e) in es.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(sep)?;
+                }
+                match e {
+                    LabelExpr::And(_) | LabelExpr::Or(_) => write!(f, "({e})")?,
+                    _ => write!(f, "{e}")?,
+                }
+            }
+            Ok(())
+        };
+        match self {
+            LabelExpr::Label(l) => f.write_str(l),
+            LabelExpr::Any => f.write_str("%"),
+            LabelExpr::Not(e) => match &**e {
+                LabelExpr::And(_) | LabelExpr::Or(_) => write!(f, "!({e})"),
+                _ => write!(f, "!{e}"),
+            },
+            LabelExpr::And(es) => join(f, es, "&"),
+            LabelExpr::Or(es) => join(f, es, "|"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +440,9 @@ pub struct RelPattern {
     pub var: Option<String>,
     /// Alternatives (`:A|B`); empty means any type.
     pub types: Vec<String>,
+    /// A type expression that is more than a choice of types (`:!A`, `:%`, `:A&B`); the
+    /// relationship must also satisfy it (`types` is then empty).
+    pub type_expr: Option<LabelExpr>,
     pub direction: RelDirection,
     pub props: Option<Expr>,
     /// Variable length `*min..max`; `None` means exactly one hop.
@@ -412,6 +511,15 @@ pub enum Expr {
         negated: bool,
     },
     HasLabels(Box<Expr>, Vec<String>),
+    /// `x:A|B`, `x:!A`, `x:%`: a label expression more than a conjunction of labels.
+    /// On a relationship it tests the type.
+    HasLabelExpr(Box<Expr>, LabelExpr),
+    /// `n {.name, .*, key: expr, var}`: a map built from `base` (a node, relationship or
+    /// map); `null` when `base` is `null`.
+    MapProjection {
+        base: Box<Expr>,
+        items: Vec<MapProjectionItem>,
+    },
     /// Function call; `name` is lower-cased.
     Function {
         name: String,
@@ -461,6 +569,19 @@ pub enum Expr {
     AggregateRef(usize),
 }
 
+/// One entry of a map projection; later entries replace earlier ones of the same key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapProjectionItem {
+    /// `.key`: the base's property (`null` when missing).
+    Property(String),
+    /// `.*`: every property of the base.
+    AllProperties,
+    /// `key: expr`
+    Entry(String, Expr),
+    /// `var`: the variable under its own name.
+    Var(String),
+}
+
 /// The internal function `s IS [NOT] [form] NORMALIZED` parses to, with the arguments
 /// `s` and the form's name (`'NFC'` when none is given). The space keeps it out of reach
 /// of a function call in a query.
@@ -498,7 +619,19 @@ impl Expr {
             | Expr::CountStar
             | Expr::AggregateRef(_) => {}
             Expr::PatternPredicate(_) | Expr::Subquery { .. } => {}
-            Expr::Property(e, _) | Expr::Unary(_, e) | Expr::HasLabels(e, _) => e.walk(f),
+            Expr::Property(e, _) | Expr::Unary(_, e) | Expr::HasLabels(e, _) | Expr::HasLabelExpr(e, _) => {
+                e.walk(f)
+            }
+            Expr::MapProjection { base, items } => {
+                base.walk(f);
+                for item in items {
+                    match item {
+                        MapProjectionItem::Entry(_, e) => e.walk(f),
+                        MapProjectionItem::Var(v) => f(&Expr::Var(v.clone())),
+                        MapProjectionItem::Property(_) | MapProjectionItem::AllProperties => {}
+                    }
+                }
+            }
             Expr::IsNull { expr, .. } => expr.walk(f),
             Expr::Index(a, b) | Expr::Binary(_, a, b) => {
                 a.walk(f);

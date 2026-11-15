@@ -1510,11 +1510,22 @@ fn node_ok(
             return Ok(false);
         }
     }
+    if let Some(e) = &np.label_expr
+        && !e.matches(&store.node_labels(id)?)
+    {
+        return Ok(false);
+    }
     props_ok(ex, &np.props, scope, row, |k| store.node_property(id, k))
 }
 
 fn rel_ok(ex: &Executor<'_>, id: RelId, rp: &RelPattern, scope: &Scope, row: &[Value]) -> Result<bool> {
     let store = ex.store();
+    if let Some(e) = &rp.type_expr {
+        let t: Vec<String> = store.relationship_type(id)?.into_iter().collect();
+        if !e.matches(&t) {
+            return Ok(false);
+        }
+    }
     props_ok(ex, &rp.props, scope, row, |k| store.relationship_property(id, k))
 }
 

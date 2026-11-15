@@ -410,6 +410,16 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             Clause::Merge { pattern, .. } if pattern.shortest.is_some() => {
                 return Err(Error::Semantic("shortestPath(...) cannot be used in MERGE".into()));
             }
+            Clause::Create { patterns } if patterns.iter().any(has_label_expr) => {
+                return Err(Error::Semantic(
+                    "CREATE needs plain labels (`:A:B` or `:A&B`) and a single relationship type".into(),
+                ));
+            }
+            Clause::Merge { pattern, .. } if has_label_expr(pattern) => {
+                return Err(Error::Semantic(
+                    "MERGE needs plain labels (`:A:B` or `:A&B`) and a single relationship type".into(),
+                ));
+            }
             Clause::Create { patterns } => Operator::Create {
                 input,
                 patterns: patterns.clone(),
@@ -2192,14 +2202,30 @@ fn seek_text(sources: &[SeekSource], composite: &[CompositeSeek], label: impl Fn
     single.chain(multi).collect::<Vec<_>>().join(" | ")
 }
 
+/// Whether a pattern uses a label or type expression beyond plain labels and types.
+fn has_label_expr(p: &PatternPart) -> bool {
+    p.start.label_expr.is_some()
+        || p.chain
+            .iter()
+            .any(|(r, n)| r.type_expr.is_some() || n.label_expr.is_some())
+}
+
 fn node_text(n: &NodePattern) -> String {
     let mut s = String::from("(");
     if let Some(v) = &n.var {
         s.push_str(v);
     }
-    for l in &n.labels {
-        s.push(':');
-        s.push_str(l);
+    match &n.label_expr {
+        Some(e) => {
+            s.push(':');
+            s.push_str(&e.to_string());
+        }
+        None => {
+            for l in &n.labels {
+                s.push(':');
+                s.push_str(l);
+            }
+        }
     }
     if n.props.is_some() {
         s.push_str(" {…}");
@@ -2213,7 +2239,10 @@ fn rel_text(r: &RelPattern) -> String {
     if let Some(v) = &r.var {
         inner.push_str(v);
     }
-    if !r.types.is_empty() {
+    if let Some(e) = &r.type_expr {
+        inner.push(':');
+        inner.push_str(&e.to_string());
+    } else if !r.types.is_empty() {
         inner.push(':');
         inner.push_str(&r.types.join("|"));
     }

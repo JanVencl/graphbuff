@@ -948,16 +948,36 @@ impl Executor<'_> {
         let key_idx: Vec<usize> = (0..rewritten.len())
             .filter(|i| !rewritten[*i].contains_aggregate())
             .collect();
+        // Variables used outside the aggregates of an aggregating item (`p` in
+        // `p {.name, friends: collect(f)}` or `p.age + count(*)`) group the rows too.
+        let mut implicit: Vec<usize> = Vec::new();
+        for e in rewritten.iter().filter(|e| e.contains_aggregate()) {
+            e.walk(&mut |x| {
+                let names: &[String] = match x {
+                    Expr::Var(v) => std::slice::from_ref(v),
+                    Expr::Subquery { names, .. } => names,
+                    _ => &[],
+                };
+                for n in names {
+                    if let Some(i) = frame.scope.get(n)
+                        && !implicit.contains(&i)
+                    {
+                        implicit.push(i);
+                    }
+                }
+            });
+        }
         let Frame { scope, rows, .. } = frame;
         let mut group_of: HashMap<Vec<Value>, usize> = HashMap::new();
         let mut groups: Vec<(Vec<Value>, Row, Vec<Accumulator>)> = Vec::new();
         for row in rows {
             self.check_interrupt()?;
             let env = Env::new(&scope, &row);
-            let key = key_idx
+            let mut key = key_idx
                 .iter()
                 .map(|i| self.eval(&rewritten[*i], &env))
                 .collect::<Result<Vec<_>>>()?;
+            key.extend(implicit.iter().map(|&i| row[i].clone()));
             let gi = match group_of.get(&key) {
                 Some(gi) => *gi,
                 None => {
@@ -978,7 +998,7 @@ impl Executor<'_> {
                 groups[gi].2[ai].update(v)?;
             }
         }
-        if groups.is_empty() && key_idx.is_empty() {
+        if groups.is_empty() && key_idx.is_empty() && implicit.is_empty() {
             let accs = aggs
                 .iter()
                 .map(Accumulator::new)

@@ -61,6 +61,9 @@ struct Parser<'a> {
     src: &'a str,
     toks: Vec<Token>,
     pos: usize,
+    /// In the `WHERE` of a list or pattern comprehension, where `|` starts the mapping
+    /// expression: `x:A|B` there stops before the `|` (parenthesize to use it).
+    pipe_ends_where: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -69,6 +72,7 @@ impl<'a> Parser<'a> {
             src,
             toks: tokenize(src)?,
             pos: 0,
+            pipe_ends_where: false,
         })
     }
 
@@ -1182,6 +1186,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Label expressions after `:`, as in `(n:A|B)` or `n:A:B`; `None` without a `:`.
+    /// Several (`:A:B`) must all hold. `pipe`: whether `|` may continue the expression.
+    fn parse_label_exprs(&mut self, pipe: bool) -> Result<Option<LabelExpr>> {
+        let mut all = Vec::new();
+        while self.eat(&Tok::Colon) {
+            all.push(self.parse_label_or(pipe)?);
+        }
+        Ok(match all.len() {
+            0 => None,
+            1 => all.pop(),
+            _ => Some(LabelExpr::And(all)),
+        })
+    }
+
+    fn parse_label_or(&mut self, pipe: bool) -> Result<LabelExpr> {
+        let mut alts = vec![self.parse_label_and()?];
+        while pipe && self.eat(&Tok::Pipe) {
+            self.eat(&Tok::Colon); // the old form `:A|:B`
+            alts.push(self.parse_label_and()?);
+        }
+        Ok(if alts.len() == 1 { alts.pop().unwrap() } else { LabelExpr::Or(alts) })
+    }
+
+    fn parse_label_and(&mut self) -> Result<LabelExpr> {
+        let mut all = vec![self.parse_label_not()?];
+        while self.eat(&Tok::Amp) {
+            all.push(self.parse_label_not()?);
+        }
+        Ok(if all.len() == 1 { all.pop().unwrap() } else { LabelExpr::And(all) })
+    }
+
+    fn parse_label_not(&mut self) -> Result<LabelExpr> {
+        if self.eat(&Tok::Bang) {
+            return Ok(LabelExpr::Not(Box::new(self.parse_label_not()?)));
+        }
+        if self.eat(&Tok::Percent) {
+            return Ok(LabelExpr::Any);
+        }
+        if self.eat(&Tok::LParen) {
+            let e = self.parse_label_or(true)?;
+            self.expect(Tok::RParen, "')' to close the label expression")?;
+            return Ok(e);
+        }
+        Ok(LabelExpr::Label(self.ident()?))
+    }
+
     fn parse_label_list(&mut self) -> Result<Vec<String>> {
         let mut labels = Vec::new();
         while self.eat(&Tok::Colon) {
@@ -1328,10 +1378,21 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let labels = self.parse_label_list()?;
+        let (labels, label_expr) = match self.parse_label_exprs(true)? {
+            None => (Vec::new(), None),
+            Some(e) => match e.as_conjunction() {
+                Some(labels) => (labels, None),
+                None => (e.required(), Some(e)),
+            },
+        };
         let props = self.parse_pattern_props()?;
         self.expect(Tok::RParen, "')' to close the node pattern")?;
-        Ok(NodePattern { var, labels, props })
+        Ok(NodePattern {
+            var,
+            labels,
+            label_expr,
+            props,
+        })
     }
 
     fn parse_pattern_props(&mut self) -> Result<Option<Expr>> {
@@ -1348,16 +1409,15 @@ impl<'a> Parser<'a> {
     fn parse_rel_pattern(&mut self) -> Result<RelPattern> {
         let left = self.eat(&Tok::Lt);
         self.expect(Tok::Minus, "'-'")?;
-        let (mut var, mut types, mut props, mut length) = (None, Vec::new(), None, None);
+        let (mut var, mut types, mut type_expr, mut props, mut length) = (None, Vec::new(), None, None, None);
         if self.eat(&Tok::LBracket) {
             if self.at_ident() {
                 var = Some(self.ident()?);
             }
-            if self.eat(&Tok::Colon) {
-                types.push(self.ident()?);
-                while self.eat(&Tok::Pipe) {
-                    self.eat(&Tok::Colon);
-                    types.push(self.ident()?);
+            if let Some(e) = self.parse_label_exprs(true)? {
+                match e.as_disjunction() {
+                    Some(t) => types = t,
+                    None => type_expr = Some(e),
                 }
             }
             if self.eat(&Tok::Star) {
@@ -1391,6 +1451,7 @@ impl<'a> Parser<'a> {
         Ok(RelPattern {
             var,
             types,
+            type_expr,
             direction,
             props,
             length,
@@ -1608,8 +1669,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Tok::Colon => {
-                    let labels = self.parse_label_list()?;
-                    e = Expr::HasLabels(Box::new(e), labels);
+                    let pipe = !self.pipe_ends_where;
+                    let expr = self.parse_label_exprs(pipe)?.expect("starts with ':'");
+                    e = match expr.as_conjunction() {
+                        Some(labels) => Expr::HasLabels(Box::new(e), labels),
+                        None => Expr::HasLabelExpr(Box::new(e), expr),
+                    };
                 }
                 _ => return Ok(e),
             }
@@ -1655,7 +1720,10 @@ impl<'a> Parser<'a> {
                 }
                 self.pos = save;
                 self.advance();
-                let e = self.parse_expr()?;
+                let outer = std::mem::replace(&mut self.pipe_ends_where, false);
+                let e = self.parse_expr();
+                self.pipe_ends_where = outer;
+                let e = e?;
                 self.expect(Tok::RParen, "')'")?;
                 Ok(e)
             }
@@ -1794,17 +1862,129 @@ impl<'a> Parser<'a> {
             });
         }
         self.advance();
+        if *self.peek() == Tok::LBrace {
+            return self.parse_map_projection(Expr::Var(name));
+        }
         Ok(Expr::Var(name))
+    }
+
+    /// `{.key, .*, key: expr, var, …}` after the variable `base`.
+    fn parse_map_projection(&mut self, base: Expr) -> Result<Expr> {
+        self.expect(Tok::LBrace, "'{'")?;
+        let mut items = Vec::new();
+        if !self.eat(&Tok::RBrace) {
+            loop {
+                if self.eat(&Tok::Dot) {
+                    if self.eat(&Tok::Star) {
+                        items.push(MapProjectionItem::AllProperties);
+                    } else {
+                        items.push(MapProjectionItem::Property(self.ident()?));
+                    }
+                } else if *self.peek_at(1) == Tok::Colon {
+                    let key = match self.peek().clone() {
+                        Tok::Str(s) => {
+                            self.advance();
+                            s
+                        }
+                        _ => self.ident()?,
+                    };
+                    self.advance(); // ':'
+                    items.push(MapProjectionItem::Entry(key, self.parse_expr()?));
+                } else {
+                    items.push(MapProjectionItem::Var(self.ident()?));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBrace, "'}' to close the map projection")?;
+        }
+        Ok(Expr::MapProjection {
+            base: Box::new(base),
+            items,
+        })
+    }
+
+    /// After `[`: a pattern comprehension `[p = (a)-->(b) WHERE … | expr]`, if one starts
+    /// here. It runs as `COLLECT { MATCH p = (a)-->(b) WHERE … RETURN expr }`.
+    fn try_pattern_comprehension(&mut self) -> Result<Option<Expr>> {
+        let named = self.at_ident() && *self.peek_at(1) == Tok::Eq;
+        if *self.peek() != Tok::LParen && !named {
+            return Ok(None);
+        }
+        let start = self.pos;
+        let part = match self.parse_pattern_part() {
+            Ok(p) if !p.chain.is_empty() && (self.is_kw("WHERE") || *self.peek() == Tok::Pipe) => p,
+            _ => {
+                self.pos = start;
+                return Ok(None);
+            }
+        };
+        let where_ = if self.eat_kw("WHERE") {
+            let outer = std::mem::replace(&mut self.pipe_ends_where, true);
+            let w = self.parse_expr();
+            self.pipe_ends_where = outer;
+            Some(w?)
+        } else {
+            None
+        };
+        self.expect(Tok::Pipe, "'|' in the pattern comprehension")?;
+        let expr = self.parse_expr()?;
+        let mut names: Vec<String> = Vec::new();
+        for t in &self.toks[start..self.pos] {
+            if let Tok::Ident(n) | Tok::QuotedIdent(n) = &t.tok
+                && !names.contains(n)
+            {
+                names.push(n.clone());
+            }
+        }
+        self.expect(Tok::RBracket, "']' to close the pattern comprehension")?;
+        let query = Query {
+            parts: vec![SingleQuery {
+                clauses: vec![
+                    Clause::Match {
+                        optional: false,
+                        patterns: vec![part],
+                        where_,
+                    },
+                    Clause::Return(Projection {
+                        distinct: false,
+                        star: false,
+                        items: vec![ProjectionItem {
+                            expr,
+                            alias: "\u{0}value".into(),
+                        }],
+                        order_by: Vec::new(),
+                        skip: None,
+                        limit: None,
+                        where_: None,
+                    }),
+                ],
+            }],
+            union_all: false,
+            mode: QueryMode::Run,
+        };
+        Ok(Some(Expr::Subquery {
+            kind: SubqueryKind::Collect,
+            query: Box::new(query),
+            names,
+        }))
     }
 
     fn parse_list(&mut self) -> Result<Expr> {
         self.expect(Tok::LBracket, "'['")?;
+        if let Some(e) = self.try_pattern_comprehension()? {
+            return Ok(e);
+        }
         if self.at_ident() && self.kw_at(1, "IN") {
             let var = self.ident()?;
             self.advance(); // IN
             let list = self.parse_expr()?;
             let filter = if self.eat_kw("WHERE") {
-                Some(Box::new(self.parse_expr()?))
+                let outer = std::mem::replace(&mut self.pipe_ends_where, true);
+                let w = self.parse_expr();
+                self.pipe_ends_where = outer;
+                Some(Box::new(w?))
             } else {
                 None
             };
