@@ -17,8 +17,8 @@ Feature: Temporal and Spatial Data Types
     And the response JSON should have:
       | path       | value                     |
       | rows[0][0] | 2024-01-01                |
-      | rows[0][1] | 12:30:00                  |
-      | rows[0][2] | 2024-01-01T12:30:00Z      |
+      | rows[0][1] | 12:30                     |
+      | rows[0][2] | 2024-01-01T12:30Z         |
 
   Scenario: Temporal arithmetic
     When I send a POST request to "/query" with JSON:

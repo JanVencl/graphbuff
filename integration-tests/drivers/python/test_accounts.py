@@ -16,7 +16,7 @@ import pytest
 from neo4j import GraphDatabase, TrustCustomCAs
 from neo4j import exceptions as ex
 
-from conftest import ROOT, _free_port, _server_binary
+from graphbuff_server import ROOT, free_port as _free_port, server_binary as _server_binary
 
 CERTS = os.path.join(ROOT, "crates", "server", "tests", "tls")
 
