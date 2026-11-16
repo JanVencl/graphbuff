@@ -59,7 +59,7 @@ pub use dbms::{DEFAULT_DATABASE, DatabaseInfo, DatabaseManager, Session, Storage
 pub use graphbuff_core::{
     BackupInfo, BoxedStore, BulkLoader, CheckReport, Crs, Csr, CsrAdjacency, DEFAULT_MAX_TRANSACTION_BYTES, Direction, Error, GraphStore, HybridGraph, HybridOptions, IndexDef, IndexEntity, MemoryGraph,
     NodeId, Path, PersistentGraph, PersistentOptions, Point, RelId, Result, Scan, Snapshot, StorageMode,
-    SyncPolicy, Temporal, Value, ValueRange, open_store, temporal,
+    SyncPolicy, Temporal, Value, ValueRange, open_store, temporal, tz, tz::Tz,
 };
 pub use graphbuff_core::kernels::{
     self, Aggregates, Bits, CmpOp, Column, CpuKernels, ExpandBatch, Hop, Kernels, Mask, Num, label_mask,

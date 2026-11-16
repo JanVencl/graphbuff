@@ -129,11 +129,20 @@ impl Encoder {
                         self.u64(days as u64);
                         self.u64(nanos as u64);
                     }
-                    Temporal::DateTime { days, nanos, offset } => {
+                    Temporal::DateTime { days, nanos, offset, zone: None } => {
                         self.u8(5);
                         self.u64(days as u64);
                         self.u64(nanos as u64);
                         self.u32(offset as u32);
+                    }
+                    // The zone by name, so that the stored value outlives the order of
+                    // zones in the database.
+                    Temporal::DateTime { days, nanos, offset, zone: Some(z) } => {
+                        self.u8(7);
+                        self.u64(days as u64);
+                        self.u64(nanos as u64);
+                        self.u32(offset as u32);
+                        self.str(z.name());
                     }
                     Temporal::Duration(d) => {
                         self.u8(6);
@@ -299,6 +308,18 @@ impl<'a> Decoder<'a> {
                     days: days(self, d)?,
                     nanos: nanos(self, n)?,
                     offset: offset(self, o)?,
+                    zone: None,
+                }
+            }
+            7 => {
+                let (d, n, o) = (self.u64()?, self.u64()?, self.u32()?);
+                let name = self.str()?;
+                let zone = crate::tz::Tz::find(&name).ok_or_else(|| self.corrupt(format!("unknown time zone `{name}`")))?;
+                Temporal::DateTime {
+                    days: days(self, d)?,
+                    nanos: nanos(self, n)?,
+                    offset: offset(self, o)?,
+                    zone: Some(zone),
                 }
             }
             6 => {

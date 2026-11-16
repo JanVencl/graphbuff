@@ -1365,7 +1365,18 @@ impl Encoder {
                 let (s, n) = split(local(days, nanos));
                 structure(LOCAL_DATE_TIME, vec![s, n])
             }
-            Temporal::DateTime { days, nanos, offset } => {
+            Temporal::DateTime { days, nanos, offset, zone: Some(z) } => {
+                let mut ns = local(days, nanos);
+                let tag = if self.utc {
+                    ns -= offset as i128 * NANOS_PER_SECOND as i128;
+                    DATE_TIME_ZONE_ID
+                } else {
+                    DATE_TIME_ZONE_ID_LEGACY
+                };
+                let (s, n) = split(ns);
+                structure(tag, vec![s, n, PackValue::str(z.name())])
+            }
+            Temporal::DateTime { days, nanos, offset, zone: None } => {
                 let mut ns = local(days, nanos);
                 let tag = if self.utc {
                     ns -= offset as i128 * NANOS_PER_SECOND as i128;
@@ -1469,7 +1480,7 @@ fn structure_value(tag: u8, fields: &[PackValue]) -> Result<Value, Failure> {
                 ns += offset as i128 * NANOS_PER_SECOND as i128; // UTC to local
             }
             let (days, nanos) = local(ns, "date-time")?;
-            Temporal::DateTime { days, nanos, offset }
+            Temporal::DateTime { days, nanos, offset, zone: None }
         }
         DURATION => {
             let v = ints(4, "duration")?;
@@ -1477,7 +1488,20 @@ fn structure_value(tag: u8, fields: &[PackValue]) -> Result<Value, Failure> {
             Temporal::Duration(d)
         }
         DATE_TIME_ZONE_ID | DATE_TIME_ZONE_ID_LEGACY => {
-            return Err(Failure::new(NOT_SUPPORTED, "named time zones are not supported; use an offset"));
+            let (Some(PackValue::Int(s)), Some(PackValue::Int(n)), Some(PackValue::String(name)), 3) =
+                (fields.first(), fields.get(1), fields.get(2), fields.len())
+            else {
+                return Err(bad("date-time"));
+            };
+            let zone = graphbuff::Tz::find(name)
+                .ok_or_else(|| Failure::new(TYPE_ERROR, format!("unknown time zone `{name}`")))?;
+            let ns = epoch(*s, *n);
+            if tag == DATE_TIME_ZONE_ID {
+                Temporal::at_instant_in(ns, zone).map_err(|_| bad("date-time"))?
+            } else {
+                let (days, nanos) = local(ns, "date-time")?;
+                Temporal::in_zone(days, nanos, zone, None).map_err(|_| bad("date-time"))?
+            }
         }
         POINT_2D | POINT_3D => {
             let dims = if tag == POINT_2D { 2 } else { 3 };
@@ -1549,7 +1573,10 @@ mod tests {
                 days: 20_000,
                 nanos: 3_600 * NANOS_PER_SECOND + 7,
                 offset: 7200,
+                zone: None,
             },
+            Temporal::in_zone(17_000, 3_600 * NANOS_PER_SECOND, graphbuff::Tz::find("Europe/Stockholm").unwrap(), None)
+                .unwrap(),
             Temporal::Duration(temporal::Duration::from_nanos(14, -3, -1_500_000_000).unwrap()),
         ];
         for utc in [true, false] {

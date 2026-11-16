@@ -2,10 +2,10 @@
 //! `ZONED DATETIME` and `DURATION`.
 //!
 //! Dates use the proleptic Gregorian calendar and count days from 1970-01-01. Times
-//! count nanoseconds from midnight. Zoned values carry a fixed UTC offset in seconds;
-//! named time zones (`Europe/Berlin`) need a time zone database and are not supported.
-//! A zoned date-time keeps its local wall-clock fields and its offset, and compares and
-//! equals by instant.
+//! count nanoseconds from midnight. Zoned values carry a UTC offset in seconds; a zoned
+//! date-time may also carry a named time zone (`Europe/Berlin`, see [`crate::tz`]), whose
+//! rules then decide its offset. A zoned date-time keeps its local wall-clock fields and
+//! its offset, and compares and equals by instant.
 //!
 //! A duration has three independent parts, as in Cypher: months, days and seconds (with
 //! nanoseconds). Adding one to a date-time adds the months first (clamping the day to the
@@ -15,6 +15,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::tz::Tz;
 use crate::{Error, Result, Value};
 
 pub const NANOS_PER_SECOND: i64 = 1_000_000_000;
@@ -38,8 +39,9 @@ pub enum Temporal {
     /// Nanoseconds since midnight, local to `offset` (seconds east of UTC).
     Time { nanos: i64, offset: i32 },
     LocalDateTime { days: i64, nanos: i64 },
-    /// Local date and time at `offset`.
-    DateTime { days: i64, nanos: i64, offset: i32 },
+    /// Local date and time at `offset`, in the named time zone `zone` if there is one
+    /// (`offset` is then the zone's offset at that time).
+    DateTime { days: i64, nanos: i64, offset: i32, zone: Option<Tz> },
     Duration(Duration),
 }
 
@@ -386,9 +388,9 @@ fn parse_time_part(c: &mut Cursor) -> Result<i64> {
     hms(h, m, s, nanos)
 }
 
-/// `Z`, `±HH`, `±HHMM` or `±HH:MM`, if present. A named zone (`[Europe/Paris]`) is an
-/// error: there is no time zone database.
-fn parse_offset_part(c: &mut Cursor) -> Result<Option<i32>> {
+/// `Z`, `±HH`, `±HHMM`, `±HH:MM` or `±HH:MM:SS`, if present, then a named zone
+/// (`[Europe/Paris]`).
+fn parse_offset_part(c: &mut Cursor) -> Result<(Option<i32>, Option<Tz>)> {
     let offset = if c.eat(b'Z') || c.eat(b'z') {
         Some(0)
     } else if matches!(c.peek(), Some(b'+' | b'-')) {
@@ -400,20 +402,84 @@ fn parse_offset_part(c: &mut Cursor) -> Result<Option<i32>> {
             None if colon => return Err(c.bad("UTC offset")),
             None => 0,
         };
-        if h > 18 || m > 59 {
+        let s = if (colon && c.eat(b':')) || (!colon && c.count_digits() == 2) {
+            c.digits(2, 2).ok_or_else(|| c.bad("UTC offset"))?.0
+        } else {
+            0
+        };
+        if h > 18 || m > 59 || s > 59 {
             return Err(c.bad("UTC offset"));
         }
-        Some(check_offset(sign * (h * 3600 + m * 60))?)
+        Some(check_offset(sign * (h * 3600 + m * 60 + s))?)
     } else {
         None
     };
-    if c.peek() == Some(b'[') {
-        return Err(Error::Unsupported(format!(
-            "named time zones are not supported (`{}`); use a UTC offset such as +01:00",
-            c.text
-        )));
+    let zone = if c.eat(b'[') {
+        let rest = &c.text[c.pos..];
+        let end = rest.find(']').ok_or_else(|| c.bad("time zone"))?;
+        let name = &rest[..end];
+        c.pos += end + 1;
+        Some(find_zone(name)?)
+    } else {
+        None
+    };
+    Ok((offset, zone))
+}
+
+/// `zone`'s offset now (a time of day in a named zone takes today's offset).
+fn zone_offset_now(zone: Tz) -> i32 {
+    let (days, nanos) = now_utc();
+    zone.offset_at(days * SECONDS_PER_DAY + nanos / NANOS_PER_SECOND)
+}
+
+/// The named time zone `name`.
+fn find_zone(name: &str) -> Result<Tz> {
+    Tz::find(name).ok_or_else(|| err(format!("unknown time zone `{name}`")))
+}
+
+/// A `timezone` field: a UTC offset or a named zone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZoneSpec {
+    Offset(i32),
+    Named(Tz),
+}
+
+fn parse_zone(text: &str) -> Result<ZoneSpec> {
+    match parse_offset(text) {
+        Ok(o) => Ok(ZoneSpec::Offset(o)),
+        Err(_) if !text.starts_with(['+', '-']) => find_zone(text).map(ZoneSpec::Named),
+        Err(e) => Err(e),
     }
-    Ok(offset)
+}
+
+/// A date-time at the local `days` / `nanos` in `zone`. A local time in a gap moves on
+/// by the gap; in an overlap, `prefer` picks the offset if it is one of the two.
+fn zoned(days: i64, nanos: i64, zone: Tz, prefer: Option<i32>) -> Result<Temporal> {
+    let secs = days * SECONDS_PER_DAY + nanos.div_euclid(NANOS_PER_SECOND);
+    let (moved, offset) = zone.resolve(secs, prefer);
+    let local = days as i128 * NANOS_PER_DAY as i128 + nanos as i128 + (moved - secs) as i128 * NANOS_PER_SECOND as i128;
+    Ok(Temporal::DateTime {
+        days: check_days(local.div_euclid(NANOS_PER_DAY as i128) as i64)?,
+        nanos: local.rem_euclid(NANOS_PER_DAY as i128) as i64,
+        offset,
+        zone: Some(zone),
+    })
+}
+
+/// The date-time at the instant `instant` (nanoseconds since the epoch) in `zone`, or at
+/// the fixed `offset` when there is no zone.
+fn at_instant(instant: i128, offset: i32, zone: Option<Tz>) -> Result<Temporal> {
+    let offset = match zone {
+        Some(z) => z.offset_at(instant.div_euclid(NANOS_PER_SECOND as i128) as i64),
+        None => offset,
+    };
+    let local = instant + offset as i128 * NANOS_PER_SECOND as i128;
+    Ok(Temporal::DateTime {
+        days: check_days(i64::try_from(local.div_euclid(NANOS_PER_DAY as i128)).map_err(|_| overflow())?)?,
+        nanos: local.rem_euclid(NANOS_PER_DAY as i128) as i64,
+        offset,
+        zone,
+    })
 }
 
 /// Parses a UTC offset given on its own (`timezone` fields): `Z`, `UTC`, `+01:00`, ….
@@ -423,7 +489,7 @@ pub fn parse_offset(text: &str) -> Result<i32> {
     }
     let mut c = Cursor::new(text);
     match parse_offset_part(&mut c)? {
-        Some(o) if c.done() => Ok(o),
+        (Some(o), None) if c.done() => Ok(o),
         _ => Err(Error::Unsupported(format!(
             "time zone `{text}` is not supported; use a UTC offset such as +01:00"
         ))),
@@ -442,29 +508,32 @@ impl Temporal {
             TemporalKind::LocalTime | TemporalKind::Time => {
                 c.eat(b'T');
                 let nanos = parse_time_part(&mut c)?;
-                let offset = parse_offset_part(&mut c)?;
-                match (kind, offset) {
-                    (TemporalKind::LocalTime, None) => Temporal::LocalTime(nanos),
-                    (TemporalKind::LocalTime, Some(_)) => return Err(c.bad("local time (it has an offset)")),
-                    (_, o) => Temporal::Time {
+                let (offset, zone) = parse_offset_part(&mut c)?;
+                match (kind, offset, zone) {
+                    (TemporalKind::LocalTime, None, None) => Temporal::LocalTime(nanos),
+                    (TemporalKind::LocalTime, ..) => return Err(c.bad("local time (it has an offset)")),
+                    // A time keeps only an offset; a zone alone gives today's.
+                    (_, o, z) => Temporal::Time {
                         nanos,
-                        offset: o.unwrap_or(0),
+                        offset: o.or_else(|| z.map(zone_offset_now)).unwrap_or(0),
                     },
                 }
             }
             TemporalKind::LocalDateTime | TemporalKind::DateTime => {
                 let days = parse_date_part(&mut c)?;
                 let nanos = if c.eat(b'T') || c.eat(b't') { parse_time_part(&mut c)? } else { 0 };
-                let offset = parse_offset_part(&mut c)?;
-                match (kind, offset) {
-                    (TemporalKind::LocalDateTime, None) => Temporal::LocalDateTime { days, nanos },
-                    (TemporalKind::LocalDateTime, Some(_)) => {
+                let (offset, zone) = parse_offset_part(&mut c)?;
+                match (kind, offset, zone) {
+                    (TemporalKind::LocalDateTime, None, None) => Temporal::LocalDateTime { days, nanos },
+                    (TemporalKind::LocalDateTime, ..) => {
                         return Err(c.bad("local datetime (it has an offset)"));
                     }
-                    (_, o) => Temporal::DateTime {
+                    (_, o, Some(z)) => zoned(days, nanos, z, o)?,
+                    (_, o, None) => Temporal::DateTime {
                         days,
                         nanos,
                         offset: o.unwrap_or(0),
+                        zone: None,
                     },
                 }
             }
@@ -517,6 +586,25 @@ impl Temporal {
         }
     }
 
+    /// A zoned date-time at the local `days` / `nanos` in `zone` (see [`Tz::resolve`]
+    /// for local times that occur twice or not at all; `prefer` picks the offset then).
+    pub fn in_zone(days: i64, nanos: i64, zone: Tz, prefer: Option<i32>) -> Result<Temporal> {
+        zoned(days, nanos, zone, prefer)
+    }
+
+    /// The zoned date-time at `instant` (nanoseconds since the epoch) in `zone`.
+    pub fn at_instant_in(instant: i128, zone: Tz) -> Result<Temporal> {
+        at_instant(instant, 0, Some(zone))
+    }
+
+    /// The named time zone of a zoned date-time, if it has one.
+    pub fn zone(&self) -> Option<Tz> {
+        match *self {
+            Temporal::DateTime { zone, .. } => zone,
+            _ => None,
+        }
+    }
+
     /// The UTC offset in seconds, if the value is zoned.
     pub fn offset(&self) -> Option<i32> {
         match *self {
@@ -543,12 +631,13 @@ impl Temporal {
                 nanos: Self::utc_time(nanos, offset),
                 offset: 0,
             },
-            Temporal::DateTime { days, nanos, offset } => {
+            Temporal::DateTime { days, nanos, offset, .. } => {
                 let i = Self::instant(days, nanos, offset);
                 Temporal::DateTime {
                     days: i.div_euclid(NANOS_PER_DAY as i128) as i64,
                     nanos: i.rem_euclid(NANOS_PER_DAY as i128) as i64,
                     offset: 0,
+                    zone: None,
                 }
             }
             other => other,
@@ -573,8 +662,8 @@ impl Temporal {
                 (a, na).cmp(&(b, nb))
             }
             (
-                Temporal::DateTime { days: a, nanos: na, offset: oa },
-                Temporal::DateTime { days: b, nanos: nb, offset: ob },
+                Temporal::DateTime { days: a, nanos: na, offset: oa, .. },
+                Temporal::DateTime { days: b, nanos: nb, offset: ob, .. },
             ) => Self::instant(a, na, oa).cmp(&Self::instant(b, nb, ob)),
             _ => return None,
         })
@@ -615,8 +704,16 @@ impl Temporal {
     /// value. `now` is the current UTC `(days, nanos)`, used when there is no argument.
     pub fn construct(kind: TemporalKind, arg: Option<&Value>, now: (i64, i64)) -> Result<Value> {
         let what = kind.function();
+        // `{timezone: …}` alone: the current time there.
+        if let (Some(Value::Map(m)), true) = (arg, kind != TemporalKind::Duration) {
+            if m.len() == 1 {
+                if let Some(z) = m.get("timezone") {
+                    return Self::now_in(kind, Some(z), now);
+                }
+            }
+        }
         let t = match arg {
-            None => Self::convert(kind, &Temporal::DateTime { days: now.0, nanos: now.1, offset: 0 })?,
+            None => Self::convert(kind, &Temporal::DateTime { days: now.0, nanos: now.1, offset: 0, zone: None })?,
             Some(Value::Null) => return Ok(Value::Null),
             Some(Value::String(s)) => Self::parse(kind, s)?,
             Some(Value::Temporal(t)) => Self::convert(kind, t)?,
@@ -629,6 +726,25 @@ impl Temporal {
             }
         };
         Ok(Value::Temporal(t))
+    }
+
+    /// `date.statement(zone)` and friends: the current time `now` (UTC days and nanos) as
+    /// a `kind` value in `zone` (a UTC offset or a named zone; UTC when there is none).
+    /// A `null` zone gives `null`.
+    pub fn now_in(kind: TemporalKind, zone: Option<&Value>, now: (i64, i64)) -> Result<Value> {
+        let instant = now.0 as i128 * NANOS_PER_DAY as i128 + now.1 as i128;
+        let dt = match zone {
+            None => at_instant(instant, 0, None)?,
+            Some(Value::Null) => return Ok(Value::Null),
+            Some(Value::String(z)) => match parse_zone(z)? {
+                ZoneSpec::Offset(o) => at_instant(instant, o, None)?,
+                ZoneSpec::Named(tz) => at_instant(instant, 0, Some(tz))?,
+            },
+            Some(v) => {
+                return Err(Error::Type(format!("{}(): a time zone must be a string, got {}", kind.function(), v.type_name())));
+            }
+        };
+        Ok(Value::Temporal(Self::convert(kind, &dt)?))
     }
 
     /// `kind`'s value made from another temporal value.
@@ -653,6 +769,7 @@ impl Temporal {
                 days: date.ok_or_else(bad)?,
                 nanos: time.unwrap_or(0),
                 offset: t.offset().unwrap_or(0),
+                zone: t.zone(),
             },
             TemporalKind::Duration => match t {
                 Temporal::Duration(_) => *t,
@@ -691,10 +808,13 @@ impl Temporal {
             return Err(err(format!("{what}(): unknown field `{k}`")));
         }
         let (mut date, mut time, mut offset) = (None, None, None);
+        // The named zone of a zoned date-time the fields start from.
+        let mut base_zone = None;
         if let Some(t) = temporal("datetime")? {
             date = t.date_days();
             time = t.time_nanos();
             offset = t.offset();
+            base_zone = t.zone();
         }
         if let Some(t) = temporal("date")? {
             date = Some(t.date_days().ok_or_else(|| err(format!("{what}(): `date` has no date")))?);
@@ -703,6 +823,7 @@ impl Temporal {
             time = Some(t.time_nanos().ok_or_else(|| err(format!("{what}(): `time` has no time")))?);
             if t.offset().is_some() {
                 offset = t.offset();
+                base_zone = t.zone();
             }
         }
         // Date fields.
@@ -760,7 +881,7 @@ impl Temporal {
         }
         let zone = match m.get("timezone") {
             None | Some(Value::Null) => None,
-            Some(Value::String(z)) => Some(parse_offset(z)?),
+            Some(Value::String(z)) => Some(parse_zone(z)?),
             Some(v) => return Err(Error::Type(format!("{what}(): `timezone` must be a string, got {}", v.type_name()))),
         };
         if let Some(e) = int("epochSeconds")? {
@@ -768,38 +889,55 @@ impl Temporal {
             date = Some(i.div_euclid(NANOS_PER_DAY as i128) as i64);
             time = Some(i.rem_euclid(NANOS_PER_DAY as i128) as i64);
             offset = Some(0);
+            base_zone = None;
         }
         let need_date = || date.ok_or_else(|| err(format!("{what}(): a date is required (`year`, or `date`)")));
         let need_time = || time.ok_or_else(|| err(format!("{what}(): a time is required (`hour`, or `time`)")));
         Ok(match kind {
             TemporalKind::Date => Temporal::Date(check_days(need_date()?)?),
             TemporalKind::LocalTime => Temporal::LocalTime(need_time()?),
-            TemporalKind::Time => Temporal::Time {
-                nanos: need_time()?,
-                offset: zone.or(offset).unwrap_or(0),
-            },
+            TemporalKind::Time => {
+                let nanos = need_time()?;
+                let to = match zone {
+                    None => offset.unwrap_or(0),
+                    Some(ZoneSpec::Offset(o)) => o,
+                    Some(ZoneSpec::Named(z)) => match date {
+                        Some(d) => z.resolve(d * SECONDS_PER_DAY + nanos / NANOS_PER_SECOND, offset).1,
+                        None => zone_offset_now(z),
+                    },
+                };
+                // A time with an offset moved to another one keeps its instant.
+                let nanos = match offset {
+                    Some(from) if from != to => (nanos + (to - from) as i64 * NANOS_PER_SECOND).rem_euclid(NANOS_PER_DAY),
+                    _ => nanos,
+                };
+                Temporal::Time { nanos, offset: to }
+            }
             TemporalKind::LocalDateTime => Temporal::LocalDateTime {
                 days: check_days(need_date()?)?,
                 nanos: time.unwrap_or(0),
             },
             TemporalKind::DateTime => {
                 let (days, nanos) = (check_days(need_date()?)?, time.unwrap_or(0));
-                match (offset, zone) {
-                    // A zoned base moved to another zone keeps its instant, unless the
-                    // time was given explicitly.
-                    (Some(from), Some(to)) if from != to && !given.iter().any(Option::is_some) => {
-                        let i = Self::instant(days, nanos, from) + to as i128 * NANOS_PER_SECOND as i128;
-                        Temporal::DateTime {
-                            days: check_days(i.div_euclid(NANOS_PER_DAY as i128) as i64)?,
-                            nanos: i.rem_euclid(NANOS_PER_DAY as i128) as i64,
-                            offset: to,
+                // The fields read in the zone (or at the offset) they came from.
+                let base = match (base_zone, offset) {
+                    (Some(z), o) => Some(zoned(days, nanos, z, o)?),
+                    (None, Some(o)) => Some(Temporal::DateTime { days, nanos, offset: o, zone: None }),
+                    (None, None) => None,
+                };
+                match (base, zone) {
+                    (Some(b), None) => b,
+                    // A zoned value moved to another zone keeps its instant.
+                    (Some(Temporal::DateTime { days, nanos, offset, .. }), Some(to)) => {
+                        let i = Self::instant(days, nanos, offset);
+                        match to {
+                            ZoneSpec::Offset(o) => at_instant(i, o, None)?,
+                            ZoneSpec::Named(z) => at_instant(i, 0, Some(z))?,
                         }
                     }
-                    (o, z) => Temporal::DateTime {
-                        days,
-                        nanos,
-                        offset: z.or(o).unwrap_or(0),
-                    },
+                    (_, Some(ZoneSpec::Named(z))) => zoned(days, nanos, z, None)?,
+                    (_, Some(ZoneSpec::Offset(o))) => Temporal::DateTime { days, nanos, offset: o, zone: None },
+                    (_, None) => Temporal::DateTime { days, nanos, offset: 0, zone: None },
                 }
             }
             TemporalKind::Duration => unreachable!("durations are built by Duration::from_map"),
@@ -869,7 +1007,10 @@ impl Temporal {
             TemporalKind::LocalTime => Temporal::LocalTime(nanos.unwrap()),
             TemporalKind::Time => Temporal::Time { nanos: nanos.unwrap(), offset },
             TemporalKind::LocalDateTime => Temporal::LocalDateTime { days: days.unwrap(), nanos: nanos.unwrap() },
-            _ => Temporal::DateTime { days: days.unwrap(), nanos: nanos.unwrap(), offset },
+            _ => match t.zone() {
+                Some(z) => zoned(days.unwrap(), nanos.unwrap(), z, Some(offset))?,
+                None => Temporal::DateTime { days: days.unwrap(), nanos: nanos.unwrap(), offset, zone: None },
+            },
         };
         if fields.is_empty() {
             return Ok(base);
@@ -904,7 +1045,11 @@ impl Temporal {
             }
         }
         if matches!(kind, TemporalKind::Time | TemporalKind::DateTime) {
-            m.insert("timezone".to_string(), Value::String(offset_text(offset)));
+            let zone = match (kind, t.zone()) {
+                (TemporalKind::DateTime, Some(z)) => z.name().to_string(),
+                _ => offset_text(offset),
+            };
+            m.insert("timezone".to_string(), Value::String(zone));
         }
         for (k, v) in fields {
             m.insert(k.clone(), v.clone());
@@ -920,6 +1065,7 @@ impl Temporal {
             days: check_days(days)?,
             nanos: nanos.rem_euclid(NANOS_PER_DAY as i128) as i64,
             offset: 0,
+            zone: None,
         })
     }
 
@@ -960,13 +1106,19 @@ impl Temporal {
         }
         if let Some(o) = self.offset() {
             match key {
-                "timezone" | "offset" => return Some(Value::String(offset_text(o))),
+                "timezone" => {
+                    return Some(Value::String(match self.zone() {
+                        Some(z) => z.name().to_string(),
+                        None => offset_text(o),
+                    }));
+                }
+                "offset" => return Some(Value::String(offset_text(o))),
                 "offsetMinutes" => return int(o as i64 / 60),
                 "offsetSeconds" => return int(o as i64),
                 _ => {}
             }
         }
-        if let Temporal::DateTime { days, nanos, offset } = *self {
+        if let Temporal::DateTime { days, nanos, offset, .. } = *self {
             let i = Self::instant(days, nanos, offset);
             match key {
                 "epochSeconds" => return int(i.div_euclid(NANOS_PER_SECOND as i128) as i64),
@@ -1007,9 +1159,18 @@ impl Temporal {
                 let (days, nanos) = date_time(days, nanos)?;
                 Temporal::LocalDateTime { days, nanos }
             }
-            Temporal::DateTime { days, nanos, offset } => {
+            Temporal::DateTime { days, nanos, offset, zone: None } => {
                 let (days, nanos) = date_time(days, nanos)?;
-                Temporal::DateTime { days, nanos, offset }
+                Temporal::DateTime { days, nanos, offset, zone: None }
+            }
+            // In a named zone, months and days move the wall clock (keeping the offset
+            // where it still fits); seconds move the instant.
+            Temporal::DateTime { days, nanos, offset, zone: Some(z) } => {
+                let days = add_months(days, d.months)?.checked_add(d.days).ok_or_else(overflow)?;
+                let Temporal::DateTime { days, nanos, offset, .. } = zoned(check_days(days)?, nanos, z, Some(offset))? else {
+                    unreachable!("zoned() makes a date-time")
+                };
+                at_instant(Self::instant(days, nanos, offset) + total, offset, Some(z))?
             }
             Temporal::Duration(a) => Temporal::Duration(a.add(d)?),
         })
@@ -1021,6 +1182,16 @@ impl Temporal {
     pub fn between(a: &Temporal, b: &Temporal, unit: BetweenUnit) -> Result<Duration> {
         if matches!(a, Temporal::Duration(_)) || matches!(b, Temporal::Duration(_)) {
             return Err(Error::Type("duration.between() needs two dates or times, not durations".into()));
+        }
+        if let (Some(z), BetweenUnit::Seconds) = (a.zone().or(b.zone()), unit) {
+            // A local value counts in the zone, on the other value's date if it has none.
+            let instant = |t: &Temporal, other: &Temporal| -> i128 {
+                let days = t.date_days().or(other.date_days()).unwrap_or(0);
+                let nanos = t.time_nanos().unwrap_or(0);
+                let offset = t.offset().unwrap_or_else(|| z.resolve(days * SECONDS_PER_DAY + nanos / NANOS_PER_SECOND, None).1);
+                Self::instant(days, nanos, offset)
+            };
+            return Duration::from_nanos(0, 0, instant(b, a) - instant(a, b));
         }
         // b's local fields at a's offset.
         let shift = match (a.offset(), b.offset()) {
@@ -1144,11 +1315,15 @@ impl fmt::Display for Temporal {
                 f.write_str("T")?;
                 write_time(f, nanos)
             }
-            Temporal::DateTime { days, nanos, offset } => {
+            Temporal::DateTime { days, nanos, offset, zone } => {
                 write_date(f, days)?;
                 f.write_str("T")?;
                 write_time(f, nanos)?;
-                f.write_str(&offset_text(offset))
+                f.write_str(&offset_text(offset))?;
+                match zone {
+                    Some(z) => write!(f, "[{}]", z.name()),
+                    None => Ok(()),
+                }
             }
             Temporal::Duration(d) => write!(f, "{d}"),
         }
@@ -1507,10 +1682,18 @@ mod tests {
         ] {
             assert!(Temporal::parse(k, bad).is_err(), "{bad}");
         }
-        assert!(matches!(
-            Temporal::parse(K::DateTime, "2015-07-21T21:40:32[Europe/Paris]"),
-            Err(Error::Unsupported(_))
-        ));
+        for (text, shown) in [
+            ("2015-07-21T21:40:32[Europe/Paris]", "2015-07-21T21:40:32+02:00[Europe/Paris]"),
+            ("2015-07-21T21:40:32.142+0845[Australia/Eucla]", "2015-07-21T21:40:32.142+08:45[Australia/Eucla]"),
+            ("1818-07-21T21:40:32.142[Europe/Stockholm]", "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]"),
+            // In a gap the clock moves on; in an overlap the given offset is kept.
+            ("2017-03-26T02:30[Europe/Stockholm]", "2017-03-26T03:30+02:00[Europe/Stockholm]"),
+            ("2017-10-29T02:30+01:00[Europe/Stockholm]", "2017-10-29T02:30+01:00[Europe/Stockholm]"),
+            ("2017-10-29T02:30[Europe/Stockholm]", "2017-10-29T02:30+02:00[Europe/Stockholm]"),
+        ] {
+            assert_eq!(p(K::DateTime, text).to_string(), shown, "{text}");
+        }
+        assert!(Temporal::parse(K::DateTime, "2015-07-21T21:40[Frost/Nixon]").is_err());
     }
 
     #[test]

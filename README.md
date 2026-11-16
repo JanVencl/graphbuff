@@ -642,8 +642,8 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   `EXPLAIN`/`PROFILE`.
 * **Values:** nodes, relationships (with element ids from Bolt 5, the strings
   `elementId()` returns) and paths,
-  dates, times, date-times with offsets, durations and points, in both directions.
-  Byte arrays and date-times with named zones are refused.
+  dates, times, date-times with offsets or named time zones, durations and points, in both
+  directions. Byte arrays are refused.
 * **Authentication:** without `--token` or `--users` any credentials pass. With
   `--users`, `basic` with a user's name and password; with `--token`, `basic` with the
   token as the password (any user name) or `bearer` with the token.
@@ -896,9 +896,10 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,485 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (89.5 %).
-The TCK is the official compatibility suite for openCypher. Most failures are named time
-zones and the test procedures of `CALL`. The TCK
+**openCypher TCK:** 3,609 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (92.6 %).
+The TCK is the official compatibility suite for openCypher. Most failures are the test
+procedures of `CALL` and temporal values built from others with a `second` field (graphbuff
+drops the fraction of a second). The TCK
 checks errors only by category, not by detail code. The suite and the full table per
 feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 
@@ -989,9 +990,15 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   {dayOfWeek: 2})` and the other `*.truncate` functions (`millennium` … `microsecond`). Output
   follows Neo4j: `12:00`, not `12:00:00`; durations drop trailing zeros (`PT0.5S`). Values of one kind compare (zoned
   values by instant: `datetime('…T01:00+01:00') = datetime('…T00:00Z')`); durations only test
-  equality. They can be stored as properties (and in lists) and indexed for equality. Time zones
-  are UTC offsets only: named zones such as `[Europe/Paris]` need a time zone database and
-  return `Unsupported`
+  equality. They can be stored as properties (and in lists) and indexed for equality.
+  **Time zones** are UTC offsets (`+01:00`, `+02:05:59`) or IANA names
+  (`datetime('2015-07-21T21:40[Europe/Paris]')`, `datetime({…, timezone: 'Europe/Stockholm'})`,
+  `datetime.statement('Asia/Tokyo')`). A named zone decides the offset from its rules and
+  history (daylight saving time, local mean time before 1900): `dt.timezone` is the name,
+  `dt.offset` the offset. A local time in a gap moves on by the gap; in an overlap the offset
+  given (or else the earlier one) wins. Adding days or months moves the wall clock, adding
+  hours moves the instant. The time zone database (IANA 2026f, all 598 zones) is built into
+  the binary; `crates/core/tzdata/generate.py` rebuilds it from a newer release
 * **Spatial values:** 2D and 3D points, Cartesian (`point({x: 1, y: 2})`,
   `point({x: 1, y: 2, z: 3})`) or WGS-84 (`point({longitude: 12.5, latitude: 56.1})`, with
   `height` for 3D), or chosen with `crs: 'cartesian' | 'cartesian-3d' | 'wgs-84' | 'wgs-84-3d'`
@@ -1006,7 +1013,7 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship
-constraints, named time zones,
+constraints,
 spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).
 
