@@ -207,6 +207,10 @@ impl Executor<'_> {
             }
             "range" => {
                 arity(name, &args, 2, 3)?;
+                // Only integers: `range(0.0, 1)` fails like `range(true, 1)`.
+                if let Some(f) = args.iter().find(|a| matches!(a, Value::Float(_))) {
+                    return Err(wrong_type(name, f));
+                }
                 let start = int_arg(name, &args[0])?;
                 let end = int_arg(name, &args[1])?;
                 let step = args
@@ -926,6 +930,24 @@ impl Executor<'_> {
             (k, Some("statement" | "transaction" | "realtime")) if k != TemporalKind::Duration => {
                 arity(name, args, 0, 0)?;
                 Temporal::construct(kind, None, self.statement_time())?
+            }
+            (k, Some("truncate")) if k != TemporalKind::Duration => {
+                arity(name, args, 2, 3)?;
+                let Some(t) = temporal(&args[1])? else {
+                    return Ok(Some(Value::Null));
+                };
+                let unit = match &args[0] {
+                    Value::Null => return Ok(Some(Value::Null)),
+                    Value::String(u) => u.as_str(),
+                    o => return Err(wrong_type(name, o)),
+                };
+                let empty = std::collections::BTreeMap::new();
+                let fields = match args.get(2) {
+                    None | Some(Value::Null) => &empty,
+                    Some(Value::Map(m)) => m,
+                    Some(o) => return Err(wrong_type(name, o)),
+                };
+                Value::Temporal(Temporal::truncate(k, unit, &t, fields)?)
             }
             (TemporalKind::DateTime, Some("fromepoch")) => {
                 arity(name, args, 1, 2)?;

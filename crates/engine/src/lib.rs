@@ -37,6 +37,7 @@ mod matcher;
 mod ops;
 #[cfg(test)]
 mod legacy;
+mod typecheck;
 mod plan;
 mod procedures;
 mod regex;

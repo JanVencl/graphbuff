@@ -3,8 +3,8 @@
 Smoke tests that run the official Neo4j drivers against `graphbuff-server` over Bolt. Each suite starts its own server (HTTP and Bolt on free ports,
 `--token` auth) and stops it at the end.
 
-Build the server first; the suites use `target/debug` (or `target/release`), or the
-binary named by `GRAPHBUFF_SERVER`:
+Build the server first. The suites use the binary named by `GRAPHBUFF_SERVER`, else
+whichever of `target/release` and `target/debug` was built last:
 
 ```bash
 cargo build -p graphbuff-server

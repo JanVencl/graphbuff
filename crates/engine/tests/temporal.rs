@@ -84,18 +84,18 @@ fn constructors_and_fields() {
         ("localtime('12:31:14.645')", "12:31:14.645"),
         ("localtime({hour: 12, minute: 31, second: 14, millisecond: 645})", "12:31:14.645"),
         ("time('12:31:14+01:00')", "12:31:14+01:00"),
-        ("time({hour: 12, timezone: '-05:30'})", "12:00:00-05:30"),
+        ("time({hour: 12, timezone: '-05:30'})", "12:00-05:30"),
         ("localdatetime('2015-07-21T21:40:32')", "2015-07-21T21:40:32"),
-        ("localdatetime({date: date('2015-07-21'), time: localtime('10:00')})", "2015-07-21T10:00:00"),
+        ("localdatetime({date: date('2015-07-21'), time: localtime('10:00')})", "2015-07-21T10:00"),
         ("datetime('2015-07-21T21:40:32.142+01:00')", "2015-07-21T21:40:32.142+01:00"),
-        ("datetime({year: 2015, month: 7, day: 21, hour: 21, timezone: 'Z'})", "2015-07-21T21:00:00Z"),
-        ("datetime({datetime: datetime('2015-07-21T21:00Z'), timezone: '+02:00'})", "2015-07-21T23:00:00+02:00"),
+        ("datetime({year: 2015, month: 7, day: 21, hour: 21, timezone: 'Z'})", "2015-07-21T21:00Z"),
+        ("datetime({datetime: datetime('2015-07-21T21:00Z'), timezone: '+02:00'})", "2015-07-21T23:00+02:00"),
         ("datetime({epochSeconds: 1437511232})", "2015-07-21T20:40:32Z"),
         ("datetime.fromepoch(1437511232, 5000000)", "2015-07-21T20:40:32.005Z"),
         ("datetime.fromepochmillis(1437511232142)", "2015-07-21T20:40:32.142Z"),
-        ("duration('P1Y2M10DT12H45M30.25S')", "P1Y2M10DT12H45M30.250S"),
+        ("duration('P1Y2M10DT12H45M30.25S')", "P1Y2M10DT12H45M30.25S"),
         ("duration({days: 14, hours: 16, minutes: 12})", "P14DT16H12M"),
-        ("duration({months: 0.75})", "P22DT19H51M49.500S"),
+        ("duration({months: 0.75})", "P22DT19H51M49.5S"),
         ("date(null)", "null"),
         ("toString(date('2015-07-21'))", "\"2015-07-21\""),
         // Fields.
@@ -152,8 +152,8 @@ fn arithmetic_and_comparison() {
         ("duration('P1M') + date('2020-01-31')", "2020-02-29"),
         ("date('2020-03-31') - duration('P1M')", "2020-02-29"),
         ("date('2020-01-01') + duration('PT36H')", "2020-01-02"),
-        ("localtime('23:30') + duration('PT1H')", "00:30:00"),
-        ("localdatetime('2020-12-31T23:30') + duration('PT1H')", "2021-01-01T00:30:00"),
+        ("localtime('23:30') + duration('PT1H')", "00:30"),
+        ("localdatetime('2020-12-31T23:30') + duration('PT1H')", "2021-01-01T00:30"),
         ("datetime('2020-03-01T00:00+02:00') - duration('PT1S')", "2020-02-29T23:59:59+02:00"),
         ("duration('P1D') + duration('PT12H')", "P1DT12H"),
         ("duration('P1D') - duration('PT12H')", "P1DT-12H"),
@@ -190,8 +190,8 @@ fn arithmetic_and_comparison() {
              RETURN v ORDER BY v"
         ),
         [
-            "2020-01-01T00:00:00Z", "2020-01-01T00:00:00", "2019-12-31", "2020-01-01", "10:00:00Z",
-            "10:00:00", "P30D", "P1M", "\"a\"", "1", "null",
+            "2020-01-01T00:00Z", "2020-01-01T00:00", "2019-12-31", "2020-01-01", "10:00Z",
+            "10:00", "P30D", "P1M", "\"a\"", "1", "null",
         ]
     );
     assert_eq!(
@@ -207,6 +207,37 @@ fn arithmetic_and_comparison() {
         ["2"],
         "DISTINCT keeps both offsets (like 1 and 1.0)"
     );
+}
+
+#[test]
+fn truncate() {
+    let db = mem();
+    let dt = "datetime('2017-10-11T12:31:14.645876123+01:00')";
+    for (expr, want) in [
+        (format!("date.truncate('millennium', {dt})"), "2000-01-01"),
+        (format!("date.truncate('decade', {dt}, {{day: 2}})"), "2010-01-02"),
+        ("date.truncate('weekYear', date('1984-01-01'))".to_string(), "1983-01-03"),
+        ("date.truncate('quarter', date('1984-11-11'))".to_string(), "1984-10-01"),
+        ("date.truncate('week', date('1984-10-11'), {dayOfWeek: 2})".to_string(), "1984-10-09"),
+        (format!("datetime.truncate('day', {dt})"), "2017-10-11T00:00+01:00"),
+        (format!("datetime.truncate('hour', {dt}, {{timezone: '-05:00'}})"), "2017-10-11T12:00-05:00"),
+        ("datetime.truncate('month', date('2017-10-11'))".to_string(), "2017-10-01T00:00Z"),
+        (format!("localdatetime.truncate('millisecond', {dt}, {{nanosecond: 2}})"), "2017-10-11T12:31:14.645000002"),
+        (format!("localtime.truncate('microsecond', {dt})"), "12:31:14.645876"),
+        (format!("time.truncate('minute', {dt})"), "12:31+01:00"),
+        (format!("time.truncate('day', {dt}, {{nanosecond: 2}})"), "00:00:00.000000002+01:00"),
+        ("date.truncate('year', null)".to_string(), "null"),
+    ] {
+        assert_eq!(eval(&db, &expr), want, "{expr}");
+    }
+    for bad in [
+        "date.truncate('hour', date('2017-10-11'))",
+        "localtime.truncate('month', localtime('12:00'))",
+        "date.truncate('fortnight', date('2017-10-11'))",
+        "date.truncate('day', localtime('12:00'))",
+    ] {
+        assert!(db.execute(&format!("RETURN {bad}")).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -226,8 +257,8 @@ fn stored_temporals_and_indexes() {
         run(&db, "CREATE INDEX FOR (e:Ev) ON (e.on)");
         let db = reopen(db);
         let q = |q: &str| rows(&db, q);
-        assert_eq!(q("MATCH (e:Ev {i: 31}) RETURN e.on, e.at, e.t, e.len"), ["2024-02-01, 2024-01-02T07:00:00Z, 00:31:00, PT31M"], "{store}");
-        assert_eq!(q("MATCH (e:Ev {i: 0}) RETURN e.tags"), ["[2024-01-01, 2024-01-01T10:00:00]"], "{store}");
+        assert_eq!(q("MATCH (e:Ev {i: 31}) RETURN e.on, e.at, e.t, e.len"), ["2024-02-01, 2024-01-02T07:00Z, 00:31, PT31M"], "{store}");
+        assert_eq!(q("MATCH (e:Ev {i: 0}) RETURN e.tags"), ["[2024-01-01, 2024-01-01T10:00]"], "{store}");
         // An index seek finds the same instant at another offset.
         let seek = "MATCH (e:Ev) WHERE e.at = datetime('2024-01-02T09:00+02:00') RETURN e.i";
         assert!(run(&db, &format!("EXPLAIN {seek}")).plan.unwrap().to_string().contains("NodeIndexSeek"), "{store}");
@@ -235,7 +266,7 @@ fn stored_temporals_and_indexes() {
         assert_eq!(q("MATCH (e:Ev {on: date('2024-04-09')}) RETURN e.i"), ["99"], "{store}");
         assert_eq!(q("MATCH (e:Ev) WHERE e.on > date('2024-04-07') RETURN e.i ORDER BY e.i"), ["98", "99"], "{store}");
         assert_eq!(q("MATCH (e:Ev) WHERE e.len >= duration('PT1M') RETURN count(e)"), ["0"], "{store}: durations do not compare");
-        assert_eq!(q("MATCH (e:Ev) RETURN max(e.at)"), ["2024-01-05T03:00:00Z"], "{store}");
+        assert_eq!(q("MATCH (e:Ev) RETURN max(e.at)"), ["2024-01-05T03:00Z"], "{store}");
         // Updates, then reopen again.
         run(&db, "MATCH (e:Ev) WHERE e.i < 10 SET e.at = e.at + duration('P1Y')");
         let db = reopen(db);

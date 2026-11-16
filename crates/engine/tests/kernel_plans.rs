@@ -209,7 +209,7 @@ fn differential(db: &Database<BoxedStore>, seed: u64) {
             (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "query {i}: {q}"),
             (a, b) => panic!("query {i}: {q}\nrows: {a:?}\nkernels: {b:?}"),
         }
-        if db.explain(&q).unwrap().contains("Kernel") {
+        if db.explain(&q).is_ok_and(|p| p.contains("Kernel")) {
             kernel_plans += 1;
         }
     }
