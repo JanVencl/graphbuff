@@ -28,7 +28,7 @@
 //! Updates are eager: everything below an update is run to completion first, so an
 //! update always applies to every row.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use graphbuff_core::{Direction, Error, IndexEntity, Result};
@@ -42,6 +42,7 @@ use crate::context::{Executor, Profile};
 use crate::result::{PlanDescription, PlanLine};
 use crate::matcher::{SeekKind, extract_hints};
 use crate::procedures::Procedure;
+use crate::typecheck::{self, Ty, TyEnv};
 
 /// The plan of a whole query.
 #[derive(Debug, Clone)]
@@ -374,6 +375,161 @@ pub(crate) fn profile_key<T>(node: &T) -> usize {
 
 /// Plans one query part whose start row holds `imported`; also returns the columns it
 /// returns (none if it does not end with `RETURN`).
+/// What a variable is known to hold at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarKind {
+    Node,
+    Rel,
+    /// The relationships of a variable-length pattern.
+    RelList,
+    Path,
+    /// A list (it may hold relationships for a variable-length pattern).
+    List,
+    /// A value that is none of the above (a literal, a map …).
+    Value,
+    /// Could be anything (a parameter, a function's result, an imported variable …).
+    Unknown,
+}
+
+impl VarKind {
+    fn name(self) -> &'static str {
+        match self {
+            VarKind::Node => "a node",
+            VarKind::Rel => "a relationship",
+            VarKind::RelList => "a list of relationships",
+            VarKind::Path => "a path",
+            VarKind::List => "a list",
+            VarKind::Value => "a value",
+            VarKind::Unknown => "a value",
+        }
+    }
+}
+
+/// What `e` is known to hold.
+fn expr_kind(e: &Expr, kinds: &HashMap<String, VarKind>) -> VarKind {
+    match e {
+        Expr::Var(v) => kinds.get(v).copied().unwrap_or(VarKind::Unknown),
+        Expr::Literal(Value::Null) => VarKind::Unknown,
+        Expr::Literal(Value::List(_)) | Expr::List(_) | Expr::ListComprehension { .. } => VarKind::List,
+        Expr::Literal(_) | Expr::Map(_) => VarKind::Value,
+        _ => VarKind::Unknown,
+    }
+}
+
+/// Compile-time checks of the variables in `patterns` (a `MATCH`, or a `CREATE` /
+/// `MERGE` when `creating`) against what `kinds` knows, which it then extends: a
+/// variable must keep its kind (`VariableTypeConflict`), a path variable and a
+/// relationship that is created must be new, and a relationship is matched once per
+/// clause (`VariableAlreadyBound`).
+/// `var` declared as `want` in a pattern, given what `kinds` knows (updated).
+fn check_kind(var: &str, want: VarKind, kinds: &mut HashMap<String, VarKind>) -> Result<()> {
+    match kinds.get(var).copied() {
+        Some(VarKind::List) if want == VarKind::RelList => Ok(()),
+        Some(have) if have != want && have != VarKind::Unknown => Err(Error::Semantic(format!(
+            "variable `{var}` is {} here but was already declared as {}",
+            want.name(),
+            have.name()
+        ))),
+        Some(_) if want == VarKind::Path => {
+            Err(Error::Semantic(format!("variable `{var}` already declared; a path variable must be new")))
+        }
+        _ => {
+            kinds.insert(var.to_string(), want);
+            Ok(())
+        }
+    }
+}
+
+fn check_pattern_vars(patterns: &[PatternPart], kinds: &mut HashMap<String, VarKind>, creating: bool) -> Result<()> {
+    let mut fresh_rels: HashSet<&str> = HashSet::new();
+    let mut new_here: HashSet<&str> = HashSet::new();
+    for part in patterns {
+        let mut nodes: Vec<&NodePattern> = vec![&part.start];
+        nodes.extend(part.chain.iter().map(|(_, n)| n));
+        if let Some(p) = &part.var {
+            check_kind(p, VarKind::Path, kinds)?;
+            new_here.insert(p);
+        }
+        for (i, n) in nodes.iter().enumerate() {
+            let Some(v) = &n.var else { continue };
+            let was_bound = kinds.contains_key(v.as_str()) && !new_here.contains(v.as_str());
+            check_kind(v, VarKind::Node, kinds)?;
+            if creating && was_bound && (!n.labels.is_empty() || n.props.is_some() || (part.chain.is_empty() && i == 0)) {
+                return Err(Error::Semantic(format!(
+                    "variable `{v}` already declared; it cannot be created again with labels or properties"
+                )));
+            }
+            if !was_bound {
+                new_here.insert(v);
+            }
+        }
+        for (r, _) in &part.chain {
+            let Some(v) = &r.var else { continue };
+            let was_bound = kinds.contains_key(v.as_str());
+            let want = if r.length.is_some() { VarKind::RelList } else { VarKind::Rel };
+            check_kind(v, want, kinds)?;
+            if (creating && was_bound) || !fresh_rels.insert(v) {
+                return Err(Error::Semantic(format!(
+                    "variable `{v}` already declared; a relationship can only be used once in a pattern"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The compile-time types of the variables `kinds` knows.
+fn ty_env(kinds: &HashMap<String, VarKind>) -> TyEnv {
+    kinds
+        .iter()
+        .map(|(v, k)| {
+            let t = match k {
+                VarKind::Node => Ty::Node,
+                VarKind::Rel => Ty::Rel,
+                VarKind::RelList => Ty::List(Box::new(Ty::Rel)),
+                VarKind::Path => Ty::Path,
+                VarKind::List => Ty::List(Box::new(Ty::Any)),
+                VarKind::Value | VarKind::Unknown => Ty::Any,
+            };
+            (v.clone(), t)
+        })
+        .collect()
+}
+
+/// Compile-time type checks of a clause's expressions (see [`crate::typecheck`]).
+fn check_clause_types(clause: &Clause, kinds: &HashMap<String, VarKind>) -> Result<()> {
+    let env = ty_env(kinds);
+    match clause {
+        Clause::Match { where_: Some(w), .. } => typecheck::check_predicate(w, &env)?,
+        Clause::With(p) | Clause::Return(p) => {
+            let mut after = env.clone();
+            for it in &p.items {
+                let t = typecheck::check(&it.expr, &env)?;
+                after.insert(it.alias.clone(), t);
+            }
+            for s in &p.order_by {
+                typecheck::check(&s.expr, &after)?;
+            }
+            if let Some(w) = &p.where_ {
+                typecheck::check_predicate(w, &after)?;
+            }
+            for x in [&p.skip, &p.limit].into_iter().flatten() {
+                typecheck::check(x, &env)?;
+            }
+        }
+        Clause::Unwind { expr, .. } => {
+            typecheck::check(expr, &env)?;
+        }
+        Clause::Delete { exprs, .. } => {
+            for e in exprs {
+                typecheck::check_deletable(e, &env)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(PartPlan, Vec<String>)> {
     if q.clauses.iter().any(Clause::is_schema) {
         if q.clauses.len() > 1 {
@@ -392,7 +548,17 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             bound.push(v.to_string());
         }
     };
+    // What each variable in scope is known to hold, for the compile-time checks of
+    // patterns. Imported variables could hold anything.
+    let mut kinds: HashMap<String, VarKind> = imported.iter().map(|v| (v.clone(), VarKind::Unknown)).collect();
     for clause in &q.clauses {
+        match clause {
+            Clause::Match { patterns, .. } => check_pattern_vars(patterns, &mut kinds, false)?,
+            Clause::Create { patterns } => check_pattern_vars(patterns, &mut kinds, true)?,
+            Clause::Merge { pattern, .. } => check_pattern_vars(std::slice::from_ref(pattern), &mut kinds, true)?,
+            _ => {}
+        }
+        check_clause_types(clause, &kinds)?;
         let input = Box::new(op);
         op = match clause {
             Clause::Match {
@@ -591,6 +757,19 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             }
             _ => {}
         }
+        // Keep `kinds` in step with `bound`.
+        let mut next: HashMap<String, VarKind> = HashMap::new();
+        for v in &bound {
+            let kind = match clause {
+                Clause::With(p) | Clause::Return(p) => match p.items.iter().rev().find(|it| &it.alias == v) {
+                    Some(it) => expr_kind(&it.expr, &kinds),
+                    None => kinds.get(v).copied().unwrap_or(VarKind::Unknown),
+                },
+                _ => kinds.get(v).copied().unwrap_or(VarKind::Unknown),
+            };
+            next.insert(v.clone(), kind);
+        }
+        kinds = next;
     }
     // A standalone `CALL` returns what it yields.
     let returns = match q.clauses.last() {

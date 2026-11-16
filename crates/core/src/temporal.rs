@@ -806,6 +806,112 @@ impl Temporal {
         })
     }
 
+    /// `date.truncate(unit, t, fields)`, `datetime.truncate(…)`, …: `t` as a `kind`
+    /// value, cut down to the start of its `unit` (`millennium`, `century`, `decade`,
+    /// `year`, `weekYear`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`,
+    /// `millisecond`, `microsecond`); then `fields` are set as in `kind`'s constructor.
+    pub fn truncate(kind: TemporalKind, unit: &str, t: &Temporal, fields: &BTreeMap<String, Value>) -> Result<Temporal> {
+        let what = format!("{}.truncate", kind.function());
+        // The unit's rank: date units truncate the date, then 0 is `day`, and time units
+        // count up to `microsecond`.
+        const UNITS: [&str; 14] = [
+            "millennium", "century", "decade", "year", "weekyear", "quarter", "month", "week", "day", "hour",
+            "minute", "second", "millisecond", "microsecond",
+        ];
+        let lower = unit.to_ascii_lowercase();
+        let rank = UNITS
+            .iter()
+            .position(|u| *u == lower)
+            .ok_or_else(|| err(format!("{what}(): unknown unit `{unit}`")))?;
+        let has_date = matches!(kind, TemporalKind::Date | TemporalKind::LocalDateTime | TemporalKind::DateTime);
+        let has_time = !matches!(kind, TemporalKind::Date);
+        if kind == TemporalKind::Duration || (!has_time && rank > 8) || (!has_date && rank < 8) {
+            return Err(err(format!("{what}(): cannot truncate to `{unit}`")));
+        }
+        let bad = || Error::Type(format!("{what}() cannot truncate a {}", t.type_name()));
+        let days = match has_date {
+            true => {
+                let d = t.date_days().ok_or_else(bad)?;
+                let (y, m, _) = civil_from_days(d);
+                Some(match rank {
+                    0..=2 => {
+                        let step = [1000, 100, 10][rank];
+                        days_from_civil(y.div_euclid(step) * step, 1, 1)
+                    }
+                    3 => days_from_civil(y, 1, 1),
+                    4 => week_one(iso_week(d).0),
+                    5 => days_from_civil(y, (m - 1) / 3 * 3 + 1, 1),
+                    6 => days_from_civil(y, m, 1),
+                    7 => d - (weekday(d) - 1),
+                    _ => d,
+                })
+            }
+            false => None,
+        };
+        let nanos = match has_time {
+            true => {
+                let n = t.time_nanos().or(days.map(|_| 0)).ok_or_else(bad)?;
+                let step = match rank {
+                    0..=8 => NANOS_PER_DAY,
+                    9 => 3600 * NANOS_PER_SECOND,
+                    10 => 60 * NANOS_PER_SECOND,
+                    11 => NANOS_PER_SECOND,
+                    12 => 1_000_000,
+                    _ => 1000,
+                };
+                Some(n - n % step)
+            }
+            false => None,
+        };
+        let offset = t.offset().unwrap_or(0);
+        let base = match kind {
+            TemporalKind::Date => Temporal::Date(days.unwrap()),
+            TemporalKind::LocalTime => Temporal::LocalTime(nanos.unwrap()),
+            TemporalKind::Time => Temporal::Time { nanos: nanos.unwrap(), offset },
+            TemporalKind::LocalDateTime => Temporal::LocalDateTime { days: days.unwrap(), nanos: nanos.unwrap() },
+            _ => Temporal::DateTime { days: days.unwrap(), nanos: nanos.unwrap(), offset },
+        };
+        if fields.is_empty() {
+            return Ok(base);
+        }
+        // The truncated value as constructor fields, with `fields` over them. A
+        // `nanosecond` adds to the milli- and microseconds that are left.
+        let mut m = BTreeMap::new();
+        if let Some(d) = days {
+            if fields.contains_key("week") || fields.contains_key("dayOfWeek") {
+                let (wy, w) = iso_week(d);
+                m.insert("year".to_string(), Value::Int(wy));
+                m.insert("week".to_string(), Value::Int(w));
+                m.insert("dayOfWeek".to_string(), Value::Int(weekday(d)));
+            } else {
+                let (y, mo, dd) = civil_from_days(d);
+                m.insert("year".to_string(), Value::Int(y));
+                m.insert("month".to_string(), Value::Int(mo as i64));
+                m.insert("day".to_string(), Value::Int(dd as i64));
+            }
+        }
+        if let Some(n) = nanos {
+            let s = n / NANOS_PER_SECOND;
+            let sub = n % NANOS_PER_SECOND;
+            for (k, v) in [
+                ("hour", s / 3600),
+                ("minute", s / 60 % 60),
+                ("second", s % 60),
+                ("millisecond", sub / 1_000_000),
+                ("microsecond", sub / 1000 % 1000),
+            ] {
+                m.insert(k.to_string(), Value::Int(v));
+            }
+        }
+        if matches!(kind, TemporalKind::Time | TemporalKind::DateTime) {
+            m.insert("timezone".to_string(), Value::String(offset_text(offset)));
+        }
+        for (k, v) in fields {
+            m.insert(k.clone(), v.clone());
+        }
+        Self::from_map(kind, &m)
+    }
+
     /// `datetime.fromepoch(seconds, nanos)`.
     pub fn from_epoch_nanos(nanos: i128) -> Result<Temporal> {
         let days = nanos.div_euclid(NANOS_PER_DAY as i128);
@@ -1013,9 +1119,14 @@ fn write_fraction(f: &mut fmt::Formatter<'_>, nanos: i64) -> fmt::Result {
     }
 }
 
+/// `HH:MM`, plus `:SS` and a fraction when they are not zero (as Java and Neo4j).
 fn write_time(f: &mut fmt::Formatter<'_>, n: i64) -> fmt::Result {
     let s = n / NANOS_PER_SECOND;
-    write!(f, "{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)?;
+    write!(f, "{:02}:{:02}", s / 3600, s / 60 % 60)?;
+    if n % (60 * NANOS_PER_SECOND) == 0 {
+        return Ok(());
+    }
+    write!(f, ":{:02}", s % 60)?;
     write_fraction(f, n % NANOS_PER_SECOND)
 }
 
@@ -1253,10 +1364,8 @@ impl Duration {
     /// A duration field: totals per unit within its group (`months`, `days`, `seconds`
     /// …), or the remainder within the next larger unit (`monthsOfYear`, …).
     pub fn field(&self, key: &str) -> Option<Value> {
-        let secs = self.seconds;
-        let n = self.nanos as i64;
-        // Whole seconds toward zero, with the sub-second part of the same sign.
-        let (ts, tn) = if secs < 0 && n > 0 { (secs + 1, n - NANOS_PER_SECOND) } else { (secs, n) };
+        // Whole seconds rounded down, with a non-negative sub-second part (as Neo4j).
+        let (ts, tn) = (self.seconds, self.nanos as i64);
         let v = match key {
             "years" => self.months / 12,
             "quarters" => self.months / 3,
@@ -1318,7 +1427,11 @@ impl fmt::Display for Duration {
         }
         if s != 0 || frac != 0 {
             write!(f, "{sign}{s}")?;
-            write_fraction(f, frac)?;
+            if frac != 0 {
+                // All the digits a duration needs, no trailing zeros: `0.5S`, `0.001S`.
+                let digits = format!("{frac:09}");
+                write!(f, ".{}", digits.trim_end_matches('0'))?;
+            }
             f.write_str("S")?;
         }
         Ok(())
@@ -1361,21 +1474,21 @@ mod tests {
             (K::Date, "+12345-01-01", "+12345-01-01"),
             (K::LocalTime, "12:31:14.645876123", "12:31:14.645876123"),
             (K::LocalTime, "123114.5", "12:31:14.500"),
-            (K::LocalTime, "12:31", "12:31:00"),
-            (K::LocalTime, "12", "12:00:00"),
+            (K::LocalTime, "12:31", "12:31"),
+            (K::LocalTime, "12", "12:00"),
             (K::Time, "12:31:14+01:00", "12:31:14+01:00"),
             (K::Time, "12:31:14", "12:31:14Z"),
             (K::Time, "12:31:14-0530", "12:31:14-05:30"),
             (K::LocalDateTime, "2015-07-21T21:40:32.142", "2015-07-21T21:40:32.142"),
-            (K::LocalDateTime, "2015-07-21", "2015-07-21T00:00:00"),
+            (K::LocalDateTime, "2015-07-21", "2015-07-21T00:00"),
             (K::DateTime, "2015-07-21T21:40:32.142+01:00", "2015-07-21T21:40:32.142+01:00"),
-            (K::DateTime, "2015-07-21T21:40Z", "2015-07-21T21:40:00Z"),
+            (K::DateTime, "2015-07-21T21:40Z", "2015-07-21T21:40Z"),
             (K::Duration, "P14DT16H12M", "P14DT16H12M"),
-            (K::Duration, "P1Y2M10DT2H30M15.5S", "P1Y2M10DT2H30M15.500S"),
+            (K::Duration, "P1Y2M10DT2H30M15.5S", "P1Y2M10DT2H30M15.5S"),
             (K::Duration, "PT0S", "PT0S"),
             (K::Duration, "P0.5D", "PT12H"),
             (K::Duration, "P1W", "P7D"),
-            (K::Duration, "PT-1.5S", "PT-1.500S"),
+            (K::Duration, "PT-1.5S", "PT-1.5S"),
             (K::Duration, "-P1D", "P-1D"),
         ] {
             assert_eq!(p(k, text).to_string(), shown, "{text}");
@@ -1411,8 +1524,8 @@ mod tests {
         assert_eq!(plus(K::Date, "2020-01-31", "P1M"), "2020-02-29");
         assert_eq!(plus(K::Date, "2020-01-31", "P1M1D"), "2020-03-01");
         assert_eq!(plus(K::Date, "2020-01-01", "PT47H"), "2020-01-02");
-        assert_eq!(plus(K::LocalTime, "23:00", "PT2H"), "01:00:00");
-        assert_eq!(plus(K::LocalDateTime, "2020-12-31T23:00", "PT2H"), "2021-01-01T01:00:00");
+        assert_eq!(plus(K::LocalTime, "23:00", "PT2H"), "01:00");
+        assert_eq!(plus(K::LocalDateTime, "2020-12-31T23:00", "PT2H"), "2021-01-01T01:00");
         assert_eq!(plus(K::DateTime, "2020-03-01T00:00+02:00", "-PT1S"), "2020-02-29T23:59:59+02:00");
         assert_eq!(d("P1DT1H").scale(1.5).unwrap().to_string(), "P1DT13H30M");
         assert_eq!(d("P1M").scale(0.5).unwrap().to_string(), "P15DT5H14M33S");
@@ -1425,7 +1538,7 @@ mod tests {
         assert_eq!(b("2020-01-31T10:00", "2020-03-01T09:00", BetweenUnit::All), "P1MT23H");
         assert_eq!(b("2020-01-31T10:00", "2020-03-01T09:00", BetweenUnit::Days), "P29D");
         assert_eq!(b("2020-03-01", "2020-01-31", BetweenUnit::All), "P-1M-1D");
-        assert_eq!(b("2020-01-01", "2020-01-02T00:00:00.5", BetweenUnit::Seconds), "PT24H0.500S");
+        assert_eq!(b("2020-01-01", "2020-01-02T00:00:00.5", BetweenUnit::Seconds), "PT24H0.5S");
         let z = Temporal::between(
             &p(K::DateTime, "2020-01-01T00:00+01:00"),
             &p(K::DateTime, "2020-01-01T00:00Z"),

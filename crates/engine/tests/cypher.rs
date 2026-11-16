@@ -584,6 +584,79 @@ fn semantic_errors() {
 }
 
 #[test]
+fn compile_time_type_errors() {
+    let db = db_with("CREATE (:A)-[:R]->(:B)");
+    for bad in [
+        "RETURN NOT 1",
+        "RETURN NOT {}",
+        "RETURN [] AND true",
+        "RETURN false OR 'x'",
+        "RETURN true XOR 1.5",
+        "RETURN 'a' % 2",
+        "RETURN 1 IN 'abc'",
+        "RETURN none(x IN ['a', 'b'] WHERE x % 2 = 0)",
+        "MATCH (n) RETURN length(n)",
+        "MATCH ()-[r]->() RETURN length(r)",
+        "MATCH p = ()-->() RETURN size(p)",
+        "MATCH (n) WHERE n RETURN n",
+        "MATCH (n) RETURN type(n)",
+        "MATCH p = ()-->() RETURN labels(p)",
+        "MATCH p = ()-->() WHERE p.name = 'x' RETURN p",
+        "MATCH (n) DELETE 1 + 1",
+    ] {
+        assert!(matches!(db.execute(bad), Err(Error::Semantic(_))), "{bad}");
+    }
+    for bad in ["WITH 123 AS x RETURN x.num", "WITH [1, true] AS x RETURN x.num", "RETURN range(0.0, 1)"] {
+        assert!(matches!(db.execute(bad), Err(Error::Type(_))), "{bad}");
+    }
+    // Types not known before the query runs are left to the runtime.
+    for good in [
+        "RETURN NOT null, null AND true, 1 IN null",
+        "WITH $p AS x RETURN x",
+        "MATCH (n) RETURN NOT n.flag",
+        "RETURN date('2020-01-02') - duration('P1D')",
+        "RETURN size('abc'), size([1]), length('abc')",
+        "MATCH p = ()-->() RETURN length(p), size(nodes(p))",
+        "MATCH (n) RETURN properties(n), labels(n)",
+    ] {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("p".to_string(), graphbuff::Value::Int(1));
+        db.execute_with_params(good, &params).unwrap_or_else(|e| panic!("`{good}` failed: {e}"));
+    }
+}
+
+#[test]
+fn pattern_variable_kinds() {
+    let db = db_with("CREATE (:A)-[:R]->(:B)-[:R]->(:C)");
+    for bad in [
+        // A variable keeps its kind (VariableTypeConflict).
+        "MATCH ()-[r]-() MATCH (r) RETURN r",
+        "MATCH (r) MATCH ()-[r]-() RETURN r",
+        "MATCH p = ()-[]-() MATCH (p) RETURN p",
+        "MATCH ()-[r]-(r) RETURN r",
+        "MATCH (n) WITH [n] AS users MATCH (users)-->(m) RETURN m",
+        "WITH 1 AS n MATCH (n) RETURN n",
+        // A path variable must be new; a relationship is used once (VariableAlreadyBound).
+        "MATCH (p)-[]-() MATCH p = ()-[]-() RETURN p",
+        "MATCH p = (p)-[]-() RETURN p",
+        "MATCH ()-[r]->()-[r]->() RETURN r",
+        "MATCH (a) CREATE (a:L)",
+        "MATCH ()-[r]->() CREATE ()-[r:R]->()",
+    ] {
+        assert!(matches!(db.execute(bad), Err(Error::Semantic(_))), "{bad}");
+    }
+    for good in [
+        "MATCH (a)-[r]->(b) MATCH (a)-[r]->(c) RETURN a, b, c",
+        "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 MATCH (x)-[rs*]->(y) RETURN x, y",
+        "MATCH (a:A) WITH a MATCH (a)-->(b) RETURN b",
+        "MATCH (a:A) CREATE (a)-[:S]->(:D)",
+        "WITH null AS n MATCH (n) RETURN n",
+    ] {
+        run(&db, good);
+    }
+}
+
+#[test]
 fn table_output() {
     let db = db_with("CREATE (:P {name: 'Ann'})");
     let table = run(&db, "MATCH (p:P) RETURN p.name AS name, 1 AS one").to_table();

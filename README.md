@@ -896,6 +896,12 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
+**openCypher TCK:** 3,485 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (89.5 %).
+The TCK is the official compatibility suite for openCypher. Most failures are named time
+zones and the test procedures of `CALL`. The TCK
+checks errors only by category, not by detail code. The suite and the full table per
+feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
+
 * **Clauses:** `MATCH`, `OPTIONAL MATCH`, `WHERE`, `CREATE`, `MERGE` (+ `ON CREATE SET` / `ON MATCH SET`),
   `SET` (`n.p = v`, `n = {…}`, `n += {…}`, `n:Label`), `REMOVE`, `DELETE`, `DETACH DELETE`,
   `UNWIND`, `WITH`, `RETURN`, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, `UNION [ALL]`,
@@ -979,7 +985,9 @@ DROP CONSTRAINT user_id;
   `dt.epochMillis`, `dur.months`, `dur.minutesOfHour`. Arithmetic: temporal `±` duration (months
   first, clamped to the month's end; then days; then seconds), duration `±` duration, duration
   `*` and `/` a number; `duration.between(a, b)`, `duration.inMonths/inDays/inSeconds`,
-  `datetime.fromepoch(s, ns)`, `datetime.fromepochmillis(ms)`. Values of one kind compare (zoned
+  `datetime.fromepoch(s, ns)`, `datetime.fromepochmillis(ms)`, `date.truncate('week', d,
+  {dayOfWeek: 2})` and the other `*.truncate` functions (`millennium` … `microsecond`). Output
+  follows Neo4j: `12:00`, not `12:00:00`; durations drop trailing zeros (`PT0.5S`). Values of one kind compare (zoned
   values by instant: `datetime('…T01:00+01:00') = datetime('…T00:00Z')`); durations only test
   equality. They can be stored as properties (and in lists) and indexed for equality. Time zones
   are UTC offsets only: named zones such as `[Europe/Paris]` need a time zone database and
@@ -998,7 +1006,7 @@ DROP CONSTRAINT user_id;
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship
-constraints, named time zones, `date.truncate` and the other temporal truncation functions,
+constraints, named time zones,
 spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).
 

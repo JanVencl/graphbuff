@@ -78,7 +78,7 @@ fn movies(t: &TempDir) -> ImportOptions {
     let other = t.file(
         "other.csv",
         ":START_ID(Person),:END_ID(Movie),:TYPE,since:datetime\n\
-         p3,m1,DIRECTED,1998-01-01T10:00:00Z\n\
+         p3,m1,DIRECTED,1998-01-01T10:00Z\n\
          p3,m2,DIRECTED,\n\
          p1,p2,KNOWS_WRONG_SPACE,\n",
     );
@@ -142,7 +142,7 @@ fn imports_a_database_into_the_catalog() {
     );
     assert_eq!(
         run(&mut s, "MATCH (:Director)-[d:DIRECTED]->(m) RETURN m.title, d.since ORDER BY m.title"),
-        ["\"The Matrix\", 1998-01-01T10:00:00Z", "\"The Matrix, Reloaded\", null"]
+        ["\"The Matrix\", 1998-01-01T10:00Z", "\"The Matrix, Reloaded\", null"]
     );
     // The indexes exist and are used.
     let explained = s
