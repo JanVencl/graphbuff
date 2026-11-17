@@ -29,7 +29,7 @@ def _mark(status):
 
 
 def before_all(context):
-    context.server = Server().start()
+    context.server = Server(["--test-procedures"]).start()
     context.tck_results = []
 
 

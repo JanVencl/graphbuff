@@ -2135,6 +2135,22 @@ fn validate_aggregates(p: &Projection) -> Result<()> {
             "aggregate functions are not allowed inside a list comprehension".into(),
         ));
     }
+    // An aggregate of a random value is not well defined.
+    let mut random = false;
+    for e in p.items.iter().map(|it| &it.expr) {
+        e.walk(&mut |x| {
+            if let Expr::Function { args, .. } = x {
+                if x.is_aggregate_call() {
+                    for a in args {
+                        a.walk(&mut |y| random |= matches!(y, Expr::Function { name, .. } if name == "rand"));
+                    }
+                }
+            }
+        });
+    }
+    if random {
+        return Err(Error::Semantic("rand() cannot be used inside an aggregate function".into()));
+    }
     let aggregates = p.items.iter().any(|it| it.expr.contains_aggregate());
     for s in &p.order_by {
         let key = if aggregates { sort_key_over_items(&s.expr, &p.items)? } else { s.expr.clone() };
@@ -2181,6 +2197,11 @@ fn validate_clause_order(q: &SingleQuery) -> Result<()> {
         }
         if let Clause::With(p) | Clause::Return(p) = c {
             validate_aggregates(p)?;
+        }
+        if let Clause::CallProcedure { args: Some(args), .. } = c {
+            if args.iter().any(Expr::contains_aggregate) {
+                return Err(Error::Semantic("aggregate functions are not allowed in procedure arguments".into()));
+            }
         }
     }
     let last = &q.clauses[n - 1];

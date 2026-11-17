@@ -10,6 +10,7 @@ property as an (entity, key, value) triple).
 
 import json
 import os
+import re
 
 from behave import step, use_step_matcher
 
@@ -123,7 +124,28 @@ def parameters(context):
 
 @step(r"there exists a procedure (?P<signature>.+):")
 def procedure(context, signature):
-    raise NotImplementedError("test procedures cannot be registered over HTTP")
+    """`test.my.proc(in :: INTEGER?) :: (out :: STRING?)` with a table of inputs and
+    outputs, added through the server's test-procedure endpoint (--test-procedures)."""
+    m = re.fullmatch(r"\s*([\w.]+)\((.*)\)\s*::\s*\((.*)\)\s*", signature)
+    if not m:
+        raise ValueError(f"cannot read the procedure signature `{signature}`")
+    name, inputs, outputs = m.group(1), _field_names(m.group(2)), _field_names(m.group(3))
+    rows = _rows(context.table)[1:] if context.table is not None else []
+    body = {
+        "name": name,
+        "inputs": inputs,
+        "outputs": outputs,
+        "rows": [[tck_values.to_param(tck_values.parse(c)) for c in row] for row in rows],
+    }
+    server = context.server
+    answer = server.http.post(f"{server.url}/db/{DB}/test-procedure", json=body, timeout=30).json()
+    if "error" in answer:
+        raise AssertionError(f"registering {name} failed: {answer['error']}")
+
+
+def _field_names(text):
+    """`a :: INTEGER?, b :: STRING?` → ['a', 'b']."""
+    return [f.split("::")[0].strip() for f in text.split(",") if f.strip()]
 
 
 # ---- execution --------------------------------------------------------------------------

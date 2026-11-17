@@ -152,3 +152,15 @@ fn comparisons_columns_and_merge() {
     assert_eq!(rows(&db, "MATCH (a:A) WITH DISTINCT a.n AS n WHERE a.n = 1 RETURN n"), ["1"]);
     assert_eq!(rows(&db, "CREATE () WITH * RETURN 1"), ["1"]);
 }
+
+#[test]
+fn deleted_entities_and_procedure_arguments() {
+    let db = db_with("CREATE (:A {num: 1})-[:T {num: 2}]->(:B)");
+    assert_eq!(rows(&db, "MATCH ()-[r]->() DELETE r RETURN type(r)"), ["\"T\""]);
+    for q in ["MATCH (n:A) DETACH DELETE n RETURN n.num", "MATCH (n:B) DETACH DELETE n RETURN labels(n)"] {
+        assert!(matches!(db_with("CREATE (:A {num: 1})-[:T]->(:B)").execute(q), Err(Error::Runtime(_))), "{q}");
+    }
+    let db = Database::in_memory();
+    semantic_error(&db, "RETURN count(rand())");
+    semantic_error(&db, "UNWIND [1] AS x CALL db.labels(count(x)) YIELD label RETURN label");
+}

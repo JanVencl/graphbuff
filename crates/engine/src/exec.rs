@@ -918,8 +918,12 @@ impl Executor<'_> {
             }
         }
         for r in rels {
+            let ty = self.store().relationship_type(r)?;
             if self.store_mut()?.delete_relationship(r)? {
                 self.stats.relationships_deleted += 1;
+                if let Some(ty) = ty {
+                    self.deleted_rels.insert(r, ty);
+                }
             }
         }
         for n in nodes {
@@ -929,6 +933,7 @@ impl Executor<'_> {
                 0
             };
             if self.store_mut()?.delete_node(n, detach)? {
+                self.deleted_nodes.insert(n);
                 self.stats.nodes_deleted += 1;
                 self.stats.relationships_deleted += degree;
             }

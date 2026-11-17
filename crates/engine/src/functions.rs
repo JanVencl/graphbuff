@@ -116,7 +116,10 @@ impl Executor<'_> {
                 arity(name, &args, 1, 1)?;
                 match a0 {
                     Value::Null => Ok(Value::Null),
-                    Value::Node(id) => Ok(Value::from(store.node_labels(id)?)),
+                    Value::Node(id) => {
+                        self.check_not_deleted(&a0)?;
+                        Ok(Value::from(store.node_labels(id)?))
+                    }
                     o => Err(wrong_type(name, &o)),
                 }
             }
@@ -124,14 +127,17 @@ impl Executor<'_> {
                 arity(name, &args, 1, 1)?;
                 match a0 {
                     Value::Null => Ok(Value::Null),
-                    Value::Rel(id) => Ok(store
-                        .relationship_type(id)?
-                        .map_or(Value::Null, Value::String)),
+                    Value::Rel(id) => Ok(match store.relationship_type(id)? {
+                        Some(t) => Value::String(t),
+                        // A relationship deleted by this query keeps its type.
+                        None => self.deleted_rels.get(&id).cloned().map_or(Value::Null, Value::String),
+                    }),
                     o => Err(wrong_type(name, &o)),
                 }
             }
             "keys" | "properties" => {
                 arity(name, &args, 1, 1)?;
+                self.check_not_deleted(&a0)?;
                 let props: BTreeMap<String, Value> = match a0 {
                     Value::Null => return Ok(Value::Null),
                     Value::Node(id) => store.node_properties(id)?,

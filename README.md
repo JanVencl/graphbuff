@@ -896,9 +896,10 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,836 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (98.5 %).
-The TCK is the official compatibility suite for openCypher. The largest group of failures
-is the test procedures of `CALL`, which cannot be registered over HTTP. The TCK
+**openCypher TCK:** 3,889 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (99.8 %).
+The TCK is the official compatibility suite for openCypher. The remaining failures expect
+compile-time errors graphbuff does not raise: typed procedure arguments, and expressions
+that mix an aggregate with a variable that is not a grouping key. The TCK
 checks errors only by category, not by detail code. The suite and the full table per
 feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 

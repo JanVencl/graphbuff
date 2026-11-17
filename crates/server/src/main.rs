@@ -57,6 +57,8 @@ Options:
   --log-level LEVEL    error, warn, info (default) or debug (also every connection);
                        also: env GRAPHBUFF_LOG_LEVEL
   --slow-query MS      log queries that take at least MS milliseconds to query.log
+  --test-procedures    for compatibility tests only: admins may add procedures that
+                       answer from a fixed table (POST /db/{name}/test-procedure)
   -h, --help           show this help
 
 Endpoints:
@@ -217,6 +219,7 @@ fn main() {
             "--bind" => config.bind = value("--bind"),
             "--data" => data = Some(value("--data")),
             "--in-memory" => in_memory = true,
+            "--test-procedures" => config.test_procedures = true,
             "--log-dir" => log_dir = Some(value("--log-dir")),
             "--log-level" => log_level = Some(value("--log-level")),
             "--slow-query" => {

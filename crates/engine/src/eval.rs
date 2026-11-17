@@ -516,6 +516,7 @@ impl Executor<'_> {
     }
 
     pub fn property_of(&self, v: &Value, key: &str) -> Result<Value> {
+        self.check_not_deleted(v)?;
         Ok(match v {
             Value::Null => Value::Null,
             Value::Node(id) => self.store().node_property(*id, key)?.unwrap_or_default(),
