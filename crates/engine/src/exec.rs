@@ -610,6 +610,7 @@ impl Executor<'_> {
             self.check_interrupt()?;
             row.resize(scope.len(), Value::Null);
             let bound = initial_bound(old_len, scope.len());
+            self.check_merge_props(&scope, pattern, &row)?;
             let mut matches: Vec<Row> = Vec::new();
             let mut st = MatchState::new(row.clone(), bound.clone());
             self.match_parts(
@@ -624,7 +625,14 @@ impl Executor<'_> {
             )?;
             if matches.is_empty() {
                 let mut bound = bound;
-                self.create_part(&scope, pattern, &mut row, &mut bound)?;
+                // An undirected relationship is created pointing left to right.
+                let mut created = pattern.clone();
+                for (r, _) in &mut created.chain {
+                    if r.direction == RelDirection::Both {
+                        r.direction = RelDirection::Right;
+                    }
+                }
+                self.create_part(&scope, &created, &mut row, &mut bound)?;
                 for item in on_create {
                     self.apply_set(item, &scope, &row)?;
                 }
@@ -639,6 +647,20 @@ impl Executor<'_> {
             }
         }
         Ok(Frame::new(scope, out))
+    }
+
+    /// MERGE cannot match or create a property whose value is null.
+    fn check_merge_props(&self, scope: &Scope, pattern: &PatternPart, row: &Row) -> Result<()> {
+        let nodes = std::iter::once(&pattern.start).chain(pattern.chain.iter().map(|(_, n)| n));
+        let props = nodes
+            .filter_map(|n| n.props.as_ref())
+            .chain(pattern.chain.iter().filter_map(|(r, _)| r.props.as_ref()));
+        for e in props {
+            if let Some((k, _)) = self.eval_map(e, &Env::new(scope, row))?.iter().find(|(_, v)| v.is_null()) {
+                return Err(Error::Semantic(format!("MERGE cannot use a null value for property `{k}`")));
+            }
+        }
+        Ok(())
     }
 
     fn create_part(
@@ -922,12 +944,10 @@ impl Executor<'_> {
     pub(crate) fn projection_items(&self, star: bool, items: &[Item], scope: &Scope) -> Result<(Vec<Item>, Scope)> {
         let mut all: Vec<Item> = Vec::new();
         if star {
-            if scope.len() == 0 {
-                return Err(Error::Semantic(
-                    "RETURN * / WITH * requires at least one variable in scope".into(),
-                ));
-            }
-            for name in scope.names() {
+            // `*` lists the variables in alphabetical order.
+            let mut names = scope.names().to_vec();
+            names.sort();
+            for name in &names {
                 all.push((name.clone(), Expr::Var(name.clone())));
             }
         }

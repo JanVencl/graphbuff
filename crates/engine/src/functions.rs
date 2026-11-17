@@ -73,6 +73,13 @@ fn next_random() -> f64 {
 }
 
 impl Executor<'_> {
+    /// Whether `name` is a function (not an aggregate): calling it with no arguments
+    /// fails with anything but "unknown function". Functions without arguments only read
+    /// the clock or the random generator.
+    pub(crate) fn function_exists(&self, name: &str) -> bool {
+        !matches!(self.call_function(name, Vec::new()), Err(Error::Semantic(m)) if m.starts_with("unknown function"))
+    }
+
     pub fn call_function(&self, name: &str, args: Vec<Value>) -> Result<Value> {
         let a0 = args.first().cloned().unwrap_or_default();
         let store = self.store();
@@ -334,6 +341,7 @@ impl Executor<'_> {
                 Ok(match a0 {
                     Value::Int(i) => Value::Int(i),
                     Value::Float(f) if f.is_finite() => Value::Int(f.trunc() as i64),
+                    Value::Float(_) => Value::Null,
                     Value::Bool(b) => Value::Int(b as i64),
                     Value::String(s) => {
                         let s = s.trim();
@@ -342,7 +350,10 @@ impl Executor<'_> {
                             .or_else(|_| s.parse::<f64>().map(|f| Value::Int(f.trunc() as i64)))
                             .unwrap_or(Value::Null)
                     }
-                    _ => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
             "tofloat" | "tofloatornull" => {
@@ -355,7 +366,10 @@ impl Executor<'_> {
                         .parse::<f64>()
                         .map(Value::Float)
                         .unwrap_or(Value::Null),
-                    _ => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
             "toboolean" | "tobooleanornull" => {
@@ -367,7 +381,11 @@ impl Executor<'_> {
                     Value::String(s) if s.trim().eq_ignore_ascii_case("false") => {
                         Value::Bool(false)
                     }
-                    _ => Value::Null,
+                    Value::String(_) => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
 

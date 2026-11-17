@@ -896,7 +896,7 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,773 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (96.8 %).
+**openCypher TCK:** 3,836 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (98.5 %).
 The TCK is the official compatibility suite for openCypher. The largest group of failures
 is the test procedures of `CALL`, which cannot be registered over HTTP. The TCK
 checks errors only by category, not by detail code. The suite and the full table per

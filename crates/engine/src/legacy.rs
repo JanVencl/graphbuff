@@ -221,12 +221,10 @@ impl Executor<'_> {
     fn legacy_projection(&mut self, proj: &Projection, frame: Frame, cap: Option<usize>) -> Result<Frame> {
         let mut items: Vec<(String, Expr)> = Vec::new();
         if proj.star {
-            if frame.scope.len() == 0 {
-                return Err(Error::Semantic(
-                    "RETURN * / WITH * requires at least one variable in scope".into(),
-                ));
-            }
-            for name in frame.scope.names() {
+            // `*` lists the variables in alphabetical order.
+            let mut names = frame.scope.names().to_vec();
+            names.sort();
+            for name in &names {
                 items.push((name.clone(), Expr::Var(name.clone())));
             }
         }

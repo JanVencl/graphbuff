@@ -497,8 +497,9 @@ fn ty_env(kinds: &HashMap<String, VarKind>) -> TyEnv {
 }
 
 /// Compile-time check that a clause reads only variables in scope (`UndefinedVariable`).
-fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
-    let defined = |e: &Expr, env: &TyEnv| typecheck::check_defined(e, env);
+fn check_clause_vars(clause: &Clause, env: &TyEnv, ex: &Executor) -> Result<()> {
+    let known = |name: &str| ex.function_exists(name);
+    let defined = |e: &Expr, env: &TyEnv| typecheck::check_defined(e, env, &known);
     let var = |v: &str| {
         if env.contains_key(v) {
             Ok(())
@@ -506,12 +507,23 @@ fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
             Err(Error::Semantic(format!("variable `{v}` not defined")))
         }
     };
+    // A pattern is a predicate, not a value (`RETURN (n)-->()`).
+    let value = |e: &Expr| {
+        if matches!(e, Expr::PatternPredicate(_)) {
+            Err(Error::Semantic(
+                "a pattern can only be used as a predicate (in WHERE, or with exists())".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let set_items = |items: &[SetItem]| -> Result<()> {
         for it in items {
             match it {
-                SetItem::Property { var: v, value, .. } | SetItem::Replace { var: v, value } | SetItem::Merge { var: v, value } => {
+                SetItem::Property { var: v, value: x, .. } | SetItem::Replace { var: v, value: x } | SetItem::Merge { var: v, value: x } => {
                     var(v)?;
-                    defined(value, env)?;
+                    value(x)?;
+                    defined(x, env)?;
                 }
                 SetItem::Labels { var: v, .. } => var(v)?,
             }
@@ -532,6 +544,17 @@ fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
     };
     match clause {
         Clause::Match { patterns, where_, .. } => {
+            let param_map = patterns.iter().any(|part| {
+                std::iter::once(&part.start)
+                    .chain(part.chain.iter().map(|(_, n)| n))
+                    .any(|n| matches!(n.props, Some(Expr::Param(_))))
+                    || part.chain.iter().any(|(r, _)| matches!(r.props, Some(Expr::Param(_))))
+            });
+            if param_map {
+                return Err(Error::Semantic(
+                    "a parameter cannot stand for the properties of a MATCH pattern; write `{key: $param.key}`".into(),
+                ));
+            }
             pattern_props(patterns)?;
             if let Some(w) = where_ {
                 defined(w, env)?;
@@ -556,6 +579,7 @@ fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
         Clause::With(p) | Clause::Return(p) => {
             let mut after = env.clone();
             for it in &p.items {
+                value(&it.expr)?;
                 defined(&it.expr, env)?;
                 after.insert(it.alias.clone(), Ty::Any);
             }
@@ -572,7 +596,12 @@ fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
                 }
             }
             if let Some(w) = &p.where_ {
-                defined(w, &after)?;
+                if grouped && !p.star {
+                    let only: TyEnv = p.items.iter().map(|it| (it.alias.clone(), Ty::Any)).collect();
+                    defined(&sort_key_over_items(w, &p.items)?, &only)?;
+                } else {
+                    defined(w, &after)?;
+                }
             }
         }
         _ => {}
@@ -581,9 +610,9 @@ fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
 }
 
 /// Compile-time type checks of a clause's expressions (see [`crate::typecheck`]).
-fn check_clause_types(clause: &Clause, kinds: &HashMap<String, VarKind>) -> Result<()> {
+fn check_clause_types(clause: &Clause, kinds: &HashMap<String, VarKind>, ex: &Executor) -> Result<()> {
     let env = ty_env(kinds);
-    check_clause_vars(clause, &env)?;
+    check_clause_vars(clause, &env, ex)?;
     match clause {
         Clause::Match { where_: Some(w), .. } => typecheck::check_predicate(w, &env)?,
         Clause::With(p) | Clause::Return(p) => {
@@ -643,7 +672,12 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             Clause::Merge { pattern, .. } => check_pattern_vars(std::slice::from_ref(pattern), &mut kinds, true)?,
             _ => {}
         }
-        check_clause_types(clause, &kinds)?;
+        check_clause_types(clause, &kinds, ex)?;
+        if let Clause::Return(p) = clause {
+            if p.star && p.items.is_empty() && bound.is_empty() {
+                return Err(Error::Semantic("RETURN * needs at least one variable in scope".into()));
+            }
+        }
         let input = Box::new(op);
         op = match clause {
             Clause::Match {
@@ -665,6 +699,9 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 return Err(Error::Semantic(
                     "CREATE needs plain labels (`:A:B` or `:A&B`) and a single relationship type".into(),
                 ));
+            }
+            Clause::Merge { pattern, .. } if pattern.chain.iter().any(|(r, _)| r.types.len() != 1 || r.type_expr.is_some()) => {
+                return Err(Error::Semantic("MERGE needs exactly one type for each relationship".into()));
             }
             Clause::Merge { pattern, .. } if has_label_expr(pattern) => {
                 return Err(Error::Semantic(
@@ -833,7 +870,9 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 }
             }
             Clause::With(p) | Clause::Return(p) => {
-                if !p.star {
+                if p.star {
+                    bound.sort();
+                } else {
                     bound.clear();
                 }
                 for it in &p.items {
@@ -1094,7 +1133,8 @@ fn plan_projection(input: Box<Operator>, p: &Projection) -> Operator {
     let filter = |op: Operator| match &p.where_ {
         Some(w) => Operator::Filter {
             input: Box::new(op),
-            predicate: w.clone(),
+            // After DISTINCT or aggregating, parts equal to a projected item read its column.
+            predicate: if sees_source { w.clone() } else { sort_key_over_items(w, &p.items).unwrap_or_else(|_| w.clone()) },
         },
         None => op,
     };

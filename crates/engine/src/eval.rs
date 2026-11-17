@@ -443,6 +443,12 @@ impl Executor<'_> {
                 if a.is_null() || b.is_null() {
                     return Ok(Value::Null);
                 }
+                // NaN is neither smaller nor larger than any number.
+                let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+                let number = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
+                if (nan(&a) || nan(&b)) && number(&a) && number(&b) {
+                    return Ok(Value::Bool(false));
+                }
                 Ok(from_tri(cypher_cmp(&a, &b).map(|o| match op {
                     BinaryOp::Lt => o.is_lt(),
                     BinaryOp::Le => o.is_le(),
@@ -460,7 +466,8 @@ impl Executor<'_> {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => {
                     if a.is_null() {
-                        return Ok(Value::Null);
+                        // Nothing is in an empty list, not even null.
+                        return Ok(if items.is_empty() { Value::Bool(false) } else { Value::Null });
                     }
                     let mut unknown = false;
                     for item in &items {

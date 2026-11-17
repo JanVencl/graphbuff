@@ -42,7 +42,21 @@ def _run(context, query):
 def _rows(table):
     """All rows of a behave table, the heading row included (TCK tables of parameters and
     side effects have no heading)."""
-    return [list(table.headings)] + [list(r.cells) for r in table.rows]
+    # Gherkin escapes in cells: a doubled backslash is one backslash, and a backslash
+    # before a vertical bar is the bar (behave leaves both as written). Other backslashes
+    # belong to the Cypher value.
+    backslash = chr(92)
+
+    def unescape(cell):
+        out, i = [], 0
+        while i < len(cell):
+            if cell[i] == backslash and cell[i + 1:i + 2] in (backslash, "|"):
+                i += 1
+            out.append(cell[i])
+            i += 1
+        return "".join(out)
+
+    return [[unescape(c) for c in row] for row in [table.headings] + [r.cells for r in table.rows]]
 
 
 def _fresh_graph(context):

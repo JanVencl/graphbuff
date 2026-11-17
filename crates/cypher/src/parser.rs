@@ -1124,7 +1124,15 @@ impl<'a> Parser<'a> {
     fn parse_set_items(&mut self) -> Result<Vec<SetItem>> {
         let mut items = Vec::new();
         loop {
+            // `SET (n).name = …`: a parenthesized variable before a property.
+            let parenthesized = self.eat(&Tok::LParen);
             let var = self.ident()?;
+            if parenthesized {
+                self.expect(Tok::RParen, "')'")?;
+                if *self.peek() != Tok::Dot {
+                    return self.err("expected '.' and a property name after the parenthesized variable");
+                }
+            }
             if self.eat(&Tok::Dot) {
                 let key = self.ident()?;
                 self.expect(Tok::Eq, "'='")?;
@@ -1247,10 +1255,10 @@ impl<'a> Parser<'a> {
         if self.eat(&Tok::Star) {
             star = true;
             if self.eat(&Tok::Comma) {
-                items = self.parse_projection_items()?;
+                items = self.parse_projection_items(is_with)?;
             }
         } else {
-            items = self.parse_projection_items()?;
+            items = self.parse_projection_items(is_with)?;
         }
 
         let mut order_by = Vec::new();
@@ -1296,7 +1304,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_projection_items(&mut self) -> Result<Vec<ProjectionItem>> {
+    /// `is_with`: every item other than a plain variable needs `AS`.
+    fn parse_projection_items(&mut self, is_with: bool) -> Result<Vec<ProjectionItem>> {
         let mut items = Vec::new();
         loop {
             let start = self.offset();
@@ -1306,6 +1315,11 @@ impl<'a> Parser<'a> {
                 self.ident()?
             } else if let Expr::Var(name) = &expr {
                 name.clone()
+            } else if is_with {
+                return self.err(format!(
+                    "expression in WITH must be aliased (use AS): {}",
+                    self.src[start..end].trim()
+                ));
             } else {
                 self.src[start..end].trim().to_string()
             };
@@ -1445,8 +1459,8 @@ impl<'a> Parser<'a> {
         let direction = match (left, right) {
             (true, false) => RelDirection::Left,
             (false, true) => RelDirection::Right,
-            (false, false) => RelDirection::Both,
-            (true, true) => return self.err("a relationship cannot point in both directions"),
+            // `<-->` points both ways, which openCypher reads as either direction.
+            (false, false) | (true, true) => RelDirection::Both,
         };
         Ok(RelPattern {
             var,
