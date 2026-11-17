@@ -19,6 +19,7 @@ fn temp_dir(name: &str) -> PathBuf {
 fn start(args: &[&str], env: &[(&str, &Path)]) -> (Child, String) {
     let mut cmd = Command::new(BIN);
     cmd.args(["--bind", "127.0.0.1:0"]).args(args);
+    cmd.env("GRAPHBUFF_CONFIG", "-");
     for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
         cmd.env_remove(key);
     }
@@ -127,7 +128,45 @@ fn log_dir_can_be_elsewhere_and_in_memory_writes_no_files() {
 
 #[test]
 fn in_memory_and_data_exclude_each_other() {
-    let out = Command::new(BIN).args(["--in-memory", "--data", "x"]).output().unwrap();
+    let out = Command::new(BIN).args(["--in-memory", "--data", "x"]).env("GRAPHBUFF_CONFIG", "-").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--in-memory and --data exclude each other"));
+}
+
+#[test]
+fn config_file_sets_data_and_logs_and_is_created_when_missing() {
+    let dir = temp_dir("config");
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("graphbuff.conf");
+    std::fs::write(&conf, "data = db   # relative to the file\nlog-dir = mylogs\nlog-level = warn\n").unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["--bind", "127.0.0.1:0", "--config"]).arg(&conf);
+    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL", "GRAPHBUFF_CONFIG"] {
+        cmd.env_remove(key);
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    stop(child);
+    assert!(line.contains(&format!("data in {}", dir.join("db").display())), "{line}");
+    assert!(dir.join("db").join("catalog").exists());
+    assert!(dir.join("mylogs").join("graphbuff.log").exists());
+
+    // A missing config file is created with every setting commented out.
+    let fresh = dir.join("new").join("graphbuff.conf");
+    let mut cmd = Command::new(BIN);
+    cmd.args(["--bind", "127.0.0.1:0", "--in-memory"]).env("GRAPHBUFF_CONFIG", &fresh);
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    stop(child);
+    let text = std::fs::read_to_string(&fresh).unwrap();
+    assert!(text.contains("# bind = 127.0.0.1:7475"), "{text}");
+
+    let bad = dir.join("bad.conf");
+    std::fs::write(&bad, "nope = 1\n").unwrap();
+    let out = Command::new(BIN).arg("--config").arg(&bad).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown setting `nope`"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

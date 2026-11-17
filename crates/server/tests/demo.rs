@@ -12,6 +12,7 @@ fn demo_movies_is_loaded_at_startup() {
     let mut child = Command::new(BIN)
         .args(["--bind", "127.0.0.1:0", "--in-memory", "--demo", "movies"])
         .env_remove("GRAPHBUFF_TOKEN")
+        .env("GRAPHBUFF_CONFIG", "-")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -52,7 +53,7 @@ fn demo_movies_is_loaded_at_startup() {
 
 #[test]
 fn unknown_demo_is_refused() {
-    let out = Command::new(BIN).args(["--demo", "nope"]).output().unwrap();
+    let out = Command::new(BIN).args(["--demo", "nope"]).env("GRAPHBUFF_CONFIG", "-").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("unknown demo `nope`; available: movies"), "{err}");

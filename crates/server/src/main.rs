@@ -1,5 +1,6 @@
 //! `graphbuff-server` — serves graphbuff databases over HTTP/JSON and Bolt.
 
+mod settings;
 mod signal;
 
 use std::path::PathBuf;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
+use settings::Settings;
 use graphbuff_server::{Level, Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
 
 const USAGE: &str = "\
@@ -16,6 +18,16 @@ usage: graphbuff-server [options]
                                     | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
 
 Options:
+  --config FILE        read settings from FILE (also: env GRAPHBUFF_CONFIG; `-` for none);
+                       default, created with every setting commented out if missing:
+                         Linux    $XDG_CONFIG_HOME/graphbuff/graphbuff.conf
+                                  (~/.config/graphbuff/graphbuff.conf),
+                                  /etc/graphbuff/graphbuff.conf when run as root
+                         macOS    ~/Library/Application Support/graphbuff/graphbuff.conf
+                         Windows  %LOCALAPPDATA%\\graphbuff\\graphbuff.conf
+                       One `key = value` per line, keys are the options below without
+                       `--` (`bind = 0.0.0.0:7475`, `in-memory = true`). The command line
+                       overrides the environment, which overrides the file.
   --bind ADDR          address to listen on (default 127.0.0.1:7475; use 0.0.0.0:7475
                        to accept other machines, together with --token)
   --bolt ADDR          also serve the Bolt protocol (Neo4j drivers) on ADDR, such as
@@ -85,34 +97,6 @@ User accounts (--users):
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users FILE ...`, which
   reads new passwords from env GRAPHBUFF_PASSWORD or the first line of standard input.
   Change the file offline only while no server uses it.";
-
-/// Where databases go without --data or GRAPHBUFF_DATA.
-fn default_data_dir() -> Option<PathBuf> {
-    let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if cfg!(windows) {
-        return env("LOCALAPPDATA").map(|d| d.join("graphbuff"));
-    }
-    if cfg!(target_os = "macos") {
-        return env("HOME").map(|h| h.join("Library/Application Support/graphbuff"));
-    }
-    if running_as_root() {
-        return Some("/var/lib/graphbuff".into());
-    }
-    env("XDG_DATA_HOME")
-        .or_else(|| env("HOME").map(|h| h.join(".local/share")))
-        .map(|d| d.join("graphbuff"))
-}
-
-/// Whether the effective user is root (Linux; elsewhere: no).
-fn running_as_root() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            let uid = s.lines().find(|l| l.starts_with("Uid:"))?.split_whitespace().nth(2)?.to_string();
-            Some(uid == "0")
-        })
-        .unwrap_or(false)
-}
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
@@ -191,117 +175,106 @@ fn main() {
         }
         return;
     }
+    let command_line = Settings::command_line(std::env::args().skip(1)).unwrap_or_else(|e| fail(&e));
+    if command_line.help {
+        println!("{USAGE}");
+        return;
+    }
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let mut settings = Settings::default();
+    // The config file: --config, else GRAPHBUFF_CONFIG, else the default one. It is
+    // created (every setting commented out) when it does not exist.
+    let config_file = match command_line.config.clone().or_else(|| env("GRAPHBUFF_CONFIG")) {
+        Some(f) if f == "-" => None,
+        Some(f) => Some(PathBuf::from(f)),
+        None => settings::default_config_file(),
+    };
+    let config_file: Option<PathBuf> = config_file.and_then(|f| match std::fs::read_to_string(&f) {
+            Ok(text) => {
+                settings.apply_file(&f, &text).unwrap_or_else(|e| fail(&e));
+                Some(f)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let written = f.parent().map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&f, settings::TEMPLATE));
+                match written {
+                    Ok(()) => Some(f),
+                    Err(e) => {
+                        eprintln!("warning: cannot create the config file {}: {e}", f.display());
+                        None
+                    }
+                }
+            }
+            Err(e) => fail(&format!("cannot read the config file {}: {e}", f.display())),
+        });
+    settings.apply_env().unwrap_or_else(|e| fail(&e));
+    settings.apply_command_line(command_line.settings).unwrap_or_else(|e| fail(&e));
+
+    let get = |key: &str| settings.get(key).map(str::to_string);
+    let number = |key: &str, what: &str, positive: bool| -> Option<u64> {
+        settings.get(key).map(|v| {
+            v.parse::<u64>()
+                .ok()
+                .filter(|&n| !positive || n > 0)
+                .unwrap_or_else(|| fail(&format!("--{key} needs a {}number of {what}", if positive { "positive " } else { "" })))
+        })
+    };
     let mut config = ServerConfig {
-        token: std::env::var("GRAPHBUFF_TOKEN").ok().filter(|t| !t.is_empty()),
+        token: get("token"),
+        bolt: get("bolt"),
+        backup_dir: get("backup-dir").map(Into::into),
+        test_procedures: settings.flag("test-procedures"),
         ..ServerConfig::default()
     };
-    let mut data: Option<String> = None;
-    let mut in_memory = false;
-    let mut log_dir: Option<String> = None;
-    let mut log_level: Option<String> = None;
-    let mut slow_query: Option<Duration> = None;
-    let mut persistent = false;
-    let mut sync = SyncPolicy::EveryCommit;
-    let mut import_dir: Option<String> = None;
-    let mut users_file: Option<String> = None;
-    let mut gpu = false;
-    let mut demo: Option<String> = None;
-    let (mut tls_cert, mut tls_key, mut tls_plain): (Option<String>, Option<String>, bool) = (None, None, false);
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        let mut value = |name: &str| args.next().unwrap_or_else(|| fail(&format!("{name} needs a value")));
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return;
-            }
-            "--bind" => config.bind = value("--bind"),
-            "--data" => data = Some(value("--data")),
-            "--in-memory" => in_memory = true,
-            "--test-procedures" => config.test_procedures = true,
-            "--log-dir" => log_dir = Some(value("--log-dir")),
-            "--log-level" => log_level = Some(value("--log-level")),
-            "--slow-query" => {
-                let ms: u64 = value("--slow-query")
-                    .parse()
-                    .unwrap_or_else(|_| fail("--slow-query needs a number of milliseconds"));
-                slow_query = Some(Duration::from_millis(ms));
-            }
-            "--demo" => demo = Some(value("--demo")),
-            "--bolt" => config.bolt = Some(value("--bolt")),
-            "--persistent" => persistent = true,
-            "--gpu" => gpu = true,
-            "--no-fsync" => sync = SyncPolicy::OsBuffered,
-            "--token" => config.token = Some(value("--token")),
-            "--import-dir" => import_dir = Some(value("--import-dir")),
-            "--backup-dir" => config.backup_dir = Some(value("--backup-dir").into()),
-            "--users" => users_file = Some(value("--users")),
-            "--tls-cert" => tls_cert = Some(value("--tls-cert")),
-            "--tls-key" => tls_key = Some(value("--tls-key")),
-            "--tls-allow-plain" => tls_plain = true,
-            "--max-connections" => {
-                config.max_connections = value("--max-connections")
-                    .parse()
-                    .unwrap_or_else(|_| fail("--max-connections needs a number"));
-            }
-            "--keep-alive" => {
-                let secs: u64 = value("--keep-alive")
-                    .parse()
-                    .unwrap_or_else(|_| fail("--keep-alive needs a number of seconds"));
-                config.keep_alive = Duration::from_secs(secs);
-            }
-            "--tx-timeout" => {
-                let secs: u64 = value("--tx-timeout")
-                    .parse()
-                    .ok()
-                    .filter(|&s| s > 0)
-                    .unwrap_or_else(|| fail("--tx-timeout needs a positive number of seconds"));
-                config.transaction_timeout = Duration::from_secs(secs);
-            }
-            "--query-timeout" => {
-                let ms: u64 = value("--query-timeout")
-                    .parse()
-                    .ok()
-                    .filter(|&ms| ms > 0)
-                    .unwrap_or_else(|| fail("--query-timeout needs a positive number of milliseconds"));
-                config.query_timeout = Some(Duration::from_millis(ms));
-            }
-            "--shutdown-timeout" => {
-                let secs: u64 = value("--shutdown-timeout")
-                    .parse()
-                    .unwrap_or_else(|_| fail("--shutdown-timeout needs a number of seconds"));
-                config.shutdown_grace = Duration::from_secs(secs);
-            }
-            other => fail(&format!("unknown option `{other}`")),
-        }
+    if let Some(bind) = get("bind") {
+        config.bind = bind;
     }
+    if let Some(n) = settings.get("max-connections") {
+        config.max_connections = n.parse().unwrap_or_else(|_| fail("--max-connections needs a number"));
+    }
+    if let Some(s) = number("keep-alive", "seconds", false) {
+        config.keep_alive = Duration::from_secs(s);
+    }
+    if let Some(s) = number("tx-timeout", "seconds", true) {
+        config.transaction_timeout = Duration::from_secs(s);
+    }
+    if let Some(ms) = number("query-timeout", "milliseconds", true) {
+        config.query_timeout = Some(Duration::from_millis(ms));
+    }
+    if let Some(s) = number("shutdown-timeout", "seconds", false) {
+        config.shutdown_grace = Duration::from_secs(s);
+    }
+    let slow_query = number("slow-query", "milliseconds", false).map(Duration::from_millis);
+    let in_memory = settings.flag("in-memory");
+    let persistent = settings.flag("persistent");
+    let sync = if settings.flag("no-fsync") { SyncPolicy::OsBuffered } else { SyncPolicy::EveryCommit };
+    let import_dir = get("import-dir");
+    let users_file = get("users");
+    let gpu = settings.flag("gpu");
+    let demo = get("demo");
+    let (tls_cert, tls_key, tls_plain) = (get("tls-cert"), get("tls-key"), settings.flag("tls-allow-plain"));
 
     if let Some(name) = &demo
         && let Err(e) = graphbuff::demo_script(name)
     {
         fail(&e.to_string());
     }
-    if in_memory && data.is_some() {
-        fail("--in-memory and --data exclude each other");
-    }
 
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     let data: Option<PathBuf> = if in_memory {
         None
     } else {
-        Some(match data.or_else(|| env("GRAPHBUFF_DATA")) {
+        Some(match get("data") {
             Some(d) => d.into(),
-            None => default_data_dir().unwrap_or_else(|| {
+            None => settings::default_data_dir().unwrap_or_else(|| {
                 fail("no default data directory (HOME or LOCALAPPDATA is not set); use --data DIR or --in-memory")
             }),
         })
     };
-    let level = match log_level.or_else(|| env("GRAPHBUFF_LOG_LEVEL")) {
+    let level = match settings.get("log-level") {
         Some(l) => Level::parse(&l).unwrap_or_else(|| fail("--log-level needs error, warn, info or debug")),
         None => Level::Info,
     };
-    let log_dir = match log_dir.or_else(|| env("GRAPHBUFF_LOG_DIR")) {
+    let log_dir = match get("log-dir") {
         Some(d) if d == "-" => None,
         Some(d) => Some(PathBuf::from(d)),
         None => data.as_ref().map(|d| d.join("logs")),
@@ -432,7 +405,8 @@ fn main() {
     log.info(&listening);
     let fsync = if sync == SyncPolicy::EveryCommit { "fsync every commit" } else { "no fsync" };
     log.info(format_args!(
-        "new databases: {}; log: {}; slow-query log: {}; logins: {}",
+        "config: {}; new databases: {}; log: {}; slow-query log: {}; logins: {}",
+        config_file.as_ref().map_or("none".into(), |f| f.display().to_string()),
         match (&data, persistent) {
             (None, _) => "in memory".to_string(),
             (Some(_), true) => format!("persistent, {fsync}"),

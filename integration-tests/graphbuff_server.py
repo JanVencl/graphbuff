@@ -63,7 +63,8 @@ class Server:
         if "--data" not in self.args:
             cmd.append("--in-memory")
         cmd += self.args
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                     env={**os.environ, "GRAPHBUFF_CONFIG": "-"})
         deadline = time.time() + 20
         while True:
             try:
