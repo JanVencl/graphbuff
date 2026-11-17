@@ -29,6 +29,8 @@ mod storage;
 mod store;
 pub mod temporal;
 pub mod tz;
+#[rustfmt::skip]
+mod tzdata;
 mod value;
 
 pub use csr::{Csr, CsrAdjacency};

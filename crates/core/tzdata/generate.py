@@ -1,44 +1,38 @@
-"""Builds tzdata.bin, the time zone table graphbuff-core embeds, from the IANA time zone
-database (public domain) as the `tzdata` Python package ships it (compiled TZif files).
+"""Generates crates/core/src/tzdata.rs, the time zone table graphbuff-core compiles in,
+from the IANA time zone database (public domain) as the `tzdata` Python package ships it
+(compiled TZif files).
 
     python -m pip install --upgrade tzdata
     python crates/core/tzdata/generate.py
 
-Run it again when a new tzdata release changes a zone. The format (all little-endian):
-
-    "GBTZ" u8:format=1  u8:len version
-    u16:zones   per zone, by name:  u8:len name  u16:data
-    u16:datas   per data (zones that are links share one):
-        u8:offsets  i32 offset (seconds east of UTC) per offset
-        u8:initial  (offset index before the first transition)
-        u32:transitions  i64 UTC second per transition, then u8 offset index per transition
-        u8:len POSIX TZ rule for after the last transition (may be empty)
+Run it again when a new tzdata release changes a zone. Per zone, the table has its UTC
+offset changes and the POSIX TZ rule (`CET-1CEST,M3.5.0,M10.5.0/3`) for the years after
+the last change, parsed here so that nothing is parsed at run time. Zones that are links
+share their data.
 """
 
 import os
+import re
 import struct
 import sys
 
 import tzdata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "tzdata.bin")
+OUT = os.path.join(HERE, "..", "src", "tzdata.rs")
 
 
 def read_tzif(path):
-    """(utc offsets per type, transition times, type per transition, footer) of a TZif file."""
+    """(utc offset per type, transition times, type per transition, footer) of a TZif file."""
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"TZif":
-        raise ValueError(f"{path}: not a TZif file")
-    version = data[4]
+    if data[:4] != b"TZif" or data[4] == 0:
+        raise ValueError(f"{path}: not a TZif file with 64-bit data")
 
     def counts(at):
         return struct.unpack(">6l", data[at + 20:at + 44])
 
     isut, isstd, leap, timecnt, typecnt, charcnt = counts(0)
-    if version == 0:
-        raise ValueError(f"{path}: TZif version 1 has no 64-bit data")
     # Skip the 32-bit block; the 64-bit one follows with its own header.
     at = 44 + timecnt * 5 + typecnt * 6 + charcnt + leap * 8 + isstd + isut
     isut, isstd, leap, timecnt, typecnt, charcnt = counts(at)
@@ -47,69 +41,106 @@ def read_tzif(path):
     at += timecnt * 8
     idx = list(data[at:at + timecnt])
     at += timecnt
-    types = []
-    for i in range(typecnt):
-        off, _dst, _abbr = struct.unpack(">lBB", data[at + i * 6:at + i * 6 + 6])
-        types.append(off)
+    types = [struct.unpack(">l", data[at + i * 6:at + i * 6 + 4])[0] for i in range(typecnt)]
     at += typecnt * 6 + charcnt + leap * 12 + isstd + isut
     footer = data[at:].strip(b"\n").decode("ascii")
     return types, times, idx, footer
 
 
-def zone_names(root):
-    with open(os.path.join(root, "..", "zones"), encoding="utf-8") as f:
-        return sorted(line.strip() for line in f if line.strip())
+# ---- POSIX TZ rules ---------------------------------------------------------------------
+
+NAME = r"(?:[A-Za-z]{3,}|<[^>]+>)"
+TIME = r"[+-]?\d{1,3}(?::\d{2}){0,2}"
+DATE = r"(?:J\d{1,3}|\d{1,3}|M\d{1,2}\.\d\.\d)"
+RULE = re.compile(
+    rf"^{NAME}(?P<std>{TIME})(?:{NAME}(?P<dst>{TIME})?"
+    rf",(?P<start>{DATE})(?:/(?P<start_t>{TIME}))?,(?P<end>{DATE})(?:/(?P<end_t>{TIME}))?)?$"
+)
 
 
-def encode(types, times, idx, footer):
-    # Offsets used, in first-use order; the initial one is type 0 (RFC 8536).
-    offsets = []
+def seconds(t):
+    sign = -1 if t.startswith("-") else 1
+    parts = [int(p) for p in t.lstrip("+-").split(":")]
+    return sign * sum(p * u for p, u in zip(parts, (3600, 60, 1)))
 
-    def index(o):
-        if o not in offsets:
-            offsets.append(o)
-        return offsets.index(o)
 
-    initial = index(types[0])
-    # Drop transitions that keep the offset (only the abbreviation or DST flag changes).
-    kept_times, kept_idx, last = [], [], types[0]
+def rule_date(d):
+    if d.startswith("J"):
+        return f"RuleDate::Julian({int(d[1:])})"
+    if d.startswith("M"):
+        m, w, wd = d[1:].split(".")
+        return f"RuleDate::Month({int(m)}, {int(w)}, {int(wd)})"
+    return f"RuleDate::Zero({int(d)})"
+
+
+def rule(footer):
+    """The Rust `Option<Rule>` for a POSIX TZ footer."""
+    if not footer:
+        return "None"
+    m = RULE.match(footer)
+    if not m:
+        raise ValueError(f"unexpected POSIX TZ rule {footer!r}")
+    # POSIX offsets count west of UTC.
+    std = -seconds(m["std"])
+    if m["start"] is None:
+        return f"Some(Rule {{ std: {std}, dst: None }})"
+    dst = -seconds(m["dst"]) if m["dst"] else std + 3600
+    start_t = seconds(m["start_t"]) if m["start_t"] else 7200
+    end_t = seconds(m["end_t"]) if m["end_t"] else 7200
+    return (f"Some(Rule {{ std: {std}, dst: Some(Dst {{ offset: {dst}, start: {rule_date(m['start'])}, "
+            f"start_time: {start_t}, end: {rule_date(m['end'])}, end_time: {end_t} }}) }})")
+
+
+# ---- output -----------------------------------------------------------------------------
+
+def zone(types, times, idx, footer):
+    """The Rust `Zone` for a TZif file's data."""
+    # Before the first change the offset is type 0's (RFC 8536). Changes that keep the
+    # offset (only the abbreviation or the DST flag change) are dropped.
+    changes, last = [], types[0]
     for t, i in zip(times, idx):
         if types[i] != last:
-            kept_times.append(t)
-            kept_idx.append(index(types[i]))
+            changes.append(f"({t}, {types[i]})")
             last = types[i]
-    out = bytearray()
-    out += struct.pack("<B", len(offsets)) + struct.pack(f"<{len(offsets)}l", *offsets)
-    out += struct.pack("<BI", initial, len(kept_times))
-    out += struct.pack(f"<{len(kept_times)}q", *kept_times) + bytes(kept_idx)
-    out += struct.pack("<B", len(footer)) + footer.encode("ascii")
-    return bytes(out)
+    comment = f" // {footer}" if footer else ""
+    return (f"Zone {{ initial: {types[0]}, rule: {rule(footer)}, changes: &[{', '.join(changes)}] }},"
+            f"{comment}")
 
 
 def main():
     root = os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo")
-    names = zone_names(root)
-    datas, data_index, zones = [], {}, []
+    with open(os.path.join(root, "..", "zones"), encoding="utf-8") as f:
+        names = sorted(line.strip() for line in f if line.strip())
+    zones, index, named = [], {}, []
     for name in names:
-        blob = encode(*read_tzif(os.path.join(root, *name.split("/"))))
-        if blob not in data_index:
-            data_index[blob] = len(datas)
-            datas.append(blob)
-        zones.append((name, data_index[blob]))
-    out = bytearray(b"GBTZ" + bytes([1]))
-    version = tzdata.IANA_VERSION.encode("ascii")
-    out += bytes([len(version)]) + version
-    out += struct.pack("<H", len(zones))
-    for name, d in zones:
-        n = name.encode("ascii")
-        out += bytes([len(n)]) + n + struct.pack("<H", d)
-    out += struct.pack("<H", len(datas))
-    for blob in datas:
-        out += blob
-    with open(OUT, "wb") as f:
-        f.write(out)
-    print(f"tzdata {tzdata.IANA_VERSION}: {len(zones)} zones, {len(datas)} distinct, {len(out)} bytes -> {OUT}",
-          file=sys.stderr)
+        z = zone(*read_tzif(os.path.join(root, *name.split("/"))))
+        if z not in index:
+            index[z] = len(zones)
+            zones.append(z)
+        named.append((name, index[z]))
+    lines = [
+        f"//! The IANA time zone database {tzdata.IANA_VERSION}, generated by `tzdata/generate.py`;",
+        "//! do not edit. Offsets are seconds east of UTC, changes are `(UTC second, offset)`.",
+        "",
+        "use crate::tz::{Dst, Rule, RuleDate, Zone};",
+        "",
+        f'pub(crate) const VERSION: &str = "{tzdata.IANA_VERSION}";',
+        "",
+        "/// Zone names, sorted, with the index of their data in [`ZONES`].",
+        "pub(crate) static NAMES: &[(&str, u16)] = &[",
+        *(f'    ("{n}", {i}),' for n, i in named),
+        "];",
+        "",
+        "pub(crate) static ZONES: &[Zone] = &[",
+        *(f"    {z}" for z in zones),
+        "];",
+        "",
+    ]
+    text = "\n".join(lines)
+    with open(OUT, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(f"tzdata {tzdata.IANA_VERSION}: {len(named)} zones, {len(zones)} distinct, "
+          f"{len(text)} bytes -> {os.path.normpath(OUT)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
