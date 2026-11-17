@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# graphbuff-server (and the graphbuff shell) without a Rust toolchain:
+# graphbuff-server without a Rust toolchain:
 #
 #   docker build -t graphbuff .
 #   docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 graphbuff --demo movies
@@ -29,9 +29,9 @@ COPY crates crates
 COPY examples/movies.cypher examples/movies.cypher
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=graphbuff-target-$TARGETARCH \
-    cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-cli -p graphbuff-server \
+    cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-server \
  && mkdir -p /out/bin /out/data \
- && cp "target/$(cat /target-triple)/release/graphbuff" "target/$(cat /target-triple)/release/graphbuff-server" /out/bin/
+ && cp "target/$(cat /target-triple)/release/graphbuff-server" /out/bin/
 
 # glibc, libgcc and CA certificates only; runs as the unprivileged user `nonroot` (65532).
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -44,9 +44,11 @@ COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot
 WORKDIR /data
 VOLUME /data
-# Databases in the /data volume; logs to standard error (`docker logs`). `--data DIR`,
-# `--in-memory` or `--log-dir DIR` after the image name override these.
+# Databases and the config file (graphbuff.conf, created on the first start) in the
+# /data volume; logs to standard error (`docker logs`). Options after the image name
+# override the config file and these variables.
 ENV GRAPHBUFF_DATA=/data \
+    GRAPHBUFF_CONFIG=/data/graphbuff.conf \
     GRAPHBUFF_LOG_DIR=-
 # HTTP/JSON and Bolt. The server listens on every interface of the container; which
 # machines can reach it is decided by `docker run -p`.

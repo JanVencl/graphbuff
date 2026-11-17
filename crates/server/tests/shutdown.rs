@@ -63,6 +63,7 @@ fn stop_request_checkpoints_and_exits_zero() {
     let data = temp_dir("shutdown");
     let mut cmd = Command::new(BIN);
     cmd.args(["--bind", "127.0.0.1:0", "--data"]).arg(&data);
+    cmd.env("GRAPHBUFF_CONFIG", "-");
     for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
         cmd.env_remove(key);
     }
@@ -110,7 +111,7 @@ fn stop_request_checkpoints_and_exits_zero() {
     // The data is there on the next start.
     let mut cmd = Command::new(BIN);
     cmd.args(["--bind", "127.0.0.1:0", "--data"]).arg(&data);
-    cmd.env_remove("GRAPHBUFF_TOKEN");
+    cmd.env_remove("GRAPHBUFF_TOKEN").env("GRAPHBUFF_CONFIG", "-");
     let mut child = spawn(&mut cmd);
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();

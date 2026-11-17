@@ -581,7 +581,7 @@ impl DatabaseManager {
     }
 
     /// Creates database `name` from the backup in `from` (written by
-    /// [`backup_database`](Self::backup_database) or `graphbuff backup`). The backup is
+    /// [`backup_database`](Self::backup_database) or the server's backup endpoint). The backup is
     /// copied, so it stays usable. A persistent backup is checked for consistency first.
     /// The database gets the manager's default storage settings if they are of the
     /// backup's kind, else that kind's defaults. An existing database is replaced only

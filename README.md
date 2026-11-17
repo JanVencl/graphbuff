@@ -5,7 +5,7 @@
   disk-resident paged storage for graphs larger than RAM
 - **Cypher:** query planner, streaming execution, indexes, constraints, transactions
 - **Protocols:** HTTP/JSON and Bolt (Neo4j drivers), user accounts, TLS
-- **Tools:** interactive shell, bulk CSV import, online backup, restore and consistency check
+- **Tools:** online backup, restore and consistency check; bulk CSV import (Rust API)
 - **GPU:** graph kernels and algorithms on wgpu (Vulkan, Direct3D 12, Metal)
 
 ## Quick start
@@ -23,14 +23,10 @@ HTTP/JSON is then on `http://127.0.0.1:7475` and Bolt on `bolt://127.0.0.1:7687`
 From source:
 
 ```bash
-cargo run --release -p graphbuff-cli                               # interactive shell
-cargo run --release -p graphbuff-cli -- -i examples/movies.cypher  # load a script, then stay interactive
-cargo run --release -p graphbuff-cli -- --data ./data              # durable databases in ./data
-cargo run --release -p graphbuff-cli -- --data ./data --persistent # ... in disk-resident storage
-cargo run --release -p graphbuff-cli -- --demo movies              # shell with the built-in movies graph
 cargo run --release -p graphbuff-server                            # HTTP/JSON server on 127.0.0.1:7475, durable
 cargo run --release -p graphbuff-server -- --demo movies           # ... with the built-in movies graph
 cargo run --release -p graphbuff-server -- --bolt 127.0.0.1:7687   # ... plus Bolt for Neo4j drivers
+cargo run --release -p graphbuff-server -- --data ./data --persistent # durable in ./data, disk-resident storage
 cargo test --workspace
 ```
 
@@ -83,7 +79,6 @@ them with the container):
 docker run -d --name graphbuff -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
        -v graphbuff-data:/data ghcr.io/janvencl/graphbuff
 docker logs -f graphbuff                        # start-up, failed logins, errors
-docker exec -it graphbuff graphbuff --help      # the shell binary is in the image too
 ```
 
 Add `--slow-query 500` to log queries that take 500 ms or more, `--in-memory` for a
@@ -94,7 +89,7 @@ Build the image yourself with `docker build -t graphbuff .`.
 ### Prebuilt binaries
 
 Each [release](https://github.com/JanVencl/graphbuff/releases) carries one archive per
-platform, with `graphbuff` (shell) and `graphbuff-server` inside a folder
+platform, with `graphbuff-server` inside a folder
 `graphbuff-VERSION-PLATFORM/`:
 
 | Platform | Archive |
@@ -156,7 +151,7 @@ let big = Database::open(StorageMode::Persistent(
 **Hybrid storage** (`crates/core/src/hybrid.rs`) keeps a `MemoryGraph` and logs every
 committed transaction as one checksummed record of logical operations. With
 `SyncPolicy::EveryCommit` (the default) a query that returned is durable. A
-checkpoint (`db.checkpoint()`, `:checkpoint` in the shell, or automatically once the log
+checkpoint (`db.checkpoint()`, or automatically once the log
 passes `checkpoint_after_bytes`) writes a snapshot by temp-file + rename and empties the
 log. On open, the snapshot is loaded and the log replayed. A torn last record from a crash
 is cut off, and records already covered by the snapshot are skipped. A `LOCK` file keeps a
@@ -246,7 +241,7 @@ s.execute("CREATE (:Movie {title: 'Heat'})")?;
   `sync` (`'commit'` or `'os'`) and `checkpointAfterBytes` apply to hybrid and persistent
   storage, `cacheBytes` and `maxTransactionBytes` (the transaction size cap) to persistent
   storage. Without `OPTIONS`, a manager opened on a
-  directory creates hybrid databases (persistent ones with `--persistent` in the shell, or
+  directory creates hybrid databases (persistent ones with `graphbuff-server --persistent`, or
   `DatabaseManager::open_with(dir, StorageKind::persistent())`) and an in-memory manager
   creates memory databases. `OPTIONS $map` works too, as does `$name`
   for the database name. `WAIT`/`NOWAIT` and `DESTROY DATA` are accepted and ignored.
@@ -261,22 +256,13 @@ s.execute("CREATE (:Movie {title: 'Heat'})")?;
 * A plain `Database` has no other databases, so it rejects `USE` and database commands
   with an `Unsupported` error.
 
-In the shell, `:use name` and `:dbs` are shortcuts, and the prompt shows the current
-database.
-
 ## Bulk import
 
-`graphbuff import` builds a new persistent database from CSV files in the
+`DatabaseManager::import_database` builds a new persistent database from CSV files in the
 `neo4j-admin database import` format. It writes store records directly: no Cypher, no
 redo log, no transaction size cap. On 100,000 nodes and 1,000,000 relationships (with
-properties) it takes about 9 s, where `LOAD CSV` with `CREATE` takes about 140 s.
-
-```text
-graphbuff import --data data --database social \
-    --nodes Person=people_header.csv,people1.csv,people2.csv \
-    --relationships FOLLOWS=follows.csv \
-    --index 'Person(id)'
-```
+properties) it takes about 9 s, where `LOAD CSV` with `CREATE` takes about 140 s. The
+server must not be running on the data directory (the catalog lock keeps it out).
 
 ```text
 people_header.csv   id:ID(Person),name,born:int,tags:string[],:LABEL
@@ -289,16 +275,12 @@ follows.csv         :START_ID(Person),:END_ID(Person),since:date
   `string`, `point`, `date`, `localtime`, `time`, `localdatetime`, `datetime` or
   `duration`, or an array such as `string[]`. A plain `name` is a string. The first
   record of a group's first file is the header; the group's other files have none.
-* **Options:** `--delimiter`, `--array-delimiter` (also separates labels, default `;`),
-  `--id-type string|integer`, `--skip-bad-relationships`, `--skip-duplicate-nodes`,
-  `--index 'Label(a, b)'` or `--index '[:TYPE](a)'` (built after loading, from sorted
-  keys), `--cache-mb`, `--no-fsync`. `graphbuff import --help` lists them all.
-* **Target:** `--data DIR` adds the database to that data directory's catalog (default
-  name: the default database). An existing database is replaced only if it is empty, or
-  with `--overwrite`. A failed import leaves it as it was. The server must not be running
-  on `DIR` (the catalog lock keeps it out). `--into STORE_DIR` writes a bare persistent
-  store into a new directory instead.
-* **From Rust:** `DatabaseManager::import_database`, or `PersistentGraph::bulk_loader`
+* **Options** (`ImportOptions`): delimiter, array delimiter (also separates labels,
+  default `;`), id type (string or integer), skipping bad relationships or duplicate
+  nodes, indexes built after loading from sorted keys, cache size, fsync.
+* **Target:** an existing database is replaced only if it is empty, or with overwrite. A
+  failed import leaves it as it was.
+* **Bare stores:** `PersistentGraph::bulk_loader`
   plus `import_csv` for a bare store. `BulkLoader` can also be filled directly
   (`create_node`, `create_relationship`, `create_index`, `finish`).
 
@@ -306,7 +288,7 @@ Nothing is durable until the import finishes. While it runs, the store directory
 `IMPORTING` marker, and opening a directory that still has one fails: delete it and import
 again. Import ids are kept in memory (one map per id space), as are the label index and
 property index keys until they are written. Constraints are not created by the import; add
-them with `CREATE CONSTRAINT` afterwards (with an index from `--index`, it seeks instead of
+them with `CREATE CONSTRAINT` afterwards (with an index from the import, it seeks instead of
 building its own).
 
 ## Backup, restore and consistency checks
@@ -317,23 +299,19 @@ reads a snapshot, copying pages a batch at a time without filling the page cache
 Persistent databases back up as persistent stores (their pages and metadata); in-memory
 and hybrid ones as hybrid stores (a snapshot file).
 
-```bash
-graphbuff backup  --data data --database social --to backups/social-monday
-graphbuff restore --from backups/social-monday --data data --database social --overwrite
-graphbuff check   --data data --database social          # exit code 1 if inconsistent
-graphbuff check   --store some/persistent/store
-```
+Start the server with `--backup-dir DIR`; then admins can:
 
-* **Online:** the commands above open the data directory, so the server must not be
-  running on it. A running server does the same over HTTP when started with
-  `--backup-dir DIR` (admins only): `POST /db/{name}/backup` with `{"backup": "monday"}`
-  writes `DIR/monday`, `POST /db/{name}/restore` with `{"backup": "monday",
-  "overwrite": false}` creates (or replaces) the database from it, and
-  `POST /db/{name}/check` checks a persistent database.
+* **Back up:** `POST /db/{name}/backup` with `{"backup": "monday"}` writes `DIR/monday`.
+* **Restore:** `POST /db/{name}/restore` with `{"backup": "monday", "overwrite": false}`
+  creates (or replaces) the database from it.
+* **Check:** `POST /db/{name}/check` checks a persistent database.
+
+From Rust: `DatabaseManager::backup_database`, `restore_database` and `check_database`.
+
 * **Restore** copies the backup (it stays usable) and checks a persistent one before the
   database is created. An existing database is replaced only if it is empty or with
   overwrite, and stays as it was if the restore fails.
-* **Check** (`graphbuff check`, persistent storage only) reads every record and verifies
+* **Check** (persistent storage only) reads every record and verifies
   adjacency lists in both directions (links, list ends, endpoints, relationship groups of
   dense nodes, degrees and self-loop counts), node, relationship, label and type counts,
   blob chains and free lists, every B+tree (page use, key order, leaf links) against the
@@ -453,10 +431,10 @@ The `gpu` feature adds `WgpuKernels` (crate `graphbuff-gpu`), a backend on
 [wgpu](https://wgpu.rs): Vulkan, Direct3D 12 or Metal, whichever the machine has.
 
 ```bash
-cargo run --release -p graphbuff-cli --features gpu -- --gpu
+cargo run --release -p graphbuff-server --features gpu -- --gpu
 ```
 
-`--gpu` (CLI and `graphbuff-server`) puts every database on the GPU backend; in code,
+`--gpu` (`graphbuff-server`) puts every database on the GPU backend; in code,
 `DatabaseManager::set_kernels(graphbuff::gpu_kernels()?)` or `Database::set_kernels`.
 `EXPLAIN` then shows `(wgpu; …)`. Walk counts (multi-hop aggregates, `walk` / `propagate`),
 BFS, connected components, triangle counts and, on devices with 64-bit floats, PageRank
@@ -474,7 +452,7 @@ an import-library tool and a linker that reads LLVM import libraries: put a copy
 component), and link with the bundled `rust-lld`:
 
 ```bash
-RUSTFLAGS="-C linker=rust-lld -C linker-flavor=ld.lld" cargo build --release -p graphbuff-cli --features gpu
+RUSTFLAGS="-C linker=rust-lld -C linker-flavor=ld.lld" cargo build --release -p graphbuff-server --features gpu
 ```
 
 The MSVC toolchain and other platforms need nothing extra.
@@ -583,9 +561,32 @@ it uses:
 
 The start-up line names the directory in use. New databases there use hybrid storage
 (`--persistent`: disk-resident, for graphs larger than RAM). `--in-memory` keeps everything
-in memory and writes nothing; the `graphbuff` shell keeps databases in memory unless it
-gets `--data`. Back up a data directory with `graphbuff backup` (see
+in memory and writes nothing. Back up databases with the server's backup endpoint (see
 [Backup, restore and consistency checks](#backup-restore-and-consistency-checks)).
+
+Settings can also live in a config file, `graphbuff.conf`: one `key = value` per line, the
+keys being the command-line options without `--`, `#` for comments, relative paths
+relative to the file. The command line overrides the environment, which overrides the
+file. `--config FILE` (or env `GRAPHBUFF_CONFIG`; `-` for none) picks the file; by default
+it is:
+
+| Platform | Config file |
+|----------|-------------|
+| Linux | `$XDG_CONFIG_HOME/graphbuff/graphbuff.conf`, usually `~/.config/graphbuff/graphbuff.conf`; `/etc/graphbuff/graphbuff.conf` when run as root |
+| macOS | `~/Library/Application Support/graphbuff/graphbuff.conf` |
+| Windows | `%LOCALAPPDATA%\graphbuff\graphbuff.conf` |
+| Docker image | `/data/graphbuff.conf` |
+
+A missing config file is created with every setting commented out. Example:
+
+```text
+data = /srv/graphbuff
+log-dir = /var/log/graphbuff
+bind = 0.0.0.0:7475
+bolt = 0.0.0.0:7687
+users = users.txt
+slow-query = 500
+```
 
 Logs go to `DATA/logs` (`--log-dir DIR` or env `GRAPHBUFF_LOG_DIR`; `-` for standard
 error, the default with `--in-memory` and in the Docker image):
@@ -719,8 +720,6 @@ crates/
   engine/  graphbuff         executor: pattern matcher, expressions, aggregation, Database API,
                              DatabaseManager + Session (multiple databases), CSV import
   gpu/     graphbuff-gpu     GPU kernel backend (`WgpuKernels`, WGSL shaders); optional
-  cli/     graphbuff-cli     `graphbuff` REPL / script runner, `graphbuff import`,
-                             `graphbuff backup` / `restore` / `check`
   server/  graphbuff-server  HTTP/JSON and Bolt server (`graphbuff-server` binary + embeddable `Server`)
 ```
 

@@ -1,5 +1,5 @@
 # Pushing a tag `vX.Y.Z` publishes a release:
-#   * archives of `graphbuff` and `graphbuff-server` for Linux, macOS and Windows,
+#   * archives of `graphbuff-server` for Linux, macOS and Windows,
 #     plus SHA256SUMS, attached to the GitHub release of the tag;
 #   * the image ghcr.io/janvencl/graphbuff, tagged X.Y.Z and latest (amd64 and arm64).
 name: release
@@ -50,7 +50,7 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p graphbuff-cli -p graphbuff-server
+        run: cargo build --release --locked --target ${{ matrix.target }} -p graphbuff-server
       - name: Package
         shell: bash
         run: |
@@ -59,10 +59,10 @@ jobs:
           cp README.md "$dir/"
           bin=target/${{ matrix.target }}/release
           if [ "${{ runner.os }}" = Windows ]; then
-            cp "$bin/graphbuff.exe" "$bin/graphbuff-server.exe" "$dir/"
+            cp "$bin/graphbuff-server.exe" "$dir/"
             7z a "dist/graphbuff-${{ matrix.name }}.zip" "$dir"
           else
-            cp "$bin/graphbuff" "$bin/graphbuff-server" "$dir/"
+            cp "$bin/graphbuff-server" "$dir/"
             tar -czf "dist/graphbuff-${{ matrix.name }}.tar.gz" "$dir"
           fi
       - uses: actions/upload-artifact@v4
