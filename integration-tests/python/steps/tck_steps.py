@@ -21,7 +21,7 @@ use_step_matcher("re")
 
 DB = "tck"
 QUERY_TIMEOUT_MS = 10_000
-GRAPHS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "graphs")
+GRAPHS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tck", "graphs"))
 
 # TCK error class -> graphbuff error codes that count as it.
 ERRORS = {

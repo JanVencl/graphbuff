@@ -1,15 +1,16 @@
 """Runs the openCypher TCK against graphbuff-server and reports the pass rate.
 
-    python run.py                   run everything; print the pass rate per feature group
-    python run.py --features        ... a line per feature file
-    python run.py --failures        ... and every failing scenario with the reason
-    python run.py --report FILE     ... and write the table as Markdown to FILE
-    python run.py --save-baseline   ... and record the passing scenarios in passing.txt
-    python run.py -v                show every scenario live (default: a line per feature file)
-    python run.py -q                no live progress
-    python run.py -- ARGS           pass ARGS to behave (e.g. a feature file to run)
+    python run_tck.py                   run everything; print the pass rate per feature group
+    python run_tck.py --features        ... a line per feature file
+    python run_tck.py --failures        ... and every failing scenario with the reason
+    python run_tck.py --report FILE     ... and write the table as Markdown to FILE
+    python run_tck.py --save-baseline   ... and record the passing scenarios in tck/passing.txt
+    python run_tck.py -v                show every scenario live (default: a line per feature file)
+    python run_tck.py -q                no live progress
+    python run_tck.py -- ARGS           pass ARGS to behave, run from integration-tests/
+                                        (e.g. tck/features/clauses/match/Match1.feature)
 
-Exits 1 if a scenario listed in passing.txt no longer passes (on a full run).
+Exits 1 if a scenario listed in tck/passing.txt no longer passes (on a full run).
 """
 
 import argparse
@@ -19,9 +20,10 @@ import sys
 import time
 from collections import defaultdict
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(HERE, "results", "results.tsv")
-BASELINE = os.path.join(HERE, "passing.txt")
+TESTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # integration-tests/
+TCK = os.path.join(TESTS, "tck")
+RESULTS = os.path.join(TCK, "results", "results.tsv")
+BASELINE = os.path.join(TCK, "passing.txt")
 TCK_VERSION = "2024.3"
 
 
@@ -75,8 +77,9 @@ def main():
         os.remove(RESULTS)
     start = time.time()
     env = dict(os.environ, TCK_PROGRESS="" if args.quiet else "scenario" if args.verbose else "feature")
-    subprocess.run([sys.executable, "-m", "behave", "-f", "null", "--no-summary", *args.behave_args],
-                   cwd=HERE, env=env)
+    paths = args.behave_args or ["tck/features"]
+    subprocess.run([sys.executable, "-m", "behave", "-f", "null", "--no-summary", *paths],
+                   cwd=TESTS, env=env)
     if not args.quiet:
         print()
     elapsed = time.time() - start
@@ -100,7 +103,7 @@ def main():
     if args.save_baseline:
         with open(BASELINE, "w", encoding="utf-8", newline="\n") as f:
             f.write(f"# openCypher TCK {TCK_VERSION} scenarios that pass; run.py fails if one stops passing.\n"
-                    "# Regenerate with: python run.py --save-baseline\n")
+                    "# Regenerate with: python python/run_tck.py --save-baseline\n")
             f.write("".join(p + "\n" for p in passing))
         print(f"wrote {BASELINE}")
     elif full and os.path.exists(BASELINE):
@@ -110,7 +113,7 @@ def main():
         lost = sorted(baseline - now)
         gained = len(now - baseline)
         if gained:
-            print(f"{gained} scenarios pass that are not in passing.txt yet (python run.py --save-baseline)")
+            print(f"{gained} scenarios pass that are not in passing.txt yet (python python/run_tck.py --save-baseline)")
         if lost:
             print(f"{len(lost)} scenarios in passing.txt no longer pass:")
             print("".join(f"  {x}\n" for x in lost))

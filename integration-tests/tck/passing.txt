@@ -1,5 +1,5 @@
-# openCypher TCK 2024.3 scenarios that pass; run.py fails if one stops passing.
-# Regenerate with: python run.py --save-baseline
+# openCypher TCK 2024.3 scenarios that pass; python/run_tck.py fails if one stops passing.
+# Regenerate with: python python/run_tck.py --save-baseline
 Aggregation1 [1] Count only non-null values
 Aggregation1 [2] Counting loop relationships
 Aggregation2 [10] `min()` over list values

@@ -1,21 +1,33 @@
-"""behave hooks for the TCK: one server for the whole run, and a record of every
-scenario's outcome in results/results.tsv for run.py."""
+"""behave hooks for both suites.
+
+- tck/features: one server (with --test-procedures) for the whole run; each scenario gets a
+  fresh database (see tck_steps). Every scenario's outcome goes to tck/results/results.tsv
+  for run_tck.py.
+- everything else (cucumber/features): every scenario starts on a fresh in-memory server
+  on a free port. Steps that need other server options restart it with `restart_server`.
+"""
 
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:0] = [HERE, os.path.dirname(HERE)]
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 from graphbuff_server import Server  # noqa: E402
 
-RESULTS = os.path.join(HERE, "results", "results.tsv")
+TESTS = os.path.dirname(HERE)
+TCK_FEATURES = os.path.join(TESTS, "tck", "features")
+TCK_RESULTS = os.path.join(TESTS, "tck", "results", "results.tsv")
 
-# Live progress from run.py: "feature" (a line per feature file), "scenario" (a line per
-# scenario) or "" (none). Written to the real stderr: behave captures stdout.
+# Live progress from run_tck.py: "feature" (a line per feature file), "scenario" (a line
+# per scenario) or "" (none). Written to the real stderr: behave captures stdout.
 PROGRESS = os.environ.get("TCK_PROGRESS", "")
 COLOR = sys.__stderr__.isatty() and not os.environ.get("NO_COLOR")
 _MARK = {"passed": ("PASS", "32"), "failed": ("FAIL", "31"), "skipped": ("SKIP", "33")}
+
+_tck_server = None  # shared by every TCK scenario; started on the first one
+_tck_ran = False  # a TCK feature ran: write the results file
 
 
 def _say(line):
@@ -28,20 +40,52 @@ def _mark(status):
     return f"\033[{color}m{text}\033[0m" if COLOR else text
 
 
+def _is_tck(feature):
+    path = os.path.abspath(feature.filename)
+    return os.path.commonpath([path, TCK_FEATURES]) == TCK_FEATURES
+
+
+# ---- server per scenario (cucumber) ------------------------------------------------------
+
+def restart_server(context, args=()):
+    """Stops the running server, if any, and starts one with `args`."""
+    stop_server(context)
+    context.server = Server(args).start()
+    context.base_url = context.server.url
+
+
+def stop_server(context):
+    server = getattr(context, "server", None)
+    if server is not None:
+        server.stop()
+        context.server = None
+
+
+# ---- hooks -------------------------------------------------------------------------------
+
 def before_all(context):
-    context.server = Server(["--test-procedures"]).start()
     context.tck_results = []
 
 
 def before_feature(context, feature):
+    global _tck_ran
+    context.tck = _is_tck(feature)
     context.tck_feature_start = len(context.tck_results)
+    _tck_ran = _tck_ran or context.tck
 
 
 def before_scenario(context, scenario):
+    global _tck_server
+    if not context.tck:
+        restart_server(context)
+        return
     if "ignore" in scenario.effective_tags:
         scenario.skip("marked @ignore by the TCK")
-    if not context.server.alive():  # an earlier query crashed it
-        context.server.restart()
+    if _tck_server is None:
+        _tck_server = Server(["--test-procedures"]).start()
+    elif not _tck_server.alive():  # an earlier query crashed it
+        _tck_server.restart()
+    context.server = _tck_server
     context.params = {}
     context.result = None
     context.error = None
@@ -49,7 +93,10 @@ def before_scenario(context, scenario):
 
 
 def after_scenario(context, scenario):
-    feature = os.path.relpath(scenario.feature.filename, os.path.join(HERE, "features"))
+    if not context.tck:
+        stop_server(context)
+        return
+    feature = os.path.relpath(scenario.feature.filename, TCK_FEATURES)
     feature = os.path.splitext(feature)[0].replace(os.sep, "/")
     reason = ""
     status = scenario.status.name
@@ -70,7 +117,7 @@ def after_scenario(context, scenario):
 
 
 def after_feature(context, feature):
-    if PROGRESS != "feature":
+    if not context.tck or PROGRESS != "feature":
         return
     rows = context.tck_results[context.tck_feature_start:]
     if not rows:
@@ -85,9 +132,13 @@ def after_feature(context, feature):
 
 
 def after_all(context):
-    if getattr(context, "server", None):
-        context.server.stop()
-    os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
-    with open(RESULTS, "w", encoding="utf-8", newline="\n") as f:
+    global _tck_server
+    if _tck_server is not None:
+        _tck_server.stop()
+        _tck_server = None
+    if not _tck_ran:
+        return
+    os.makedirs(os.path.dirname(TCK_RESULTS), exist_ok=True)
+    with open(TCK_RESULTS, "w", encoding="utf-8", newline="\n") as f:
         for row in context.tck_results:
             f.write("\t".join(row) + "\n")
