@@ -429,7 +429,7 @@ pub(crate) fn check_defined(e: &Expr, env: &TyEnv, known_function: &dyn Fn(&str)
 }
 
 /// The direct sub-expressions of `e` (not those of binders; see [`check_defined`]).
-fn children(e: &Expr) -> Vec<&Expr> {
+pub(crate) fn children(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::Property(x, _) | Expr::Unary(_, x) | Expr::HasLabels(x, _) | Expr::HasLabelExpr(x, _) => vec![x],
         Expr::IsNull { expr, .. } => vec![expr],

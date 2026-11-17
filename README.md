@@ -896,10 +896,10 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,889 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (99.8 %).
-The TCK is the official compatibility suite for openCypher. The remaining failures expect
-compile-time errors graphbuff does not raise: typed procedure arguments, and expressions
-that mix an aggregate with a variable that is not a grouping key. The TCK
+**openCypher TCK:** 3,894 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (99.9 %).
+The TCK is the official compatibility suite for openCypher. The two that fail expect a
+compile-time error for a procedure argument of the wrong type; procedure arguments have no
+declared types in graphbuff. The TCK
 checks errors only by category, not by detail code. The suite and the full table per
 feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 
@@ -960,9 +960,11 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   `COLLECT { … }` subqueries (a pattern with an optional `WHERE`, or a full read-only query; they
   see every outer variable)
 * **Aggregates:** `count`, `count(*)`, `sum`, `avg`, `min`, `max`, `collect`, `stdev`, `stdevp`,
-  `percentileCont`, `percentileDisc` (with `DISTINCT`), implicit grouping: by the items without
-  aggregates, and by the variables an aggregating item uses outside its aggregates (`RETURN
-  p {.name, friends: collect(f.name)}` gives a row per `p`)
+  `percentileCont`, `percentileDisc` (with `DISTINCT`), implicit grouping by the items without
+  aggregates. Next to an aggregate, only grouping keys, their properties, literals and
+  parameters may appear (`RETURN me.age + count(*)` without `me` as a key is an error, as in
+  Neo4j); a map projection groups by its own variable (`RETURN p {.name, friends:
+  collect(f.name)}` gives a row per `p`)
 * **Functions:** `id`, `elementId`, `labels`, `type`, `keys`, `properties`, `startNode`, `endNode`, `nodes`,
   `relationships`, `length`, `size`, `degree`, `head`, `last`, `tail`, `range`, `reverse`, `coalesce`, `isEmpty`,
   `toUpper` / `upper`, `toLower` / `lower`, `trim` / `btrim`, `ltrim`, `rtrim` (each with an optional

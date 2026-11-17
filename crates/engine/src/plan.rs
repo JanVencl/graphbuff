@@ -34,7 +34,7 @@ use std::sync::Arc;
 use graphbuff_core::{Direction, Error, IndexEntity, Result};
 use graphbuff_core::Value;
 use graphbuff_cypher::ast::{
-    CallScope, Clause, Expr, ProcedureYield, NodePattern, PatternPart, Projection, ProjectionItem, Query, RelDirection,
+    CallScope, MapProjectionItem, Clause, Expr, ProcedureYield, NodePattern, PatternPart, Projection, ProjectionItem, Query, RelDirection,
     RelPattern, RemoveItem, SetItem, SingleQuery, SortItem, SubqueryKind,
 };
 
@@ -2152,6 +2152,18 @@ fn validate_aggregates(p: &Projection) -> Result<()> {
         return Err(Error::Semantic("rand() cannot be used inside an aggregate function".into()));
     }
     let aggregates = p.items.iter().any(|it| it.expr.contains_aggregate());
+    if aggregates {
+        // Grouping keys: the items without aggregates.
+        let keys: Vec<&Expr> = p.items.iter().map(|it| &it.expr).filter(|e| !e.contains_aggregate()).collect();
+        for it in p.items.iter().filter(|it| it.expr.contains_aggregate()) {
+            check_grouping(&it.expr, &keys, &[], &mut Vec::new())?;
+        }
+        // ORDER BY may also use the projected columns by alias.
+        let aliases: Vec<&str> = p.items.iter().map(|it| it.alias.as_str()).collect();
+        for s in p.order_by.iter().filter(|s| s.expr.contains_aggregate()) {
+            check_grouping(&s.expr, &keys, &aliases, &mut Vec::new())?;
+        }
+    }
     for s in &p.order_by {
         let key = if aggregates { sort_key_over_items(&s.expr, &p.items)? } else { s.expr.clone() };
         if key.contains_aggregate() {
@@ -2161,6 +2173,70 @@ fn validate_aggregates(p: &Projection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// In an expression that aggregates, what is outside the aggregates must be fixed per
+/// group: literals, parameters, grouping-key variables (or `aliases`), or a grouping key's
+/// property (`n.p` when `n` or `n.p` is a key). Anything else is ambiguous
+/// (`me.age + count(*)` without `me` as a key; `a.x + b.x + count(*)` even with
+/// `a.x + b.x` as a key). A map projection's own variable is the exception:
+/// `p {.name, friends: collect(f)}` groups by `p`.
+fn check_grouping(e: &Expr, keys: &[&Expr], aliases: &[&str], local: &mut Vec<String>) -> Result<()> {
+    let key_var = |v: &str| keys.iter().any(|k| matches!(k, Expr::Var(x) if x == v)) || aliases.contains(&v);
+    let ambiguous = |what: &str| {
+        Err(Error::Semantic(format!(
+            "`{what}` is used next to an aggregate but is not a grouping key; \
+             project it on its own (`WITH {what} AS x, …`) and use the alias"
+        )))
+    };
+    match e {
+        _ if e.is_aggregate_call() => Ok(()),
+        Expr::Literal(_) | Expr::Param(_) | Expr::AggregateRef(_) | Expr::Subquery { .. } => Ok(()),
+        Expr::Var(v) if key_var(v) || local.contains(v) => Ok(()),
+        Expr::Var(v) => ambiguous(v),
+        Expr::Property(base, key) => match base.as_ref() {
+            Expr::Var(v) if key_var(v) || local.contains(v) || keys.contains(&e) => Ok(()),
+            Expr::Var(v) => ambiguous(&format!("{v}.{key}")),
+            other => check_grouping(other, keys, aliases, local),
+        },
+        Expr::MapProjection { base, items } => {
+            if !matches!(base.as_ref(), Expr::Var(_)) {
+                check_grouping(base, keys, aliases, local)?;
+            }
+            for item in items {
+                match item {
+                    MapProjectionItem::Entry(_, x) => check_grouping(x, keys, aliases, local)?,
+                    MapProjectionItem::Var(v) if !key_var(v) && !local.contains(v) => return ambiguous(v),
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        Expr::ListComprehension { var, list, filter, map } => {
+            check_grouping(list, keys, aliases, local)?;
+            local.push(var.clone());
+            let r = [filter, map].into_iter().flatten().try_for_each(|x| check_grouping(x, keys, aliases, local));
+            local.pop();
+            r
+        }
+        Expr::Quantified { var, list, pred, .. } => {
+            check_grouping(list, keys, aliases, local)?;
+            local.push(var.clone());
+            let r = check_grouping(pred, keys, aliases, local);
+            local.pop();
+            r
+        }
+        Expr::Reduce { acc, init, var, list, expr } => {
+            check_grouping(init, keys, aliases, local)?;
+            check_grouping(list, keys, aliases, local)?;
+            local.push(acc.clone());
+            local.push(var.clone());
+            let r = check_grouping(expr, keys, aliases, local);
+            local.truncate(local.len() - 2);
+            r
+        }
+        _ => typecheck::children(e).into_iter().try_for_each(|x| check_grouping(x, keys, aliases, local)),
+    }
 }
 
 /// A sort key of an aggregating projection with every part that is a projected item

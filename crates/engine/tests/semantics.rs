@@ -70,7 +70,7 @@ fn undefined_variables_fail_at_compile_time() {
         "MATCH (a)--(b) RETURN count(b) AS c ORDER BY a.age + count(b)",
     ] {
         let m = semantic_error(&db, q);
-        assert!(m.contains("not defined"), "`{q}`: {m}");
+        assert!(m.contains("not defined") || m.contains("not a grouping key"), "`{q}`: {m}");
     }
     // Variables bound inside the expression are fine.
     let db = db_with("CREATE ({n: 1})");

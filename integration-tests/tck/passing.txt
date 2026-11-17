@@ -2285,6 +2285,8 @@ Return6 [17] Handle constants and parameters inside an expression which contains
 Return6 [18] Handle returned variables inside an expression which contains an aggregation expression
 Return6 [19] Handle returned property accesses inside an expression which contains an aggregation expression
 Return6 [1] Return count aggregation over nodes
+Return6 [20] Fail if not returned variables are used inside an expression which contains an aggregation expression
+Return6 [21] Fail if more complex expressions, even if returned, are used inside expression which contains an aggregation expression
 Return6 [2] Projecting an arithmetic expression with aggregation
 Return6 [3] Aggregating by a list property has a correct definition of equality
 Return6 [4] Support multiple divisions in aggregate function
@@ -2330,6 +2332,7 @@ ReturnOrderBy6 [1] Handle constants and parameters inside an order by item which
 ReturnOrderBy6 [2] Handle returned aliases inside an order by item which contains an aggregation expression
 ReturnOrderBy6 [3] Handle returned property accesses inside an order by item which contains an aggregation expression
 ReturnOrderBy6 [4] Fail if not returned variables are used inside an order by item which contains an aggregation expression
+ReturnOrderBy6 [5] Fail if more complex expressions, even if returned, are used inside an order by item which contains an aggregation expression
 ReturnSkipLimit1 [10] Fail when using non-constants in SKIP
 ReturnSkipLimit1 [11] Fail when using negative value in SKIP
 ReturnSkipLimit1 [1] Start the result from the second row
@@ -3567,6 +3570,8 @@ With6 [4] Implicit grouping with single path variable as grouping key and single
 With6 [5] Handle constants and parameters inside an expression which contains an aggregation expression
 With6 [6] Handle projected variables inside an expression which contains an aggregation expression
 With6 [7] Handle projected property accesses inside an expression which contains an aggregation expression
+With6 [8] Fail if not projected variables are used inside an expression which contains an aggregation expression
+With6 [9] Fail if more complex expression, even if projected, are used inside expression which contains an aggregation expression
 With7 [1] A simple pattern with one bound endpoint
 With7 [2] Multiple WITHs using a predicate and aggregation
 WithOrderBy1 [10] Sort lists in descending order
