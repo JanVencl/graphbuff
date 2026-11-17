@@ -6,15 +6,18 @@ Compatibility Kit) against `graphbuff-server` over HTTP. It's driven by behave (
 `features/` and `graphs/` are the TCK of openCypher release 2024.3, copied unchanged
 (Apache License 2.0: [LICENSE-TCK](LICENSE-TCK), [NOTICE-TCK](NOTICE-TCK)).
 
+The hooks and step definitions are shared with the cucumber suite and live in
+[`../python`](../python) (`environment.py`, `steps/tck_steps.py`, `tck_values.py`, `run_tck.py`).
+
 ```bash
 cargo build --release -p graphbuff-server
-pip install -r integration-tests/requirements.txt
-cd integration-tests/tck
-python run.py                    # pass rate per feature group
-python run.py --features         # ... per feature file
-python run.py --failures         # ... plus every failing scenario and why
-python run.py -v                 # live line per scenario (default: per feature file; -q: none)
-python run.py -- features/clauses/match/Match1.feature   # one file (any behave arguments)
+pip install -r integration-tests/python/requirements.txt
+cd integration-tests
+python python/run_tck.py             # pass rate per feature group
+python python/run_tck.py --features  # ... per feature file
+python python/run_tck.py --failures  # ... plus every failing scenario and why
+python python/run_tck.py -v          # live line per scenario (default: per feature file; -q: none)
+python python/run_tck.py -- tck/features/clauses/match/Match1.feature   # one file (any behave arguments)
 ```
 
 The suite uses the server binary named by `GRAPHBUFF_SERVER`. Without it, the suite uses whichever of
@@ -23,7 +26,7 @@ the pass rate: the debug build overflows its stack on queries that the release b
 
 `passing.txt` lists the scenarios that pass. A full run exits 1 if one of them no longer
 passes. After a change that makes more scenarios pass, record them with
-`python run.py --save-baseline`. Each run writes every scenario's outcome to
+`python python/run_tck.py --save-baseline`. Each run writes every scenario's outcome to
 `results/results.tsv` (git-ignored).
 
 ## How scenarios run

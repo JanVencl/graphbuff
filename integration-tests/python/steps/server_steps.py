@@ -7,7 +7,7 @@ from behave import given, then, when
 
 from environment import restart_server
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def _query(context, query):
