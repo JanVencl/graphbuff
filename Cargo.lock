@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graphbuff-core",
  "graphbuff-cypher",
@@ -551,18 +551,18 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "graphbuff-cypher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graphbuff-core",
 ]
 
 [[package]]
 name = "graphbuff-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "graphbuff-core",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graphbuff",
  "rustls",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graphbuff",
 ]
