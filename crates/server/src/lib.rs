@@ -94,6 +94,11 @@ use tx::Transactions;
 /// How often blocked reads wake up to check for shutdown.
 const POLL: Duration = Duration::from_millis(250);
 
+/// Stack of the threads that run queries. Planning and running walk the query
+/// recursively, so a long query (hundreds of `CREATE` clauses) needs more than the
+/// default 2 MiB. Only the pages a thread touches are committed.
+pub(crate) const QUERY_STACK: usize = 64 << 20;
+
 /// Settings for [`Server::start`].
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -134,6 +139,10 @@ pub struct ServerConfig {
     /// At shutdown, how long queries already running may take to finish before they are
     /// cancelled (and rolled back). Default: 5 seconds.
     pub shutdown_grace: Duration,
+    /// For compatibility tests (the openCypher TCK) only: turns on
+    /// `POST /db/{name}/test-procedure`, which lets an admin add a procedure that answers
+    /// from a fixed table. Default: off.
+    pub test_procedures: bool,
 }
 
 impl Default for ServerConfig {
@@ -152,6 +161,7 @@ impl Default for ServerConfig {
             backup_dir: None,
             log: None,
             shutdown_grace: Duration::from_secs(5),
+            test_procedures: false,
         }
     }
 }
@@ -219,6 +229,7 @@ impl Server {
                 backup_dir: config.backup_dir,
                 log: config.log,
                 abort: abort.clone(),
+                test_procedures: config.test_procedures,
             },
             tls,
             limits: Limits {
@@ -352,6 +363,7 @@ fn accept_loop(
         let s = Arc::clone(&shared);
         let spawned = thread::Builder::new()
             .name("graphbuff-conn".into())
+            .stack_size(QUERY_STACK)
             .spawn(move || {
                 if let Some(stream) = open(stream, protocol, &s) {
                     match protocol {

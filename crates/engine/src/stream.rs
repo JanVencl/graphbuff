@@ -554,15 +554,31 @@ impl<'a> Stream<'a> for FilterStream<'a> {
         self.input.scope()
     }
 
+    fn hidden(&self) -> Option<&Scope> {
+        self.input.hidden()
+    }
+
     fn next(&mut self, ex: &'a Executor<'_>, max: usize) -> Result<Option<Vec<Row>>> {
         loop {
             let Some(batch) = self.input.next(ex, max)? else {
                 return Ok(None);
             };
             let scope = self.input.scope();
+            let hidden = self.input.hidden();
             let mut out = Vec::new();
             for row in batch {
-                if ex.eval_predicate(self.predicate, &Env::new(scope, &row))? {
+                let keep = match hidden {
+                    // Between a projection and its `Select`: the projected values
+                    // shadow the source row's variables.
+                    Some(src) => {
+                        let k = scope.len();
+                        let mut env = Env::new(src, &row[k..]);
+                        env.locals = scope.names().iter().cloned().zip(row[..k].iter().cloned()).collect();
+                        ex.eval_predicate(self.predicate, &env)?
+                    }
+                    None => ex.eval_predicate(self.predicate, &Env::new(scope, &row))?,
+                };
+                if keep {
                     out.push(row);
                 }
             }

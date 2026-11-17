@@ -73,6 +73,13 @@ fn next_random() -> f64 {
 }
 
 impl Executor<'_> {
+    /// Whether `name` is a function (not an aggregate): calling it with no arguments
+    /// fails with anything but "unknown function". Functions without arguments only read
+    /// the clock or the random generator.
+    pub(crate) fn function_exists(&self, name: &str) -> bool {
+        !matches!(self.call_function(name, Vec::new()), Err(Error::Semantic(m)) if m.starts_with("unknown function"))
+    }
+
     pub fn call_function(&self, name: &str, args: Vec<Value>) -> Result<Value> {
         let a0 = args.first().cloned().unwrap_or_default();
         let store = self.store();
@@ -109,7 +116,10 @@ impl Executor<'_> {
                 arity(name, &args, 1, 1)?;
                 match a0 {
                     Value::Null => Ok(Value::Null),
-                    Value::Node(id) => Ok(Value::from(store.node_labels(id)?)),
+                    Value::Node(id) => {
+                        self.check_not_deleted(&a0)?;
+                        Ok(Value::from(store.node_labels(id)?))
+                    }
                     o => Err(wrong_type(name, &o)),
                 }
             }
@@ -117,14 +127,17 @@ impl Executor<'_> {
                 arity(name, &args, 1, 1)?;
                 match a0 {
                     Value::Null => Ok(Value::Null),
-                    Value::Rel(id) => Ok(store
-                        .relationship_type(id)?
-                        .map_or(Value::Null, Value::String)),
+                    Value::Rel(id) => Ok(match store.relationship_type(id)? {
+                        Some(t) => Value::String(t),
+                        // A relationship deleted by this query keeps its type.
+                        None => self.deleted_rels.get(&id).cloned().map_or(Value::Null, Value::String),
+                    }),
                     o => Err(wrong_type(name, &o)),
                 }
             }
             "keys" | "properties" => {
                 arity(name, &args, 1, 1)?;
+                self.check_not_deleted(&a0)?;
                 let props: BTreeMap<String, Value> = match a0 {
                     Value::Null => return Ok(Value::Null),
                     Value::Node(id) => store.node_properties(id)?,
@@ -334,6 +347,7 @@ impl Executor<'_> {
                 Ok(match a0 {
                     Value::Int(i) => Value::Int(i),
                     Value::Float(f) if f.is_finite() => Value::Int(f.trunc() as i64),
+                    Value::Float(_) => Value::Null,
                     Value::Bool(b) => Value::Int(b as i64),
                     Value::String(s) => {
                         let s = s.trim();
@@ -342,7 +356,10 @@ impl Executor<'_> {
                             .or_else(|_| s.parse::<f64>().map(|f| Value::Int(f.trunc() as i64)))
                             .unwrap_or(Value::Null)
                     }
-                    _ => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
             "tofloat" | "tofloatornull" => {
@@ -355,7 +372,10 @@ impl Executor<'_> {
                         .parse::<f64>()
                         .map(Value::Float)
                         .unwrap_or(Value::Null),
-                    _ => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
             "toboolean" | "tobooleanornull" => {
@@ -367,7 +387,11 @@ impl Executor<'_> {
                     Value::String(s) if s.trim().eq_ignore_ascii_case("false") => {
                         Value::Bool(false)
                     }
-                    _ => Value::Null,
+                    Value::String(_) => Value::Null,
+                    Value::Null => Value::Null,
+                    // The `…OrNull` forms turn any other type into null.
+                    _ if name.ends_with("ornull") => Value::Null,
+                    o => return Err(wrong_type(name, &o)),
                 })
             }
 

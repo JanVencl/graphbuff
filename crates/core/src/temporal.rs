@@ -834,8 +834,11 @@ impl Temporal {
         let any_date = [year, month, day, week, dow, ordinal, quarter, doq].iter().any(Option::is_some);
         if any_date {
             let base = date.map(civil_from_days);
-            let y = year.or(base.map(|b| b.0)).ok_or_else(|| err(format!("{what}(): `year` is required")))?;
-            date = Some(if week.is_some() || (dow.is_some() && month.is_none() && day.is_none()) {
+            let week_based = week.is_some() || (dow.is_some() && month.is_none() && day.is_none());
+            // A week date counts from the base's week-based year (1816-12-30 is in 1817's week 1).
+            let base_year = if week_based { date.map(|d| iso_week(d).0) } else { base.map(|b| b.0) };
+            let y = year.or(base_year).ok_or_else(|| err(format!("{what}(): `year` is required")))?;
+            date = Some(if week_based {
                 let (bw, bd) = match date {
                     Some(d) => (iso_week(d).1, weekday(d)),
                     None => (1, 1),
@@ -844,7 +847,11 @@ impl Temporal {
             } else if let Some(o) = ordinal {
                 ordinal_date(y, o)?
             } else if let Some(q) = quarter {
-                quarter_date(y, q, doq.unwrap_or(1))?
+                // Without `dayOfQuarter`, the base's day of its quarter.
+                let base_doq = base.zip(date).map(|((by, bm, _), d)| {
+                    d - days_from_civil(by, (bm - 1) / 3 * 3 + 1, 1) + 1
+                });
+                quarter_date(y, q, doq.or(base_doq).unwrap_or(1))?
             } else {
                 ymd(
                     y,
@@ -872,9 +879,10 @@ impl Temporal {
                     return Err(err(format!("{what}(): fraction of a second out of range")));
                 }
                 ms * 1_000_000 + us * 1000 + ns
-            } else if given[2].is_some() {
+            } else if given[0].is_some() || given[1].is_some() {
                 0
             } else {
+                // `second` alone keeps the base's fraction of a second.
                 base % NANOS_PER_SECOND
             };
             time = Some(hms(h, mi, s, sub)?);
@@ -1384,11 +1392,37 @@ impl Duration {
                 self.total_nanos().checked_mul(k as i128).ok_or_else(overflow)?,
             );
         }
-        Duration::cascade(
-            self.months as f64 * k,
-            self.days as f64 * k,
-            self.total_nanos() as f64 * k,
-        )
+        self.scale_exact(k).unwrap_or_else(|| {
+            Duration::cascade(self.months as f64 * k, self.days as f64 * k, self.total_nanos() as f64 * k)
+        })
+    }
+
+    /// `self * k` computed exactly with `k` as the fraction `p / 2^n` it is, rounding
+    /// only the final nanoseconds (half to even). `None` if it does not fit in `i128`.
+    fn scale_exact(&self, k: f64) -> Option<Result<Duration>> {
+        let (mut p, mut shift) = (k, 0u32);
+        while p.fract() != 0.0 {
+            p *= 2.0;
+            shift += 1;
+        }
+        if p.abs() >= 9.0e15 || shift > 64 {
+            return None;
+        }
+        let (p, q) = (p as i128, 1i128 << shift);
+        const NANOS_PER_MONTH: i128 = 2_629_746 * NANOS_PER_SECOND as i128;
+        let npd = NANOS_PER_DAY as i128;
+        // Months: whole ones, the rest (in 1/q months) spills into days at the average length.
+        let mq = (self.months as i128).checked_mul(p)?;
+        let (m, rm) = (mq / q, mq % q);
+        let x = (self.days as i128).checked_mul(p)?.checked_mul(npd)?.checked_add(rm.checked_mul(NANOS_PER_MONTH)?)?;
+        let dq = q.checked_mul(npd)?;
+        let (d, rd) = (x / dq, x % dq);
+        let nq = rd.checked_add(self.total_nanos().checked_mul(p)?)?;
+        let (mut n, r) = (nq.div_euclid(q), nq.rem_euclid(q));
+        if 2 * r > q || (2 * r == q && n % 2 != 0) {
+            n += 1;
+        }
+        Some(Duration::from_nanos(i64::try_from(m).ok()?, i64::try_from(d).ok()?, n))
     }
 
     /// Whole months, days and nanoseconds from fractional amounts.
@@ -1448,8 +1482,30 @@ impl Duration {
         Duration::from_nanos(im, id, inn)?.add(&frac)
     }
 
-    /// ISO 8601: `P[nY][nM][nW][nD][T[nH][nM][nS]]`, each number optionally signed;
-    /// weeks, days, hours, minutes and seconds may have a fraction.
+    /// The ISO 8601 alternative form after the `P`: `YYYY-MM-DDThh:mm:ss[.fff]`. `None`
+    /// if `rest` does not have that shape.
+    fn parse_alternative(rest: &str) -> Option<Result<Duration>> {
+        let b = rest.as_bytes();
+        let shape = b"dddd-dd-ddTdd:dd:dd";
+        if b.len() < shape.len()
+            || !shape.iter().zip(b).all(|(p, c)| if *p == b'd' { c.is_ascii_digit() } else { p.eq_ignore_ascii_case(c) })
+        {
+            return None;
+        }
+        let num = |r: std::ops::Range<usize>| rest[r].parse::<i64>().unwrap();
+        let mut nanos = (num(11..13) * 3600 + num(14..16) * 60 + num(17..19)) as i128 * NANOS_PER_SECOND as i128;
+        match &rest[19..] {
+            "" => {}
+            f if f.len() >= 2 && f.len() <= 10 && f.starts_with(['.', ',']) && f[1..].bytes().all(|c| c.is_ascii_digit()) => {
+                nanos += f[1..].parse::<i128>().unwrap() * 10i128.pow(10 - f.len() as u32);
+            }
+            _ => return None,
+        }
+        Some(Duration::from_nanos(num(0..4) * 12 + num(5..7), num(8..10), nanos))
+    }
+
+    /// ISO 8601: `P[nY][nM][nW][nD][T[nH][nM][nS]]`, each number optionally signed and
+    /// with an optional fraction, or `PYYYY-MM-DDThh:mm:ss[.fff]`.
     pub fn parse(text: &str) -> Result<Duration> {
         let bad = || err(format!("invalid duration `{text}`"));
         let s = text.as_bytes();
@@ -1463,6 +1519,9 @@ impl Duration {
             return Err(bad());
         }
         i += 1;
+        if let Some(d) = Self::parse_alternative(&text[i..]) {
+            return if neg_all { d?.negate() } else { d };
+        }
         let (mut months, mut days, mut nanos): (i64, i64, i128) = (0, 0, 0);
         let mut in_time = false;
         let mut any = false;
@@ -1508,15 +1567,29 @@ impl Duration {
             i += 1;
             let sign: i128 = if neg { -1 } else { 1 };
             let scaled = |unit_nanos: i128| sign * (whole as i128 * unit_nanos + frac * unit_nanos / 10i128.pow(digits));
+            // A fraction of a larger unit goes to whole days and the rest to time; a month
+            // is 1/12 of the average Gregorian year (30.436875 days).
+            const NANOS_PER_MONTH: i128 = 2_629_746 * NANOS_PER_SECOND as i128;
+            let spill = |f: i128, days: &mut i64, nanos: &mut i128| {
+                *days += (f / NANOS_PER_DAY as i128) as i64;
+                *nanos += f % NANOS_PER_DAY as i128;
+            };
             match (in_time, unit.to_ascii_uppercase()) {
-                (false, b'Y') | (false, b'M') if digits > 0 => {
-                    return Err(err(format!("invalid duration `{text}`: years and months must be whole")));
+                (false, b'Y') => {
+                    months += sign as i64 * whole.checked_mul(12).ok_or_else(overflow)?;
+                    // Twelfths of the fraction are months, the rest a fraction of a month.
+                    let twelfths = frac * 12;
+                    let scale = 10i128.pow(digits);
+                    months += (sign * (twelfths / scale)) as i64;
+                    spill(sign * (twelfths % scale) * NANOS_PER_MONTH / scale, &mut days, &mut nanos);
                 }
-                (false, b'Y') => months += sign as i64 * whole.checked_mul(12).ok_or_else(overflow)?,
-                (false, b'M') => months += sign as i64 * whole,
+                (false, b'M') => {
+                    months += sign as i64 * whole;
+                    spill(sign * frac * NANOS_PER_MONTH / 10i128.pow(digits), &mut days, &mut nanos);
+                }
                 (false, b'W') => {
                     days += sign as i64 * whole.checked_mul(7).ok_or_else(overflow)?;
-                    nanos += sign * frac * 7 * NANOS_PER_DAY as i128 / 10i128.pow(digits);
+                    spill(sign * frac * 7 * NANOS_PER_DAY as i128 / 10i128.pow(digits), &mut days, &mut nanos);
                 }
                 (false, b'D') => {
                     days += sign as i64 * whole;
@@ -1663,6 +1736,10 @@ mod tests {
             (K::Duration, "PT0S", "PT0S"),
             (K::Duration, "P0.5D", "PT12H"),
             (K::Duration, "P1W", "P7D"),
+            (K::Duration, "P1.5Y", "P1Y6M"),
+            (K::Duration, "P0.75M", "P22DT19H51M49.5S"),
+            (K::Duration, "P2.5W", "P17DT12H"),
+            (K::Duration, "P2012-02-02T14:37:21.545", "P2012Y2M2DT14H37M21.545S"),
             (K::Duration, "PT-1.5S", "PT-1.5S"),
             (K::Duration, "-P1D", "P-1D"),
         ] {
@@ -1676,7 +1753,6 @@ mod tests {
             (K::LocalTime, "24:00"),
             (K::LocalTime, "12:00+01:00"),
             (K::LocalDateTime, "2015-01-01T00:00Z"),
-            (K::Duration, "P1.5Y"),
             (K::Duration, "P"),
             (K::Duration, "PT1D"),
         ] {

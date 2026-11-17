@@ -345,3 +345,104 @@ fn function(name: &str, args: &[Ty]) -> Result<Ty> {
         _ => Ty::Any,
     })
 }
+
+/// Fails with `variable … not defined` (openCypher's `UndefinedVariable`) if `e` reads a
+/// variable that is neither in `env` nor bound inside `e` (by a list comprehension,
+/// `reduce`, or a quantifier). Variables of a pattern predicate must all be bound: it
+/// cannot introduce new ones. Subqueries are checked when they are planned.
+/// `known_function` tells whether a (non-aggregate) function name exists.
+pub(crate) fn check_defined(e: &Expr, env: &TyEnv, known_function: &dyn Fn(&str) -> bool) -> Result<()> {
+    fn go(e: &Expr, env: &TyEnv, local: &mut Vec<String>, kf: &dyn Fn(&str) -> bool) -> Result<()> {
+        let known = |v: &str, local: &Vec<String>| env.contains_key(v) || local.iter().any(|l| l == v);
+        let undefined = |v: &str| Err(Error::Semantic(format!("variable `{v}` not defined")));
+        let scoped = |var: &str, parts: &[Option<&Expr>], local: &mut Vec<String>| -> Result<()> {
+            local.push(var.to_string());
+            let r = parts.iter().flatten().try_for_each(|x| go(x, env, local, kf));
+            local.pop();
+            r
+        };
+        match e {
+            Expr::Var(v) if !known(v, local) => return undefined(v),
+            Expr::MapProjection { base, items } => {
+                go(base, env, local, kf)?;
+                for item in items {
+                    match item {
+                        MapProjectionItem::Entry(_, x) => go(x, env, local, kf)?,
+                        MapProjectionItem::Var(v) if !known(v, local) => return undefined(v),
+                        _ => {}
+                    }
+                }
+            }
+            Expr::PatternPredicate(part) => {
+                if let Some(v) = part.variables().into_iter().find(|v| !known(v, local)) {
+                    return undefined(v);
+                }
+                let nodes = std::iter::once(&part.start).chain(part.chain.iter().map(|(_, n)| n));
+                let props = nodes
+                    .filter_map(|n| n.props.as_ref())
+                    .chain(part.chain.iter().filter_map(|(r, _)| r.props.as_ref()));
+                for p in props {
+                    go(p, env, local, kf)?;
+                }
+            }
+            Expr::ListComprehension { var, list, filter, map } => {
+                go(list, env, local, kf)?;
+                scoped(var, &[filter.as_deref(), map.as_deref()], local)?;
+            }
+            Expr::Quantified { var, list, pred, .. } => {
+                go(list, env, local, kf)?;
+                scoped(var, &[Some(pred)], local)?;
+            }
+            Expr::Reduce { acc, init, var, list, expr } => {
+                go(init, env, local, kf)?;
+                go(list, env, local, kf)?;
+                local.push(acc.clone());
+                let r = scoped(var, &[Some(expr)], local);
+                local.pop();
+                r?;
+            }
+            Expr::Subquery { query, .. } if query.is_updating() => {
+                return Err(Error::Semantic("an EXISTS, COUNT or COLLECT subquery cannot change the graph".into()));
+            }
+            Expr::Subquery { .. } => {}
+            Expr::Function { name, args, .. } => {
+                if !e.is_aggregate_call() && name != "exists" && !kf(name) {
+                    return Err(Error::Semantic(format!("unknown function '{name}'")));
+                }
+                // A pattern is a predicate; only exists() takes one as its argument.
+                if name != "exists" && args.iter().any(|a| matches!(a, Expr::PatternPredicate(_))) {
+                    return Err(Error::Semantic(format!("{name}() cannot take a pattern; a pattern is a predicate")));
+                }
+                for a in args {
+                    go(a, env, local, kf)?;
+                }
+            }
+            _ => {
+                for child in children(e) {
+                    go(child, env, local, kf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    go(e, env, &mut Vec::new(), known_function)
+}
+
+/// The direct sub-expressions of `e` (not those of binders; see [`check_defined`]).
+pub(crate) fn children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Property(x, _) | Expr::Unary(_, x) | Expr::HasLabels(x, _) | Expr::HasLabelExpr(x, _) => vec![x],
+        Expr::IsNull { expr, .. } => vec![expr],
+        Expr::Index(a, b) | Expr::Binary(_, a, b) => vec![a, b],
+        Expr::Slice(a, b, c) => std::iter::once(&**a).chain(b.as_deref()).chain(c.as_deref()).collect(),
+        Expr::List(items) | Expr::Function { args: items, .. } => items.iter().collect(),
+        Expr::Map(items) => items.iter().map(|(_, x)| x).collect(),
+        Expr::Case { subject, whens, else_ } => subject
+            .as_deref()
+            .into_iter()
+            .chain(whens.iter().flat_map(|(w, t)| [w, t]))
+            .chain(else_.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    }
+}

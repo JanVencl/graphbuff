@@ -43,5 +43,7 @@ passes. After a change that makes more scenarios pass, record them with
   and graphbuff reports these as `SyntaxError` or `SemanticError`, so either one counts.
   `ArgumentError` accepts `RuntimeError` or `TypeError`. `Unsupported` never counts as an
   expected error.
-- Scenarios that need test procedures (`there exists a procedure …`, in `clauses/call`)
-  fail: such procedures cannot be registered over HTTP.
+- Test procedures (`there exists a procedure …`, in `clauses/call`) are added through
+  `POST /db/{name}/test-procedure`, which the server offers only when started with
+  `--test-procedures`. Each answers from its table: the rows whose input columns equal
+  the arguments. Argument types are not checked.

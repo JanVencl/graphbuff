@@ -1011,3 +1011,25 @@ fn backups_are_off_without_a_backup_dir() {
     let r = c.request("POST", "/db/graphbuff/check", None, &[]);
     assert_eq!((r.status, r.error_code().as_str()), (400, "Unsupported"));
 }
+
+#[test]
+fn test_procedures_only_with_the_flag() {
+    let body = r#"{"name": "test.my.proc", "inputs": ["in"], "outputs": ["out"], "rows": [[1, "a"], [2, "b"], [1, "c"]]}"#;
+    let server = start(ServerConfig::default());
+    let mut c = Client::connect(server.local_addr());
+    assert_eq!(c.request("POST", "/db/graphbuff/test-procedure", Some(body), &[]).status, 404);
+
+    let server = start(ServerConfig {
+        test_procedures: true,
+        ..ServerConfig::default()
+    });
+    let mut c = Client::connect(server.local_addr());
+    let r = c.request("POST", "/db/graphbuff/test-procedure", Some(body), &[]);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let rows = c.rows("/db/graphbuff/query", "CALL test.my.proc(1) YIELD out RETURN out", "{}");
+    assert_eq!(rows, vec![Json::Array(vec![s("a")]), Json::Array(vec![s("c")])]);
+    // Another database does not have it.
+    c.rows("/query", "CREATE DATABASE other", "{}");
+    let r = c.query("/db/other/query", "CALL test.my.proc(1)", "{}");
+    assert_ne!(r.status, 200);
+}

@@ -29,6 +29,8 @@ pub(crate) struct Ctx {
     /// Cancelled when shutdown stops waiting for queries to finish; every query runs
     /// with it or a child of it.
     pub abort: CancelHandle,
+    /// `POST /db/{name}/test-procedure` is on (see [`crate::ServerConfig::test_procedures`]).
+    pub test_procedures: bool,
 }
 
 impl Ctx {
@@ -229,6 +231,10 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
         },
         ["db", name, "restore"] => match method {
             "POST" => restore(ctx, name, req),
+            _ => not_allowed("POST"),
+        },
+        ["db", name, "test-procedure"] if ctx.0.test_procedures => match method {
+            "POST" => test_procedure(ctx, name, req),
             _ => not_allowed("POST"),
         },
         ["db", name, "check"] => match method {
@@ -541,6 +547,59 @@ fn restore(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
 }
 
 /// `POST /db/{name}/check`: an online consistency check of a persistent database.
+/// `{"name": "test.my.proc", "inputs": ["in"], "outputs": ["out"], "rows": [[1, "a"], …]}`:
+/// adds a procedure to database `name` that returns, for each table row whose input
+/// columns equal the arguments, its output columns. For compatibility tests only.
+fn test_procedure(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
+    if let Err(e) = check(me.access, Access::Admin, "adding a test procedure") {
+        return query_error(&e);
+    }
+    let mut fields = match body_fields(req, &["name", "inputs", "outputs", "rows"]) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let names = |v: Option<Json>| -> Option<Vec<String>> {
+        match v? {
+            Json::Array(a) => a.into_iter().map(|x| if let Json::String(s) = x { Some(s) } else { None }).collect(),
+            _ => None,
+        }
+    };
+    let (Some(Json::String(proc)), Some(inputs), Some(outputs), Some(Json::Array(rows))) = (
+        fields.remove("name"),
+        names(fields.remove("inputs")),
+        names(fields.remove("outputs")),
+        fields.remove("rows"),
+    ) else {
+        return error(400, "BadRequest", "expected `name`, `inputs`, `outputs` (strings) and `rows` (arrays)");
+    };
+    let mut table: Vec<Vec<Value>> = Vec::new();
+    for row in rows {
+        match row {
+            Json::Array(cells) if cells.len() == inputs.len() + outputs.len() => {
+                table.push(cells.into_iter().map(to_value).collect());
+            }
+            _ => return error(400, "BadRequest", "each row needs one value per input and output"),
+        }
+    }
+    let n_in = inputs.len();
+    let same = |a: &Value, b: &Value| match (a, b) {
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => *x as f64 == *y,
+        _ => a == b,
+    };
+    let signature = graphbuff::ProcedureSignature::new(&proc, inputs, outputs);
+    let body = move |_: &graphbuff::ProcedureContext<'_>, args: &[Value]| {
+        Ok(table
+            .iter()
+            .filter(|row| row[..n_in].iter().zip(args).all(|(a, b)| same(a, b)))
+            .map(|row| row[n_in..].to_vec())
+            .collect())
+    };
+    match ctx.mgr.database(name).and_then(|db| db.register_procedure(signature, body)) {
+        Ok(()) => Response::json(200, r#"{"registered":true}"#.into()),
+        Err(e) => query_error(&e),
+    }
+}
+
 fn check_database(&(ctx, me): &Req, name: &str) -> Response {
     if let Err(e) = check(me.access, Access::Admin, "checking a database") {
         return query_error(&e);

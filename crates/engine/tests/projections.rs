@@ -73,14 +73,26 @@ fn map_projection_with_aggregation() {
         ),
         [r#"{friends: ["Bob"], name: "Ann"}"#, r#"{friends: ["Cat"], name: "Bob"}"#]
     );
-    // Any variable used outside the aggregates groups the rows, not only in projections.
+    // Elsewhere, a variable next to an aggregate must be a grouping key (as in Neo4j).
     assert_eq!(
-        rows(&db, "MATCH (p:Person)-->(x) RETURN p.age + count(x) AS v ORDER BY v"),
+        rows(&db, "MATCH (p:Person)-->(x) RETURN p, p.age + count(x) AS v ORDER BY v")
+            .iter()
+            .map(|r| r.rsplit(", ").next().unwrap().to_string())
+            .collect::<Vec<_>>(),
         ["27", "37"]
     );
+    for q in [
+        "MATCH (p:Person)-->(x) RETURN p.age + count(x) AS v",
+        "MATCH (p:Person)-->() WITH 10 AS k, p RETURN k + count(*) AS v",
+        "MATCH (p:Person)-->(x) RETURN p.age + x.age AS g, p.age + x.age + count(*) AS v",
+        "MATCH (p:Person)-->(x) RETURN p.name AS n, count(*) AS c ORDER BY p.age + count(*)",
+        "MATCH (p:Person)-->(x) RETURN p {.name, other: x.name, n: count(*)}",
+    ] {
+        assert!(matches!(db.execute(q), Err(Error::Semantic(_))), "{q}");
+    }
     assert_eq!(
-        rows(&db, "MATCH (p:Person)-->() WITH 10 AS k, p RETURN k + count(*) AS v"),
-        ["15"]
+        rows(&db, "MATCH (p:Person)-->(x) RETURN p.age AS a, count(*) AS c ORDER BY a + count(*), p.age + count(*)"),
+        ["25, 2", "34, 3"]
     );
     // No rows, no groups.
     assert!(rows(&db, "MATCH (p:Nobody) RETURN p {.name, n: count(*)}").is_empty());

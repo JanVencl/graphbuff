@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::Duration;
 
-use graphbuff_core::{Error, GraphStore, NodeId, Result, Value};
+use graphbuff_core::{Error, GraphStore, NodeId, RelId, Result, Value};
 
 use crate::plan::QueryPlan;
 use crate::result::QueryStats;
@@ -150,6 +150,10 @@ pub(crate) struct Executor<'s> {
     /// Kernels for a read query on a committed state ([`crate::accel`]); `None` runs
     /// everything on rows.
     pub accel: Option<crate::accel::Accel>,
+    /// Nodes this query deleted, and the relationships it deleted with their types:
+    /// reading their properties or labels afterwards fails, `type(r)` still answers.
+    pub deleted_nodes: std::collections::HashSet<NodeId>,
+    pub deleted_rels: HashMap<RelId, String>,
 }
 
 /// Cached subquery plans: (query address, visible variables) → plan.
@@ -182,11 +186,26 @@ impl<'s> Executor<'s> {
             procedures: crate::procedures::Procedures::builtin(),
             interrupt: None,
             accel: None,
+            deleted_nodes: Default::default(),
+            deleted_rels: HashMap::new(),
         };
         if !ex.store().constraints().is_empty() {
             ex.touched = Some(BTreeSet::new());
         }
         ex
+    }
+
+    /// Fails if `v` is a node or relationship this query deleted.
+    pub fn check_not_deleted(&self, v: &Value) -> Result<()> {
+        let deleted = match v {
+            Value::Node(id) => self.deleted_nodes.contains(id),
+            Value::Rel(id) => self.deleted_rels.contains_key(id),
+            _ => false,
+        };
+        if deleted {
+            return Err(Error::Runtime(format!("the {} was deleted in this transaction", v.type_name().to_lowercase())));
+        }
+        Ok(())
     }
 
     /// The statement's current time (see [`Executor::now`]).
