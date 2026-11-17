@@ -6,7 +6,7 @@ import sys
 import pytest
 from neo4j import GraphDatabase
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 from graphbuff_server import Server, free_port  # noqa: E402
 
 TOKEN = "smoke-secret"

@@ -44,6 +44,7 @@ const PATHS: &[&str] = &["data", "users", "tls-cert", "tls-key", "import-dir", "
 /// Environment variables and the settings they stand for.
 const ENV: &[(&str, &str)] = &[
     ("GRAPHBUFF_TOKEN", "token"),
+    ("GRAPHBUFF_USERS", "users"),
     ("GRAPHBUFF_DATA", "data"),
     ("GRAPHBUFF_LOG_DIR", "log-dir"),
     ("GRAPHBUFF_LOG_LEVEL", "log-level"),
@@ -55,8 +56,9 @@ pub const TEMPLATE: &str = "\
 #
 # One `key = value` per line; the keys are the command-line options without `--`.
 # Command-line options and environment variables (GRAPHBUFF_DATA, GRAPHBUFF_LOG_DIR,
-# GRAPHBUFF_LOG_LEVEL, GRAPHBUFF_TOKEN) override this file. Relative paths are relative
-# to this file's directory. `graphbuff-server --help` describes every setting.
+# GRAPHBUFF_LOG_LEVEL, GRAPHBUFF_TOKEN, GRAPHBUFF_USERS) override this file. Relative
+# paths are relative to this file's directory. `graphbuff-server --help` describes
+# every setting.
 
 # Network
 # bind = 127.0.0.1:7475

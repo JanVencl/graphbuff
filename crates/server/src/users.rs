@@ -430,7 +430,12 @@ fn save(path: &Path, accounts: &BTreeMap<String, Account>) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     {
-        let mut f = fs::File::create(&tmp)?;
+        // Only the owner may read the password hashes.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
     }

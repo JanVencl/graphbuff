@@ -1,5 +1,6 @@
 //! `graphbuff-server` — serves graphbuff databases over HTTP/JSON and Bolt.
 
+mod prompt;
 mod settings;
 mod signal;
 
@@ -46,6 +47,7 @@ Options:
                        the token holder may do anything
   --users FILE         user accounts in FILE (created on the first CREATE USER); clients
                        log in with a user name and password (HTTP Basic, Bolt basic)
+                       (also: env GRAPHBUFF_USERS; `-` for none)
   --tls-cert FILE      serve HTTPS and Bolt over TLS with this PEM certificate chain
   --tls-key FILE       ... and this PEM private key (needs the `tls` build feature)
   --tls-allow-plain    with TLS: also accept clients without TLS on the same ports
@@ -95,8 +97,15 @@ User accounts (--users):
   databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
   PASSWORD 'pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users FILE ...`, which
-  reads new passwords from env GRAPHBUFF_PASSWORD or the first line of standard input.
-  Change the file offline only while no server uses it.";
+  reads new passwords from env GRAPHBUFF_PASSWORD, else asks for them without echo on a
+  terminal, else reads the first line of standard input. Change the file offline only
+  while no server uses it.
+
+  The first administrator, at start-up: when the users file has no accounts yet, the
+  server creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the
+  password in env GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
+  GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker or Compose secret; one trailing newline is
+  ignored). Once the file has accounts, these variables are ignored.";
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
@@ -117,10 +126,7 @@ fn users_command(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         if let Ok(p) = std::env::var("GRAPHBUFF_PASSWORD") {
             return Ok(p);
         }
-        eprintln!("password (one line):");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
-        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+        prompt::new_password().map_err(|e| format!("cannot read the password: {e}"))
     };
     let err = |e: graphbuff::Error| e.to_string();
     match command.as_str() {
@@ -165,6 +171,31 @@ fn users_command(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         other => return Err(format!("unknown users command `{other}`")),
     }
     Ok(())
+}
+
+/// The first administrator from the environment: GRAPHBUFF_ADMIN_USER (default `admin`)
+/// and GRAPHBUFF_ADMIN_PASSWORD or GRAPHBUFF_ADMIN_PASSWORD_FILE; `None` without either.
+fn first_admin() -> Result<Option<(String, String)>, String> {
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let password = match (env("GRAPHBUFF_ADMIN_PASSWORD"), env("GRAPHBUFF_ADMIN_PASSWORD_FILE")) {
+        (Some(_), Some(_)) => {
+            return Err("set GRAPHBUFF_ADMIN_PASSWORD or GRAPHBUFF_ADMIN_PASSWORD_FILE, not both".into());
+        }
+        (Some(p), None) => p,
+        (None, Some(file)) => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| format!("cannot read GRAPHBUFF_ADMIN_PASSWORD_FILE {file}: {e}"))?;
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            text.strip_suffix('\r').unwrap_or(text).to_string()
+        }
+        (None, None) => {
+            if env("GRAPHBUFF_ADMIN_USER").is_some() {
+                return Err("GRAPHBUFF_ADMIN_USER needs GRAPHBUFF_ADMIN_PASSWORD or GRAPHBUFF_ADMIN_PASSWORD_FILE".into());
+            }
+            return Ok(None);
+        }
+    };
+    Ok(Some((env("GRAPHBUFF_ADMIN_USER").unwrap_or_else(|| "admin".into()), password)))
 }
 
 fn main() {
@@ -249,7 +280,7 @@ fn main() {
     let persistent = settings.flag("persistent");
     let sync = if settings.flag("no-fsync") { SyncPolicy::OsBuffered } else { SyncPolicy::EveryCommit };
     let import_dir = get("import-dir");
-    let users_file = get("users");
+    let users_file = get("users").filter(|f| f != "-");
     let gpu = settings.flag("gpu");
     let demo = get("demo");
     let (tls_cert, tls_key, tls_plain) = (get("tls-cert"), get("tls-key"), settings.flag("tls-allow-plain"));
@@ -315,12 +346,28 @@ fn main() {
         (None, None) => None,
         _ => fail("TLS needs both --tls-cert and --tls-key"),
     };
+    let admin = first_admin().unwrap_or_else(|e| fatal(&e));
+    if admin.is_some() && users_file.is_none() {
+        fatal("GRAPHBUFF_ADMIN_PASSWORD needs a users file (--users FILE or env GRAPHBUFF_USERS)");
+    }
     if let Some(file) = &users_file {
         match Users::open(file) {
             Ok(u) => {
+                match &admin {
+                    Some((name, password)) if u.is_empty() => {
+                        if let Err(e) = u.create(name, password, &[Role::Admin], ExistingDatabase::Fail) {
+                            fatal(&format!("cannot create the administrator `{name}` in {file}: {e}"));
+                        }
+                        log.info(format!("created the administrator `{name}` in {file} (GRAPHBUFF_ADMIN_PASSWORD)"));
+                    }
+                    Some(_) => log.info(format!(
+                        "{file} already has accounts; GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD are ignored"
+                    )),
+                    None => {}
+                }
                 if u.is_empty() && config.token.is_none() {
                     warn(&format!(
-                        "{file} has no users yet, so nobody can log in; add an admin with `graphbuff-server users {file} add NAME admin`, or start with --token"
+                        "{file} has no users yet, so nobody can log in; add an admin with `graphbuff-server users {file} add NAME admin`, set GRAPHBUFF_ADMIN_PASSWORD, or start with --token"
                     ));
                 }
                 config.users = Some(Arc::new(u));

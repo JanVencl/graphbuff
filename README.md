@@ -13,10 +13,12 @@
 Without a Rust toolchain, start the server with the movies demo graph loaded:
 
 ```bash
-docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 ghcr.io/janvencl/graphbuff --demo movies
+docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
+       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff --demo movies
 ```
 
-HTTP/JSON is then on `http://127.0.0.1:7475` and Bolt on `bolt://127.0.0.1:7687`; see
+HTTP/JSON is then on `http://127.0.0.1:7475` and Bolt on `bolt://127.0.0.1:7687`, for the
+user `admin` with the password `change-me`; see
 [Install without Rust](#install-without-rust) for prebuilt binaries and
 [Data directory and logs](#data-directory-and-logs) for where the server keeps your data.
 
@@ -49,11 +51,12 @@ println!("{}", r.to_table());
 ### Docker
 
 ```bash
-docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 ghcr.io/janvencl/graphbuff --demo movies
+docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
+       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff --demo movies
 ```
 
 ```bash
-curl -s http://127.0.0.1:7475/query -H 'Content-Type: application/json'      -d '{"query": "MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name, m.title"}'
+curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: application/json'      -d '{"query": "MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name, m.title"}'
 ```
 
 The image `ghcr.io/janvencl/graphbuff` (tags: `latest` and each version, such as `0.1.0`;
@@ -63,14 +66,49 @@ error (`docker logs`); anything after the image name is added to that command li
 `--demo movies` loads the graph of [examples/movies.cypher](examples/movies.cypher), which
 is compiled into the binary, into the default database (unless it already holds data).
 
-Inside the container the server has to listen on every interface, so it warns that it has
-no `--token`. Who can reach it is decided by `-p`: `-p 127.0.0.1:7475:7475` publishes the
-port to this machine only, which is what makes the command above safe. To publish it to
-other machines (`-p 7475:7475`), set a token or user accounts:
+The image keeps user accounts in `/data/users.txt` (`GRAPHBUFF_USERS`), so clients log in.
+On the first start, while that file has no accounts, the server creates the administrator
+`GRAPHBUFF_ADMIN_USER` (default `admin`) with the password in `GRAPHBUFF_ADMIN_PASSWORD`;
+later starts ignore both, and the password is changed with Cypher (`ALTER CURRENT USER SET
+PASSWORD FROM … TO …`). To keep the password out of the environment, use a secret file
+instead:
 
 ```bash
-docker run --rm -p 7475:7475 -p 7687:7687 -e GRAPHBUFF_TOKEN=s3cret ghcr.io/janvencl/graphbuff
+docker run -d --name graphbuff -p 127.0.0.1:7687:7687 -v graphbuff-data:/data \
+       -v ./admin-password.txt:/run/secrets/admin:ro \
+       -e GRAPHBUFF_ADMIN_PASSWORD_FILE=/run/secrets/admin ghcr.io/janvencl/graphbuff
 ```
+
+or, in Compose:
+
+```yaml
+services:
+  graphbuff:
+    image: ghcr.io/janvencl/graphbuff
+    environment:
+      GRAPHBUFF_ADMIN_PASSWORD_FILE: /run/secrets/graphbuff_admin
+    secrets: [graphbuff_admin]
+    volumes: [graphbuff-data:/data]
+secrets:
+  graphbuff_admin:
+    file: ./admin-password.txt
+volumes:
+  graphbuff-data:
+```
+
+Without either, the server warns that nobody can log in; add the administrator offline
+(the image has no shell, so name the binary):
+
+```bash
+docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
+       ghcr.io/janvencl/graphbuff users /data/users.txt add admin admin
+```
+
+`-e GRAPHBUFF_USERS=-` turns accounts off: then `-e GRAPHBUFF_TOKEN=s3cret` makes one token
+the only login, and with neither anyone who reaches the ports may do anything. Who can
+reach them is decided by `-p`: `-p 127.0.0.1:7475:7475` publishes a port to this machine
+only. A bind mount for `/data` (`-v ./data:/data`) must be writable by the container's user,
+uid 65532 (`sudo chown 65532 ./data` on Linux).
 
 Name the volume to keep the databases when the container is removed (`--rm` above drops
 them with the container):
@@ -672,10 +710,26 @@ works alongside, as an administrator. The file keeps PBKDF2-HMAC-SHA-256 hashes 
 rounds, random salts); a missing file is created on the first change.
 
 ```bash
-# the first administrator, offline (password from GRAPHBUFF_PASSWORD or standard input)
+# the first administrator, offline (password from GRAPHBUFF_PASSWORD, else asked for
+# twice without echo on a terminal, else the first line of standard input)
 graphbuff-server users users.txt add root admin
 graphbuff-server --users users.txt --bolt 127.0.0.1:7687
 ```
+
+Or let the server create the first administrator when it starts with an empty users file
+(Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
+`GRAPHBUFF_ADMIN_PASSWORD`, or `GRAPHBUFF_ADMIN_PASSWORD_FILE` naming a file that holds
+the password (one trailing newline is ignored). Once the file has accounts these are
+ignored, so they may stay set; setting them without a users file is an error.
+
+```powershell
+# Windows: the same, asking without echo (PowerShell 7)
+$env:GRAPHBUFF_ADMIN_PASSWORD = Read-Host -MaskInput 'password'
+graphbuff-server --users users.txt
+```
+
+`GRAPHBUFF_USERS` sets `--users` from the environment; `-` turns accounts off. On Unix the
+file is written readable by its owner only (mode 600).
 
 Each user holds roles; the strongest decides what they may do, checked for every
 statement (a role granted or revoked applies to open connections at once):

@@ -21,8 +21,9 @@ from graphbuff_server import ROOT, free_port as _free_port, server_binary as _se
 CERTS = os.path.join(ROOT, "crates", "server", "tests", "tls")
 
 
-def _start(args, health_url, context=None):
-    proc = subprocess.Popen([_server_binary(), *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+def _start(args, health_url, context=None, env=None):
+    proc = subprocess.Popen([_server_binary(), *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            env=env)
     deadline = time.time() + 20
     while True:
         try:
@@ -100,6 +101,32 @@ def test_admins_manage_users(accounts):
         with GraphDatabase.driver(accounts, auth=("eve", "evepw2")) as eve:
             with pytest.raises(ex.AuthError):
                 eve.verify_connectivity()
+
+
+def test_first_admin_from_the_environment():
+    """GRAPHBUFF_ADMIN_* create the administrator in an empty users file (as in Docker)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        secret = os.path.join(tmp, "secret")
+        with open(secret, "w") as f:
+            f.write("bootpw\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
+        env.update(GRAPHBUFF_USERS=os.path.join(tmp, "users.txt"), GRAPHBUFF_ADMIN_USER="boot",
+                   GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
+        http_port, bolt_port = _free_port(), _free_port()
+        proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
+                       "--in-memory", "--config", "-"],
+                      f"http://127.0.0.1:{http_port}/health", env=env)
+        try:
+            url = f"bolt://127.0.0.1:{bolt_port}"
+            with GraphDatabase.driver(url, auth=("boot", "bootpw")) as d:
+                records, _, _ = d.execute_query("SHOW CURRENT USER", database_="system")
+                assert records[0]["roles"] == ["admin"]
+            with GraphDatabase.driver(url, auth=("boot", "bootpw\n")) as d:
+                with pytest.raises(ex.AuthError):
+                    d.verify_connectivity()
+        finally:
+            proc.terminate()
+            proc.wait(10)
 
 
 # --- TLS --------------------------------------------------------------------
