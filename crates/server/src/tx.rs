@@ -152,6 +152,7 @@ impl Transactions {
         };
         let spawned = thread::Builder::new()
             .name("graphbuff-tx".into())
+            .stack_size(crate::QUERY_STACK)
             .spawn(move || {
                 let tx = Started {
                     id: &thread_id,

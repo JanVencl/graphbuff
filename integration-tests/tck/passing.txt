@@ -194,6 +194,7 @@ Comparison1 [13] Handling explicit equality of large integer, non-equal values
 Comparison1 [14] Direction of traversed relationship is not significant for path equality, simple
 Comparison1 [15] It is unknown - i.e. null - if a null is equal to a null
 Comparison1 [16] It is unknown - i.e. null - if a null is not equal to a null
+Comparison1 [17] Failing when comparing to an undefined variable
 Comparison1 [1] Number-typed integer comparison
 Comparison1 [2] Number-typed float comparison
 Comparison1 [3] Any-typed string comparison
@@ -231,6 +232,10 @@ Comparison1 [9] Equality between strings and numbers #1.3
 Comparison1 [9] Equality between strings and numbers #1.4
 Comparison2 [1] Comparing strings and integers using > in an AND'd predicate
 Comparison2 [2] Comparing strings and integers using > in a OR'd predicate
+Comparison2 [3] Comparing across types yields null, except numbers #1.1
+Comparison2 [3] Comparing across types yields null, except numbers #1.2
+Comparison2 [3] Comparing across types yields null, except numbers #1.3
+Comparison2 [3] Comparing across types yields null, except numbers #1.4
 Comparison2 [4] Comparing lists #1.1
 Comparison2 [4] Comparing lists #1.2
 Comparison2 [4] Comparing lists #1.3
@@ -310,6 +315,7 @@ Create2 [20] Fail when creating a relationship with two directions
 Create2 [21] Fail when creating a relationship with more than one type
 Create2 [22] Fail when creating a variable-length relationship
 Create2 [23] Fail when creating a relationship that is already bound
+Create2 [24] Fail when creating a relationship using undefined variable in pattern
 Create2 [2] Create two nodes and a single relationship in separate patterns
 Create2 [3] Create two nodes and a single relationship in separate clauses
 Create2 [4] Create two nodes and a single relationship in the reverse direction
@@ -374,6 +380,7 @@ Delete5 [4] Delete relationships from a map
 Delete5 [5] Detach delete nodes from nested map/list
 Delete5 [6] Delete relationships from nested map/list
 Delete5 [7] Delete paths from nested map/list
+Delete5 [8] Failing when using undefined variable in DELETE
 Delete5 [9] Failing when deleting an integer expression
 Delete6 [10] Skipping and limiting to a few results after deleting relationships affects the result set but not the side effects
 Delete6 [11] Skipping zero result and limiting to all results after deleting relationships does not affect the result set nor the side effects
@@ -554,6 +561,7 @@ List12 [3] Size of list comprehension
 List12 [4] Returning a list comprehension
 List12 [5] Using a list comprehension in a WITH
 List12 [6] Using a list comprehension in a WHERE
+List12 [7] Fail when using aggregation in list comprehension
 List2 [10] List slice with parameterised range
 List2 [11] List slice with parameterised invalid range
 List2 [1] List slice
@@ -658,27 +666,60 @@ Literals2 [4] Return a positive zero
 Literals2 [5] Return a negative zero
 Literals2 [6] Return a short negative integer
 Literals2 [7] Return a long negative integer
+Literals2 [8] Return the smallest integer
 Literals2 [9] Fail on a too large integer
+Literals3 [10] Return a upper case hexadecimal integer
+Literals3 [11] Return a mixed case hexadecimal integer
 Literals3 [12] Fail on an incomplete hexadecimal integer
 Literals3 [13] Fail on an hexadecimal literal containing a lower case invalid alphanumeric character
 Literals3 [14] Fail on an hexadecimal literal containing a upper case invalid alphanumeric character
 Literals3 [16] Fail on a too large hexadecimal integer
 Literals3 [17] Fail on a too small hexadecimal integer
+Literals3 [1] Return a short positive hexadecimal integer
+Literals3 [2] Return a long positive hexadecimal integer
+Literals3 [3] Return the largest hexadecimal integer
+Literals3 [4] Return a positive hexadecimal zero
+Literals3 [5] Return a negative hexadecimal zero
+Literals3 [6] Return a short negative hexadecimal integer
+Literals3 [7] Return a long negative hexadecimal integer
+Literals3 [8] Return the smallest hexadecimal integer
+Literals3 [9] Return a lower case hexadecimal integer
 Literals4 [10] Fail on a too small octal integer
+Literals4 [1] Return a short positive octal integer
+Literals4 [2] Return a long positive octal integer
+Literals4 [3] Return the largest octal integer
+Literals4 [4] Return a positive octal zero
+Literals4 [5] Return a negative octal zero
+Literals4 [6] Return a short negative octal integer
+Literals4 [7] Return a long negative octal integer
+Literals4 [8] Return the smallest octal integer
 Literals4 [9] Fail on a too large octal integer
+Literals5 [10] Return a negative zero float without integer digits
 Literals5 [11] Return a very long negative float
+Literals5 [12] Return a very long negative float without integer digits
 Literals5 [13] Return a positive float with positive lower case exponent
 Literals5 [14] Return a positive float with positive upper case exponent
+Literals5 [15] Return a positive float with positive lower case exponent without integer digits
 Literals5 [16] Return a positive float with negative lower case exponent
+Literals5 [17] Return a positive float with negative lower case exponent without integer digits
+Literals5 [18] Return a positive float with negative upper case exponent without integer digits
 Literals5 [19] Return a negative float in with positive lower case exponent
 Literals5 [1] Return a short positive float
 Literals5 [20] Return a negative float in with positive upper case exponent
+Literals5 [21] Return a negative float with positive lower case exponent without integer digits
 Literals5 [22] Return a negative float with negative lower case exponent
+Literals5 [23] Return a negative float with negative lower case exponent without integer digits
+Literals5 [24] Return a negative float with negative upper case exponent without integer digits
 Literals5 [25] Return a positive float with one integer digit and maximum positive exponent
 Literals5 [26] Return a positive float with nine integer digit and maximum positive exponent
+Literals5 [27] Fail when float value is too large
+Literals5 [2] Return a short positive float without integer digits
 Literals5 [3] Return a long positive float
+Literals5 [4] Return a long positive float without integer digits
 Literals5 [5] Return a very long positive float
+Literals5 [6] Return a very long positive float without integer digits
 Literals5 [7] Return a positive zero float
+Literals5 [8] Return a positive zero float without integer digits
 Literals5 [9] Return a negative zero float
 Literals6 [10] Accept valid Unicode literal
 Literals6 [11] Return a double-quoted string with one character
@@ -696,6 +737,7 @@ Literals7 [10] Return seven-deep nested empty lists
 Literals7 [11] Return 20-deep nested empty lists
 Literals7 [12] Return 40-deep nested empty lists
 Literals7 [13] Return a list containing an empty map
+Literals7 [14] Return a list containing multiple integer
 Literals7 [16] Return a list containing multiple mixed values
 Literals7 [17] Return a list containing real and fake nested lists
 Literals7 [18] Return a complex list containing multiple mixed and nested values
@@ -706,8 +748,13 @@ Literals7 [21] Fail on a nested list with missing commas
 Literals7 [2] Return a list containing a boolean
 Literals7 [3] Return a list containing a null
 Literals7 [4] Return a list containing a integer
+Literals7 [5] Return a list containing a hexadecimal integer
+Literals7 [6] Return a list containing a octal integer
+Literals7 [7] Return a list containing a float
 Literals7 [8] Return a list containing a string
 Literals7 [9] Return a list containing an empty lists
+Literals8 [10] Return a map containing a octal integer
+Literals8 [11] Return a map containing a float
 Literals8 [12] Return a map containing a string
 Literals8 [13] Return a map containing an empty map
 Literals8 [14] Return seven-deep nested maps
@@ -732,6 +779,7 @@ Literals8 [5] Return a map containing one value with alphanumeric mixed case key
 Literals8 [6] Return a map containing a boolean
 Literals8 [7] Return a map containing a null
 Literals8 [8] Return a map containing a integer
+Literals8 [9] Return a map containing a hexadecimal integer
 Map1 [1] Statically access a field of a non-null map
 Map1 [2] Statically access a field of a null map
 Map1 [3] Statically access a field of a map resulting from an expression
@@ -1217,6 +1265,7 @@ Merge3 [1] Merge should be able to set labels on match
 Merge3 [2] Merge node with label add label on match when it exists
 Merge3 [3] Merge node and set property on match
 Merge3 [4] Merge should be able to use properties of bound node in ON MATCH
+Merge3 [5] Fail when using undefined variable in ON MATCH
 Merge4 [1] Merge should be able to set labels on match and on create
 Merge4 [2] Merge should be able to use properties of bound node in ON MATCH and ON CREATE
 Merge5 [10] Merge should bind a path
@@ -1312,6 +1361,20 @@ Path3 [1] Return a var length path of length zero
 Path3 [2] Failing when using `length()` on a node
 Path3 [3] Failing when using `length()` on a relationship
 Pattern1 [10] Fail on introducing unbounded variables in pattern #1.1
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.10
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.11
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.12
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.13
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.14
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.15
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.2
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.3
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.4
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.5
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.6
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.7
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.8
+Pattern1 [10] Fail on introducing unbounded variables in pattern #1.9
 Pattern1 [10] Matching on a specific type of undirected connection with length 2
 Pattern1 [11] Fail on checking self pattern
 Pattern1 [12] Matching two nodes on a single directed connection between them
@@ -2103,6 +2166,7 @@ Remove3 [7] Aggregating in `WITH` after removing a property from nodes affects t
 Remove3 [8] Limiting to zero results after removing a label from nodes affects the result set but not the side effects
 Remove3 [9] Skipping all results after removing a label from nodes affects the result set but not the side effects
 Return1 [1] Returning a list property
+Return1 [2] Fail when returning an undefined variable
 Return2 [10] Return count aggregation over an empty graph
 Return2 [11] RETURN does not lose precision on large integers
 Return2 [12] Projecting a list of nodes and relationships
@@ -2170,6 +2234,8 @@ ReturnOrderBy1 [9] ORDER BY should order lists in the expected order
 ReturnOrderBy2 [10] Returned columns do not change from using ORDER BY
 ReturnOrderBy2 [11] Aggregates ordered by arithmetics
 ReturnOrderBy2 [12] Aggregation of named paths
+ReturnOrderBy2 [13] Fail when sorting on variable removed by DISTINCT
+ReturnOrderBy2 [14] Fail on aggregation in ORDER BY after RETURN
 ReturnOrderBy2 [1] ORDER BY should return results in ascending order
 ReturnOrderBy2 [2] ORDER BY DESC should return results in descending order
 ReturnOrderBy2 [3] Sort on aggregated function
@@ -2183,6 +2249,7 @@ ReturnOrderBy3 [1] Sort on aggregate function and normal property
 ReturnOrderBy4 [1] ORDER BY of a column introduced in RETURN should return salient results in ascending order
 ReturnOrderBy4 [2] Handle projections with ORDER BY
 ReturnOrderBy5 [1] Renaming columns before ORDER BY should return results in ascending order
+ReturnOrderBy6 [1] Handle constants and parameters inside an order by item which contains an aggregation expression
 ReturnOrderBy6 [2] Handle returned aliases inside an order by item which contains an aggregation expression
 ReturnOrderBy6 [3] Handle returned property accesses inside an order by item which contains an aggregation expression
 ReturnOrderBy6 [4] Fail if not returned variables are used inside an order by item which contains an aggregation expression
@@ -2225,6 +2292,7 @@ Set1 [5] Adding a list property
 Set1 [6] Concatenate elements onto a list property
 Set1 [7] Concatenate elements in reverse onto a list property
 Set1 [8] Ignore null when setting property
+Set1 [9] Failing when using undefined variable in SET
 Set2 [1] Setting a node property to null removes the existing property
 Set2 [2] Setting a node property to null removes the existing property, but not before SET
 Set2 [3] Setting a relationship property to null removes the existing property
@@ -2683,38 +2751,58 @@ Temporal2 [7] Should parse duration from string #1.4
 Temporal2 [7] Should parse duration from string #1.6
 Temporal3 [10] Should select date and time into date time #1.1
 Temporal3 [10] Should select date and time into date time #1.10
+Temporal3 [10] Should select date and time into date time #1.11
+Temporal3 [10] Should select date and time into date time #1.12
 Temporal3 [10] Should select date and time into date time #1.13
 Temporal3 [10] Should select date and time into date time #1.14
 Temporal3 [10] Should select date and time into date time #1.15
 Temporal3 [10] Should select date and time into date time #1.16
 Temporal3 [10] Should select date and time into date time #1.17
 Temporal3 [10] Should select date and time into date time #1.18
+Temporal3 [10] Should select date and time into date time #1.19
 Temporal3 [10] Should select date and time into date time #1.2
+Temporal3 [10] Should select date and time into date time #1.20
 Temporal3 [10] Should select date and time into date time #1.21
 Temporal3 [10] Should select date and time into date time #1.22
+Temporal3 [10] Should select date and time into date time #1.23
+Temporal3 [10] Should select date and time into date time #1.24
 Temporal3 [10] Should select date and time into date time #1.25
 Temporal3 [10] Should select date and time into date time #1.26
+Temporal3 [10] Should select date and time into date time #1.27
+Temporal3 [10] Should select date and time into date time #1.28
 Temporal3 [10] Should select date and time into date time #1.29
+Temporal3 [10] Should select date and time into date time #1.3
 Temporal3 [10] Should select date and time into date time #1.30
 Temporal3 [10] Should select date and time into date time #1.31
 Temporal3 [10] Should select date and time into date time #1.32
 Temporal3 [10] Should select date and time into date time #1.33
 Temporal3 [10] Should select date and time into date time #1.34
+Temporal3 [10] Should select date and time into date time #1.35
+Temporal3 [10] Should select date and time into date time #1.36
 Temporal3 [10] Should select date and time into date time #1.37
 Temporal3 [10] Should select date and time into date time #1.38
+Temporal3 [10] Should select date and time into date time #1.39
+Temporal3 [10] Should select date and time into date time #1.4
+Temporal3 [10] Should select date and time into date time #1.40
 Temporal3 [10] Should select date and time into date time #1.41
 Temporal3 [10] Should select date and time into date time #1.42
+Temporal3 [10] Should select date and time into date time #1.43
+Temporal3 [10] Should select date and time into date time #1.44
 Temporal3 [10] Should select date and time into date time #1.45
 Temporal3 [10] Should select date and time into date time #1.46
 Temporal3 [10] Should select date and time into date time #1.47
 Temporal3 [10] Should select date and time into date time #1.48
 Temporal3 [10] Should select date and time into date time #1.5
 Temporal3 [10] Should select date and time into date time #1.6
+Temporal3 [10] Should select date and time into date time #1.7
+Temporal3 [10] Should select date and time into date time #1.8
 Temporal3 [10] Should select date and time into date time #1.9
 Temporal3 [11] Should datetime into date time #1.1
 Temporal3 [11] Should datetime into date time #1.10
 Temporal3 [11] Should datetime into date time #1.2
 Temporal3 [11] Should datetime into date time #1.3
+Temporal3 [11] Should datetime into date time #1.4
+Temporal3 [11] Should datetime into date time #1.5
 Temporal3 [11] Should datetime into date time #1.6
 Temporal3 [11] Should datetime into date time #1.7
 Temporal3 [11] Should datetime into date time #1.8
@@ -2742,14 +2830,20 @@ Temporal3 [2] Should select local time #1.10
 Temporal3 [2] Should select local time #1.11
 Temporal3 [2] Should select local time #1.12
 Temporal3 [2] Should select local time #1.2
+Temporal3 [2] Should select local time #1.3
 Temporal3 [2] Should select local time #1.4
 Temporal3 [2] Should select local time #1.5
+Temporal3 [2] Should select local time #1.6
 Temporal3 [2] Should select local time #1.7
 Temporal3 [2] Should select local time #1.8
+Temporal3 [2] Should select local time #1.9
 Temporal3 [3] Should select time #1.1
+Temporal3 [3] Should select time #1.10
 Temporal3 [3] Should select time #1.11
 Temporal3 [3] Should select time #1.12
 Temporal3 [3] Should select time #1.13
+Temporal3 [3] Should select time #1.14
+Temporal3 [3] Should select time #1.15
 Temporal3 [3] Should select time #1.16
 Temporal3 [3] Should select time #1.17
 Temporal3 [3] Should select time #1.18
@@ -2757,9 +2851,12 @@ Temporal3 [3] Should select time #1.19
 Temporal3 [3] Should select time #1.2
 Temporal3 [3] Should select time #1.20
 Temporal3 [3] Should select time #1.3
+Temporal3 [3] Should select time #1.4
+Temporal3 [3] Should select time #1.5
 Temporal3 [3] Should select time #1.6
 Temporal3 [3] Should select time #1.7
 Temporal3 [3] Should select time #1.8
+Temporal3 [3] Should select time #1.9
 Temporal3 [4] Should select date into local date time #1.1
 Temporal3 [4] Should select date into local date time #1.2
 Temporal3 [4] Should select date into local date time #1.3
@@ -2767,27 +2864,40 @@ Temporal3 [4] Should select date into local date time #1.4
 Temporal3 [4] Should select date into local date time #1.5
 Temporal3 [4] Should select date into local date time #1.6
 Temporal3 [5] Should select time into local date time #1.1
+Temporal3 [5] Should select time into local date time #1.2
 Temporal3 [5] Should select time into local date time #1.3
+Temporal3 [5] Should select time into local date time #1.4
 Temporal3 [5] Should select time into local date time #1.5
+Temporal3 [5] Should select time into local date time #1.6
 Temporal3 [5] Should select time into local date time #1.7
 Temporal3 [5] Should select time into local date time #1.8
 Temporal3 [6] Should select date and time into local date time #1.1
+Temporal3 [6] Should select date and time into local date time #1.10
 Temporal3 [6] Should select date and time into local date time #1.11
+Temporal3 [6] Should select date and time into local date time #1.12
 Temporal3 [6] Should select date and time into local date time #1.13
+Temporal3 [6] Should select date and time into local date time #1.14
 Temporal3 [6] Should select date and time into local date time #1.15
 Temporal3 [6] Should select date and time into local date time #1.16
 Temporal3 [6] Should select date and time into local date time #1.17
+Temporal3 [6] Should select date and time into local date time #1.18
 Temporal3 [6] Should select date and time into local date time #1.19
+Temporal3 [6] Should select date and time into local date time #1.2
+Temporal3 [6] Should select date and time into local date time #1.20
 Temporal3 [6] Should select date and time into local date time #1.21
+Temporal3 [6] Should select date and time into local date time #1.22
 Temporal3 [6] Should select date and time into local date time #1.23
 Temporal3 [6] Should select date and time into local date time #1.24
 Temporal3 [6] Should select date and time into local date time #1.3
+Temporal3 [6] Should select date and time into local date time #1.4
 Temporal3 [6] Should select date and time into local date time #1.5
+Temporal3 [6] Should select date and time into local date time #1.6
 Temporal3 [6] Should select date and time into local date time #1.7
 Temporal3 [6] Should select date and time into local date time #1.8
 Temporal3 [6] Should select date and time into local date time #1.9
 Temporal3 [7] Should select datetime into local date time #1.1
 Temporal3 [7] Should select datetime into local date time #1.2
+Temporal3 [7] Should select datetime into local date time #1.3
 Temporal3 [7] Should select datetime into local date time #1.4
 Temporal3 [7] Should select datetime into local date time #1.5
 Temporal3 [7] Should select datetime into local date time #1.6
@@ -2805,13 +2915,19 @@ Temporal3 [8] Should select date into date time #1.8
 Temporal3 [8] Should select date into date time #1.9
 Temporal3 [9] Should select time into date time #1.1
 Temporal3 [9] Should select time into date time #1.10
+Temporal3 [9] Should select time into date time #1.11
+Temporal3 [9] Should select time into date time #1.12
 Temporal3 [9] Should select time into date time #1.13
 Temporal3 [9] Should select time into date time #1.14
 Temporal3 [9] Should select time into date time #1.15
 Temporal3 [9] Should select time into date time #1.16
 Temporal3 [9] Should select time into date time #1.2
+Temporal3 [9] Should select time into date time #1.3
+Temporal3 [9] Should select time into date time #1.4
 Temporal3 [9] Should select time into date time #1.5
 Temporal3 [9] Should select time into date time #1.6
+Temporal3 [9] Should select time into date time #1.7
+Temporal3 [9] Should select time into date time #1.8
 Temporal3 [9] Should select time into date time #1.9
 Temporal4 [10] Should store date time array #1.1
 Temporal4 [10] Should store date time array #1.2
@@ -3241,7 +3357,25 @@ Temporal9 [5] Should truncate time #1.6
 Temporal9 [5] Should truncate time #1.7
 Temporal9 [5] Should truncate time #1.8
 Temporal9 [5] Should truncate time #1.9
+TriadicSelection1 [10] Handling triadic friend of a friend that is not a friend with implicit superset of labels
+TriadicSelection1 [11] Handling triadic friend of a friend that is a friend
+TriadicSelection1 [12] Handling triadic friend of a friend that is a friend with different relationship type
+TriadicSelection1 [13] Handling triadic friend of a friend that is a friend with superset of relationship type
+TriadicSelection1 [14] Handling triadic friend of a friend that is a friend with implicit subset of relationship type
+TriadicSelection1 [15] Handling triadic friend of a friend that is a friend with explicit subset of relationship type
+TriadicSelection1 [16] Handling triadic friend of a friend that is a friend with same labels
+TriadicSelection1 [17] Handling triadic friend of a friend that is a friend with different labels
+TriadicSelection1 [18] Handling triadic friend of a friend that is a friend with implicit subset of labels
+TriadicSelection1 [19] Handling triadic friend of a friend that is a friend with implicit superset of labels
 TriadicSelection1 [1] Handling triadic friend of a friend
+TriadicSelection1 [2] Handling triadic friend of a friend that is not a friend
+TriadicSelection1 [3] Handling triadic friend of a friend that is not a friend with different relationship type
+TriadicSelection1 [4] Handling triadic friend of a friend that is not a friend with superset of relationship type
+TriadicSelection1 [5] Handling triadic friend of a friend that is not a friend with implicit subset of relationship type
+TriadicSelection1 [6] Handling triadic friend of a friend that is not a friend with explicit subset of relationship type
+TriadicSelection1 [7] Handling triadic friend of a friend that is not a friend with same labels
+TriadicSelection1 [8] Handling triadic friend of a friend that is not a friend with different labels
+TriadicSelection1 [9] Handling triadic friend of a friend that is not a friend with implicit subset of labels
 TypeConversion1 [1] `toBoolean()` on booleans
 TypeConversion1 [2] `toBoolean()` on valid literal string
 TypeConversion1 [3] `toBoolean()` on variables with valid string values
@@ -3456,6 +3590,31 @@ WithOrderBy2 [23] Sort by an expression that is only partially orderable on a no
 WithOrderBy2 [23] Sort by an expression that is only partially orderable on a non-distinct binding table, but used in parts as a grouping key #1.2
 WithOrderBy2 [24] Sort by an expression that is only partially orderable on a non-distinct binding table, but made distinct #1.1
 WithOrderBy2 [24] Sort by an expression that is only partially orderable on a non-distinct binding table, but made distinct #1.2
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.1
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.10
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.11
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.12
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.13
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.14
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.15
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.16
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.17
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.18
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.19
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.2
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.20
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.21
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.22
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.23
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.24
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.25
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.3
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.4
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.5
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.6
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.7
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.8
+WithOrderBy2 [25] Fail on sorting by an aggregation #1.9
 WithOrderBy2 [2] Sort by a boolean expression in descending order #1.1
 WithOrderBy2 [2] Sort by a boolean expression in descending order #1.2
 WithOrderBy2 [3] Sort by an integer expression in ascending order #1.1
@@ -3575,6 +3734,7 @@ WithOrderBy4 [12] Sort by an aliased aggregate projection
 WithOrderBy4 [13] Fail on sorting by a non-projected aggregation on a variable
 WithOrderBy4 [14] Fail on sorting by a non-projected aggregation on an expression
 WithOrderBy4 [15] Sort by an aliased aggregate projection does allow subsequent matching
+WithOrderBy4 [16] Handle constants and parameters inside an order by item which contains an aggregation expression
 WithOrderBy4 [17] Handle projected variables inside an order by item which contains an aggregation expression
 WithOrderBy4 [18]  Handle projected property accesses inside an order by item which contains an aggregation expression
 WithOrderBy4 [19] Fail if not projected variables are used inside an order by item which contains an aggregation expression
@@ -3596,6 +3756,8 @@ WithSkipLimit3 [1] Get rows in the middle
 WithSkipLimit3 [2] Get rows in the middle by param
 WithSkipLimit3 [3] Limiting amount of rows when there are fewer left than the LIMIT argument
 WithWhere1 [1] Filter node with property predicate on a single variable with multiple bindings
+WithWhere1 [3] Filter for an unbound relationship variable
+WithWhere1 [4] Filter for an unbound node variable
 WithWhere2 [1] Filter nodes with conjunctive two-part property predicate on multi variables with multiple bindings
 WithWhere2 [2] Filter node with conjunctive multi-part property predicates on multi variables with multiple bindings
 WithWhere3 [1] Join between node identities
@@ -3608,4 +3770,6 @@ WithWhere5 [2] Filter out on null if the AND'd predicate evaluates to false
 WithWhere5 [3] Filter out on null if the AND'd predicate evaluates to true
 WithWhere5 [4] Do not filter out on null if the OR'd predicate evaluates to true
 WithWhere6 [1] Filter a single aggregate
+WithWhere7 [1] WHERE sees a variable bound before but not after WITH
 WithWhere7 [2] WHERE sees a variable bound after but not before WITH
+WithWhere7 [3] WHERE sees both, variable bound before but not after WITH and variable bound after but not before WITH

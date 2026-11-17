@@ -94,6 +94,11 @@ use tx::Transactions;
 /// How often blocked reads wake up to check for shutdown.
 const POLL: Duration = Duration::from_millis(250);
 
+/// Stack of the threads that run queries. Planning and running walk the query
+/// recursively, so a long query (hundreds of `CREATE` clauses) needs more than the
+/// default 2 MiB. Only the pages a thread touches are committed.
+pub(crate) const QUERY_STACK: usize = 64 << 20;
+
 /// Settings for [`Server::start`].
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -352,6 +357,7 @@ fn accept_loop(
         let s = Arc::clone(&shared);
         let spawned = thread::Builder::new()
             .name("graphbuff-conn".into())
+            .stack_size(QUERY_STACK)
             .spawn(move || {
                 if let Some(stream) = open(stream, protocol, &s) {
                     match protocol {

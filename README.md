@@ -896,10 +896,9 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,609 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (92.6 %).
-The TCK is the official compatibility suite for openCypher. Most failures are the test
-procedures of `CALL` and temporal values built from others with a `second` field (graphbuff
-drops the fraction of a second). The TCK
+**openCypher TCK:** 3,773 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (96.8 %).
+The TCK is the official compatibility suite for openCypher. The largest group of failures
+is the test procedures of `CALL`, which cannot be registered over HTTP. The TCK
 checks errors only by category, not by detail code. The suite and the full table per
 feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 
@@ -950,7 +949,8 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   `shortestPath((a)-[:T*]->(b))` and `allShortestPaths(…)` (a bidirectional breadth-first search;
   `WHERE` conditions on the path or its relationships are applied during the search, so the result
   is the shortest path that passes them)
-* **Expressions:** arithmetic, string concatenation, comparison chains, three-valued `AND/OR/XOR/NOT`,
+* **Expressions:** integer literals in decimal, hexadecimal (`0x1F`) and octal (`0o17`), floats
+  with or without integer digits (`.5`, `1e-3`), arithmetic, string concatenation, comparison chains, three-valued `AND/OR/XOR/NOT`,
   `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (Java-style regular expressions, whole-string
   match, flags such as `(?i)`; no lookaround or backreferences), `IS [NOT] NULL`, `IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED`, indexing and slicing, maps, lists,
   `CASE`, list comprehensions, pattern comprehensions (`[(a)-[:KNOWS]->(b) WHERE b.age > 30 | b.name]`,

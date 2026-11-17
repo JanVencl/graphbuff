@@ -12,6 +12,8 @@ pub enum Tok {
     Ident(String),
     /// Backtick-quoted identifier (never a keyword).
     QuotedIdent(String),
+    /// Integer literal. `i64::MIN` stands for the magnitude 2^63, which is only valid
+    /// right after a unary minus (`-9223372036854775808`).
     Int(i64),
     Float(f64),
     Str(String),
@@ -108,6 +110,10 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
             '%' => (Tok::Percent, 1),
             '^' => (Tok::Caret, 1),
             '.' if next == Some('.') => (Tok::DotDot, 2),
+            '.' if next.is_some_and(|d| d.is_ascii_digit()) => {
+                let (tok, end) = lex_number(src, i)?;
+                (tok, end - i)
+            }
             '.' => (Tok::Dot, 1),
             '+' if next == Some('=') => (Tok::PlusEq, 2),
             '+' => (Tok::Plus, 1),
@@ -166,6 +172,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
 
 fn lex_number(src: &str, start: usize) -> Result<(Tok, usize)> {
     let b = src.as_bytes();
+    if b[start] == b'0' && start + 1 < b.len() && matches!(b[start + 1], b'x' | b'X' | b'o' | b'O') {
+        return lex_radix(src, start);
+    }
     let mut j = start;
     while j < b.len() && b[j].is_ascii_digit() {
         j += 1;
@@ -194,13 +203,38 @@ fn lex_number(src: &str, start: usize) -> Result<(Tok, usize)> {
     }
     let text = &src[start..j];
     if is_float {
-        text.parse::<f64>()
-            .map(|f| (Tok::Float(f), j))
-            .map_err(|_| Error::syntax(format!("invalid float literal '{text}'"), start))
+        match text.parse::<f64>() {
+            Ok(f) if f.is_finite() => Ok((Tok::Float(f), j)),
+            Ok(_) => Err(Error::syntax(format!("float literal '{text}' is too large"), start)),
+            Err(_) => Err(Error::syntax(format!("invalid float literal '{text}'"), start)),
+        }
     } else {
-        text.parse::<i64>()
-            .map(|n| (Tok::Int(n), j))
-            .map_err(|_| Error::syntax(format!("integer literal '{text}' is too large"), start))
+        int_token(text.parse::<u64>().ok(), text, start, j)
+    }
+}
+
+/// `0x1F` (hexadecimal) or `0o17` (octal).
+fn lex_radix(src: &str, start: usize) -> Result<(Tok, usize)> {
+    let b = src.as_bytes();
+    let radix = if matches!(b[start + 1], b'x' | b'X') { 16 } else { 8 };
+    let mut j = start + 2;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    let text = &src[start..j];
+    let digits = &src[start + 2..j];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(Error::syntax(format!("invalid integer literal '{text}'"), start));
+    }
+    int_token(u64::from_str_radix(digits, radix).ok(), text, start, j)
+}
+
+/// An integer token from its magnitude; 2^63 becomes `i64::MIN` for the parser to negate.
+fn int_token(magnitude: Option<u64>, text: &str, start: usize, end: usize) -> Result<(Tok, usize)> {
+    match magnitude {
+        Some(n) if n <= i64::MAX as u64 => Ok((Tok::Int(n as i64), end)),
+        Some(n) if n == 1 << 63 => Ok((Tok::Int(i64::MIN), end)),
+        _ => Err(Error::syntax(format!("integer literal '{text}' is too large"), start)),
     }
 }
 
@@ -320,6 +354,29 @@ mod tests {
                 Tok::Eof
             ]
         );
+    }
+
+    #[test]
+    fn number_forms() {
+        assert_eq!(
+            toks("0x1aF 0o17 .5 .1e-5 0X10 1..3"),
+            vec![
+                Tok::Int(0x1af),
+                Tok::Int(0o17),
+                Tok::Float(0.5),
+                Tok::Float(0.1e-5),
+                Tok::Int(16),
+                Tok::Int(1),
+                Tok::DotDot,
+                Tok::Int(3),
+                Tok::Eof
+            ]
+        );
+        assert_eq!(toks("0x8000000000000000")[0], Tok::Int(i64::MIN));
+        assert_eq!(toks("n.k")[1], Tok::Dot);
+        for bad in ["0x", "0x1g", "0o8", "0x10000000000000000", "9223372036854775809", "1e999"] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

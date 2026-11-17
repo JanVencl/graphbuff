@@ -616,9 +616,13 @@ mod tests {
             items.push(("1".into(), "c9".into(), false));
         }
         let mut q = String::from(if last { "RETURN " } else { "WITH " });
-        if rng.chance(30) {
+        let distinct = rng.chance(30);
+        if distinct {
             q.push_str("DISTINCT ");
         }
+        // After DISTINCT or an aggregation, ORDER BY sees only the projected columns.
+        let is_agg = |e: &str| ["count(", "collect(", "min(", "max(", "sum("].iter().any(|f| e.starts_with(f));
+        let grouped = !star && (distinct || items.iter().any(|(e, _, _)| is_agg(e)));
         let mut parts: Vec<String> = Vec::new();
         if star {
             parts.push("*".into());
@@ -633,6 +637,10 @@ mod tests {
                 let key = match rng.below(3) {
                     0 => items[rng.below(items.len())].1.clone(), // an alias
                     1 => items[rng.below(items.len())].0.clone(), // an item expression
+                    _ if grouped => {
+                        rng.below(plain.len());
+                        items[0].1.clone()
+                    }
                     _ => plain[rng.below(plain.len())].0.clone(), // a source expression
                 };
                 keys.push(if rng.chance(40) { format!("{key} DESC") } else { key });

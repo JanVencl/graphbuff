@@ -496,9 +496,94 @@ fn ty_env(kinds: &HashMap<String, VarKind>) -> TyEnv {
         .collect()
 }
 
+/// Compile-time check that a clause reads only variables in scope (`UndefinedVariable`).
+fn check_clause_vars(clause: &Clause, env: &TyEnv) -> Result<()> {
+    let defined = |e: &Expr, env: &TyEnv| typecheck::check_defined(e, env);
+    let var = |v: &str| {
+        if env.contains_key(v) {
+            Ok(())
+        } else {
+            Err(Error::Semantic(format!("variable `{v}` not defined")))
+        }
+    };
+    let set_items = |items: &[SetItem]| -> Result<()> {
+        for it in items {
+            match it {
+                SetItem::Property { var: v, value, .. } | SetItem::Replace { var: v, value } | SetItem::Merge { var: v, value } => {
+                    var(v)?;
+                    defined(value, env)?;
+                }
+                SetItem::Labels { var: v, .. } => var(v)?,
+            }
+        }
+        Ok(())
+    };
+    let pattern_props = |parts: &[PatternPart]| -> Result<()> {
+        for part in parts {
+            let nodes = std::iter::once(&part.start).chain(part.chain.iter().map(|(_, n)| n));
+            let props = nodes
+                .filter_map(|n| n.props.as_ref())
+                .chain(part.chain.iter().filter_map(|(r, _)| r.props.as_ref()));
+            for p in props {
+                defined(p, env)?;
+            }
+        }
+        Ok(())
+    };
+    match clause {
+        Clause::Match { patterns, where_, .. } => {
+            pattern_props(patterns)?;
+            if let Some(w) = where_ {
+                defined(w, env)?;
+            }
+        }
+        Clause::Create { patterns } => pattern_props(patterns)?,
+        Clause::Merge { pattern, on_create, on_match } => {
+            pattern_props(std::slice::from_ref(pattern))?;
+            set_items(on_create)?;
+            set_items(on_match)?;
+        }
+        Clause::Set(items) => set_items(items)?,
+        Clause::Remove(items) => {
+            for it in items {
+                match it {
+                    RemoveItem::Property { var: v, .. } | RemoveItem::Labels { var: v, .. } => var(v)?,
+                }
+            }
+        }
+        Clause::Delete { exprs, .. } => exprs.iter().try_for_each(|e| defined(e, env))?,
+        Clause::Unwind { expr, .. } => defined(expr, env)?,
+        Clause::With(p) | Clause::Return(p) => {
+            let mut after = env.clone();
+            for it in &p.items {
+                defined(&it.expr, env)?;
+                after.insert(it.alias.clone(), Ty::Any);
+            }
+            // After aggregating or DISTINCT, ORDER BY sees only the projected columns.
+            let grouped = p.distinct || p.items.iter().any(|it| it.expr.contains_aggregate());
+            if grouped && !p.star {
+                let only: TyEnv = p.items.iter().map(|it| (it.alias.clone(), Ty::Any)).collect();
+                for s in &p.order_by {
+                    defined(&sort_key_over_items(&s.expr, &p.items)?, &only)?;
+                }
+            } else {
+                for s in &p.order_by {
+                    defined(&s.expr, &after)?;
+                }
+            }
+            if let Some(w) = &p.where_ {
+                defined(w, &after)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Compile-time type checks of a clause's expressions (see [`crate::typecheck`]).
 fn check_clause_types(clause: &Clause, kinds: &HashMap<String, VarKind>) -> Result<()> {
     let env = ty_env(kinds);
+    check_clause_vars(clause, &env)?;
     match clause {
         Clause::Match { where_: Some(w), .. } => typecheck::check_predicate(w, &env)?,
         Clause::With(p) | Clause::Return(p) => {
@@ -965,17 +1050,28 @@ fn plan_projection(input: Box<Operator>, p: &Projection) -> Operator {
         };
     }
     if !p.order_by.is_empty() {
+        let keys: Vec<SortItem> = if aggregates {
+            p.order_by
+                .iter()
+                .map(|s| SortItem {
+                    expr: sort_key_over_items(&s.expr, &p.items).unwrap_or_else(|_| s.expr.clone()),
+                    descending: s.descending,
+                })
+                .collect()
+        } else {
+            p.order_by.clone()
+        };
         op = match &p.limit {
             Some(limit) => Operator::Top {
                 input: Box::new(op),
-                keys: p.order_by.clone(),
+                keys: keys.clone(),
                 items,
                 skip: p.skip.clone(),
                 limit: limit.clone(),
             },
             None => Operator::Sort {
                 input: Box::new(op),
-                keys: p.order_by.clone(),
+                keys: keys.clone(),
                 items,
             },
         };
@@ -992,14 +1088,24 @@ fn plan_projection(input: Box<Operator>, p: &Projection) -> Operator {
             count: count.clone(),
         };
     }
+    // The WHERE of a WITH that neither aggregates nor is DISTINCT also sees the
+    // variables coming in (`WITH c WHERE r IS NULL`), so it runs before `Select`.
+    let sees_source = !aggregates && !p.distinct;
+    let filter = |op: Operator| match &p.where_ {
+        Some(w) => Operator::Filter {
+            input: Box::new(op),
+            predicate: w.clone(),
+        },
+        None => op,
+    };
+    if sees_source {
+        op = filter(op);
+    }
     op = Operator::Select {
         input: Box::new(op),
     };
-    if let Some(w) = &p.where_ {
-        op = Operator::Filter {
-            input: Box::new(op),
-            predicate: w.clone(),
-        };
+    if !sees_source {
+        op = filter(op);
     }
     op
 }
@@ -1972,6 +2078,47 @@ impl Step {
     }
 }
 
+/// Where a projection may use aggregates: not inside a list comprehension's body, and in
+/// `ORDER BY` only as an aggregate the projection also returns.
+fn validate_aggregates(p: &Projection) -> Result<()> {
+    let mut nested = false;
+    for e in p.items.iter().map(|it| &it.expr).chain(p.order_by.iter().map(|s| &s.expr)) {
+        e.walk(&mut |x| {
+            if let Expr::ListComprehension { filter, map, .. } = x {
+                nested |= filter.as_deref().is_some_and(Expr::contains_aggregate)
+                    || map.as_deref().is_some_and(Expr::contains_aggregate);
+            }
+        });
+    }
+    if nested {
+        return Err(Error::Semantic(
+            "aggregate functions are not allowed inside a list comprehension".into(),
+        ));
+    }
+    let aggregates = p.items.iter().any(|it| it.expr.contains_aggregate());
+    for s in &p.order_by {
+        let key = if aggregates { sort_key_over_items(&s.expr, &p.items)? } else { s.expr.clone() };
+        if key.contains_aggregate() {
+            return Err(Error::Semantic(
+                "ORDER BY can only use aggregates that also appear in the projection".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A sort key of an aggregating projection with every part that is a projected item
+/// read from that item's column instead (`age + count(x)` with `count(x) AS c`).
+fn sort_key_over_items(e: &Expr, items: &[ProjectionItem]) -> Result<Expr> {
+    crate::aggregate::rewrite(e, &mut |x| {
+        Ok(items
+            .iter()
+            .rev()
+            .find(|it| it.expr == *x && !matches!(x, Expr::Var(_)))
+            .map(|it| Expr::Var(it.alias.clone())))
+    })
+}
+
 fn validate_clause_order(q: &SingleQuery) -> Result<()> {
     let n = q.clauses.len();
     for (i, c) in q.clauses.iter().enumerate() {
@@ -1991,6 +2138,9 @@ fn validate_clause_order(q: &SingleQuery) -> Result<()> {
             return Err(Error::Semantic(
                 "aggregate functions are not allowed in WHERE".into(),
             ));
+        }
+        if let Clause::With(p) | Clause::Return(p) = c {
+            validate_aggregates(p)?;
         }
     }
     let last = &q.clauses[n - 1];

@@ -1459,8 +1459,11 @@ impl<'a> Parser<'a> {
     }
 
     fn eat_uint(&mut self) -> Option<u64> {
-        if let Tok::Int(n) = self.peek() {
-            let n = *n as u64;
+        if let Tok::Int(n) = self.peek().clone() {
+            if n < 0 {
+                return None;
+            }
+            let n = n as u64;
             self.advance();
             Some(n)
         } else {
@@ -1632,8 +1635,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.eat(&Tok::Minus) {
+            if *self.peek() == Tok::Int(i64::MIN) {
+                self.advance();
+                return Ok(Expr::Literal(Value::Int(i64::MIN)));
+            }
             return Ok(match self.parse_unary()? {
-                Expr::Literal(Value::Int(n)) => Expr::Literal(Value::Int(-n)),
+                Expr::Literal(Value::Int(n)) if n != i64::MIN => Expr::Literal(Value::Int(-n)),
                 Expr::Literal(Value::Float(f)) => Expr::Literal(Value::Float(-f)),
                 e => Expr::Unary(UnaryOp::Neg, Box::new(e)),
             });
@@ -1692,6 +1699,7 @@ impl<'a> Parser<'a> {
 
     fn parse_atom(&mut self) -> Result<Expr> {
         match self.peek().clone() {
+            Tok::Int(i64::MIN) => self.err("integer literal '9223372036854775808' is too large"),
             Tok::Int(n) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Int(n)))

@@ -872,9 +872,10 @@ impl Temporal {
                     return Err(err(format!("{what}(): fraction of a second out of range")));
                 }
                 ms * 1_000_000 + us * 1000 + ns
-            } else if given[2].is_some() {
+            } else if given[0].is_some() || given[1].is_some() {
                 0
             } else {
+                // `second` alone keeps the base's fraction of a second.
                 base % NANOS_PER_SECOND
             };
             time = Some(hms(h, mi, s, sub)?);
