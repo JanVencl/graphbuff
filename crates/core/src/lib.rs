@@ -28,6 +28,9 @@ pub mod spatial;
 mod storage;
 mod store;
 pub mod temporal;
+pub mod tz;
+#[rustfmt::skip]
+mod tzdata;
 mod value;
 
 pub use csr::{Csr, CsrAdjacency};
@@ -46,4 +49,5 @@ pub use store::{
 };
 pub use spatial::{Crs, Point};
 pub use temporal::{Duration, Temporal, TemporalKind};
+pub use tz::Tz;
 pub use value::{NodeId, Path, RelId, Value, format_float, write_quoted};

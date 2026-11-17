@@ -125,7 +125,8 @@ fn constructors_and_fields() {
         ("date({year: 2015, colour: 'red'})", "runtime"),
         ("localtime('12:00+01:00')", "runtime"),
         ("date(42)", "type"),
-        ("datetime('2015-07-21T21:40[Europe/Paris]')", "unsupported"),
+        ("datetime('2015-07-21T21:40[Frost/Nixon]')", "runtime"),
+        ("datetime({year: 2015, timezone: 'Frost/Nixon'})", "runtime"),
         ("date('2015-07-21').hour", "semantic"),
         ("date('2015-01-01') < localdatetime('2015-01-01')", "ok"),
     ] {
@@ -278,5 +279,60 @@ fn stored_temporals_and_indexes() {
         );
         // Maps and other non-storable values still are not storable.
         assert!(db.execute("CREATE (:Ev {m: {d: date()}})").is_err());
+    });
+}
+
+#[test]
+fn named_time_zones() {
+    let db = mem();
+    for (expr, want) in [
+        // The zone decides the offset, with its daylight saving time and history.
+        ("datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: 'Europe/Stockholm'})", "1984-10-11T12:00+01:00[Europe/Stockholm]"),
+        ("datetime({year: 1984, month: 7, day: 20, hour: 12, timezone: 'Europe/Stockholm'})", "1984-07-20T12:00+02:00[Europe/Stockholm]"),
+        ("datetime('1818-07-21T21:40:32.142[Europe/Stockholm]')", "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]"),
+        ("datetime('2015-07-21T21:40:32.142-04[America/New_York]')", "2015-07-21T21:40:32.142-04:00[America/New_York]"),
+        // Fields.
+        ("datetime('2015-07-21T21:40[Europe/London]').timezone", "\"Europe/London\""),
+        ("datetime('2015-07-21T21:40[Europe/London]').offset", "\"+01:00\""),
+        ("datetime('2015-07-21T21:40+01:00').timezone", "\"+01:00\""),
+        // Moving to another zone keeps the instant.
+        ("datetime({datetime: datetime('1984-10-11T12:00[Europe/Stockholm]'), timezone: 'Pacific/Honolulu'})", "1984-10-11T01:00-10:00[Pacific/Honolulu]"),
+        ("time({time: datetime('1984-10-11T12:00[Europe/Stockholm]'), timezone: '+05:00'})", "16:00+05:00"),
+        ("time(datetime('1984-10-11T12:00[Europe/Stockholm]'))", "12:00+01:00"),
+        ("datetime({timezone: '+02:05:59', year: 2000})", "2000-01-01T00:00+02:05:59"),
+        // Days move the wall clock, hours the instant (2017-10-29 has 25 hours in Stockholm).
+        ("datetime('2017-10-28T12:00[Europe/Stockholm]') + duration('P1D')", "2017-10-29T12:00+01:00[Europe/Stockholm]"),
+        ("datetime('2017-10-28T12:00[Europe/Stockholm]') + duration('PT24H')", "2017-10-29T11:00+01:00[Europe/Stockholm]"),
+        ("duration.inSeconds(datetime('2017-10-29T00:00[Europe/Stockholm]'), date('2017-10-30'))", "PT25H"),
+        ("duration.inSeconds(datetime('2017-10-29T00:00[Europe/Stockholm]'), localtime('04:00'))", "PT5H"),
+        // Equality and order are by instant.
+        ("datetime('2017-10-29T02:30+02:00[Europe/Stockholm]') < datetime('2017-10-29T02:30+01:00[Europe/Stockholm]')", "true"),
+        ("datetime('2015-07-21T21:40[Europe/London]') = datetime('2015-07-21T20:40Z')", "true"),
+        ("datetime.truncate('day', datetime('2017-10-29T12:00[Europe/Stockholm]'))", "2017-10-29T00:00+02:00[Europe/Stockholm]"),
+        ("date.statement(null)", "null"),
+    ] {
+        assert_eq!(eval(&db, expr), want, "{expr}");
+    }
+    // The current time in a zone.
+    assert!(eval(&db, "datetime.statement('Asia/Tokyo')").ends_with("+09:00[Asia/Tokyo]"));
+    assert!(eval(&db, "toString(datetime({timezone: 'Asia/Tokyo'}))").ends_with("+09:00[Asia/Tokyo]\""));
+    assert_eq!(eval(&db, "date.transaction('Asia/Tokyo') = date(datetime.transaction('Asia/Tokyo'))"), "true");
+    for bad in ["datetime('2015-07-21T21:40[Frost/Nixon]')", "datetime({year: 2015, timezone: 'Frost/Nixon'})"] {
+        assert!(matches!(db.execute(&format!("RETURN {bad}")), Err(Error::Runtime(_))), "{bad}");
+    }
+}
+
+#[test]
+fn stored_named_time_zones() {
+    on_every_store(|store, db, reopen| {
+        run(&db, "CREATE (:Ev {at: datetime('2017-10-29T02:30+01:00[Europe/Stockholm]'), list: [datetime('2020-06-01T12:00[America/New_York]')]})");
+        run(&db, "CREATE INDEX FOR (e:Ev) ON (e.at)");
+        let db = reopen(db);
+        assert_eq!(
+            rows(&db, "MATCH (e:Ev) RETURN e.at, e.list"),
+            ["2017-10-29T02:30+01:00[Europe/Stockholm], [2020-06-01T12:00-04:00[America/New_York]]"],
+            "{store}"
+        );
+        assert_eq!(rows(&db, "MATCH (e:Ev) WHERE e.at = datetime('2017-10-29T01:30Z') RETURN count(e)"), ["1"], "{store}");
     });
 }

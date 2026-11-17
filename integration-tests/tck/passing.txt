@@ -2299,6 +2299,35 @@ String9 [6] No string ends with null
 String9 [7] No string does not end with null
 String9 [8] Handling non-string operands for ENDS WITH
 String9 [9] NOT with ENDS WITH
+Temporal1 [10] Should construct date time with named time zone #1.1
+Temporal1 [10] Should construct date time with named time zone #1.10
+Temporal1 [10] Should construct date time with named time zone #1.11
+Temporal1 [10] Should construct date time with named time zone #1.12
+Temporal1 [10] Should construct date time with named time zone #1.13
+Temporal1 [10] Should construct date time with named time zone #1.14
+Temporal1 [10] Should construct date time with named time zone #1.15
+Temporal1 [10] Should construct date time with named time zone #1.16
+Temporal1 [10] Should construct date time with named time zone #1.17
+Temporal1 [10] Should construct date time with named time zone #1.18
+Temporal1 [10] Should construct date time with named time zone #1.19
+Temporal1 [10] Should construct date time with named time zone #1.2
+Temporal1 [10] Should construct date time with named time zone #1.20
+Temporal1 [10] Should construct date time with named time zone #1.21
+Temporal1 [10] Should construct date time with named time zone #1.22
+Temporal1 [10] Should construct date time with named time zone #1.23
+Temporal1 [10] Should construct date time with named time zone #1.24
+Temporal1 [10] Should construct date time with named time zone #1.25
+Temporal1 [10] Should construct date time with named time zone #1.26
+Temporal1 [10] Should construct date time with named time zone #1.27
+Temporal1 [10] Should construct date time with named time zone #1.28
+Temporal1 [10] Should construct date time with named time zone #1.29
+Temporal1 [10] Should construct date time with named time zone #1.3
+Temporal1 [10] Should construct date time with named time zone #1.4
+Temporal1 [10] Should construct date time with named time zone #1.5
+Temporal1 [10] Should construct date time with named time zone #1.6
+Temporal1 [10] Should construct date time with named time zone #1.7
+Temporal1 [10] Should construct date time with named time zone #1.8
+Temporal1 [10] Should construct date time with named time zone #1.9
 Temporal1 [11] Should construct date time from epoch
 Temporal1 [12] Should construct duration #1.1
 Temporal1 [12] Should construct duration #1.2
@@ -2309,6 +2338,10 @@ Temporal1 [12] Should construct duration #1.6
 Temporal1 [12] Should construct duration #1.7
 Temporal1 [12] Should construct duration #1.8
 Temporal1 [12] Should construct duration #1.9
+Temporal1 [13] Should construct temporal with time offset with second precision #1.1
+Temporal1 [13] Should construct temporal with time offset with second precision #1.2
+Temporal1 [13] Should construct temporal with time offset with second precision #1.3
+Temporal1 [13] Should construct temporal with time offset with second precision #1.4
 Temporal1 [1] Should construct week date #1.1
 Temporal1 [1] Should construct week date #1.10
 Temporal1 [1] Should construct week date #1.11
@@ -2491,6 +2524,8 @@ Temporal10 [1] Should split between boundaries correctly #1.1
 Temporal10 [1] Should split between boundaries correctly #1.2
 Temporal10 [1] Should split between boundaries correctly #1.3
 Temporal10 [1] Should split between boundaries correctly #1.4
+Temporal10 [1] Should split between boundaries correctly #1.5
+Temporal10 [1] Should split between boundaries correctly #1.6
 Temporal10 [2] Should compute duration between two temporals #1.1
 Temporal10 [2] Should compute duration between two temporals #1.10
 Temporal10 [2] Should compute duration between two temporals #1.11
@@ -2589,6 +2624,12 @@ Temporal10 [7] Should compute negative duration between in big units #1.2
 Temporal10 [7] Should compute negative duration between in big units #1.3
 Temporal10 [7] Should compute negative duration between in big units #1.4
 Temporal10 [7] Should compute negative duration between in big units #1.5
+Temporal10 [8] Should handle durations at daylight saving time day #1.1
+Temporal10 [8] Should handle durations at daylight saving time day #1.2
+Temporal10 [8] Should handle durations at daylight saving time day #1.3
+Temporal10 [8] Should handle durations at daylight saving time day #1.4
+Temporal10 [8] Should handle durations at daylight saving time day #1.5
+Temporal10 [8] Should handle durations at daylight saving time day #1.6
 Temporal10 [9] Should handle large durations
 Temporal2 [1] Should parse date from string #1.1
 Temporal2 [1] Should parse date from string #1.10
@@ -2631,12 +2672,21 @@ Temporal2 [5] Should parse date time from string #1.5
 Temporal2 [5] Should parse date time from string #1.6
 Temporal2 [5] Should parse date time from string #1.7
 Temporal2 [5] Should parse date time from string #1.8
+Temporal2 [6] Should parse date time with named time zone from string #1.1
+Temporal2 [6] Should parse date time with named time zone from string #1.2
+Temporal2 [6] Should parse date time with named time zone from string #1.3
+Temporal2 [6] Should parse date time with named time zone from string #1.4
+Temporal2 [6] Should parse date time with named time zone from string #1.5
 Temporal2 [7] Should parse duration from string #1.1
 Temporal2 [7] Should parse duration from string #1.2
 Temporal2 [7] Should parse duration from string #1.4
 Temporal2 [7] Should parse duration from string #1.6
 Temporal3 [10] Should select date and time into date time #1.1
 Temporal3 [10] Should select date and time into date time #1.10
+Temporal3 [10] Should select date and time into date time #1.13
+Temporal3 [10] Should select date and time into date time #1.14
+Temporal3 [10] Should select date and time into date time #1.15
+Temporal3 [10] Should select date and time into date time #1.16
 Temporal3 [10] Should select date and time into date time #1.17
 Temporal3 [10] Should select date and time into date time #1.18
 Temporal3 [10] Should select date and time into date time #1.2
@@ -2644,18 +2694,31 @@ Temporal3 [10] Should select date and time into date time #1.21
 Temporal3 [10] Should select date and time into date time #1.22
 Temporal3 [10] Should select date and time into date time #1.25
 Temporal3 [10] Should select date and time into date time #1.26
+Temporal3 [10] Should select date and time into date time #1.29
+Temporal3 [10] Should select date and time into date time #1.30
+Temporal3 [10] Should select date and time into date time #1.31
+Temporal3 [10] Should select date and time into date time #1.32
 Temporal3 [10] Should select date and time into date time #1.33
 Temporal3 [10] Should select date and time into date time #1.34
 Temporal3 [10] Should select date and time into date time #1.37
 Temporal3 [10] Should select date and time into date time #1.38
 Temporal3 [10] Should select date and time into date time #1.41
 Temporal3 [10] Should select date and time into date time #1.42
+Temporal3 [10] Should select date and time into date time #1.45
+Temporal3 [10] Should select date and time into date time #1.46
+Temporal3 [10] Should select date and time into date time #1.47
+Temporal3 [10] Should select date and time into date time #1.48
 Temporal3 [10] Should select date and time into date time #1.5
 Temporal3 [10] Should select date and time into date time #1.6
 Temporal3 [10] Should select date and time into date time #1.9
 Temporal3 [11] Should datetime into date time #1.1
+Temporal3 [11] Should datetime into date time #1.10
 Temporal3 [11] Should datetime into date time #1.2
 Temporal3 [11] Should datetime into date time #1.3
+Temporal3 [11] Should datetime into date time #1.6
+Temporal3 [11] Should datetime into date time #1.7
+Temporal3 [11] Should datetime into date time #1.8
+Temporal3 [11] Should datetime into date time #1.9
 Temporal3 [1] Should select date #1.1
 Temporal3 [1] Should select date #1.10
 Temporal3 [1] Should select date #1.11
@@ -2687,10 +2750,16 @@ Temporal3 [3] Should select time #1.1
 Temporal3 [3] Should select time #1.11
 Temporal3 [3] Should select time #1.12
 Temporal3 [3] Should select time #1.13
+Temporal3 [3] Should select time #1.16
+Temporal3 [3] Should select time #1.17
+Temporal3 [3] Should select time #1.18
+Temporal3 [3] Should select time #1.19
 Temporal3 [3] Should select time #1.2
+Temporal3 [3] Should select time #1.20
 Temporal3 [3] Should select time #1.3
 Temporal3 [3] Should select time #1.6
 Temporal3 [3] Should select time #1.7
+Temporal3 [3] Should select time #1.8
 Temporal3 [4] Should select date into local date time #1.1
 Temporal3 [4] Should select date into local date time #1.2
 Temporal3 [4] Should select date into local date time #1.3
@@ -2725,14 +2794,21 @@ Temporal3 [7] Should select datetime into local date time #1.6
 Temporal3 [8] Should select date into date time #1.1
 Temporal3 [8] Should select date into date time #1.10
 Temporal3 [8] Should select date into date time #1.11
+Temporal3 [8] Should select date into date time #1.12
 Temporal3 [8] Should select date into date time #1.2
 Temporal3 [8] Should select date into date time #1.3
+Temporal3 [8] Should select date into date time #1.4
 Temporal3 [8] Should select date into date time #1.5
 Temporal3 [8] Should select date into date time #1.6
 Temporal3 [8] Should select date into date time #1.7
+Temporal3 [8] Should select date into date time #1.8
 Temporal3 [8] Should select date into date time #1.9
 Temporal3 [9] Should select time into date time #1.1
 Temporal3 [9] Should select time into date time #1.10
+Temporal3 [9] Should select time into date time #1.13
+Temporal3 [9] Should select time into date time #1.14
+Temporal3 [9] Should select time into date time #1.15
+Temporal3 [9] Should select time into date time #1.16
 Temporal3 [9] Should select time into date time #1.2
 Temporal3 [9] Should select time into date time #1.5
 Temporal3 [9] Should select time into date time #1.6
@@ -2743,10 +2819,25 @@ Temporal4 [11] Should store duration #1.1
 Temporal4 [12] Should store duration array #1.1
 Temporal4 [12] Should store duration array #1.2
 Temporal4 [13] Should propagate null #1.1
+Temporal4 [13] Should propagate null #1.10
+Temporal4 [13] Should propagate null #1.11
+Temporal4 [13] Should propagate null #1.12
 Temporal4 [13] Should propagate null #1.13
+Temporal4 [13] Should propagate null #1.14
+Temporal4 [13] Should propagate null #1.15
+Temporal4 [13] Should propagate null #1.16
 Temporal4 [13] Should propagate null #1.17
+Temporal4 [13] Should propagate null #1.18
+Temporal4 [13] Should propagate null #1.19
+Temporal4 [13] Should propagate null #1.2
+Temporal4 [13] Should propagate null #1.20
 Temporal4 [13] Should propagate null #1.21
+Temporal4 [13] Should propagate null #1.3
+Temporal4 [13] Should propagate null #1.4
 Temporal4 [13] Should propagate null #1.5
+Temporal4 [13] Should propagate null #1.6
+Temporal4 [13] Should propagate null #1.7
+Temporal4 [13] Should propagate null #1.8
 Temporal4 [13] Should propagate null #1.9
 Temporal4 [1] Should store date #1.1
 Temporal4 [2] Should store date array #1.1
@@ -2766,6 +2857,7 @@ Temporal5 [2] Should provide accessors for date in last weekYear
 Temporal5 [3] Should provide accessors for local time
 Temporal5 [4] Should provide accessors for time
 Temporal5 [5] Should provide accessors for local date time
+Temporal5 [6] Should provide accessors for date time
 Temporal5 [7] Should provide accessors for duration
 Temporal6 [1] Should serialize date
 Temporal6 [2] Should serialize local time
@@ -2783,6 +2875,7 @@ Temporal6 [6] Should serialize duration #1.6
 Temporal6 [6] Should serialize duration #1.7
 Temporal6 [6] Should serialize duration #1.8
 Temporal6 [6] Should serialize duration #1.9
+Temporal6 [7] Should serialize timezones correctly
 Temporal7 [1] Should compare dates #1.1
 Temporal7 [1] Should compare dates #1.2
 Temporal7 [2] Should compare local times #1.1
@@ -2886,64 +2979,95 @@ Temporal9 [2] Should truncate datetime #1.103
 Temporal9 [2] Should truncate datetime #1.104
 Temporal9 [2] Should truncate datetime #1.105
 Temporal9 [2] Should truncate datetime #1.11
+Temporal9 [2] Should truncate datetime #1.12
 Temporal9 [2] Should truncate datetime #1.13
 Temporal9 [2] Should truncate datetime #1.14
+Temporal9 [2] Should truncate datetime #1.15
 Temporal9 [2] Should truncate datetime #1.16
 Temporal9 [2] Should truncate datetime #1.17
+Temporal9 [2] Should truncate datetime #1.18
 Temporal9 [2] Should truncate datetime #1.19
+Temporal9 [2] Should truncate datetime #1.2
+Temporal9 [2] Should truncate datetime #1.20
 Temporal9 [2] Should truncate datetime #1.21
 Temporal9 [2] Should truncate datetime #1.22
 Temporal9 [2] Should truncate datetime #1.23
+Temporal9 [2] Should truncate datetime #1.24
 Temporal9 [2] Should truncate datetime #1.25
+Temporal9 [2] Should truncate datetime #1.26
 Temporal9 [2] Should truncate datetime #1.27
 Temporal9 [2] Should truncate datetime #1.28
+Temporal9 [2] Should truncate datetime #1.29
 Temporal9 [2] Should truncate datetime #1.3
 Temporal9 [2] Should truncate datetime #1.30
 Temporal9 [2] Should truncate datetime #1.31
 Temporal9 [2] Should truncate datetime #1.32
+Temporal9 [2] Should truncate datetime #1.33
 Temporal9 [2] Should truncate datetime #1.34
+Temporal9 [2] Should truncate datetime #1.35
 Temporal9 [2] Should truncate datetime #1.36
 Temporal9 [2] Should truncate datetime #1.37
+Temporal9 [2] Should truncate datetime #1.38
 Temporal9 [2] Should truncate datetime #1.39
 Temporal9 [2] Should truncate datetime #1.4
 Temporal9 [2] Should truncate datetime #1.40
 Temporal9 [2] Should truncate datetime #1.41
+Temporal9 [2] Should truncate datetime #1.42
 Temporal9 [2] Should truncate datetime #1.43
+Temporal9 [2] Should truncate datetime #1.44
 Temporal9 [2] Should truncate datetime #1.45
 Temporal9 [2] Should truncate datetime #1.46
+Temporal9 [2] Should truncate datetime #1.47
 Temporal9 [2] Should truncate datetime #1.48
 Temporal9 [2] Should truncate datetime #1.49
 Temporal9 [2] Should truncate datetime #1.5
 Temporal9 [2] Should truncate datetime #1.50
+Temporal9 [2] Should truncate datetime #1.51
 Temporal9 [2] Should truncate datetime #1.52
+Temporal9 [2] Should truncate datetime #1.53
 Temporal9 [2] Should truncate datetime #1.54
 Temporal9 [2] Should truncate datetime #1.55
+Temporal9 [2] Should truncate datetime #1.56
 Temporal9 [2] Should truncate datetime #1.57
 Temporal9 [2] Should truncate datetime #1.58
 Temporal9 [2] Should truncate datetime #1.59
+Temporal9 [2] Should truncate datetime #1.6
+Temporal9 [2] Should truncate datetime #1.60
 Temporal9 [2] Should truncate datetime #1.61
+Temporal9 [2] Should truncate datetime #1.62
 Temporal9 [2] Should truncate datetime #1.63
 Temporal9 [2] Should truncate datetime #1.64
+Temporal9 [2] Should truncate datetime #1.65
 Temporal9 [2] Should truncate datetime #1.66
 Temporal9 [2] Should truncate datetime #1.67
 Temporal9 [2] Should truncate datetime #1.68
+Temporal9 [2] Should truncate datetime #1.69
 Temporal9 [2] Should truncate datetime #1.7
 Temporal9 [2] Should truncate datetime #1.70
+Temporal9 [2] Should truncate datetime #1.71
 Temporal9 [2] Should truncate datetime #1.72
 Temporal9 [2] Should truncate datetime #1.73
+Temporal9 [2] Should truncate datetime #1.74
 Temporal9 [2] Should truncate datetime #1.75
 Temporal9 [2] Should truncate datetime #1.76
 Temporal9 [2] Should truncate datetime #1.77
+Temporal9 [2] Should truncate datetime #1.78
 Temporal9 [2] Should truncate datetime #1.79
+Temporal9 [2] Should truncate datetime #1.8
+Temporal9 [2] Should truncate datetime #1.80
 Temporal9 [2] Should truncate datetime #1.81
 Temporal9 [2] Should truncate datetime #1.82
+Temporal9 [2] Should truncate datetime #1.83
 Temporal9 [2] Should truncate datetime #1.84
 Temporal9 [2] Should truncate datetime #1.85
+Temporal9 [2] Should truncate datetime #1.86
 Temporal9 [2] Should truncate datetime #1.87
 Temporal9 [2] Should truncate datetime #1.88
+Temporal9 [2] Should truncate datetime #1.89
 Temporal9 [2] Should truncate datetime #1.9
 Temporal9 [2] Should truncate datetime #1.90
 Temporal9 [2] Should truncate datetime #1.91
+Temporal9 [2] Should truncate datetime #1.92
 Temporal9 [2] Should truncate datetime #1.93
 Temporal9 [2] Should truncate datetime #1.94
 Temporal9 [2] Should truncate datetime #1.95

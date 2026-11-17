@@ -926,10 +926,10 @@ impl Executor<'_> {
                 arity(name, args, 0, 1)?;
                 Temporal::construct(kind, args.first(), self.statement_time())?
             }
-            // The current time: one clock per statement.
+            // The current time: one clock per statement; in a time zone if one is given.
             (k, Some("statement" | "transaction" | "realtime")) if k != TemporalKind::Duration => {
-                arity(name, args, 0, 0)?;
-                Temporal::construct(kind, None, self.statement_time())?
+                arity(name, args, 0, 1)?;
+                Temporal::now_in(kind, args.first(), self.statement_time())?
             }
             (k, Some("truncate")) if k != TemporalKind::Duration => {
                 arity(name, args, 2, 3)?;

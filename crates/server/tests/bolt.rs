@@ -405,12 +405,19 @@ fn values_and_parameters() {
     assert_eq!(b.failure(), "Neo.ClientError.Statement.FeatureNotSupported");
     b.send(RESET, vec![]);
     b.success();
+    // A date-time in a named zone: UTC seconds, nanoseconds and the zone, both ways.
     let zoned = PackValue::Struct {
         tag: 0x69,
         fields: vec![PackValue::Int(0), PackValue::Int(0), s("Europe/Prague")],
     };
-    b.run("RETURN $z", map(&[("z", zoned)]), empty());
-    assert_eq!(b.failure(), "Neo.ClientError.Statement.FeatureNotSupported");
+    let (rows, _) = b.query_with("RETURN toString($z), $z", map(&[("z", zoned.clone())]));
+    assert_eq!(rows[0], vec![s("1970-01-01T01:00+01:00[Europe/Prague]"), zoned]);
+    let unknown = PackValue::Struct {
+        tag: 0x69,
+        fields: vec![PackValue::Int(0), PackValue::Int(0), s("Frost/Nixon")],
+    };
+    b.run("RETURN $z", map(&[("z", unknown)]), empty());
+    assert_eq!(b.failure(), "Neo.ClientError.Statement.TypeError");
     b.send(RESET, vec![]);
     b.success();
 
