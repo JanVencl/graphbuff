@@ -662,10 +662,10 @@ impl Conn<'_> {
         }
     }
 
-    /// Whether `name` (from [`Self::database_name`]) is the `system` database: there is
-    /// no real database of that name, so it only runs database commands.
+    /// Whether `name` (from [`Self::database_name`]) is the `system` database, which
+    /// cannot be queried, so it only runs database and user commands.
     fn is_system(&self, name: &str) -> bool {
-        name == SYSTEM_DB && self.shared.ctx.mgr.database(name).is_err()
+        name == SYSTEM_DB
     }
 
     /// Checks the parts of an `extra` map that are not supported, and returns the time

@@ -10,8 +10,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 #[test]
 fn demo_movies_is_loaded_at_startup() {
     let mut child = Command::new(BIN)
-        .args(["--bind", "127.0.0.1:0", "--in-memory", "--demo", "movies"])
+        .args(["--bind", "127.0.0.1:0", "--in-memory", "--users", "off", "--demo", "movies"])
         .env_remove("GRAPHBUFF_TOKEN")
+        .env_remove("GRAPHBUFF_USERS")
         .env("GRAPHBUFF_CONFIG", "-")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

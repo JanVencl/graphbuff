@@ -1,7 +1,7 @@
 """User accounts, roles and TLS with the official Neo4j Python driver.
 
-Starts its own servers: one with `--users` (accounts made with the offline
-`graphbuff-server users` command) and, when the binary was built with TLS (`--features
+Starts its own servers: one with user accounts in the system database of a data
+directory (made with the offline `graphbuff-server users` command) and, when the binary was built with TLS (`--features
 tls` or `tls-rustcrypto`), one serving Bolt over TLS with the test certificate in
 `crates/server/tests/tls/`.
 """
@@ -36,22 +36,27 @@ def _start(args, health_url, context=None, env=None):
             time.sleep(0.1)
 
 
-def _add_user(users_file, name, password, *roles):
-    env = dict(os.environ, GRAPHBUFF_PASSWORD=password)
-    subprocess.run([_server_binary(), "users", users_file, "add", name, *roles],
-                   check=True, env=env, stdout=subprocess.DEVNULL)
+def _clean_env(**extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
+    env.update(GRAPHBUFF_CONFIG="-", **extra)
+    return env
+
+
+def _add_user(data, name, password, *roles):
+    subprocess.run([_server_binary(), "users", "--data", data, "add", name, *roles],
+                   check=True, env=_clean_env(GRAPHBUFF_PASSWORD=password), stdout=subprocess.DEVNULL)
 
 
 @pytest.fixture(scope="module")
 def accounts():
     with tempfile.TemporaryDirectory() as tmp:
-        users_file = os.path.join(tmp, "users")
-        _add_user(users_file, "root", "rootpw", "admin")
-        _add_user(users_file, "rita", "ritapw", "reader")
+        data = os.path.join(tmp, "data")
+        _add_user(data, "root", "rootpw", "admin")
+        _add_user(data, "rita", "ritapw", "reader")
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                       "--users", users_file, "--in-memory"],
-                      f"http://127.0.0.1:{http_port}/health")
+                       "--data", data, "--log-dir", "-"],
+                      f"http://127.0.0.1:{http_port}/health", env=_clean_env())
         yield f"bolt://127.0.0.1:{bolt_port}"
         proc.terminate()
         proc.wait(10)
@@ -104,14 +109,12 @@ def test_admins_manage_users(accounts):
 
 
 def test_first_admin_from_the_environment():
-    """GRAPHBUFF_ADMIN_* create the administrator in an empty users file (as in Docker)."""
+    """GRAPHBUFF_ADMIN_* create the administrator when there are no accounts (as in Docker)."""
     with tempfile.TemporaryDirectory() as tmp:
         secret = os.path.join(tmp, "secret")
         with open(secret, "w") as f:
             f.write("bootpw\n")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
-        env.update(GRAPHBUFF_USERS=os.path.join(tmp, "users.txt"), GRAPHBUFF_ADMIN_USER="boot",
-                   GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
+        env = _clean_env(GRAPHBUFF_ADMIN_USER="boot", GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
                        "--in-memory", "--config", "-"],
@@ -136,7 +139,7 @@ def tls_server():
     import ssl
     http_port, bolt_port = _free_port(), _free_port()
     args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}", "--in-memory",
-            "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
+            "--users", "off", "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "ca.pem"))
     try:
         proc = _start(args, f"https://localhost:{http_port}/health", context)

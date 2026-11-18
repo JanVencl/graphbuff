@@ -1176,7 +1176,7 @@ impl<'m> Session<'m> {
             }
             Statement::Database(cmd) => self.run_command(cmd, params),
             Statement::User(cmd) => Err(Error::Unsupported(format!(
-                "{} needs graphbuff-server with user accounts (--users)",
+                "{} needs graphbuff-server with user accounts",
                 cmd.name()
             ))),
         }

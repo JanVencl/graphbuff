@@ -20,7 +20,7 @@ fn start(args: &[&str], env: &[(&str, &Path)]) -> (Child, String) {
     let mut cmd = Command::new(BIN);
     cmd.args(["--bind", "127.0.0.1:0"]).args(args);
     cmd.env("GRAPHBUFF_CONFIG", "-");
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
+    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_USERS", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
         cmd.env_remove(key);
     }
     for (k, v) in env {
@@ -107,7 +107,7 @@ fn log_dir_can_be_elsewhere_and_in_memory_writes_no_files() {
     let data = temp_dir("data-flag");
     let logs = temp_dir("logs-flag");
     let (child, _) = start(
-        &["--data", data.to_str().unwrap(), "--log-dir", logs.to_str().unwrap(), "--log-level", "warn"],
+        &["--data", data.to_str().unwrap(), "--log-dir", logs.to_str().unwrap(), "--log-level", "warn", "--users", "off"],
         &[],
     );
     stop(child);

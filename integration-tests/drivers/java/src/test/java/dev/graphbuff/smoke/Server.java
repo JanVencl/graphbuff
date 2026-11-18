@@ -71,6 +71,7 @@ final class Server {
                 "--bind", "127.0.0.1:" + http,
                 "--bolt", "127.0.0.1:" + bolt,
                 "--token", TOKEN,
+                "--users", "off",
                 "--tx-timeout", "5",
                 "--in-memory")
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)

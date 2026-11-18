@@ -1,5 +1,5 @@
 //! User accounts: names, password hashes and roles, kept in the system database
-//! ([`Users::system`]) or, as before, in a text file ([`Users::open`]).
+//! ([`Users::system`]).
 //!
 //! In the system database each account is a node
 //! `(:User {name, password, roles})` (`password` is the encoded hash, `roles` a list of
@@ -26,9 +26,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::fs;
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use graphbuff::{BoxedStore, Database, Error, QueryResult, QueryStats, Result, ResultValue, Value};
@@ -39,7 +36,6 @@ use crate::crypto::{self, Sha256};
 /// PBKDF2 rounds for new passwords (OWASP's 2023 advice for PBKDF2-HMAC-SHA-256).
 pub const DEFAULT_ITERATIONS: u32 = 600_000;
 
-const HEADER: &str = "graphbuff users v1";
 const SALT_BYTES: usize = 16;
 
 /// The layout of the accounts in the system database that this version writes and reads.
@@ -172,8 +168,6 @@ struct State {
 enum Store {
     /// Nowhere: they live as long as the [`Users`].
     Memory,
-    /// A text file, replaced atomically (a new copy renamed over it).
-    File(PathBuf),
     /// The system database.
     System(Arc<Database<BoxedStore>>),
 }
@@ -189,7 +183,6 @@ impl fmt::Debug for Users {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let store = match &self.store {
             Store::Memory => "memory".to_string(),
-            Store::File(p) => p.display().to_string(),
             Store::System(_) => "system database".to_string(),
         };
         f.debug_struct("Users")
@@ -290,38 +283,11 @@ impl Users {
         })
     }
 
-    /// Opens the accounts kept in `path`; a missing file is an empty set (the file is
-    /// created on the first change).
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<Users> {
-        let path = path.into();
-        let accounts = match fs::read_to_string(&path) {
-            Ok(text) => parse(&text, &path)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(e),
-        };
-        Ok(Users {
-            store: Store::File(path),
-            iterations: DEFAULT_ITERATIONS,
-            state: RwLock::new(State {
-                accounts,
-                verified: HashMap::new(),
-            }),
-        })
-    }
-
     /// Hashes new passwords with `iterations` PBKDF2 rounds instead of
     /// [`DEFAULT_ITERATIONS`] (fewer only for tests; existing hashes keep theirs).
     pub fn with_iterations(mut self, iterations: u32) -> Users {
         self.iterations = iterations.max(1);
         self
-    }
-
-    /// The file the accounts are kept in, if any.
-    pub fn path(&self) -> Option<&Path> {
-        match &self.store {
-            Store::File(p) => Some(p),
-            _ => None,
-        }
     }
 
     /// Whether the accounts are kept in the system database.
@@ -394,9 +360,6 @@ impl Users {
         let out = change(&mut accounts)?;
         match &self.store {
             Store::Memory => {}
-            Store::File(path) => {
-                save(path, &accounts).map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
-            }
             Store::System(db) => save_system(db, &st.accounts, &accounts)?,
         }
         let State { accounts: old, verified } = &mut *st;
@@ -476,63 +439,6 @@ impl Users {
             Ok(true)
         })
     }
-}
-
-fn parse(text: &str, path: &Path) -> io::Result<BTreeMap<String, Account>> {
-    let bad = |line: usize, msg: &str| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("{} line {line}: {msg}", path.display()))
-    };
-    let mut lines = text.lines().enumerate().map(|(i, l)| (i + 1, l.trim()));
-    match lines.next() {
-        Some((_, HEADER)) => {}
-        _ => return Err(bad(1, "not a graphbuff users file")),
-    }
-    let mut accounts = BTreeMap::new();
-    for (n, line) in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        match words.as_slice() {
-            [] => {}
-            [w, ..] if w.starts_with('#') => {}
-            ["user", name, hash, roles] => {
-                check_name(name).map_err(|_| bad(n, "invalid user name"))?;
-                let password = PasswordHash::decode(hash).ok_or_else(|| bad(n, "invalid password hash"))?;
-                let roles = roles
-                    .strip_prefix("roles=")
-                    .ok_or_else(|| bad(n, "expected roles=…"))?
-                    .split(',')
-                    .filter(|r| !r.is_empty())
-                    .map(|r| Role::parse(r).map_err(|_| bad(n, &format!("unknown role `{r}`"))))
-                    .collect::<io::Result<_>>()?;
-                if accounts.insert(name.to_string(), Account { password, roles }).is_some() {
-                    return Err(bad(n, "duplicate user"));
-                }
-            }
-            _ => return Err(bad(n, "unrecognized line")),
-        }
-    }
-    Ok(accounts)
-}
-
-fn save(path: &Path, accounts: &BTreeMap<String, Account>) -> io::Result<()> {
-    let mut text = format!("{HEADER}\n");
-    for (name, a) in accounts {
-        let roles: Vec<&str> = a.roles.iter().map(|r| r.name()).collect();
-        text.push_str(&format!("user {name} {} roles={}\n", a.password.encode(), roles.join(",")));
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        // Only the owner may read the password hashes.
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut f = options.open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)
 }
 
 /// Writes the difference between `old` and `new` to the system database, in one
@@ -761,62 +667,57 @@ pub(crate) fn run(
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("graphbuff-users-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir.join("users")
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("graphbuff-users-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
-    fn accounts_persist_and_authenticate() {
-        let path = temp_file("persist");
-        let users = Users::open(&path).unwrap().with_iterations(10);
-        assert!(users.is_empty());
+    fn logins_and_their_cache() {
+        let users = Users::in_memory().with_iterations(10);
         assert!(users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap());
-        assert!(users.create("bob", "pw2", &[], ExistingDatabase::Fail).unwrap());
-        assert!(users.create("bob", "x", &[], ExistingDatabase::Fail).is_err());
-        assert!(!users.create("bob", "x", &[], ExistingDatabase::Keep).unwrap());
+        assert!(users.create("bob", "x", &[], ExistingDatabase::Fail).unwrap());
+        assert!(users.create("bob", "y", &[], ExistingDatabase::Fail).is_err());
+        assert!(!users.create("bob", "y", &[], ExistingDatabase::Keep).unwrap());
         assert!(users.grant("bob", Role::Reader).unwrap());
         assert!(!users.grant("bob", Role::Reader).unwrap());
         assert!(users.authenticate("alice", "pw1"));
         assert!(users.authenticate("alice", "pw1")); // from the cache
         assert!(!users.authenticate("alice", "pw2"));
         assert!(!users.authenticate("carol", "pw1"));
-
-        let again = Users::open(&path).unwrap();
-        assert_eq!(
-            again.list(),
-            vec![("alice".into(), vec![Role::Admin]), ("bob".into(), vec![Role::Reader])]
-        );
-        assert!(again.authenticate("bob", "pw2"));
-        assert_eq!(again.access("bob"), Some(Access::Read));
-        assert_eq!(again.access("nobody"), None);
-
-        // A new password replaces the remembered login.
+        assert_eq!(users.access("bob"), Some(Access::Read));
+        assert_eq!(users.access("nobody"), None);
+        // A new password replaces the remembered login; so does a rename.
         users.set_password("alice", "new").unwrap();
         assert!(!users.authenticate("alice", "pw1"));
         assert!(users.authenticate("alice", "new"));
+        assert!(users.authenticate("bob", "x"));
         assert!(users.rename("bob", "robert").unwrap());
-        assert!(!users.authenticate("bob", "pw2"));
-        assert!(users.authenticate("robert", "pw2"));
-        assert!(users.drop_user("robert").unwrap());
-        assert!(!users.drop_user("robert").unwrap());
-        assert_eq!(Users::open(&path).unwrap().list().len(), 1);
-
+        assert!(!users.authenticate("bob", "x"));
+        assert!(users.authenticate("robert", "x"));
         assert!(users.create("bad name", "x", &[], ExistingDatabase::Fail).is_err());
         assert!(users.create("ok", "", &[], ExistingDatabase::Fail).is_err());
-        fs::write(&path, "nonsense\n").unwrap();
-        assert!(Users::open(&path).is_err());
     }
 
     #[test]
     fn accounts_persist_in_the_system_database() {
-        let dir = temp_file("system").with_file_name("data");
+        let tmp = TempDir::new("system");
+        let dir = &tmp.0;
         {
-            let mgr = graphbuff::DatabaseManager::open(&dir).unwrap();
+            let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
             let users = Users::system(mgr.system_database().unwrap()).unwrap().with_iterations(10);
-            assert!(users.in_system_database() && users.path().is_none());
+            assert!(users.in_system_database());
             assert!(users.is_empty());
             users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap();
             users.create("bob", "pw2", &[Role::Reader, Role::Editor], ExistingDatabase::Fail).unwrap();
@@ -830,7 +731,7 @@ mod tests {
             assert!(users.rename("robert", "alice").is_err());
             assert!(users.grant("nobody", Role::Admin).is_err());
         }
-        let mgr = graphbuff::DatabaseManager::open(&dir).unwrap();
+        let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
         let system = mgr.system_database().unwrap();
         let users = Users::system(Arc::clone(&system)).unwrap();
         assert_eq!(
