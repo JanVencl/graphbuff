@@ -24,7 +24,11 @@
 //! | `admin`  | also create and drop databases, and manage users |
 //!
 //! A user with no role may only connect, run `SHOW CURRENT USER` and change their own
-//! password.
+//! password. Once there is an administrator, no change may leave none: dropping the last
+//! one, revoking their role or replacing their account is refused.
+//!
+//! New passwords need at least [`MIN_PASSWORD_LENGTH`] characters and must differ from
+//! the user name.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -118,6 +122,9 @@ pub(crate) enum Access {
 
 const HASH_BYTES: usize = 32;
 
+/// The fewest characters a new password may have (NIST SP 800-63B's minimum).
+pub const MIN_PASSWORD_LENGTH: usize = 8;
+
 /// An Argon2id password hash.
 #[derive(Clone, PartialEq, Eq)]
 struct PasswordHash {
@@ -203,6 +210,12 @@ struct Account {
     roles: BTreeSet<Role>,
 }
 
+impl Account {
+    fn is_admin(&self) -> bool {
+        self.roles.contains(&Role::Admin)
+    }
+}
+
 #[derive(Default)]
 struct State {
     accounts: BTreeMap<String, Account>,
@@ -222,6 +235,7 @@ enum Store {
 pub struct Users {
     store: Store,
     params: HashParams,
+    min_password_length: usize,
     state: RwLock<State>,
 }
 
@@ -252,9 +266,16 @@ pub fn check_name(name: &str) -> Result<()> {
     }
 }
 
-fn check_password(password: &str) -> Result<()> {
+/// Checks a new password for `name`.
+fn check_password(name: &str, password: &str, min_length: usize) -> Result<()> {
     if password.is_empty() {
         return Err(Error::Semantic("a password cannot be empty".into()));
+    }
+    if password.chars().count() < min_length {
+        return Err(Error::Semantic(format!("a password needs at least {min_length} characters")));
+    }
+    if password == name {
+        return Err(Error::Semantic("the password must differ from the user name".into()));
     }
     Ok(())
 }
@@ -269,6 +290,7 @@ impl Users {
         Users {
             store: Store::Memory,
             params: HashParams::DEFAULT,
+            min_password_length: MIN_PASSWORD_LENGTH,
             state: RwLock::default(),
         }
     }
@@ -322,6 +344,7 @@ impl Users {
         Ok(Users {
             store: Store::System(db),
             params: HashParams::DEFAULT,
+            min_password_length: MIN_PASSWORD_LENGTH,
             state: RwLock::new(State {
                 accounts,
                 verified: HashMap::new(),
@@ -335,6 +358,17 @@ impl Users {
     pub fn with_hash_params(mut self, params: HashParams) -> Users {
         self.params = params;
         self
+    }
+
+    /// Lets new passwords be shorter than [`MIN_PASSWORD_LENGTH`] (at least 1); for tests.
+    pub fn with_min_password_length(mut self, min: usize) -> Users {
+        self.min_password_length = min.max(1);
+        self
+    }
+
+    /// Whether some user holds the admin role.
+    pub fn has_admin(&self) -> bool {
+        self.read().accounts.values().any(Account::is_admin)
     }
 
     /// Whether the accounts are kept in the system database.
@@ -421,6 +455,11 @@ impl Users {
         let mut st = self.write();
         let mut accounts = st.accounts.clone();
         let out = change(&mut accounts)?;
+        if st.accounts.values().any(Account::is_admin) && !accounts.values().any(Account::is_admin) {
+            return Err(Error::Constraint(
+                "this would leave no administrator; give another user the admin role first".into(),
+            ));
+        }
         match &self.store {
             Store::Memory => {}
             Store::System(db) => save_system(db, &st.accounts, &accounts)?,
@@ -437,7 +476,7 @@ impl Users {
     /// whether anything changed.
     pub fn create(&self, name: &str, password: &str, roles: &[Role], existing: ExistingDatabase) -> Result<bool> {
         check_name(name)?;
-        check_password(password)?;
+        check_password(name, password, self.min_password_length)?;
         if existing == ExistingDatabase::Keep && self.read().accounts.contains_key(name) {
             return Ok(false);
         }
@@ -458,7 +497,7 @@ impl Users {
 
     /// Sets `name`'s password.
     pub fn set_password(&self, name: &str, password: &str) -> Result<()> {
-        check_password(password)?;
+        check_password(name, password, self.min_password_length)?;
         if !self.read().accounts.contains_key(name) {
             return Err(no_user(name));
         }
@@ -747,8 +786,47 @@ mod tests {
     }
 
     #[test]
-    fn logins_and_their_cache() {
+    fn password_policy() {
         let users = Users::in_memory().with_hash_params(HashParams::TESTING);
+        let err = users.create("ann", "short", &[], ExistingDatabase::Fail).unwrap_err();
+        assert!(err.to_string().contains("at least 8 characters"), "{err}");
+        let err = users.create("annabelle", "annabelle", &[], ExistingDatabase::Fail).unwrap_err();
+        assert!(err.to_string().contains("differ from the user name"), "{err}");
+        // Characters, not bytes.
+        assert!(users.create("ann", "ééééééé", &[], ExistingDatabase::Fail).is_err());
+        users.create("ann", "éééééééé", &[], ExistingDatabase::Fail).unwrap();
+        assert!(users.set_password("ann", "1234567").is_err());
+        users.set_password("ann", "12345678").unwrap();
+        assert!(users.authenticate("ann", "12345678"));
+    }
+
+    #[test]
+    fn the_last_administrator_stays() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        // Without an administrator, anything goes.
+        users.create("kim", "k", &[Role::Reader], ExistingDatabase::Fail).unwrap();
+        assert!(!users.has_admin());
+        users.create("root", "r", &[Role::Admin], ExistingDatabase::Fail).unwrap();
+        assert!(users.has_admin());
+        let refused = |r: Result<bool>| match r {
+            Err(Error::Constraint(m)) => assert!(m.contains("no administrator"), "{m}"),
+            other => panic!("{other:?}"),
+        };
+        refused(users.drop_user("root"));
+        refused(users.revoke("root", Role::Admin));
+        refused(users.create("root", "r2", &[], ExistingDatabase::Replace));
+        assert!(users.has_admin() && users.authenticate("root", "r"));
+        // With a second administrator, the first may go.
+        users.grant("kim", Role::Admin).unwrap();
+        assert!(users.revoke("root", Role::Admin).unwrap());
+        assert!(users.rename("kim", "boss").unwrap());
+        refused(users.drop_user("boss"));
+        assert!(users.drop_user("root").unwrap());
+    }
+
+    #[test]
+    fn logins_and_their_cache() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
         assert!(users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap());
         assert!(users.create("bob", "x", &[], ExistingDatabase::Fail).unwrap());
         assert!(users.create("bob", "y", &[], ExistingDatabase::Fail).is_err());
@@ -835,11 +913,11 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
-        let old = Users::system(Arc::clone(&system)).unwrap().with_hash_params(cheap);
+        let old = Users::system(Arc::clone(&system)).unwrap().with_hash_params(cheap).with_min_password_length(1);
         old.create("ann", "pw", &[], ExistingDatabase::Fail).unwrap();
         assert!(stored("ann").contains("$m=16,"));
 
-        let users = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING);
+        let users = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
         assert!(!users.authenticate("ann", "wrong"));
         assert!(stored("ann").contains("$m=16,"), "a failed login changes nothing");
         assert!(users.authenticate("ann", "pw"));
@@ -847,7 +925,7 @@ mod tests {
         assert!(users.authenticate("ann", "pw"));
         assert!(!users.authenticate("ann", "wrong"));
         // Saved: a fresh reader sees the new hash.
-        let again = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING);
+        let again = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
         assert!(again.authenticate("ann", "pw"));
     }
 
@@ -857,7 +935,7 @@ mod tests {
         let dir = &tmp.0;
         {
             let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
-            let users = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING);
+            let users = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
             assert!(users.in_system_database());
             assert!(users.is_empty());
             users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap();
@@ -910,7 +988,7 @@ mod tests {
 
     #[test]
     fn commands_check_access() {
-        let users = Users::in_memory().with_hash_params(HashParams::TESTING);
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
         let admin = Principal::User("root".into());
         let params = BTreeMap::from([("pw".to_string(), Value::String("s3cret".into()))]);
         let run_as = |who: &Principal, access, text: &str| match graphbuff::cypher::parse_statement(text).unwrap() {

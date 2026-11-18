@@ -26,7 +26,7 @@ fn start(args: &[&str], env: &[(&str, &Path)]) -> (Child, String) {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut listening = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut listening).unwrap();
     let addr = listening
@@ -117,7 +117,7 @@ fn log_dir_can_be_elsewhere_and_in_memory_writes_no_files() {
     assert_eq!(std::fs::read_to_string(logs.join("graphbuff.log")).unwrap(), "");
 
     let empty = temp_dir("in-memory");
-    let (child, _) = start(&["--in-memory"], &[("GRAPHBUFF_DATA", &empty)]);
+    let (child, _) = start(&["--in-memory", "--users", "off"], &[("GRAPHBUFF_DATA", &empty)]);
     stop(child);
     assert!(!empty.exists(), "--in-memory created {}", empty.display());
 
@@ -138,13 +138,13 @@ fn config_file_sets_data_and_logs_and_is_created_when_missing() {
     let dir = temp_dir("config");
     std::fs::create_dir_all(&dir).unwrap();
     let conf = dir.join("graphbuff.conf");
-    std::fs::write(&conf, "data = db   # relative to the file\nlog-dir = mylogs\nlog-level = warn\n").unwrap();
+    std::fs::write(&conf, "data = db   # relative to the file\nlog-dir = mylogs\nlog-level = warn\nusers = off\n").unwrap();
     let mut cmd = Command::new(BIN);
     cmd.args(["--bind", "127.0.0.1:0", "--config"]).arg(&conf);
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL", "GRAPHBUFF_CONFIG"] {
+    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_USERS", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL", "GRAPHBUFF_CONFIG"] {
         cmd.env_remove(key);
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
     stop(child);
@@ -155,8 +155,8 @@ fn config_file_sets_data_and_logs_and_is_created_when_missing() {
     // A missing config file is created with every setting commented out.
     let fresh = dir.join("new").join("graphbuff.conf");
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--in-memory"]).env("GRAPHBUFF_CONFIG", &fresh);
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    cmd.args(["--bind", "127.0.0.1:0", "--in-memory", "--users", "off"]).env("GRAPHBUFF_CONFIG", &fresh).env_remove("GRAPHBUFF_USERS");
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
     stop(child);

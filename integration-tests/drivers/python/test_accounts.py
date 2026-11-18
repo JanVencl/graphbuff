@@ -51,8 +51,8 @@ def _add_user(data, name, password, *roles):
 def accounts():
     with tempfile.TemporaryDirectory() as tmp:
         data = os.path.join(tmp, "data")
-        _add_user(data, "root", "rootpw", "admin")
-        _add_user(data, "rita", "ritapw", "reader")
+        _add_user(data, "root", "root-password", "admin")
+        _add_user(data, "rita", "rita-password", "reader")
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
                        "--data", data, "--log-dir", "-"],
@@ -63,18 +63,18 @@ def accounts():
 
 
 def test_users_log_in_with_their_passwords(accounts):
-    with GraphDatabase.driver(accounts, auth=("root", "rootpw")) as d:
+    with GraphDatabase.driver(accounts, auth=("root", "root-password")) as d:
         d.verify_connectivity()
     with GraphDatabase.driver(accounts, auth=("root", "wrong")) as d:
         with pytest.raises(ex.AuthError):
             d.verify_connectivity()
-    with GraphDatabase.driver(accounts, auth=("ghost", "rootpw")) as d:
+    with GraphDatabase.driver(accounts, auth=("ghost", "root-password")) as d:
         with pytest.raises(ex.AuthError):
             d.verify_connectivity()
 
 
 def test_readers_cannot_write(accounts):
-    with GraphDatabase.driver(accounts, auth=("rita", "ritapw")) as d:
+    with GraphDatabase.driver(accounts, auth=("rita", "rita-password")) as d:
         records, _, _ = d.execute_query("RETURN 1 AS x")
         assert records[0]["x"] == 1
         with pytest.raises(ex.Forbidden):
@@ -87,23 +87,23 @@ def test_readers_cannot_write(accounts):
 
 
 def test_admins_manage_users(accounts):
-    with GraphDatabase.driver(accounts, auth=("root", "rootpw")) as admin:
+    with GraphDatabase.driver(accounts, auth=("root", "root-password")) as admin:
         admin.execute_query("CREATE USER eve IF NOT EXISTS SET PASSWORD $pw CHANGE NOT REQUIRED",
-                            pw="evepw", database_="system")
+                            pw="eve-password", database_="system")
         admin.execute_query("GRANT ROLE editor TO eve", database_="system")
         records, summary, _ = admin.execute_query("SHOW USERS", database_="system")
         assert {r["user"] for r in records} >= {"root", "rita", "eve"}
 
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw")) as eve:
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password")) as eve:
             _, summary, _ = eve.execute_query("CREATE (:Note {by: 'eve'})")
             assert summary.counters.nodes_created == 1
             with eve.session(database="system") as s:
-                s.run("ALTER CURRENT USER SET PASSWORD FROM $old TO $new", old="evepw", new="evepw2").consume()
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw2")) as eve:
+                s.run("ALTER CURRENT USER SET PASSWORD FROM $old TO $new", old="eve-password", new="eve-password-2").consume()
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password-2")) as eve:
             eve.verify_connectivity()
 
         admin.execute_query("DROP USER eve", database_="system")
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw2")) as eve:
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password-2")) as eve:
             with pytest.raises(ex.AuthError):
                 eve.verify_connectivity()
 
@@ -113,7 +113,7 @@ def test_first_admin_from_the_environment():
     with tempfile.TemporaryDirectory() as tmp:
         secret = os.path.join(tmp, "secret")
         with open(secret, "w") as f:
-            f.write("bootpw\n")
+            f.write("boot-password\n")
         env = _clean_env(GRAPHBUFF_ADMIN_USER="boot", GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
@@ -121,10 +121,10 @@ def test_first_admin_from_the_environment():
                       f"http://127.0.0.1:{http_port}/health", env=env)
         try:
             url = f"bolt://127.0.0.1:{bolt_port}"
-            with GraphDatabase.driver(url, auth=("boot", "bootpw")) as d:
+            with GraphDatabase.driver(url, auth=("boot", "boot-password")) as d:
                 records, _, _ = d.execute_query("SHOW CURRENT USER", database_="system")
                 assert records[0]["roles"] == ["admin"]
-            with GraphDatabase.driver(url, auth=("boot", "bootpw\n")) as d:
+            with GraphDatabase.driver(url, auth=("boot", "boot-password\n")) as d:
                 with pytest.raises(ex.AuthError):
                     d.verify_connectivity()
         finally:

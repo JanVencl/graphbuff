@@ -97,17 +97,21 @@ Endpoints:
 User accounts (--users):
   Roles: reader (read queries), editor (also writes, indexes, constraints), admin (also
   databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
-  PASSWORD 'pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
+  PASSWORD 's3cret-pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users ...` on the data
   directory (the same --data, GRAPHBUFF_DATA or config file as the server), only while
   no server uses it. New passwords come from env GRAPHBUFF_PASSWORD, else are asked for
   without echo on a terminal, else read from the first line of standard input.
 
-  The first administrator, at start-up: when there are no accounts yet, the server
+  The first administrator, at start-up: when no user has the admin role, the server
   creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the password in
   env GRAPHBUFF_ADMIN_PASSWORD, or in the file named by GRAPHBUFF_ADMIN_PASSWORD_FILE (a
-  Docker or Compose secret; one trailing newline is ignored). Once there are accounts,
-  these variables are ignored.";
+  Docker or Compose secret; one trailing newline is ignored). Without them it asks on
+  the terminal; without a terminal, or with --in-memory, it does not start. With --token
+  it starts anyway (the token holder can create users). Once there is an administrator,
+  these variables are ignored, and no change may leave none.
+
+  Passwords need at least 8 characters and must differ from the user name.";
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
@@ -257,6 +261,33 @@ fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
         other => return Err(format!("unknown users command `{other}`")),
     }
     Ok(())
+}
+
+/// Asks on the terminal for the first administrator's name and password, and creates
+/// the account; a refused password is asked for again, at most three times.
+fn ask_for_admin(users: &Users) -> Result<(), String> {
+    eprintln!("There is no administrator yet. Create one now (Ctrl-C to stop).");
+    let name = prompt::line("administrator name [admin]: ").map_err(|e| e.to_string())?;
+    let name = if name.trim().is_empty() { "admin".to_string() } else { name.trim().to_string() };
+    graphbuff_server::users::check_name(&name).map_err(|e| e.to_string())?;
+    eprintln!("password (at least {} characters, not the name):", graphbuff_server::MIN_PASSWORD_LENGTH);
+    let mut last = String::new();
+    for _ in 0..3 {
+        let created = prompt::new_password()
+            .map_err(|e| e.to_string())
+            .and_then(|pw| users.create(&name, &pw, &[Role::Admin], ExistingDatabase::Fail).map_err(|e| e.to_string()));
+        match created {
+            Ok(_) => {
+                eprintln!("created the administrator `{name}`");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                last = e;
+            }
+        }
+    }
+    Err(last)
 }
 
 /// The first administrator from the environment: GRAPHBUFF_ADMIN_USER (default `admin`)
@@ -416,22 +447,39 @@ fn main() {
             fatal("this build has no system database for user accounts; start with users = off");
         };
         let users = Users::system(system).unwrap_or_else(|e| fatal(&format!("cannot read the user accounts: {e}")));
-        match &admin {
-            Some((name, password)) if users.is_empty() => {
-                if let Err(e) = users.create(name, password, &[Role::Admin], ExistingDatabase::Fail) {
-                    fatal(&format!("cannot create the administrator `{name}`: {e}"));
-                }
-                log.info(format!("created the administrator `{name}` (GRAPHBUFF_ADMIN_PASSWORD)"));
+        if users.has_admin() {
+            if admin.is_some() {
+                log.info("there is an administrator already; GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD are ignored");
             }
-            Some(_) => log.info("there are user accounts already; GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD are ignored"),
-            None => {}
-        }
-        if users.is_empty() && config.token.is_none() {
-            warn(if data.is_some() {
-                "there are no user accounts yet, so nobody can log in; set GRAPHBUFF_ADMIN_PASSWORD, add an admin with `graphbuff-server users add NAME admin` while the server is stopped, start with --token, or turn accounts off (users = off)"
-            } else {
-                "there are no user accounts yet, so nobody can log in; set GRAPHBUFF_ADMIN_PASSWORD, start with --token, or turn accounts off (users = off)"
-            });
+        } else if let Some((name, password)) = &admin {
+            if let Err(e) = users.create(name, password, &[Role::Admin], ExistingDatabase::Fail) {
+                let hint = if users.roles(name).is_some() {
+                    format!("; give it the admin role with `graphbuff-server users grant {name} admin` while the server is stopped")
+                } else {
+                    String::new()
+                };
+                fatal(&format!("cannot create the administrator `{name}`: {e}{hint}"));
+            }
+            log.info(format!("created the administrator `{name}` (GRAPHBUFF_ADMIN_PASSWORD)"));
+        } else if config.token.is_some() {
+            warn("there is no administrator yet; the token holder can create one (CREATE USER, GRANT ROLE admin TO ...)");
+        } else if data.is_none() {
+            fatal(
+                "there is no administrator, and in-memory accounts are lost at every stop: set \
+                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), start with --token, or turn accounts \
+                 off (users = off)",
+            );
+        } else if prompt::interactive() {
+            if let Err(e) = ask_for_admin(&users) {
+                fatal(&format!("no administrator was created: {e}"));
+            }
+        } else {
+            fatal(
+                "there is no administrator yet and no terminal to ask for one: set GRAPHBUFF_ADMIN_PASSWORD (or \
+                 GRAPHBUFF_ADMIN_PASSWORD_FILE), add one with `graphbuff-server users add NAME admin` while the \
+                 server is stopped, start the server in a terminal to be asked, start with --token, or turn \
+                 accounts off (users = off)",
+            );
         }
         config.users = Some(Arc::new(users));
     }

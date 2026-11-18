@@ -96,8 +96,9 @@ volumes:
   graphbuff-data:
 ```
 
-Without either, the server warns that nobody can log in; add the administrator offline
-(the image has no shell, so name the binary):
+Without either, the server asks for the administrator when it runs in a terminal
+(`docker run -it`), and otherwise stops with a message. The administrator can also be
+added offline (the image has no shell, so name the binary):
 
 ```bash
 docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
@@ -719,11 +720,17 @@ graphbuff-server users add root admin
 graphbuff-server --bolt 127.0.0.1:7687
 ```
 
-Or let the server create the first administrator when it starts without accounts
-(Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
+Or let the server create the first administrator when it starts and no user has the
+admin role (Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
 `GRAPHBUFF_ADMIN_PASSWORD`, or `GRAPHBUFF_ADMIN_PASSWORD_FILE` naming a file that holds
-the password (one trailing newline is ignored). Once there are accounts these are
+the password (one trailing newline is ignored). Once there is an administrator these are
 ignored, so they may stay set; setting them with `--users off` is an error.
+
+Without these variables, a server started in a terminal asks for the administrator's
+name and password (twice, without echo). Without a terminal (a service, a container
+without `-it`, CI) it does not start, and says what to do; neither does a server with
+`--in-memory`, whose accounts would be lost at every stop. With `--token` it starts
+anyway, and the token holder creates the users.
 
 ```powershell
 # Windows: the same, asking without echo (PowerShell 7)
@@ -744,7 +751,9 @@ statement (a role granted or revoked applies to open connections at once):
 | `admin` | also create and drop databases, and manage users |
 
 A user with no role may only log in, run `SHOW CURRENT USER` and change their own
-password. Administrators manage accounts with Neo4j's commands (on the `system` database
+password. Once there is an administrator, no change may leave none: dropping the last
+one, revoking their role or replacing their account is refused. New passwords need at
+least 8 characters and must differ from the user name. Administrators manage accounts with Neo4j's commands (on the `system` database
 over Bolt, or anywhere in auto-commit): `CREATE [OR REPLACE] USER name [IF NOT EXISTS]
 SET [PLAINTEXT] PASSWORD 'pw' | $pw [CHANGE NOT REQUIRED]`, `ALTER USER name SET PASSWORD
 …`, `RENAME USER a TO b`, `DROP USER name [IF EXISTS]`, `GRANT ROLE[S] r, … TO u, …`,

@@ -14,7 +14,7 @@ use graphbuff_server::packstream::{self, PackValue};
 use graphbuff_server::{HashParams, Role, Server, ServerConfig, Users};
 
 fn users() -> Arc<Users> {
-    let u = Users::in_memory().with_hash_params(HashParams::TESTING);
+    let u = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
     u.create("root", "rootpw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
     u.create("ed", "edpw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
     u.create("rita", "ritapw", &[Role::Reader], ExistingDatabase::Fail).unwrap();
@@ -245,7 +245,7 @@ fn users_without_accounts_and_in_the_system_database() {
     let _ = std::fs::remove_dir_all(&dir);
     {
         let mgr = Arc::new(DatabaseManager::open(&dir).unwrap());
-        let u = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING);
+        let u = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
         u.create("root", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
         let server = Server::start(
             Arc::clone(&mgr),

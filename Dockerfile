@@ -6,9 +6,10 @@
 #     -e GRAPHBUFF_ADMIN_PASSWORD=change-me graphbuff --demo movies
 #
 # Clients log in with user accounts, kept in the system database in /data. On the first
-# start (no accounts yet) the server creates the administrator GRAPHBUFF_ADMIN_USER
+# start (no administrator yet) the server creates the administrator GRAPHBUFF_ADMIN_USER
 # (default: admin) with the password in GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
-# GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker secret: /run/secrets/NAME).
+# GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker secret: /run/secrets/NAME). Without them it asks
+# when run with `-it`, and otherwise stops.
 # `-e GRAPHBUFF_USERS=off` turns accounts off (then GRAPHBUFF_TOKEN, or no login at all).
 #
 # The build stage runs on the build machine's own architecture and cross-compiles for

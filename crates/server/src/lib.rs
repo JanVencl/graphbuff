@@ -75,7 +75,7 @@ pub mod users;
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use net::TlsConfig;
-pub use users::{HashParams, Role, Users};
+pub use users::{HashParams, MIN_PASSWORD_LENGTH, Role, Users};
 
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};

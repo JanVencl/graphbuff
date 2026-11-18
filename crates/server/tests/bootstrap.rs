@@ -74,7 +74,8 @@ fn logins(args: &[&str], env: &[(&str, &str)], checks: &[(&str, &str, u16)]) {
 
 /// Like [`logins`], also running `during` while the server runs.
 fn logins_while(args: &[&str], env: &[(&str, &str)], checks: &[(&str, &str, u16)], during: impl FnOnce()) {
-    let mut child = command(args, env).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    // No terminal on standard input, so the server never waits for an answer.
+    let mut child = command(args, env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut listening = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut listening).unwrap();
     let result = std::panic::catch_unwind(|| {
@@ -172,9 +173,34 @@ fn password_file_and_user_name() {
 
 #[test]
 fn accounts_are_on_by_default() {
-    // Without accounts yet nobody gets in, except with the token.
-    logins(&[], &[], &[("", "", 401), ("admin", "", 401)]);
-    logins(&[], &[("GRAPHBUFF_TOKEN", "tok")], &[("x", "tok", 200), ("", "", 401)]);
+    // Without an administrator, the token holder gets in (and can create one).
+    logins(&[], &[("GRAPHBUFF_TOKEN", "tok")], &[("x", "tok", 200), ("", "", 401), ("admin", "x", 401)]);
+}
+
+#[test]
+fn without_an_administrator_the_server_does_not_start() {
+    let dir = temp_dir("no-admin");
+    let data = dir.join("data");
+    let data = data.to_str().unwrap();
+    // In memory: accounts would be lost at every stop, so only the environment helps.
+    let err = refused(&[], &[]);
+    assert!(err.contains("in-memory accounts are lost"), "{err}");
+    // No terminal to ask on (standard input is not one here).
+    let err = refused(&["--data", data], &[]);
+    assert!(err.contains("no terminal to ask"), "{err}");
+    // Users without the admin role do not count.
+    users(&["--data", data, "add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
+    let err = refused(&["--data", data], &[]);
+    assert!(err.contains("no terminal to ask"), "{err}");
+    let err = refused(&["--data", data], &[("GRAPHBUFF_ADMIN_USER", "kim"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
+    assert!(err.contains("users grant kim admin"), "{err}");
+    // Another name from the environment becomes the administrator.
+    logins(
+        &["--data", data],
+        &[("GRAPHBUFF_ADMIN_PASSWORD", "admin-password")],
+        &[("admin", "admin-password", 200), ("kim", "kim-password", 200)],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -224,7 +250,11 @@ fn bad_bootstrap_settings_are_refused() {
     assert!(err.contains("not both"), "{err}");
     let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD_FILE", missing.to_str().unwrap())]);
     assert!(err.contains("cannot read GRAPHBUFF_ADMIN_PASSWORD_FILE"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "bad name!"), ("GRAPHBUFF_ADMIN_PASSWORD", "pw")]);
+    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "bad name!"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
     assert!(err.contains("cannot create the administrator"), "{err}");
+    let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD", "short")]);
+    assert!(err.contains("at least 8 characters"), "{err}");
+    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "longname"), ("GRAPHBUFF_ADMIN_PASSWORD", "longname")]);
+    assert!(err.contains("differ from the user name"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -55,7 +55,7 @@ fn spawn(cmd: &mut Command) -> Child {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap()
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap()
 }
 
 #[test]
