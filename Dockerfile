@@ -9,8 +9,8 @@
 # start (no administrator yet) the server creates the administrator GRAPHBUFF_ADMIN_USER
 # (default: admin) with the password in GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
 # GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker secret: /run/secrets/NAME). Without them it asks
-# when run with `-it`, and otherwise stops.
-# `-e GRAPHBUFF_USERS=off` turns accounts off (then GRAPHBUFF_TOKEN, or no login at all).
+# when run with `-it`, and otherwise stops. `-e GRAPHBUFF_TOKEN=...` adds a token that
+# logs in as an administrator.
 #
 # The build stage runs on the build machine's own architecture and cross-compiles for
 # the target platform, so `docker buildx build --platform linux/amd64,linux/arm64` needs

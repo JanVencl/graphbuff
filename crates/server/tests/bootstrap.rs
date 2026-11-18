@@ -1,6 +1,6 @@
 //! The real binary: user accounts in the system database, the first administrator from
 //! GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD (or _FILE) when there are no
-//! accounts yet, `users = off`, and the offline `graphbuff-server users` command.
+//! accounts yet, and the offline `graphbuff-server users` command.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -14,7 +14,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 const VARS: &[&str] = &[
     "GRAPHBUFF_TOKEN",
     "GRAPHBUFF_DATA",
-    "GRAPHBUFF_USERS",
     "GRAPHBUFF_LOG_DIR",
     "GRAPHBUFF_LOG_LEVEL",
     "GRAPHBUFF_ADMIN_USER",
@@ -204,13 +203,13 @@ fn without_an_administrator_the_server_does_not_start() {
 }
 
 #[test]
-fn users_off_turns_accounts_off() {
-    for off in ["-", "off"] {
-        // The token is the only login.
-        logins(&["--users", off], &[("GRAPHBUFF_TOKEN", "tok")], &[("x", "tok", 200), ("", "", 401)]);
-        // Without a token, no login at all.
-        logins(&[], &[("GRAPHBUFF_USERS", off)], &[("", "", 200)]);
-    }
+fn accounts_cannot_be_turned_off() {
+    let out = command(&["--users", "off"], &[]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option `--users`"));
+    // The old variable is ignored: accounts stay on.
+    let err = refused(&[], &[("GRAPHBUFF_USERS", "off")]);
+    assert!(err.contains("there is no administrator"), "{err}");
 }
 
 #[test]
@@ -240,10 +239,6 @@ fn the_offline_command_works_on_the_data_directory() {
 fn bad_bootstrap_settings_are_refused() {
     let dir = temp_dir("bad");
     let missing = dir.join("missing");
-    let err = refused(&["--users", "off"], &[("GRAPHBUFF_ADMIN_PASSWORD", "pw")]);
-    assert!(err.contains("needs user accounts"), "{err}");
-    let err = refused(&["--users", "users.txt"], &[]);
-    assert!(err.contains("system database"), "{err}");
     let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "root")]);
     assert!(err.contains("GRAPHBUFF_ADMIN_USER needs GRAPHBUFF_ADMIN_PASSWORD"), "{err}");
     let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD", "pw"), ("GRAPHBUFF_ADMIN_PASSWORD_FILE", "x")]);

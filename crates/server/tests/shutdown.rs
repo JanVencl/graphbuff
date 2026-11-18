@@ -21,7 +21,7 @@ fn query(addr: &str, body: &str) -> String {
     conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         conn,
-        "POST /query HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /query HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -62,9 +62,9 @@ fn spawn(cmd: &mut Command) -> Child {
 fn stop_request_checkpoints_and_exits_zero() {
     let data = temp_dir("shutdown");
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--users", "off", "--data"]).arg(&data);
+    cmd.args(["--bind", "127.0.0.1:0", "--token", "test-token", "--data"]).arg(&data);
     cmd.env("GRAPHBUFF_CONFIG", "-");
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_USERS", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
+    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
         cmd.env_remove(key);
     }
     let mut child = spawn(&mut cmd);
@@ -110,8 +110,8 @@ fn stop_request_checkpoints_and_exits_zero() {
 
     // The data is there on the next start.
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--users", "off", "--data"]).arg(&data);
-    cmd.env_remove("GRAPHBUFF_TOKEN").env_remove("GRAPHBUFF_USERS").env("GRAPHBUFF_CONFIG", "-");
+    cmd.args(["--bind", "127.0.0.1:0", "--token", "test-token", "--data"]).arg(&data);
+    cmd.env_remove("GRAPHBUFF_TOKEN").env("GRAPHBUFF_CONFIG", "-");
     let mut child = spawn(&mut cmd);
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
@@ -120,7 +120,7 @@ fn stop_request_checkpoints_and_exits_zero() {
     let body = r#"{"query": "MATCH (n:N) RETURN count(n) AS c"}"#;
     write!(
         conn,
-        "POST /query HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /query HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .unwrap();

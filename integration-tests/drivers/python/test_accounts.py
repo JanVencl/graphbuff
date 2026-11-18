@@ -139,7 +139,7 @@ def tls_server():
     import ssl
     http_port, bolt_port = _free_port(), _free_port()
     args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}", "--in-memory",
-            "--users", "off", "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
+            "--token", "x", "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "ca.pem"))
     try:
         proc = _start(args, f"https://localhost:{http_port}/health", context)

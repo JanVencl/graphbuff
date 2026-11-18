@@ -34,6 +34,10 @@ def free_port():
         return s.getsockname()[1]
 
 
+# The token test servers accept, unless a test gives its own.
+TOKEN = "integration-test-token"
+
+
 class QueryError(Exception):
     """An error answer: `code` is the error kind (SyntaxError, TypeError, ...)."""
 
@@ -49,21 +53,28 @@ class ServerDied(Exception):
 
 class Server:
     """One server process on a free port. `args` are extra command-line options; without
-    `--data`, databases live in memory, and without `--users`, user accounts are off."""
+    `--data`, databases live in memory. Clients log in with the token: the one in `args`
+    (`--token`), else `TOKEN`; `http` sends it with every request."""
 
     def __init__(self, args=()):
         self.args = list(args)
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        self.http = requests.Session()
+        self.token = self.args[self.args.index("--token") + 1] if "--token" in self.args else TOKEN
+        self.http = self._session()
         self.proc = None
+
+    def _session(self):
+        http = requests.Session()
+        http.headers["Authorization"] = f"Bearer {self.token}"
+        return http
 
     def start(self):
         cmd = [server_binary(), "--bind", f"127.0.0.1:{self.port}", "--log-level", "error"]
         if "--data" not in self.args:
             cmd.append("--in-memory")
-        if "--users" not in self.args:
-            cmd += ["--users", "off"]
+        if "--token" not in self.args:
+            cmd += ["--token", self.token]
         cmd += self.args
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      env={**os.environ, "GRAPHBUFF_CONFIG": "-"})
@@ -91,7 +102,7 @@ class Server:
 
     def restart(self):
         self.stop()
-        self.http = requests.Session()
+        self.http = self._session()
         return self.start()
 
     def stop(self):

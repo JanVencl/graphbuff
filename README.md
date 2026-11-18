@@ -105,9 +105,8 @@ docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
        ghcr.io/janvencl/graphbuff users add admin admin
 ```
 
-`-e GRAPHBUFF_USERS=off` turns accounts off: then `-e GRAPHBUFF_TOKEN=s3cret` makes one token
-the only login, and with neither anyone who reaches the ports may do anything. Who can
-reach them is decided by `-p`: `-p 127.0.0.1:7475:7475` publishes a port to this machine
+`-e GRAPHBUFF_TOKEN=s3cret` adds a token that logs in as an administrator, besides the
+accounts. Who can reach the ports is decided by `-p`: `-p 127.0.0.1:7475:7475` publishes a port to this machine
 only. A bind mount for `/data` (`-v ./data:/data`) must be writable by the container's user,
 uid 65532 (`sudo chown 65532 ./data` on Linux).
 
@@ -557,11 +556,10 @@ A query request is its own transaction. Database commands (`CREATE DATABASE`,
   (`Forbidden`: the user's roles do not allow the statement), 413 (body
   over 16 MiB, or `TransactionTooLarge`: a transaction past its database's size cap,
   rolled back), 500 (`StorageError`).
-* **Security:** the server listens on localhost by default. With `--token` (or the
-  `GRAPHBUFF_TOKEN` environment variable) every request except `/health` needs
-  `Authorization: Bearer <token>`; with user accounts (on unless `--users off`), clients
-  log in as users (see
-  [Users and TLS](#users-and-tls)). `LOAD CSV` is off unless `--import-dir DIR` is
+* **Security:** the server listens on localhost by default. Every request except
+  `/health` needs a login: a user's name and password (see
+  [Users and TLS](#users-and-tls)), or, with `--token` (or the `GRAPHBUFF_TOKEN`
+  environment variable), `Authorization: Bearer <token>`. `LOAD CSV` is off unless `--import-dir DIR` is
   given; it then reads only files inside `DIR`.
 * **Implementation** (`crates/server`, standard library plus `argon2`, and rustls with a TLS
   feature): one thread per
@@ -685,8 +683,7 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   dates, times, date-times with offsets or named time zones, durations and points, in both
   directions. Byte arrays are refused.
 * **Authentication:** `basic` with a user's name and password; with `--token`, also
-  `basic` with the token as the password (any user name) or `bearer` with the token. With
-  `--users off` and no token, any credentials pass.
+  `basic` with the token as the password (any user name) or `bearer` with the token.
 * **Transactions and limits** behave as over HTTP: an explicit transaction holds its
   database's write lock until it ends, and is rolled back after `--tx-timeout` seconds
   without a message or when its connection closes; `--query-timeout` caps every statement.
@@ -705,9 +702,9 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
 
 ## Users and TLS
 
-User accounts are on unless `--users off`: clients log in with a user name and password,
-HTTP Basic authentication (`Authorization: Basic …`) or Bolt's `basic` scheme. A `--token`
-still works alongside, as an administrator. The accounts live in the system database of
+Clients log in with a user name and password: HTTP Basic authentication
+(`Authorization: Basic …`) or Bolt's `basic` scheme. Accounts cannot be turned off; a
+`--token` works alongside them, as an administrator. The accounts live in the system database of
 the data directory (`DATA/system/`, synced on every commit; in memory with
 `--in-memory`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
 format. A hash made with other parameters is replaced at the user's next login.
@@ -724,7 +721,7 @@ Or let the server create the first administrator when it starts and no user has 
 admin role (Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
 `GRAPHBUFF_ADMIN_PASSWORD`, or `GRAPHBUFF_ADMIN_PASSWORD_FILE` naming a file that holds
 the password (one trailing newline is ignored). Once there is an administrator these are
-ignored, so they may stay set; setting them with `--users off` is an error.
+ignored, so they may stay set.
 
 Without these variables, a server started in a terminal asks for the administrator's
 name and password (twice, without echo). Without a terminal (a service, a container
@@ -737,9 +734,6 @@ anyway, and the token holder creates the users.
 $env:GRAPHBUFF_ADMIN_PASSWORD = Read-Host -MaskInput 'password'
 graphbuff-server
 ```
-
-`GRAPHBUFF_USERS=off` (or `-`) turns accounts off from the environment; then only the
-token, if set, logs in, and without one anyone who reaches the ports may do anything.
 
 Each user holds roles; the strongest decides what they may do, checked for every
 statement (a role granted or revoked applies to open connections at once):
