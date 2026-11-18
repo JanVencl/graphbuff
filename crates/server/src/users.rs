@@ -1,4 +1,12 @@
-//! User accounts: names, password hashes and roles, kept in a text file.
+//! User accounts: names, password hashes and roles, kept in the system database
+//! ([`Users::system`]) or, as before, in a text file ([`Users::open`]).
+//!
+//! In the system database each account is a node
+//! `(:User {name, password, roles})` (`password` is the encoded hash, `roles` a list of
+//! role names), with a uniqueness constraint on `name`. A `(:SystemInfo {version})` node
+//! records the layout, so a newer layout is refused rather than misread. Every change
+//! is one statement, so it is applied completely or not at all, and is synced to disk
+//! before it takes effect.
 //!
 //! Passwords are stored as PBKDF2-HMAC-SHA-256 hashes with a random 16-byte salt
 //! ([`DEFAULT_ITERATIONS`] rounds by default). A successful login is remembered (as a
@@ -21,9 +29,9 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use graphbuff::{Error, QueryResult, QueryStats, Result, ResultValue, Value};
+use graphbuff::{BoxedStore, Database, Error, QueryResult, QueryStats, Result, ResultValue, Value};
 use graphbuff::cypher::ast::{DbName, ExistingDatabase, Secret, UserCommand};
 
 use crate::crypto::{self, Sha256};
@@ -33,6 +41,9 @@ pub const DEFAULT_ITERATIONS: u32 = 600_000;
 
 const HEADER: &str = "graphbuff users v1";
 const SALT_BYTES: usize = 16;
+
+/// The layout of the accounts in the system database that this version writes and reads.
+const SYSTEM_VERSION: i64 = 1;
 
 /// A role a user may hold. Stronger roles include what weaker ones may do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,18 +168,32 @@ struct State {
     verified: HashMap<String, [u8; 32]>,
 }
 
-/// A set of user accounts, optionally kept in a file. Changes are written to the file
-/// (atomically, by renaming a new copy over it) before they take effect.
+/// Where the accounts are kept.
+enum Store {
+    /// Nowhere: they live as long as the [`Users`].
+    Memory,
+    /// A text file, replaced atomically (a new copy renamed over it).
+    File(PathBuf),
+    /// The system database.
+    System(Arc<Database<BoxedStore>>),
+}
+
+/// A set of user accounts. Changes are saved (see [`Store`]) before they take effect.
 pub struct Users {
-    path: Option<PathBuf>,
+    store: Store,
     iterations: u32,
     state: RwLock<State>,
 }
 
 impl fmt::Debug for Users {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let store = match &self.store {
+            Store::Memory => "memory".to_string(),
+            Store::File(p) => p.display().to_string(),
+            Store::System(_) => "system database".to_string(),
+        };
         f.debug_struct("Users")
-            .field("path", &self.path)
+            .field("store", &store)
             .field("users", &self.read().accounts.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -203,10 +228,66 @@ impl Users {
     /// Accounts that live only as long as the server.
     pub fn in_memory() -> Users {
         Users {
-            path: None,
+            store: Store::Memory,
             iterations: DEFAULT_ITERATIONS,
             state: RwLock::default(),
         }
+    }
+
+    /// The accounts kept in the system database `db`
+    /// ([`graphbuff::DatabaseManager::system_database`]). Prepares an empty system
+    /// database (constraint and layout version); refuses one with a newer layout.
+    pub fn system(db: Arc<Database<BoxedStore>>) -> Result<Users> {
+        let bad = |msg: String| Error::Storage(format!("system database: {msg}"));
+        db.execute("CREATE CONSTRAINT system_user_name IF NOT EXISTS FOR (u:User) REQUIRE u.name IS UNIQUE")?;
+        let info = db.execute_with_params(
+            "MERGE (i:SystemInfo) ON CREATE SET i.version = $version RETURN i.version",
+            &BTreeMap::from([("version".to_string(), Value::Int(SYSTEM_VERSION))]),
+        )?;
+        match info.rows.as_slice() {
+            [row] => match row.first() {
+                Some(ResultValue::Int(v)) if *v <= SYSTEM_VERSION => {}
+                Some(ResultValue::Int(v)) => {
+                    return Err(bad(format!(
+                        "its accounts have layout version {v}, written by a newer graphbuff; this one reads up to {SYSTEM_VERSION}"
+                    )));
+                }
+                other => return Err(bad(format!("invalid layout version {other:?}"))),
+            },
+            rows => return Err(bad(format!("{} SystemInfo nodes, expected one", rows.len()))),
+        }
+
+        let rows = db.execute("MATCH (u:User) RETURN u.name, u.password, u.roles")?.rows;
+        let mut accounts = BTreeMap::new();
+        for row in rows {
+            let [ResultValue::String(name), ResultValue::String(hash), roles] = row.as_slice() else {
+                return Err(bad(format!("invalid user record {row:?}")));
+            };
+            check_name(name).map_err(|_| bad(format!("invalid user name `{name}`")))?;
+            let password = PasswordHash::decode(hash).ok_or_else(|| bad(format!("invalid password hash of `{name}`")))?;
+            let roles = match roles {
+                ResultValue::List(list) => list
+                    .iter()
+                    .map(|r| match r {
+                        ResultValue::String(r) => Role::parse(r).map_err(|_| bad(format!("unknown role `{r}` of `{name}`"))),
+                        other => Err(bad(format!("invalid role {other:?} of `{name}`"))),
+                    })
+                    .collect::<Result<BTreeSet<Role>>>()?,
+                ResultValue::Null => BTreeSet::new(),
+                other => return Err(bad(format!("invalid roles {other:?} of `{name}`"))),
+            };
+            if accounts.insert(name.clone(), Account { password, roles }).is_some() {
+                return Err(bad(format!("duplicate user `{name}`")));
+            }
+        }
+        Ok(Users {
+            store: Store::System(db),
+            iterations: DEFAULT_ITERATIONS,
+            state: RwLock::new(State {
+                accounts,
+                verified: HashMap::new(),
+            }),
+        })
     }
 
     /// Opens the accounts kept in `path`; a missing file is an empty set (the file is
@@ -219,7 +300,7 @@ impl Users {
             Err(e) => return Err(e),
         };
         Ok(Users {
-            path: Some(path),
+            store: Store::File(path),
             iterations: DEFAULT_ITERATIONS,
             state: RwLock::new(State {
                 accounts,
@@ -237,7 +318,15 @@ impl Users {
 
     /// The file the accounts are kept in, if any.
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        match &self.store {
+            Store::File(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Whether the accounts are kept in the system database.
+    pub fn in_system_database(&self) -> bool {
+        matches!(self.store, Store::System(_))
     }
 
     fn read(&self) -> RwLockReadGuard<'_, State> {
@@ -303,8 +392,12 @@ impl Users {
         let mut st = self.write();
         let mut accounts = st.accounts.clone();
         let out = change(&mut accounts)?;
-        if let Some(path) = &self.path {
-            save(path, &accounts).map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
+        match &self.store {
+            Store::Memory => {}
+            Store::File(path) => {
+                save(path, &accounts).map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
+            }
+            Store::System(db) => save_system(db, &st.accounts, &accounts)?,
         }
         let State { accounts: old, verified } = &mut *st;
         verified.retain(|name, _| {
@@ -440,6 +533,51 @@ fn save(path: &Path, accounts: &BTreeMap<String, Account>) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+/// Writes the difference between `old` and `new` to the system database, in one
+/// statement: accounts that are gone or renamed are deleted, new and changed ones are
+/// written.
+fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: &BTreeMap<String, Account>) -> Result<()> {
+    let remove: Vec<Value> = old
+        .keys()
+        .filter(|name| !new.contains_key(*name))
+        .map(|name| Value::String(name.clone()))
+        .collect();
+    let upsert: Vec<Value> = new
+        .iter()
+        .filter(|(name, a)| {
+            old.get(*name)
+                .is_none_or(|o| o.roles != a.roles || o.password.encode() != a.password.encode())
+        })
+        .map(|(name, a)| {
+            Value::Map(BTreeMap::from([
+                ("name".to_string(), Value::String(name.clone())),
+                ("password".to_string(), Value::String(a.password.encode())),
+                (
+                    "roles".to_string(),
+                    Value::List(a.roles.iter().map(|r| Value::String(r.name().into())).collect()),
+                ),
+            ]))
+        })
+        .collect();
+    if remove.is_empty() && upsert.is_empty() {
+        return Ok(());
+    }
+    db.execute_with_params(
+        "OPTIONAL MATCH (old:User) WHERE old.name IN $remove \
+         DELETE old \
+         WITH count(*) AS ignored \
+         UNWIND $upsert AS a \
+         MERGE (u:User {name: a.name}) \
+         SET u.password = a.password, u.roles = a.roles",
+        &BTreeMap::from([
+            ("remove".to_string(), Value::List(remove)),
+            ("upsert".to_string(), Value::List(upsert)),
+        ]),
+    )
+    .map_err(|e| Error::Storage(format!("saving the accounts in the system database: {e}")))?;
+    Ok(())
 }
 
 // ---- Cypher user commands -----------------------------------------------------------------
@@ -670,6 +808,62 @@ mod tests {
         assert!(users.create("ok", "", &[], ExistingDatabase::Fail).is_err());
         fs::write(&path, "nonsense\n").unwrap();
         assert!(Users::open(&path).is_err());
+    }
+
+    #[test]
+    fn accounts_persist_in_the_system_database() {
+        let dir = temp_file("system").with_file_name("data");
+        {
+            let mgr = graphbuff::DatabaseManager::open(&dir).unwrap();
+            let users = Users::system(mgr.system_database().unwrap()).unwrap().with_iterations(10);
+            assert!(users.in_system_database() && users.path().is_none());
+            assert!(users.is_empty());
+            users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap();
+            users.create("bob", "pw2", &[Role::Reader, Role::Editor], ExistingDatabase::Fail).unwrap();
+            users.create("carol", "pw3", &[], ExistingDatabase::Fail).unwrap();
+            assert!(users.revoke("bob", Role::Editor).unwrap());
+            users.set_password("carol", "new").unwrap();
+            assert!(users.rename("bob", "robert").unwrap());
+            assert!(users.create("dave", "pw4", &[], ExistingDatabase::Fail).unwrap());
+            assert!(users.drop_user("dave").unwrap());
+            // Failing changes leave nothing behind.
+            assert!(users.rename("robert", "alice").is_err());
+            assert!(users.grant("nobody", Role::Admin).is_err());
+        }
+        let mgr = graphbuff::DatabaseManager::open(&dir).unwrap();
+        let system = mgr.system_database().unwrap();
+        let users = Users::system(Arc::clone(&system)).unwrap();
+        assert_eq!(
+            users.list(),
+            vec![
+                ("alice".into(), vec![Role::Admin]),
+                ("carol".into(), vec![]),
+                ("robert".into(), vec![Role::Reader]),
+            ]
+        );
+        assert!(users.authenticate("alice", "pw1"));
+        assert!(users.authenticate("robert", "pw2"));
+        assert!(users.authenticate("carol", "new"));
+        assert!(!users.authenticate("carol", "pw3"));
+        // Opening again does not add a second constraint or SystemInfo.
+        drop(users);
+        Users::system(Arc::clone(&system)).unwrap();
+        let info = system.execute("MATCH (i:SystemInfo) RETURN i.version").unwrap();
+        assert_eq!(info.rows, vec![vec![ResultValue::Int(SYSTEM_VERSION)]]);
+        // The constraint holds even for writes that bypass Users.
+        assert!(system.execute("CREATE (:User {name: 'alice'})").is_err());
+    }
+
+    #[test]
+    fn a_newer_system_layout_is_refused() {
+        let mgr = graphbuff::DatabaseManager::in_memory();
+        let system = mgr.system_database().unwrap();
+        Users::system(Arc::clone(&system)).unwrap();
+        system.execute("MATCH (i:SystemInfo) SET i.version = 99").unwrap();
+        let err = Users::system(Arc::clone(&system)).unwrap_err();
+        assert!(err.to_string().contains("newer graphbuff"), "{err}");
+        system.execute("MATCH (i:SystemInfo) SET i.version = 1 CREATE (:User {name: 'x', password: 'junk'})").unwrap();
+        assert!(Users::system(system).is_err());
     }
 
     #[test]
