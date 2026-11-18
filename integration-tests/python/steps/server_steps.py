@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 
-import requests
 from behave import given, then, when
 
 from environment import restart_server
@@ -11,20 +10,20 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 
 
 def _query(context, query):
-    return requests.post(context.base_url + "/query", json={"query": query})
+    return context.server.http.post(context.base_url + "/query", json={"query": query})
 
 
 # ---- HTTP requests ----------------------------------------------------------------------
 
 @when('I send a GET request to "{endpoint}"')
 def get_request(context, endpoint):
-    context.response = requests.get(context.base_url + endpoint)
+    context.response = context.server.http.get(context.base_url + endpoint)
 
 
 @when('I send a POST request to "{endpoint}" with JSON:')
 def post_request(context, endpoint):
     # Invalid JSON is sent as it is, to test how the server rejects it.
-    context.response = requests.post(context.base_url + endpoint, data=context.text.encode(),
+    context.response = context.server.http.post(context.base_url + endpoint, data=context.text.encode(),
                                      headers={"Content-Type": "application/json"})
 
 
@@ -120,7 +119,7 @@ def fresh_database(context):
 @given('I have created a node with name "{name}"')
 @when('I have created a node with name "{name}"')
 def create_named_node(context, name):
-    resp = requests.post(context.base_url + "/query",
+    resp = context.server.http.post(context.base_url + "/query",
                          json={"query": "CREATE ({name: $name})", "params": {"name": name}})
     assert resp.status_code == 200, resp.text
 

@@ -10,9 +10,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 #[test]
 fn demo_movies_is_loaded_at_startup() {
     let mut child = Command::new(BIN)
-        .args(["--bind", "127.0.0.1:0", "--in-memory", "--users", "off", "--demo", "movies"])
+        .args(["--bind", "127.0.0.1:0", "--in-memory", "--token", "test-token", "--demo", "movies"])
         .env_remove("GRAPHBUFF_TOKEN")
-        .env_remove("GRAPHBUFF_USERS")
         .env("GRAPHBUFF_CONFIG", "-")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -36,7 +35,7 @@ fn demo_movies_is_loaded_at_startup() {
         conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         write!(
             conn,
-            "POST /query HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /query HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();

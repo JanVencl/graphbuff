@@ -31,7 +31,7 @@ Options:
                        `--` (`bind = 0.0.0.0:7475`, `in-memory = true`). The command line
                        overrides the environment, which overrides the file.
   --bind ADDR          address to listen on (default 127.0.0.1:7475; use 0.0.0.0:7475
-                       to accept other machines, together with --token)
+                       to accept other machines, preferably with TLS)
   --bolt ADDR          also serve the Bolt protocol (Neo4j drivers) on ADDR, such as
                        127.0.0.1:7687; the token, if set, is the password (any user name)
   --data DIR           keep databases durably in DIR (also: env GRAPHBUFF_DATA); default:
@@ -44,12 +44,9 @@ Options:
                        it already holds data); NAME: movies
   --persistent         with --data: new databases use disk-resident paged storage
   --no-fsync           with --data: don't fsync every commit
-  --token TOKEN        require `Authorization: Bearer TOKEN` (also: env GRAPHBUFF_TOKEN);
-                       the token holder may do anything
-  --users on|off       user accounts (default: on), kept in the system database of the
-                       data directory; clients log in with a user name and password
-                       (HTTP Basic, Bolt basic). `off` (or `-`): no accounts, only the
-                       token if set, else no login at all (also: env GRAPHBUFF_USERS)
+  --token TOKEN        also accept this token (also: env GRAPHBUFF_TOKEN): HTTP
+                       `Authorization: Bearer TOKEN`, or as the password of any user name
+                       (HTTP Basic, Bolt basic); the token holder may do anything
   --tls-cert FILE      serve HTTPS and Bolt over TLS with this PEM certificate chain
   --tls-key FILE       ... and this PEM private key (needs the `tls` build feature)
   --tls-allow-plain    with TLS: also accept clients without TLS on the same ports
@@ -94,7 +91,11 @@ Endpoints:
   POST /db/{name}/check   consistency check of a persistent database, online
                           (backup, restore and check need the admin role)
 
-User accounts (--users):
+User accounts:
+  Clients log in with a user name and password (HTTP Basic, Bolt basic), or with the
+  token. The accounts are kept in the system database of the data directory (in memory
+  with --in-memory).
+
   Roles: reader (read queries), editor (also writes, indexes, constraints), admin (also
   databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
   PASSWORD 's3cret-pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
@@ -175,18 +176,6 @@ fn default_storage(settings: &Settings) -> StorageKind {
         *sync = SyncPolicy::OsBuffered;
     }
     storage
-}
-
-/// Whether user accounts are on: `users` is `on` (the default) or `off` (also `-`).
-fn accounts_on(settings: &Settings) -> Result<bool, String> {
-    match settings.get("users") {
-        None | Some("on" | "true" | "yes") => Ok(true),
-        Some("off" | "-" | "false" | "no" | "none") => Ok(false),
-        Some(other) => Err(format!(
-            "users = {other}: user accounts are kept in the system database of the data directory, not in a file; \
-             use `on` (the default) or `off`"
-        )),
-    }
 }
 
 /// `graphbuff-server users [--data DIR] [--config FILE] …`: manages the accounts in the
@@ -368,7 +357,6 @@ fn main() {
     let persistent = settings.flag("persistent");
     let sync = if settings.flag("no-fsync") { SyncPolicy::OsBuffered } else { SyncPolicy::EveryCommit };
     let import_dir = get("import-dir");
-    let accounts = accounts_on(&settings).unwrap_or_else(|e| fail(&e));
     let gpu = settings.flag("gpu");
     let demo = get("demo");
     let (tls_cert, tls_key, tls_plain) = (get("tls-cert"), get("tls-key"), settings.flag("tls-allow-plain"));
@@ -426,9 +414,6 @@ fn main() {
         _ => fail("TLS needs both --tls-cert and --tls-key"),
     };
     let admin = first_admin().unwrap_or_else(|e| fatal(&e));
-    if admin.is_some() && !accounts {
-        fatal("GRAPHBUFF_ADMIN_PASSWORD needs user accounts, but they are off (users = off)");
-    }
 
     let mgr = match &data {
         Some(dir) => DatabaseManager::open_with(dir, default_storage(&settings)),
@@ -442,9 +427,9 @@ fn main() {
         )),
     };
 
-    if accounts {
+    {
         let Some(system) = mgr.system_database() else {
-            fatal("this build has no system database for user accounts; start with users = off");
+            fatal("this build has no system database for user accounts");
         };
         let users = Users::system(system).unwrap_or_else(|e| fatal(&format!("cannot read the user accounts: {e}")));
         if users.has_admin() {
@@ -466,8 +451,7 @@ fn main() {
         } else if data.is_none() {
             fatal(
                 "there is no administrator, and in-memory accounts are lost at every stop: set \
-                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), start with --token, or turn accounts \
-                 off (users = off)",
+                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), or start with --token",
             );
         } else if prompt::interactive() {
             if let Err(e) = ask_for_admin(&users) {
@@ -477,8 +461,7 @@ fn main() {
             fatal(
                 "there is no administrator yet and no terminal to ask for one: set GRAPHBUFF_ADMIN_PASSWORD (or \
                  GRAPHBUFF_ADMIN_PASSWORD_FILE), add one with `graphbuff-server users add NAME admin` while the \
-                 server is stopped, start the server in a terminal to be asked, start with --token, or turn \
-                 accounts off (users = off)",
+                 server is stopped, start the server in a terminal to be asked, or start with --token",
             );
         }
         config.users = Some(Arc::new(users));
@@ -504,22 +487,8 @@ fn main() {
         )),
     };
     let addr = server.local_addr();
-    let auth = config.token.is_some() || config.users.is_some();
-    if !addr.ip().is_loopback() && !auth {
-        warn(&format!(
-            "listening on {addr} without --token or user accounts; anyone who can reach this port can read and change every database"
-        ));
-    }
-    if let Some(bolt) = server.bolt_addr()
-        && !bolt.ip().is_loopback()
-        && !auth
-    {
-        warn(&format!(
-            "serving Bolt on {bolt} without --token or user accounts; anyone who can reach this port can use every database"
-        ));
-    }
     let tls = config.tls.is_some();
-    if auth && !tls && (!addr.ip().is_loopback() || server.bolt_addr().is_some_and(|b| !b.ip().is_loopback())) {
+    if !tls && (!addr.ip().is_loopback() || server.bolt_addr().is_some_and(|b| !b.ip().is_loopback())) {
         warn("without TLS (--tls-cert, --tls-key), passwords and tokens cross the network in clear text");
     }
     let (http, bolt) = if tls { ("https", "bolt+s") } else { ("http", "bolt") };
@@ -545,11 +514,7 @@ fn main() {
         },
         log.dir().map_or("standard error".into(), |d| d.display().to_string()),
         log.slow_query().map_or("off".into(), |d| format!("{} ms", d.as_millis())),
-        match (&config.users, &config.token) {
-            (Some(_), _) => "user accounts",
-            (None, Some(_)) => "token",
-            (None, None) => "none needed",
-        }
+        if config.token.is_some() { "user accounts and token" } else { "user accounts" }
     ));
     if let Some((name, d)) = demo {
         if d.loaded {

@@ -220,7 +220,7 @@ fn backup_restore_and_check_need_the_admin_role() {
 
 #[test]
 fn users_without_accounts_and_in_the_system_database() {
-    // Accounts off: user commands say so.
+    // A server without accounts (embedded): user commands say so.
     let server = Server::start(
         Arc::new(DatabaseManager::in_memory()),
         ServerConfig {
@@ -237,7 +237,7 @@ fn users_without_accounts_and_in_the_system_database() {
         Some(r#"{"query":"CREATE USER a SET PASSWORD 'b'"}"#),
     );
     assert_eq!(r.status, 400);
-    assert!(r.body.contains("user accounts are off"), "{}", r.body);
+    assert!(r.body.contains("no user accounts"), "{}", r.body);
     drop(server);
 
     // Accounts created over the wire are in the system database afterwards.
