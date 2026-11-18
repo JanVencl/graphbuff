@@ -373,7 +373,11 @@ fn checkpoint_all_covers_durable_databases() {
             })
             .collect();
         done.sort();
-        assert_eq!(done, ["graphbuff", "p"]);
+        if cfg!(feature = "system-db") {
+            assert_eq!(done, ["graphbuff", "p", "system"]);
+        } else {
+            assert_eq!(done, ["graphbuff", "p"]);
+        }
         assert!(fs::metadata(&wal).unwrap().len() < before);
     }
     let mgr = DatabaseManager::open(&dir.0).unwrap();

@@ -11,7 +11,7 @@ name = "graphbuff-server"
 path = "src/main.rs"
 
 [dependencies]
-graphbuff.workspace = true
+graphbuff = { workspace = true, features = ["system-db"] }
 
 [features]
 # HTTPS and Bolt over TLS (`ServerConfig::tls`) with rustls. `tls` uses the ring crypto

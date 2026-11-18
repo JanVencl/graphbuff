@@ -55,7 +55,7 @@ use std::thread::ThreadId;
 
 pub use import::{IdType, ImportFiles, ImportOptions, ImportSummary, import_csv, parse_index};
 pub use demo::{DEMOS, DemoSummary, demo_script, load_demo};
-pub use dbms::{DEFAULT_DATABASE, DatabaseInfo, DatabaseManager, Session, StorageKind};
+pub use dbms::{DEFAULT_DATABASE, SYSTEM_DATABASE, DatabaseInfo, DatabaseManager, Session, StorageKind};
 pub use graphbuff_core::{
     BackupInfo, BoxedStore, BulkLoader, CheckReport, Crs, Csr, CsrAdjacency, DEFAULT_MAX_TRANSACTION_BYTES, Direction, Error, GraphStore, HybridGraph, HybridOptions, IndexDef, IndexEntity, MemoryGraph,
     NodeId, Path, PersistentGraph, PersistentOptions, Point, RelId, Result, Scan, Snapshot, StorageMode,

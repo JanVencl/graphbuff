@@ -14,6 +14,9 @@ graphbuff-gpu = { workspace = true, optional = true }
 [features]
 # GPU kernels (`gpu_kernels`, `WgpuKernels`) through wgpu: Vulkan, Direct3D 12 or Metal.
 gpu = ["dep:graphbuff-gpu"]
+# The system database (`DatabaseManager::system_database`) for the server's user
+# accounts. Off for the browser build, which has no accounts.
+system-db = []
 
 [[example]]
 name = "gpubench"
