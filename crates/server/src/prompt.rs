@@ -1,7 +1,24 @@
-//! Reading a new password for `graphbuff-server users`: on a terminal without echo and
-//! twice (the two must match); otherwise the first line of standard input.
+//! Reading a new password for `graphbuff-server users` and the first administrator: on a
+//! terminal without echo and twice (the two must match); otherwise the first line of
+//! standard input.
 
 use std::io::{self, BufRead, IsTerminal, Write};
+
+/// Whether someone can be asked: standard input and standard error are a terminal.
+pub fn interactive() -> bool {
+    io::stdin().is_terminal() && io::stderr().is_terminal()
+}
+
+/// Asks for a line, shown as it is typed.
+pub fn line(label: &str) -> io::Result<String> {
+    eprint!("{label}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "standard input ended"));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
 
 /// Reads a new password: asked twice without echo when standard input is a terminal,
 /// else the first line of standard input.

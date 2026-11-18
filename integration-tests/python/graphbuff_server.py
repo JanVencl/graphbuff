@@ -49,7 +49,7 @@ class ServerDied(Exception):
 
 class Server:
     """One server process on a free port. `args` are extra command-line options; without
-    `--data`, databases live in memory."""
+    `--data`, databases live in memory, and without `--users`, user accounts are off."""
 
     def __init__(self, args=()):
         self.args = list(args)
@@ -62,6 +62,8 @@ class Server:
         cmd = [server_binary(), "--bind", f"127.0.0.1:{self.port}", "--log-level", "error"]
         if "--data" not in self.args:
             cmd.append("--in-memory")
+        if "--users" not in self.args:
+            cmd += ["--users", "off"]
         cmd += self.args
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      env={**os.environ, "GRAPHBUFF_CONFIG": "-"})

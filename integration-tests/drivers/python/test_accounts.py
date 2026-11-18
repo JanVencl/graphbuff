@@ -1,7 +1,7 @@
 """User accounts, roles and TLS with the official Neo4j Python driver.
 
-Starts its own servers: one with `--users` (accounts made with the offline
-`graphbuff-server users` command) and, when the binary was built with TLS (`--features
+Starts its own servers: one with user accounts in the system database of a data
+directory (made with the offline `graphbuff-server users` command) and, when the binary was built with TLS (`--features
 tls` or `tls-rustcrypto`), one serving Bolt over TLS with the test certificate in
 `crates/server/tests/tls/`.
 """
@@ -36,40 +36,45 @@ def _start(args, health_url, context=None, env=None):
             time.sleep(0.1)
 
 
-def _add_user(users_file, name, password, *roles):
-    env = dict(os.environ, GRAPHBUFF_PASSWORD=password)
-    subprocess.run([_server_binary(), "users", users_file, "add", name, *roles],
-                   check=True, env=env, stdout=subprocess.DEVNULL)
+def _clean_env(**extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
+    env.update(GRAPHBUFF_CONFIG="-", **extra)
+    return env
+
+
+def _add_user(data, name, password, *roles):
+    subprocess.run([_server_binary(), "users", "--data", data, "add", name, *roles],
+                   check=True, env=_clean_env(GRAPHBUFF_PASSWORD=password), stdout=subprocess.DEVNULL)
 
 
 @pytest.fixture(scope="module")
 def accounts():
     with tempfile.TemporaryDirectory() as tmp:
-        users_file = os.path.join(tmp, "users")
-        _add_user(users_file, "root", "rootpw", "admin")
-        _add_user(users_file, "rita", "ritapw", "reader")
+        data = os.path.join(tmp, "data")
+        _add_user(data, "root", "root-password", "admin")
+        _add_user(data, "rita", "rita-password", "reader")
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                       "--users", users_file, "--in-memory"],
-                      f"http://127.0.0.1:{http_port}/health")
+                       "--data", data, "--log-dir", "-"],
+                      f"http://127.0.0.1:{http_port}/health", env=_clean_env())
         yield f"bolt://127.0.0.1:{bolt_port}"
         proc.terminate()
         proc.wait(10)
 
 
 def test_users_log_in_with_their_passwords(accounts):
-    with GraphDatabase.driver(accounts, auth=("root", "rootpw")) as d:
+    with GraphDatabase.driver(accounts, auth=("root", "root-password")) as d:
         d.verify_connectivity()
     with GraphDatabase.driver(accounts, auth=("root", "wrong")) as d:
         with pytest.raises(ex.AuthError):
             d.verify_connectivity()
-    with GraphDatabase.driver(accounts, auth=("ghost", "rootpw")) as d:
+    with GraphDatabase.driver(accounts, auth=("ghost", "root-password")) as d:
         with pytest.raises(ex.AuthError):
             d.verify_connectivity()
 
 
 def test_readers_cannot_write(accounts):
-    with GraphDatabase.driver(accounts, auth=("rita", "ritapw")) as d:
+    with GraphDatabase.driver(accounts, auth=("rita", "rita-password")) as d:
         records, _, _ = d.execute_query("RETURN 1 AS x")
         assert records[0]["x"] == 1
         with pytest.raises(ex.Forbidden):
@@ -82,46 +87,44 @@ def test_readers_cannot_write(accounts):
 
 
 def test_admins_manage_users(accounts):
-    with GraphDatabase.driver(accounts, auth=("root", "rootpw")) as admin:
+    with GraphDatabase.driver(accounts, auth=("root", "root-password")) as admin:
         admin.execute_query("CREATE USER eve IF NOT EXISTS SET PASSWORD $pw CHANGE NOT REQUIRED",
-                            pw="evepw", database_="system")
+                            pw="eve-password", database_="system")
         admin.execute_query("GRANT ROLE editor TO eve", database_="system")
         records, summary, _ = admin.execute_query("SHOW USERS", database_="system")
         assert {r["user"] for r in records} >= {"root", "rita", "eve"}
 
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw")) as eve:
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password")) as eve:
             _, summary, _ = eve.execute_query("CREATE (:Note {by: 'eve'})")
             assert summary.counters.nodes_created == 1
             with eve.session(database="system") as s:
-                s.run("ALTER CURRENT USER SET PASSWORD FROM $old TO $new", old="evepw", new="evepw2").consume()
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw2")) as eve:
+                s.run("ALTER CURRENT USER SET PASSWORD FROM $old TO $new", old="eve-password", new="eve-password-2").consume()
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password-2")) as eve:
             eve.verify_connectivity()
 
         admin.execute_query("DROP USER eve", database_="system")
-        with GraphDatabase.driver(accounts, auth=("eve", "evepw2")) as eve:
+        with GraphDatabase.driver(accounts, auth=("eve", "eve-password-2")) as eve:
             with pytest.raises(ex.AuthError):
                 eve.verify_connectivity()
 
 
 def test_first_admin_from_the_environment():
-    """GRAPHBUFF_ADMIN_* create the administrator in an empty users file (as in Docker)."""
+    """GRAPHBUFF_ADMIN_* create the administrator when there are no accounts (as in Docker)."""
     with tempfile.TemporaryDirectory() as tmp:
         secret = os.path.join(tmp, "secret")
         with open(secret, "w") as f:
-            f.write("bootpw\n")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
-        env.update(GRAPHBUFF_USERS=os.path.join(tmp, "users.txt"), GRAPHBUFF_ADMIN_USER="boot",
-                   GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
+            f.write("boot-password\n")
+        env = _clean_env(GRAPHBUFF_ADMIN_USER="boot", GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
         http_port, bolt_port = _free_port(), _free_port()
         proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
                        "--in-memory", "--config", "-"],
                       f"http://127.0.0.1:{http_port}/health", env=env)
         try:
             url = f"bolt://127.0.0.1:{bolt_port}"
-            with GraphDatabase.driver(url, auth=("boot", "bootpw")) as d:
+            with GraphDatabase.driver(url, auth=("boot", "boot-password")) as d:
                 records, _, _ = d.execute_query("SHOW CURRENT USER", database_="system")
                 assert records[0]["roles"] == ["admin"]
-            with GraphDatabase.driver(url, auth=("boot", "bootpw\n")) as d:
+            with GraphDatabase.driver(url, auth=("boot", "boot-password\n")) as d:
                 with pytest.raises(ex.AuthError):
                     d.verify_connectivity()
         finally:
@@ -136,7 +139,7 @@ def tls_server():
     import ssl
     http_port, bolt_port = _free_port(), _free_port()
     args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}", "--in-memory",
-            "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
+            "--users", "off", "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "ca.pem"))
     try:
         proc = _start(args, f"https://localhost:{http_port}/health", context)

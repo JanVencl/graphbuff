@@ -11,7 +11,10 @@ name = "graphbuff-server"
 path = "src/main.rs"
 
 [dependencies]
-graphbuff.workspace = true
+graphbuff = { workspace = true, features = ["system-db"] }
+# Argon2id password hashes. Only the hash function: the server writes and reads the PHC
+# strings and makes the salts itself.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 
 [features]
 # HTTPS and Bolt over TLS (`ServerConfig::tls`) with rustls. `tls` uses the ring crypto

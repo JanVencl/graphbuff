@@ -11,10 +11,10 @@ use graphbuff::DatabaseManager;
 use graphbuff::cypher::ast::ExistingDatabase;
 use graphbuff_server::json::{self, Json};
 use graphbuff_server::packstream::{self, PackValue};
-use graphbuff_server::{Role, Server, ServerConfig, Users};
+use graphbuff_server::{HashParams, Role, Server, ServerConfig, Users};
 
 fn users() -> Arc<Users> {
-    let u = Users::in_memory().with_iterations(100);
+    let u = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
     u.create("root", "rootpw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
     u.create("ed", "edpw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
     u.create("rita", "ritapw", &[Role::Reader], ExistingDatabase::Fail).unwrap();
@@ -219,8 +219,8 @@ fn backup_restore_and_check_need_the_admin_role() {
 }
 
 #[test]
-fn users_without_accounts_and_files() {
-    // No --users: user commands explain how to turn accounts on.
+fn users_without_accounts_and_in_the_system_database() {
+    // Accounts off: user commands say so.
     let server = Server::start(
         Arc::new(DatabaseManager::in_memory()),
         ServerConfig {
@@ -237,22 +237,35 @@ fn users_without_accounts_and_files() {
         Some(r#"{"query":"CREATE USER a SET PASSWORD 'b'"}"#),
     );
     assert_eq!(r.status, 400);
-    assert!(r.body.contains("--users"), "{}", r.body);
+    assert!(r.body.contains("user accounts are off"), "{}", r.body);
     drop(server);
 
-    // Accounts created over the wire are in the file afterwards.
-    let dir = std::env::temp_dir().join(format!("graphbuff-users-test-{}", std::process::id()));
+    // Accounts created over the wire are in the system database afterwards.
+    let dir: PathBuf = std::env::temp_dir().join(format!("graphbuff-users-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file: PathBuf = dir.join("users");
-    let u = Users::open(&file).unwrap().with_iterations(100);
-    u.create("root", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
-    let server = start(Arc::new(u), None);
-    let r = query(server.local_addr(), &basic("root", "pw"), "CREATE USER zed SET PASSWORD 'zz'");
-    assert_eq!(r.status, 200, "{}", r.body);
-    drop(server);
-    let again = Users::open(&file).unwrap();
+    {
+        let mgr = Arc::new(DatabaseManager::open(&dir).unwrap());
+        let u = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        u.create("root", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
+        let server = Server::start(
+            Arc::clone(&mgr),
+            ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                users: Some(Arc::new(u)),
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap();
+        let r = query(server.local_addr(), &basic("root", "pw"), "CREATE USER zed SET PASSWORD 'zz'");
+        assert_eq!(r.status, 200, "{}", r.body);
+        // The system database cannot be queried, even by an admin.
+        let r = query(server.local_addr(), &basic("root", "pw"), "USE system MATCH (u:User) RETURN u.password");
+        assert_ne!(r.status, 200, "{}", r.body);
+    }
+    let mgr = DatabaseManager::open(&dir).unwrap();
+    let again = Users::system(mgr.system_database().unwrap()).unwrap();
     assert!(again.authenticate("zed", "zz"));
+    drop(mgr);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

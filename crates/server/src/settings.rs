@@ -39,7 +39,7 @@ const KEYS: &[(&str, bool)] = &[
 
 /// Settings that name a file or directory: relative ones in the config file are resolved
 /// against the file's directory.
-const PATHS: &[&str] = &["data", "users", "tls-cert", "tls-key", "import-dir", "backup-dir", "log-dir"];
+const PATHS: &[&str] = &["data", "tls-cert", "tls-key", "import-dir", "backup-dir", "log-dir"];
 
 /// Environment variables and the settings they stand for.
 const ENV: &[(&str, &str)] = &[
@@ -81,7 +81,7 @@ pub const TEMPLATE: &str = "\
 
 # Security
 # token = change-me
-# users = users.txt
+# users = on            # off: no user accounts (only the token, if set)
 # tls-cert = cert.pem
 # tls-key = key.pem
 # tls-allow-plain = false

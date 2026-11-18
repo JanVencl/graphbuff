@@ -5,11 +5,12 @@
 #   docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
 #     -e GRAPHBUFF_ADMIN_PASSWORD=change-me graphbuff --demo movies
 #
-# Clients log in with the user accounts in /data/users.txt. On the first start (no
-# accounts yet) the server creates the administrator GRAPHBUFF_ADMIN_USER (default:
-# admin) with the password in GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
-# GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker secret: /run/secrets/NAME).
-# `-e GRAPHBUFF_USERS=-` turns accounts off (then GRAPHBUFF_TOKEN, or no login at all).
+# Clients log in with user accounts, kept in the system database in /data. On the first
+# start (no administrator yet) the server creates the administrator GRAPHBUFF_ADMIN_USER
+# (default: admin) with the password in GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
+# GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker secret: /run/secrets/NAME). Without them it asks
+# when run with `-it`, and otherwise stops.
+# `-e GRAPHBUFF_USERS=off` turns accounts off (then GRAPHBUFF_TOKEN, or no login at all).
 #
 # The build stage runs on the build machine's own architecture and cross-compiles for
 # the target platform, so `docker buildx build --platform linux/amd64,linux/arm64` needs
@@ -51,12 +52,11 @@ COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot
 WORKDIR /data
 VOLUME /data
-# Databases, user accounts and the config file (graphbuff.conf, created on the first
+# Databases, user accounts (the system database) and the config file (graphbuff.conf, created on the first
 # start) in the /data volume; logs to standard error (`docker logs`). Options after the
 # image name override the config file and these variables.
 ENV GRAPHBUFF_DATA=/data \
     GRAPHBUFF_CONFIG=/data/graphbuff.conf \
-    GRAPHBUFF_USERS=/data/users.txt \
     GRAPHBUFF_LOG_DIR=-
 # HTTP/JSON and Bolt. The server listens on every interface of the container; which
 # machines can reach it is decided by `docker run -p`.

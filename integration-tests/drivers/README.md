@@ -43,8 +43,8 @@ timeouts; bookmarks; concurrent sessions; syntax, constraint and runtime errors 
 recovering from them; other databases, and database commands on the `system` database.
 Java also runs the async API.
 
-Python's `test_accounts.py` starts servers of its own: one with `--users`
-(accounts made with `graphbuff-server users FILE add`), checking logins, roles
+Python's `test_accounts.py` starts servers of its own: one with user accounts in a data
+directory (made with `graphbuff-server users --data DIR add`), checking logins, roles
 (`Forbidden`) and user management on the `system` database; and one with TLS, checking
 `bolt+s` with a custom CA, `bolt+ssc`, `neo4j+ssc` and refused plain or untrusted
 connections. The TLS tests are skipped unless the server was built with TLS:

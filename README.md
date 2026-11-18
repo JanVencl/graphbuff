@@ -66,8 +66,8 @@ error (`docker logs`); anything after the image name is added to that command li
 `--demo movies` loads the graph of [examples/movies.cypher](examples/movies.cypher), which
 is compiled into the binary, into the default database (unless it already holds data).
 
-The image keeps user accounts in `/data/users.txt` (`GRAPHBUFF_USERS`), so clients log in.
-On the first start, while that file has no accounts, the server creates the administrator
+User accounts are on, kept in the system database in the `/data` volume, so clients log
+in. On the first start, while there are no accounts, the server creates the administrator
 `GRAPHBUFF_ADMIN_USER` (default `admin`) with the password in `GRAPHBUFF_ADMIN_PASSWORD`;
 later starts ignore both, and the password is changed with Cypher (`ALTER CURRENT USER SET
 PASSWORD FROM … TO …`). To keep the password out of the environment, use a secret file
@@ -96,15 +96,16 @@ volumes:
   graphbuff-data:
 ```
 
-Without either, the server warns that nobody can log in; add the administrator offline
-(the image has no shell, so name the binary):
+Without either, the server asks for the administrator when it runs in a terminal
+(`docker run -it`), and otherwise stops with a message. The administrator can also be
+added offline (the image has no shell, so name the binary):
 
 ```bash
 docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
-       ghcr.io/janvencl/graphbuff users /data/users.txt add admin admin
+       ghcr.io/janvencl/graphbuff users add admin admin
 ```
 
-`-e GRAPHBUFF_USERS=-` turns accounts off: then `-e GRAPHBUFF_TOKEN=s3cret` makes one token
+`-e GRAPHBUFF_USERS=off` turns accounts off: then `-e GRAPHBUFF_TOKEN=s3cret` makes one token
 the only login, and with neither anyone who reaches the ports may do anything. Who can
 reach them is decided by `-p`: `-p 127.0.0.1:7475:7475` publishes a port to this machine
 only. A bind mount for `/data` (`-v ./data:/data`) must be writable by the container's user,
@@ -558,10 +559,11 @@ A query request is its own transaction. Database commands (`CREATE DATABASE`,
   rolled back), 500 (`StorageError`).
 * **Security:** the server listens on localhost by default. With `--token` (or the
   `GRAPHBUFF_TOKEN` environment variable) every request except `/health` needs
-  `Authorization: Bearer <token>`; with `--users FILE`, clients log in as users (see
+  `Authorization: Bearer <token>`; with user accounts (on unless `--users off`), clients
+  log in as users (see
   [Users and TLS](#users-and-tls)). `LOAD CSV` is off unless `--import-dir DIR` is
   given; it then reads only files inside `DIR`.
-* **Implementation** (`crates/server`, standard library only, plus rustls with a TLS
+* **Implementation** (`crates/server`, standard library plus `argon2`, and rustls with a TLS
   feature): one thread per
   connection (at most 256), HTTP/1.1 keep-alive, `Content-Length` or chunked bodies,
   `Expect: 100-continue`. `Server::start` embeds it in a Rust program.
@@ -622,7 +624,6 @@ data = /srv/graphbuff
 log-dir = /var/log/graphbuff
 bind = 0.0.0.0:7475
 bolt = 0.0.0.0:7687
-users = users.txt
 slow-query = 500
 ```
 
@@ -683,16 +684,16 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   `elementId()` returns) and paths,
   dates, times, date-times with offsets or named time zones, durations and points, in both
   directions. Byte arrays are refused.
-* **Authentication:** without `--token` or `--users` any credentials pass. With
-  `--users`, `basic` with a user's name and password; with `--token`, `basic` with the
-  token as the password (any user name) or `bearer` with the token.
+* **Authentication:** `basic` with a user's name and password; with `--token`, also
+  `basic` with the token as the password (any user name) or `bearer` with the token. With
+  `--users off` and no token, any credentials pass.
 * **Transactions and limits** behave as over HTTP: an explicit transaction holds its
   database's write lock until it ends, and is rolled back after `--tx-timeout` seconds
   without a message or when its connection closes; `--query-timeout` caps every statement.
   Error codes follow Neo4j's (`Neo.ClientError.Statement.SyntaxError`,
   `Neo.ClientError.Transaction.TransactionTimedOut`, ...).
-* **Administration** goes to the `system` database, as with Neo4j: with no real database
-  of that name, `db: "system"` runs database and user commands only (`CREATE DATABASE`,
+* **Administration** goes to the `system` database, as with Neo4j (the name is
+  reserved; it cannot be queried): `db: "system"` runs database and user commands only (`CREATE DATABASE`,
   `SHOW DATABASES`, `CREATE USER`, `GRANT ROLE`, …), in auto-commit or in a transaction
   (where each command takes effect when it runs, and a rollback does not undo it). Other
   databases also run them in auto-commit.
@@ -704,32 +705,41 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
 
 ## Users and TLS
 
-With `--users FILE`, clients log in with a user name and password: HTTP Basic
-authentication (`Authorization: Basic …`) or Bolt's `basic` scheme. A `--token` still
-works alongside, as an administrator. The file keeps PBKDF2-HMAC-SHA-256 hashes (600,000
-rounds, random salts); a missing file is created on the first change.
+User accounts are on unless `--users off`: clients log in with a user name and password,
+HTTP Basic authentication (`Authorization: Basic …`) or Bolt's `basic` scheme. A `--token`
+still works alongside, as an administrator. The accounts live in the system database of
+the data directory (`DATA/system/`, synced on every commit; in memory with
+`--in-memory`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
+format. A hash made with other parameters is replaced at the user's next login.
 
 ```bash
-# the first administrator, offline (password from GRAPHBUFF_PASSWORD, else asked for
-# twice without echo on a terminal, else the first line of standard input)
-graphbuff-server users users.txt add root admin
-graphbuff-server --users users.txt --bolt 127.0.0.1:7687
+# the first administrator, offline, while no server uses the data directory (password
+# from GRAPHBUFF_PASSWORD, else asked for twice without echo on a terminal, else the
+# first line of standard input); it finds the data directory as the server does
+graphbuff-server users add root admin
+graphbuff-server --bolt 127.0.0.1:7687
 ```
 
-Or let the server create the first administrator when it starts with an empty users file
-(Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
+Or let the server create the first administrator when it starts and no user has the
+admin role (Docker, Compose, CI, systemd): `GRAPHBUFF_ADMIN_USER` (default `admin`) and
 `GRAPHBUFF_ADMIN_PASSWORD`, or `GRAPHBUFF_ADMIN_PASSWORD_FILE` naming a file that holds
-the password (one trailing newline is ignored). Once the file has accounts these are
-ignored, so they may stay set; setting them without a users file is an error.
+the password (one trailing newline is ignored). Once there is an administrator these are
+ignored, so they may stay set; setting them with `--users off` is an error.
+
+Without these variables, a server started in a terminal asks for the administrator's
+name and password (twice, without echo). Without a terminal (a service, a container
+without `-it`, CI) it does not start, and says what to do; neither does a server with
+`--in-memory`, whose accounts would be lost at every stop. With `--token` it starts
+anyway, and the token holder creates the users.
 
 ```powershell
 # Windows: the same, asking without echo (PowerShell 7)
 $env:GRAPHBUFF_ADMIN_PASSWORD = Read-Host -MaskInput 'password'
-graphbuff-server --users users.txt
+graphbuff-server
 ```
 
-`GRAPHBUFF_USERS` sets `--users` from the environment; `-` turns accounts off. On Unix the
-file is written readable by its owner only (mode 600).
+`GRAPHBUFF_USERS=off` (or `-`) turns accounts off from the environment; then only the
+token, if set, logs in, and without one anyone who reaches the ports may do anything.
 
 Each user holds roles; the strongest decides what they may do, checked for every
 statement (a role granted or revoked applies to open connections at once):
@@ -741,7 +751,9 @@ statement (a role granted or revoked applies to open connections at once):
 | `admin` | also create and drop databases, and manage users |
 
 A user with no role may only log in, run `SHOW CURRENT USER` and change their own
-password. Administrators manage accounts with Neo4j's commands (on the `system` database
+password. Once there is an administrator, no change may leave none: dropping the last
+one, revoking their role or replacing their account is refused. New passwords need at
+least 8 characters and must differ from the user name. Administrators manage accounts with Neo4j's commands (on the `system` database
 over Bolt, or anywhere in auto-commit): `CREATE [OR REPLACE] USER name [IF NOT EXISTS]
 SET [PLAINTEXT] PASSWORD 'pw' | $pw [CHANGE NOT REQUIRED]`, `ALTER USER name SET PASSWORD
 …`, `RENAME USER a TO b`, `DROP USER name [IF EXISTS]`, `GRANT ROLE[S] r, … TO u, …`,
@@ -756,7 +768,7 @@ optional build feature, with two choices of crypto provider for rustls:
 ```bash
 cargo build --release -p graphbuff-server --features tls             # ring (needs a C compiler)
 cargo build --release -p graphbuff-server --features tls-rustcrypto  # pure Rust (pre-release)
-graphbuff-server --tls-cert cert.pem --tls-key key.pem --bolt 0.0.0.0:7687 --users users.txt
+graphbuff-server --tls-cert cert.pem --tls-key key.pem --bolt 0.0.0.0:7687
 ```
 
 Drivers then connect with `bolt+s://` (or `bolt+ssc://` for a self-signed certificate).

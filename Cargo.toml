@@ -19,9 +19,12 @@ graphbuff-cypher = { path = "crates/cypher" }
 graphbuff = { path = "crates/engine" }
 graphbuff-gpu = { path = "crates/gpu" }
 
-# Password hashing (PBKDF2-HMAC-SHA-256, 600,000 rounds) takes about 15 s per login
-# unoptimized; optimized it takes about half a second.
-[profile.dev.package.graphbuff-server]
+# Password hashing (Argon2id, 64 MiB) is many times slower unoptimized; debug builds and
+# tests optimize the crates that do it.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
 opt-level = 3
 
 # The browser module: small rather than fast to compile.

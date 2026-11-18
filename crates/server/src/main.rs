@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
-use settings::Settings;
+use settings::{CommandLine, Settings};
 use graphbuff_server::{Level, Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
 
 const USAGE: &str = "\
 usage: graphbuff-server [options]
-       graphbuff-server users FILE (list | add NAME [ROLE...] | password NAME
-                                    | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
+       graphbuff-server users [--data DIR] [--config FILE]
+                        (list | add NAME [ROLE...] | password NAME
+                         | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
 
 Options:
   --config FILE        read settings from FILE (also: env GRAPHBUFF_CONFIG; `-` for none);
@@ -45,9 +46,10 @@ Options:
   --no-fsync           with --data: don't fsync every commit
   --token TOKEN        require `Authorization: Bearer TOKEN` (also: env GRAPHBUFF_TOKEN);
                        the token holder may do anything
-  --users FILE         user accounts in FILE (created on the first CREATE USER); clients
-                       log in with a user name and password (HTTP Basic, Bolt basic)
-                       (also: env GRAPHBUFF_USERS; `-` for none)
+  --users on|off       user accounts (default: on), kept in the system database of the
+                       data directory; clients log in with a user name and password
+                       (HTTP Basic, Bolt basic). `off` (or `-`): no accounts, only the
+                       token if set, else no login at all (also: env GRAPHBUFF_USERS)
   --tls-cert FILE      serve HTTPS and Bolt over TLS with this PEM certificate chain
   --tls-key FILE       ... and this PEM private key (needs the `tls` build feature)
   --tls-allow-plain    with TLS: also accept clients without TLS on the same ports
@@ -95,30 +97,118 @@ Endpoints:
 User accounts (--users):
   Roles: reader (read queries), editor (also writes, indexes, constraints), admin (also
   databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
-  PASSWORD 'pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
-  FROM 'old' TO 'new', ...), or offline with `graphbuff-server users FILE ...`, which
-  reads new passwords from env GRAPHBUFF_PASSWORD, else asks for them without echo on a
-  terminal, else reads the first line of standard input. Change the file offline only
-  while no server uses it.
+  PASSWORD 's3cret-pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
+  FROM 'old' TO 'new', ...), or offline with `graphbuff-server users ...` on the data
+  directory (the same --data, GRAPHBUFF_DATA or config file as the server), only while
+  no server uses it. New passwords come from env GRAPHBUFF_PASSWORD, else are asked for
+  without echo on a terminal, else read from the first line of standard input.
 
-  The first administrator, at start-up: when the users file has no accounts yet, the
-  server creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the
-  password in env GRAPHBUFF_ADMIN_PASSWORD, or in the file named by
-  GRAPHBUFF_ADMIN_PASSWORD_FILE (a Docker or Compose secret; one trailing newline is
-  ignored). Once the file has accounts, these variables are ignored.";
+  The first administrator, at start-up: when no user has the admin role, the server
+  creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the password in
+  env GRAPHBUFF_ADMIN_PASSWORD, or in the file named by GRAPHBUFF_ADMIN_PASSWORD_FILE (a
+  Docker or Compose secret; one trailing newline is ignored). Without them it asks on
+  the terminal; without a terminal, or with --in-memory, it does not start. With --token
+  it starts anyway (the token holder can create users). Once there is an administrator,
+  these variables are ignored, and no change may leave none.
+
+  Passwords need at least 8 characters and must differ from the user name.";
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
     std::process::exit(2);
 }
 
-/// `graphbuff-server users FILE …`: manages the accounts in FILE offline.
-fn users_command(mut args: impl Iterator<Item = String>) -> Result<(), String> {
-    let file = args.next().ok_or("users needs a FILE")?;
-    let users = Users::open(&file).map_err(|e| format!("cannot open {file}: {e}"))?;
-    let command = args.next().ok_or("users FILE needs a command: list, add, password, grant, revoke or remove")?;
+/// The settings from the config file (`--config`, else GRAPHBUFF_CONFIG, else the
+/// default one), the environment and the command line, and the config file read. With
+/// `create`, a missing config file is created with every setting commented out.
+fn load_settings(command_line: &CommandLine, create: bool) -> (Settings, Option<PathBuf>) {
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let mut settings = Settings::default();
+    let config_file = match command_line.config.clone().or_else(|| env("GRAPHBUFF_CONFIG")) {
+        Some(f) if f == "-" => None,
+        Some(f) => Some(PathBuf::from(f)),
+        None => settings::default_config_file(),
+    };
+    let config_file: Option<PathBuf> = config_file.and_then(|f| match std::fs::read_to_string(&f) {
+        Ok(text) => {
+            settings.apply_file(&f, &text).unwrap_or_else(|e| fail(&e));
+            Some(f)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let written = f.parent().map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&f, settings::TEMPLATE));
+            match written {
+                Ok(()) => Some(f),
+                Err(e) => {
+                    eprintln!("warning: cannot create the config file {}: {e}", f.display());
+                    None
+                }
+            }
+        }
+        Err(e) => fail(&format!("cannot read the config file {}: {e}", f.display())),
+    });
+    settings.apply_env().unwrap_or_else(|e| fail(&e));
+    settings.apply_command_line(command_line.settings.clone()).unwrap_or_else(|e| fail(&e));
+    (settings, config_file)
+}
+
+/// The data directory, or `None` with `in-memory`.
+fn data_dir(settings: &Settings) -> Option<PathBuf> {
+    if settings.flag("in-memory") {
+        return None;
+    }
+    Some(match settings.get("data") {
+        Some(d) => d.into(),
+        None => settings::default_data_dir().unwrap_or_else(|| {
+            fail("no default data directory (HOME or LOCALAPPDATA is not set); use --data DIR or --in-memory")
+        }),
+    })
+}
+
+/// The storage of new databases in the data directory.
+fn default_storage(settings: &Settings) -> StorageKind {
+    let mut storage = if settings.flag("persistent") { StorageKind::persistent() } else { StorageKind::hybrid() };
+    if settings.flag("no-fsync")
+        && let StorageKind::Hybrid { sync, .. } | StorageKind::Persistent { sync, .. } = &mut storage
+    {
+        *sync = SyncPolicy::OsBuffered;
+    }
+    storage
+}
+
+/// Whether user accounts are on: `users` is `on` (the default) or `off` (also `-`).
+fn accounts_on(settings: &Settings) -> Result<bool, String> {
+    match settings.get("users") {
+        None | Some("on" | "true" | "yes") => Ok(true),
+        Some("off" | "-" | "false" | "no" | "none") => Ok(false),
+        Some(other) => Err(format!(
+            "users = {other}: user accounts are kept in the system database of the data directory, not in a file; \
+             use `on` (the default) or `off`"
+        )),
+    }
+}
+
+/// `graphbuff-server users [--data DIR] [--config FILE] …`: manages the accounts in the
+/// system database of the data directory, while no server uses it.
+fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = args.peekable();
+    let mut options = Vec::new();
+    while let Some(opt) = args.next_if(|a| a == "--data" || a == "--config") {
+        options.push(opt.clone());
+        options.push(args.next().ok_or(format!("{opt} needs a value"))?);
+    }
+    let command_line = Settings::command_line(options.into_iter())?;
+    let (settings, _) = load_settings(&command_line, false);
+    let command = args.next().ok_or("users needs a command: list, add, password, grant, revoke or remove")?;
+    let data = data_dir(&settings)
+        .ok_or("users works on a data directory, but the settings say in-memory; use --data DIR")?;
+    let mgr = DatabaseManager::open_with(&data, default_storage(&settings))
+        .map_err(|e| format!("cannot open the data directory {} (is a server using it?): {e}", data.display()))?;
+    let system = mgr.system_database().ok_or("this build has no system database")?;
+    let users = Users::system(system).map_err(|e| e.to_string())?;
     let rest: Vec<String> = args.collect();
-    let name = || rest.first().cloned().ok_or(format!("users FILE {command} needs a user NAME"));
+    let name = || rest.first().cloned().ok_or(format!("users {command} needs a user NAME"));
     let roles = || -> Result<Vec<Role>, String> {
         rest[1..].iter().map(|r| Role::parse(r).map_err(|e| e.to_string())).collect()
     };
@@ -151,7 +241,7 @@ fn users_command(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let name = name()?;
             let roles = roles()?;
             if roles.is_empty() {
-                return Err(format!("users FILE {command} needs at least one ROLE"));
+                return Err(format!("users {command} needs at least one ROLE"));
             }
             for role in roles {
                 if command == "grant" {
@@ -171,6 +261,33 @@ fn users_command(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         other => return Err(format!("unknown users command `{other}`")),
     }
     Ok(())
+}
+
+/// Asks on the terminal for the first administrator's name and password, and creates
+/// the account; a refused password is asked for again, at most three times.
+fn ask_for_admin(users: &Users) -> Result<(), String> {
+    eprintln!("There is no administrator yet. Create one now (Ctrl-C to stop).");
+    let name = prompt::line("administrator name [admin]: ").map_err(|e| e.to_string())?;
+    let name = if name.trim().is_empty() { "admin".to_string() } else { name.trim().to_string() };
+    graphbuff_server::users::check_name(&name).map_err(|e| e.to_string())?;
+    eprintln!("password (at least {} characters, not the name):", graphbuff_server::MIN_PASSWORD_LENGTH);
+    let mut last = String::new();
+    for _ in 0..3 {
+        let created = prompt::new_password()
+            .map_err(|e| e.to_string())
+            .and_then(|pw| users.create(&name, &pw, &[Role::Admin], ExistingDatabase::Fail).map_err(|e| e.to_string()));
+        match created {
+            Ok(_) => {
+                eprintln!("created the administrator `{name}`");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                last = e;
+            }
+        }
+    }
+    Err(last)
 }
 
 /// The first administrator from the environment: GRAPHBUFF_ADMIN_USER (default `admin`)
@@ -211,35 +328,7 @@ fn main() {
         println!("{USAGE}");
         return;
     }
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
-    let mut settings = Settings::default();
-    // The config file: --config, else GRAPHBUFF_CONFIG, else the default one. It is
-    // created (every setting commented out) when it does not exist.
-    let config_file = match command_line.config.clone().or_else(|| env("GRAPHBUFF_CONFIG")) {
-        Some(f) if f == "-" => None,
-        Some(f) => Some(PathBuf::from(f)),
-        None => settings::default_config_file(),
-    };
-    let config_file: Option<PathBuf> = config_file.and_then(|f| match std::fs::read_to_string(&f) {
-            Ok(text) => {
-                settings.apply_file(&f, &text).unwrap_or_else(|e| fail(&e));
-                Some(f)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let written = f.parent().map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|()| std::fs::write(&f, settings::TEMPLATE));
-                match written {
-                    Ok(()) => Some(f),
-                    Err(e) => {
-                        eprintln!("warning: cannot create the config file {}: {e}", f.display());
-                        None
-                    }
-                }
-            }
-            Err(e) => fail(&format!("cannot read the config file {}: {e}", f.display())),
-        });
-    settings.apply_env().unwrap_or_else(|e| fail(&e));
-    settings.apply_command_line(command_line.settings).unwrap_or_else(|e| fail(&e));
+    let (settings, config_file) = load_settings(&command_line, true);
 
     let get = |key: &str| settings.get(key).map(str::to_string);
     let number = |key: &str, what: &str, positive: bool| -> Option<u64> {
@@ -276,11 +365,10 @@ fn main() {
         config.shutdown_grace = Duration::from_secs(s);
     }
     let slow_query = number("slow-query", "milliseconds", false).map(Duration::from_millis);
-    let in_memory = settings.flag("in-memory");
     let persistent = settings.flag("persistent");
     let sync = if settings.flag("no-fsync") { SyncPolicy::OsBuffered } else { SyncPolicy::EveryCommit };
     let import_dir = get("import-dir");
-    let users_file = get("users").filter(|f| f != "-");
+    let accounts = accounts_on(&settings).unwrap_or_else(|e| fail(&e));
     let gpu = settings.flag("gpu");
     let demo = get("demo");
     let (tls_cert, tls_key, tls_plain) = (get("tls-cert"), get("tls-key"), settings.flag("tls-allow-plain"));
@@ -291,16 +379,7 @@ fn main() {
         fail(&e.to_string());
     }
 
-    let data: Option<PathBuf> = if in_memory {
-        None
-    } else {
-        Some(match get("data") {
-            Some(d) => d.into(),
-            None => settings::default_data_dir().unwrap_or_else(|| {
-                fail("no default data directory (HOME or LOCALAPPDATA is not set); use --data DIR or --in-memory")
-            }),
-        })
-    };
+    let data = data_dir(&settings);
     let level = match settings.get("log-level") {
         Some(l) => Level::parse(&l).unwrap_or_else(|| fail("--log-level needs error, warn, info or debug")),
         None => Level::Info,
@@ -347,49 +426,12 @@ fn main() {
         _ => fail("TLS needs both --tls-cert and --tls-key"),
     };
     let admin = first_admin().unwrap_or_else(|e| fatal(&e));
-    if admin.is_some() && users_file.is_none() {
-        fatal("GRAPHBUFF_ADMIN_PASSWORD needs a users file (--users FILE or env GRAPHBUFF_USERS)");
-    }
-    if let Some(file) = &users_file {
-        match Users::open(file) {
-            Ok(u) => {
-                match &admin {
-                    Some((name, password)) if u.is_empty() => {
-                        if let Err(e) = u.create(name, password, &[Role::Admin], ExistingDatabase::Fail) {
-                            fatal(&format!("cannot create the administrator `{name}` in {file}: {e}"));
-                        }
-                        log.info(format!("created the administrator `{name}` in {file} (GRAPHBUFF_ADMIN_PASSWORD)"));
-                    }
-                    Some(_) => log.info(format!(
-                        "{file} already has accounts; GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD are ignored"
-                    )),
-                    None => {}
-                }
-                if u.is_empty() && config.token.is_none() {
-                    warn(&format!(
-                        "{file} has no users yet, so nobody can log in; add an admin with `graphbuff-server users {file} add NAME admin`, set GRAPHBUFF_ADMIN_PASSWORD, or start with --token"
-                    ));
-                }
-                config.users = Some(Arc::new(u));
-            }
-            Err(e) => fatal(&format!("cannot open the users file {file}: {e}")),
-        }
+    if admin.is_some() && !accounts {
+        fatal("GRAPHBUFF_ADMIN_PASSWORD needs user accounts, but they are off (users = off)");
     }
 
     let mgr = match &data {
-        Some(dir) => {
-            let mut storage = if persistent {
-                StorageKind::persistent()
-            } else {
-                StorageKind::hybrid()
-            };
-            if let StorageKind::Hybrid { sync: s, .. } | StorageKind::Persistent { sync: s, .. } =
-                &mut storage
-            {
-                *s = sync;
-            }
-            DatabaseManager::open_with(dir, storage)
-        }
+        Some(dir) => DatabaseManager::open_with(dir, default_storage(&settings)),
         None => Ok(DatabaseManager::in_memory()),
     };
     let mgr = match mgr {
@@ -399,6 +441,48 @@ fn main() {
             data.as_deref().unwrap_or_else(|| std::path::Path::new("")).display()
         )),
     };
+
+    if accounts {
+        let Some(system) = mgr.system_database() else {
+            fatal("this build has no system database for user accounts; start with users = off");
+        };
+        let users = Users::system(system).unwrap_or_else(|e| fatal(&format!("cannot read the user accounts: {e}")));
+        if users.has_admin() {
+            if admin.is_some() {
+                log.info("there is an administrator already; GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD are ignored");
+            }
+        } else if let Some((name, password)) = &admin {
+            if let Err(e) = users.create(name, password, &[Role::Admin], ExistingDatabase::Fail) {
+                let hint = if users.roles(name).is_some() {
+                    format!("; give it the admin role with `graphbuff-server users grant {name} admin` while the server is stopped")
+                } else {
+                    String::new()
+                };
+                fatal(&format!("cannot create the administrator `{name}`: {e}{hint}"));
+            }
+            log.info(format!("created the administrator `{name}` (GRAPHBUFF_ADMIN_PASSWORD)"));
+        } else if config.token.is_some() {
+            warn("there is no administrator yet; the token holder can create one (CREATE USER, GRANT ROLE admin TO ...)");
+        } else if data.is_none() {
+            fatal(
+                "there is no administrator, and in-memory accounts are lost at every stop: set \
+                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), start with --token, or turn accounts \
+                 off (users = off)",
+            );
+        } else if prompt::interactive() {
+            if let Err(e) = ask_for_admin(&users) {
+                fatal(&format!("no administrator was created: {e}"));
+            }
+        } else {
+            fatal(
+                "there is no administrator yet and no terminal to ask for one: set GRAPHBUFF_ADMIN_PASSWORD (or \
+                 GRAPHBUFF_ADMIN_PASSWORD_FILE), add one with `graphbuff-server users add NAME admin` while the \
+                 server is stopped, start the server in a terminal to be asked, start with --token, or turn \
+                 accounts off (users = off)",
+            );
+        }
+        config.users = Some(Arc::new(users));
+    }
 
     mgr.set_import_dir(import_dir.map(Into::into));
     let demo = demo.map(|name| match graphbuff::load_demo(&mgr, &name) {
@@ -423,7 +507,7 @@ fn main() {
     let auth = config.token.is_some() || config.users.is_some();
     if !addr.ip().is_loopback() && !auth {
         warn(&format!(
-            "listening on {addr} without --token or --users; anyone who can reach this port can read and change every database"
+            "listening on {addr} without --token or user accounts; anyone who can reach this port can read and change every database"
         ));
     }
     if let Some(bolt) = server.bolt_addr()
@@ -431,7 +515,7 @@ fn main() {
         && !auth
     {
         warn(&format!(
-            "serving Bolt on {bolt} without --token or --users; anyone who can reach this port can use every database"
+            "serving Bolt on {bolt} without --token or user accounts; anyone who can reach this port can use every database"
         ));
     }
     let tls = config.tls.is_some();

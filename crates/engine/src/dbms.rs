@@ -16,6 +16,13 @@
 //! and their storage settings) and stores each hybrid database under
 //! `databases/<name>/`. Databases with `memory` storage stay in the catalog across
 //! restarts but come back empty.
+//!
+//! The name `system` ([`SYSTEM_DATABASE`]) is reserved. With the `system-db` feature
+//! every manager also has a system database, for the server's user accounts and roles
+//! ([`DatabaseManager::system_database`]). It is not in the catalog: it lives in
+//! `system/` of the data directory (hybrid storage, synced on every commit), or in
+//! memory for an in-memory manager. It cannot be created, dropped, replaced, restored,
+//! listed by `SHOW DATABASES` or queried with `USE`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -34,6 +41,14 @@ use crate::{
 
 /// Name of the database every manager starts with. It cannot be dropped.
 pub const DEFAULT_DATABASE: &str = "graphbuff";
+
+/// Name of the system database (see the [module docs](self)). Reserved in every build.
+pub const SYSTEM_DATABASE: &str = "system";
+
+/// Directory of the system database in the data directory (outside `databases/`, so a
+/// leftover user database directory can never be mistaken for it).
+#[cfg(feature = "system-db")]
+const SYSTEM_DIR: &str = "system";
 
 const CATALOG_FILE: &str = "catalog";
 const CATALOG_TMP: &str = "catalog.tmp";
@@ -128,7 +143,51 @@ pub struct DatabaseManager {
     procedures: RwLock<Arc<crate::Procedures>>,
     /// The kernel backend of every database, when not the default.
     kernels: RwLock<Option<Arc<dyn crate::Kernels>>>,
+    /// The system database; `None` without the `system-db` feature.
+    system: Option<Db>,
     _lock: Option<File>,
+}
+
+/// Fails for the reserved name `system` (`name` already normalized).
+fn check_not_system(name: &str, what: &str) -> Result<()> {
+    if name == SYSTEM_DATABASE {
+        return Err(Error::Constraint(format!(
+            "cannot {what} `{SYSTEM_DATABASE}`: the name is reserved for the system database"
+        )));
+    }
+    Ok(())
+}
+
+fn system_not_queryable() -> Error {
+    Error::Constraint(format!(
+        "the system database `{SYSTEM_DATABASE}` cannot be queried; it changes only through user and role commands"
+    ))
+}
+
+/// The system database of an in-memory manager.
+fn system_in_memory() -> Option<Db> {
+    #[cfg(feature = "system-db")]
+    {
+        Some(Arc::new(Database::with_store(Box::new(crate::MemoryGraph::new()))))
+    }
+    #[cfg(not(feature = "system-db"))]
+    {
+        None
+    }
+}
+
+/// Opens (or creates) the system database in `root/system/`.
+#[cfg(feature = "system-db")]
+fn system_on_disk(root: &Path) -> Result<Option<Db>> {
+    let dir = root.join(SYSTEM_DIR);
+    let mode = StorageMode::Hybrid(HybridOptions::new(&dir).sync(SyncPolicy::EveryCommit));
+    let db = Database::open(mode).map_err(|e| Error::Storage(format!("opening the system database: {e}")))?;
+    Ok(Some(Arc::new(db)))
+}
+
+#[cfg(not(feature = "system-db"))]
+fn system_on_disk(_root: &Path) -> Result<Option<Db>> {
+    Ok(None)
 }
 
 /// Checks a database name and returns its canonical (lower-case) form. Names are
@@ -325,6 +384,7 @@ impl DatabaseManager {
             import_dir: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
+            system: system_in_memory(),
             _lock: None,
         }
     }
@@ -364,6 +424,14 @@ impl DatabaseManager {
         let catalog = match fs::read_to_string(&catalog_path) {
             Ok(text) => {
                 let (default, list) = parse_catalog(&text, &catalog_path)?;
+                if list.iter().any(|(name, _)| name == SYSTEM_DATABASE) {
+                    return Err(Error::Storage(format!(
+                        "{} lists a database named `{SYSTEM_DATABASE}`, a name now reserved for the system \
+                         database; with the earlier graphbuff version, back it up, restore it under another \
+                         name and drop it",
+                        catalog_path.display()
+                    )));
+                }
                 let mut dbs = BTreeMap::new();
                 for (name, storage) in list {
                     let db = open_db(Some(&root), &name, &storage, false)
@@ -389,6 +457,7 @@ impl DatabaseManager {
             }
             Err(e) => return Err(io(&catalog_path, "reading")(e)),
         };
+        let system = system_on_disk(&root)?;
 
         let mgr = DatabaseManager {
             root: Some(root),
@@ -397,6 +466,7 @@ impl DatabaseManager {
             import_dir: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
+            system,
             _lock: Some(lock),
         };
         mgr.save(&mgr.catalog.read().unwrap_or_else(|e| e.into_inner()))?;
@@ -474,9 +544,19 @@ impl DatabaseManager {
         self.read().default.clone()
     }
 
-    /// The database called `name` (case-insensitive).
+    /// The system database (user accounts and roles), or `None` when the engine is built
+    /// without the `system-db` feature. Only the server's account code should change it.
+    pub fn system_database(&self) -> Option<Arc<Database<BoxedStore>>> {
+        self.system.clone()
+    }
+
+    /// The database called `name` (case-insensitive). The system database is not
+    /// returned (see [`system_database`](Self::system_database)).
     pub fn database(&self, name: &str) -> Result<Arc<Database<BoxedStore>>> {
         let key = name.to_ascii_lowercase();
+        if key == SYSTEM_DATABASE {
+            return Err(system_not_queryable());
+        }
         self.read()
             .dbs
             .get(&key)
@@ -501,15 +581,18 @@ impl DatabaseManager {
     /// Checkpoints every durable database (see [`Database::checkpoint`]), for example
     /// before the process exits, so the next start has no log to replay. Each waits for
     /// the transaction writing to it, if any. Returns each durable database's name and
-    /// outcome; in-memory databases are skipped.
+    /// outcome (the system database's too); in-memory databases are skipped.
     pub fn checkpoint_all(&self) -> Vec<(String, Result<()>)> {
-        let dbs: Vec<(String, Arc<Database<BoxedStore>>)> = self
+        let mut dbs: Vec<(String, Arc<Database<BoxedStore>>)> = self
             .read()
             .dbs
             .iter()
             .filter(|(_, e)| !matches!(e.storage, StorageKind::InMemory))
             .map(|(name, e)| (name.clone(), Arc::clone(&e.db)))
             .collect();
+        if let (Some(_), Some(system)) = (&self.root, &self.system) {
+            dbs.push((SYSTEM_DATABASE.to_string(), Arc::clone(system)));
+        }
         dbs.into_iter().map(|(name, db)| (name, db.checkpoint())).collect()
     }
 
@@ -526,6 +609,7 @@ impl DatabaseManager {
         overwrite: bool,
     ) -> Result<crate::ImportSummary> {
         let name = normalize_name(name)?;
+        check_not_system(&name, "import into")?;
         let root = self.root().ok_or_else(|| {
             Error::Unsupported("importing needs a data directory; open the manager with DatabaseManager::open".into())
         })?;
@@ -570,14 +654,23 @@ impl DatabaseManager {
     /// queries keep running: the backup holds the last commit before it started
     /// ([`Database::backup`]). Persistent databases back up as persistent stores, the
     /// others as hybrid stores; [`restore_database`](Self::restore_database) reads both.
+    /// The system database can be backed up too, but not restored.
     pub fn backup_database(&self, name: &str, dest: &Path) -> Result<crate::BackupInfo> {
-        self.database(name)?.backup(dest)
+        self.database_or_system(name)?.backup(dest)
     }
 
     /// Checks the files of persistent database `name` for consistency, while queries keep
     /// running ([`Database::check`]).
     pub fn check_database(&self, name: &str) -> Result<crate::CheckReport> {
-        self.database(name)?.check()
+        self.database_or_system(name)?.check()
+    }
+
+    /// Like [`database`](Self::database), but also gives the system database.
+    fn database_or_system(&self, name: &str) -> Result<Arc<Database<BoxedStore>>> {
+        match &self.system {
+            Some(system) if name.eq_ignore_ascii_case(SYSTEM_DATABASE) => Ok(Arc::clone(system)),
+            _ => self.database(name),
+        }
     }
 
     /// Creates database `name` from the backup in `from` (written by
@@ -588,6 +681,7 @@ impl DatabaseManager {
     /// when it is empty or `overwrite` is set; it stays untouched if the restore fails.
     pub fn restore_database(&self, name: &str, from: &Path, overwrite: bool) -> Result<DatabaseInfo> {
         let name = normalize_name(name)?;
+        check_not_system(&name, "restore into")?;
         let root = self.root().ok_or_else(|| {
             Error::Unsupported("restoring needs a data directory; open the manager with DatabaseManager::open".into())
         })?;
@@ -730,6 +824,7 @@ impl DatabaseManager {
         existing: ExistingDatabase,
     ) -> Result<bool> {
         let name = normalize_name(name)?;
+        check_not_system(&name, "create")?;
         let storage = storage.unwrap_or_else(|| self.default_storage.clone());
         let mut cat = self.write();
         if cat.dbs.contains_key(&name) {
@@ -760,6 +855,7 @@ impl DatabaseManager {
     /// `if_exists` was set.
     pub fn drop_database(&self, name: &str, if_exists: bool) -> Result<bool> {
         let name = normalize_name(name)?;
+        check_not_system(&name, "drop")?;
         let mut cat = self.write();
         if !cat.dbs.contains_key(&name) {
             return if if_exists {
@@ -1080,7 +1176,7 @@ impl<'m> Session<'m> {
             }
             Statement::Database(cmd) => self.run_command(cmd, params),
             Statement::User(cmd) => Err(Error::Unsupported(format!(
-                "{} needs graphbuff-server with user accounts (--users)",
+                "{} needs graphbuff-server with user accounts",
                 cmd.name()
             ))),
         }

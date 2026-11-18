@@ -841,16 +841,9 @@ fn the_system_database_runs_database_commands() {
     assert_eq!(rows.len(), 1);
     b.send(COMMIT, vec![]);
     assert!(matches!(get(&b.success(), "bookmark"), PackValue::String(_)));
-    // A real database named `system` wins.
+    // The name is reserved: no user database can be called `system`.
     b.run("CREATE DATABASE system", empty(), empty());
-    b.pull(-1);
-    b.success();
-    b.records();
-    b.run("CREATE (:InSystem)", empty(), system());
-    b.pull(-1);
-    b.success();
-    let (_, meta) = b.records();
-    assert_eq!(get(&meta, "type"), &s("rw"));
+    assert_eq!(b.failure(), "Neo.ClientError.Schema.ConstraintValidationFailed");
 }
 
 #[test]

@@ -115,7 +115,7 @@ impl Ctx {
     ) -> Result<QueryResult, Error> {
         let Some(users) = &self.users else {
             return Err(Error::Unsupported(format!(
-                "{}: user accounts are off; start graphbuff-server with --users FILE",
+                "{}: user accounts are off on this server (users = off)",
                 cmd.name()
             )));
         };
