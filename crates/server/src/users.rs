@@ -8,8 +8,10 @@
 //! is one statement, so it is applied completely or not at all, and is synced to disk
 //! before it takes effect.
 //!
-//! Passwords are stored as PBKDF2-HMAC-SHA-256 hashes with a random 16-byte salt
-//! ([`DEFAULT_ITERATIONS`] rounds by default). A successful login is remembered (as a
+//! Passwords are stored as Argon2id hashes with a random 16-byte salt, in the PHC string
+//! format (`$argon2id$v=19$m=65536,t=3,p=1$salt$hash`), so each hash carries its own
+//! cost ([`HashParams::DEFAULT`] for new ones). A hash made with other parameters is
+//! replaced at the user's next successful login. A successful login is remembered (as a
 //! fast salted hash) until the password changes, so clients that open many connections
 //! pay the slow hash once.
 //!
@@ -33,8 +35,29 @@ use graphbuff::cypher::ast::{DbName, ExistingDatabase, Secret, UserCommand};
 
 use crate::crypto::{self, Sha256};
 
-/// PBKDF2 rounds for new passwords (OWASP's 2023 advice for PBKDF2-HMAC-SHA-256).
-pub const DEFAULT_ITERATIONS: u32 = 600_000;
+/// The cost of Argon2id password hashes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HashParams {
+    /// Memory in KiB (at least 8 per lane).
+    pub memory_kib: u32,
+    /// Passes over the memory.
+    pub passes: u32,
+    /// Lanes (degree of parallelism).
+    pub lanes: u32,
+}
+
+impl HashParams {
+    /// 64 MiB, 3 passes, 1 lane: OWASP's advice for Argon2id. About 0.1 s per hash.
+    pub const DEFAULT: HashParams = HashParams { memory_kib: 64 * 1024, passes: 3, lanes: 1 };
+
+    /// The cheapest Argon2id allows; for tests only.
+    pub const TESTING: HashParams = HashParams { memory_kib: 8, passes: 1, lanes: 1 };
+
+    fn argon2(self, out_len: usize) -> Option<argon2::Argon2<'static>> {
+        let params = argon2::Params::new(self.memory_kib, self.passes, self.lanes, Some(out_len)).ok()?;
+        Some(argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params))
+    }
+}
 
 const SALT_BYTES: usize = 16;
 
@@ -93,29 +116,35 @@ pub(crate) enum Access {
     Admin,
 }
 
-#[derive(Clone)]
+const HASH_BYTES: usize = 32;
+
+/// An Argon2id password hash.
+#[derive(Clone, PartialEq, Eq)]
 struct PasswordHash {
-    iterations: u32,
-    salt: [u8; SALT_BYTES],
-    hash: [u8; 32],
+    params: HashParams,
+    salt: Vec<u8>,
+    hash: Vec<u8>,
 }
 
 impl PasswordHash {
-    fn new(password: &str, iterations: u32) -> Self {
-        let mut salt = [0u8; SALT_BYTES];
-        salt.copy_from_slice(&crypto::random_bytes()[..SALT_BYTES]);
-        PasswordHash {
-            iterations,
-            salt,
-            hash: crypto::pbkdf2_sha256(password.as_bytes(), &salt, iterations),
-        }
+    fn new(password: &str, params: HashParams) -> Self {
+        let salt = crypto::random_bytes()[..SALT_BYTES].to_vec();
+        let mut hash = vec![0u8; HASH_BYTES];
+        params
+            .argon2(HASH_BYTES)
+            .expect("valid hash parameters")
+            .hash_password_into(password.as_bytes(), &salt, &mut hash)
+            .expect("a 16-byte salt and a 32-byte hash are valid");
+        PasswordHash { params, salt, hash }
     }
 
     fn matches(&self, password: &str) -> bool {
-        crypto::same_bytes(
-            &crypto::pbkdf2_sha256(password.as_bytes(), &self.salt, self.iterations),
-            &self.hash,
-        )
+        let mut out = vec![0u8; self.hash.len()];
+        let Some(argon2) = self.params.argon2(self.hash.len()) else {
+            return false;
+        };
+        argon2.hash_password_into(password.as_bytes(), &self.salt, &mut out).is_ok()
+            && crypto::same_bytes(&out, &self.hash)
     }
 
     /// A fast salted hash of `password`, for the cache of verified logins.
@@ -127,27 +156,44 @@ impl PasswordHash {
         h.finish()
     }
 
+    /// The PHC string: `$argon2id$v=19$m=…,t=…,p=…$salt$hash` (unpadded base64).
     fn encode(&self) -> String {
+        let HashParams { memory_kib, passes, lanes } = self.params;
         format!(
-            "pbkdf2-sha256:{}:{}:{}",
-            self.iterations,
-            crypto::hex(&self.salt),
-            crypto::hex(&self.hash)
+            "$argon2id$v=19$m={memory_kib},t={passes},p={lanes}${}${}",
+            crypto::base64_encode(&self.salt),
+            crypto::base64_encode(&self.hash)
         )
     }
 
     fn decode(s: &str) -> Option<Self> {
-        let mut parts = s.split(':');
-        let (Some("pbkdf2-sha256"), Some(iterations), Some(salt), Some(hash), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+        let mut parts = s.split('$');
+        let (Some(""), Some("argon2id"), Some("v=19"), Some(params), Some(salt), Some(hash), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return None;
+        };
+        let mut values = params.split(',').map(|kv| kv.split_once('='));
+        let (Some(Some(("m", m))), Some(Some(("t", t))), Some(Some(("p", p))), None) =
+            (values.next(), values.next(), values.next(), values.next())
         else {
             return None;
         };
-        Some(PasswordHash {
-            iterations: iterations.parse().ok().filter(|&n| n > 0)?,
-            salt: crypto::unhex(salt)?.try_into().ok()?,
-            hash: crypto::unhex(hash)?.try_into().ok()?,
-        })
+        let params = HashParams { memory_kib: m.parse().ok()?, passes: t.parse().ok()?, lanes: p.parse().ok()? };
+        let (salt, hash) = (crypto::base64_decode(salt)?, crypto::base64_decode(hash)?);
+        // Only what Argon2id accepts: salts of 8 bytes or more, hashes of 4 or more.
+        if salt.len() < 8 || hash.len() < 4 || params.argon2(hash.len()).is_none() {
+            return None;
+        }
+        // The canonical form only, so a stored hash always reads back the same.
+        let hash = PasswordHash { params, salt, hash };
+        (hash.encode() == s).then_some(hash)
     }
 }
 
@@ -175,7 +221,7 @@ enum Store {
 /// A set of user accounts. Changes are saved (see [`Store`]) before they take effect.
 pub struct Users {
     store: Store,
-    iterations: u32,
+    params: HashParams,
     state: RwLock<State>,
 }
 
@@ -222,7 +268,7 @@ impl Users {
     pub fn in_memory() -> Users {
         Users {
             store: Store::Memory,
-            iterations: DEFAULT_ITERATIONS,
+            params: HashParams::DEFAULT,
             state: RwLock::default(),
         }
     }
@@ -275,7 +321,7 @@ impl Users {
         }
         Ok(Users {
             store: Store::System(db),
-            iterations: DEFAULT_ITERATIONS,
+            params: HashParams::DEFAULT,
             state: RwLock::new(State {
                 accounts,
                 verified: HashMap::new(),
@@ -283,10 +329,11 @@ impl Users {
         })
     }
 
-    /// Hashes new passwords with `iterations` PBKDF2 rounds instead of
-    /// [`DEFAULT_ITERATIONS`] (fewer only for tests; existing hashes keep theirs).
-    pub fn with_iterations(mut self, iterations: u32) -> Users {
-        self.iterations = iterations.max(1);
+    /// Hashes new passwords with `params` instead of [`HashParams::DEFAULT`] (cheaper
+    /// ones only for tests). Hashes made with other parameters are replaced at the next
+    /// successful login.
+    pub fn with_hash_params(mut self, params: HashParams) -> Users {
+        self.params = params;
         self
     }
 
@@ -328,9 +375,10 @@ impl Users {
         Some(account.roles.iter().map(|r| r.access()).max().unwrap_or(Access::None))
     }
 
-    /// Whether `password` is `name`'s password.
+    /// Whether `password` is `name`'s password. A hash made with parameters other than
+    /// this set's is replaced by a new one (best effort).
     pub fn authenticate(&self, name: &str, password: &str) -> bool {
-        let account = {
+        let stored = {
             let st = self.read();
             let Some(account) = st.accounts.get(name) else {
                 return false;
@@ -340,14 +388,29 @@ impl Users {
             }
             account.password.clone()
         };
-        // The slow hash runs without the lock.
-        if !account.matches(password) {
+        // The slow hashes run without the lock.
+        if !stored.matches(password) {
             return false;
+        }
+        let mut current = stored.clone();
+        if stored.params != self.params {
+            let new = PasswordHash::new(password, self.params);
+            let upgraded = self.change(|accounts| match accounts.get_mut(name) {
+                // Only if the password did not change meanwhile.
+                Some(a) if a.password == stored => {
+                    a.password = new.clone();
+                    Ok(true)
+                }
+                _ => Ok(false),
+            });
+            if let Ok(true) = upgraded {
+                current = new;
+            }
         }
         let mut st = self.write();
         // Remember it only if the password did not change meanwhile.
-        if st.accounts.get(name).is_some_and(|a| a.password.hash == account.hash) {
-            st.verified.insert(name.to_string(), account.quick(password));
+        if st.accounts.get(name).is_some_and(|a| a.password == current) {
+            st.verified.insert(name.to_string(), current.quick(password));
         }
         true
     }
@@ -364,7 +427,7 @@ impl Users {
         }
         let State { accounts: old, verified } = &mut *st;
         verified.retain(|name, _| {
-            matches!((old.get(name), accounts.get(name)), (Some(a), Some(b)) if a.password.hash == b.password.hash)
+            matches!((old.get(name), accounts.get(name)), (Some(a), Some(b)) if a.password == b.password)
         });
         st.accounts = accounts;
         Ok(out)
@@ -378,7 +441,7 @@ impl Users {
         if existing == ExistingDatabase::Keep && self.read().accounts.contains_key(name) {
             return Ok(false);
         }
-        let password = PasswordHash::new(password, self.iterations);
+        let password = PasswordHash::new(password, self.params);
         self.change(|accounts| {
             if accounts.contains_key(name) {
                 match existing {
@@ -399,7 +462,7 @@ impl Users {
         if !self.read().accounts.contains_key(name) {
             return Err(no_user(name));
         }
-        let password = PasswordHash::new(password, self.iterations);
+        let password = PasswordHash::new(password, self.params);
         self.change(|accounts| {
             accounts.get_mut(name).ok_or_else(|| no_user(name))?.password = password;
             Ok(())
@@ -454,7 +517,7 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
         .iter()
         .filter(|(name, a)| {
             old.get(*name)
-                .is_none_or(|o| o.roles != a.roles || o.password.encode() != a.password.encode())
+                .is_none_or(|o| o.roles != a.roles || o.password != a.password)
         })
         .map(|(name, a)| {
             Value::Map(BTreeMap::from([
@@ -685,7 +748,7 @@ mod tests {
 
     #[test]
     fn logins_and_their_cache() {
-        let users = Users::in_memory().with_iterations(10);
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING);
         assert!(users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap());
         assert!(users.create("bob", "x", &[], ExistingDatabase::Fail).unwrap());
         assert!(users.create("bob", "y", &[], ExistingDatabase::Fail).is_err());
@@ -711,12 +774,90 @@ mod tests {
     }
 
     #[test]
+    fn hashes_are_argon2id_phc_strings() {
+        let h = PasswordHash::new("pw", HashParams::TESTING);
+        let text = h.encode();
+        assert!(text.starts_with("$argon2id$v=19$m=8,t=1,p=1$"), "{text}");
+        // 16-byte salt and 32-byte hash, unpadded base64.
+        let parts: Vec<&str> = text.split('$').collect();
+        assert_eq!((parts[4].len(), parts[5].len()), (22, 43), "{text}");
+        let back = PasswordHash::decode(&text).unwrap();
+        assert!(back == h && back.matches("pw") && !back.matches("pW"));
+        // Salted: the same password hashes differently.
+        assert_ne!(PasswordHash::new("pw", HashParams::TESTING).encode(), text);
+
+        let default = PasswordHash::new("pw", HashParams::DEFAULT);
+        assert!(default.encode().starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
+        assert!(default.matches("pw"));
+
+        // Made by the reference implementation (argon2-cffi): both directions agree.
+        for (password, phc) in [
+            ("correct horse", "$argon2id$v=19$m=64,t=2,p=1$Z3JhcGhidWZmLXNhbHQtMQ$YKk+RR9y9LcNC5eIJtuY7yW+MxGWv2nMgMfZnbMyPXg"),
+            ("pw", "$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$Gs6vDcp/gVcHT06DjWRf+cpRnCdZDQMnY77kwsQjXjo"),
+        ] {
+            let h = PasswordHash::decode(phc).unwrap();
+            assert!(h.matches(password) && !h.matches("x"));
+            assert_eq!(h.encode(), phc);
+        }
+
+        let (salt, hash) = (parts[4], parts[5]);
+        for bad in [
+            String::new(),
+            "pbkdf2-sha256:600000:00:00".to_string(),
+            format!("$argon2i$v=19$m=8,t=1,p=1${salt}${hash}"),
+            format!("$argon2id$v=16$m=8,t=1,p=1${salt}${hash}"),
+            format!("$argon2id$v=19$t=1,m=8,p=1${salt}${hash}"),
+            format!("$argon2id$v=19$m=4,t=1,p=1${salt}${hash}"),
+            format!("$argon2id$v=19$m=8,t=0,p=1${salt}${hash}"),
+            format!("$argon2id$v=19$m=8,t=1,p=1$c2FsdA${hash}"),
+            format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}="),
+            format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}$"),
+            format!("$argon2id$v=19$m=08,t=1,p=1${salt}${hash}"),
+        ] {
+            assert!(PasswordHash::decode(&bad).is_none(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn hashes_with_other_parameters_are_replaced_at_login() {
+        let mgr = graphbuff::DatabaseManager::in_memory();
+        let system = mgr.system_database().unwrap();
+        let cheap = HashParams { memory_kib: 16, ..HashParams::TESTING };
+        let stored = |name: &str| {
+            let r = system
+                .execute_with_params(
+                    "MATCH (u:User {name: $n}) RETURN u.password",
+                    &BTreeMap::from([("n".to_string(), Value::String(name.into()))]),
+                )
+                .unwrap();
+            match &r.rows[0][0] {
+                ResultValue::String(s) => s.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let old = Users::system(Arc::clone(&system)).unwrap().with_hash_params(cheap);
+        old.create("ann", "pw", &[], ExistingDatabase::Fail).unwrap();
+        assert!(stored("ann").contains("$m=16,"));
+
+        let users = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING);
+        assert!(!users.authenticate("ann", "wrong"));
+        assert!(stored("ann").contains("$m=16,"), "a failed login changes nothing");
+        assert!(users.authenticate("ann", "pw"));
+        assert!(stored("ann").contains("$m=8,"), "{}", stored("ann"));
+        assert!(users.authenticate("ann", "pw"));
+        assert!(!users.authenticate("ann", "wrong"));
+        // Saved: a fresh reader sees the new hash.
+        let again = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING);
+        assert!(again.authenticate("ann", "pw"));
+    }
+
+    #[test]
     fn accounts_persist_in_the_system_database() {
         let tmp = TempDir::new("system");
         let dir = &tmp.0;
         {
             let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
-            let users = Users::system(mgr.system_database().unwrap()).unwrap().with_iterations(10);
+            let users = Users::system(mgr.system_database().unwrap()).unwrap().with_hash_params(HashParams::TESTING);
             assert!(users.in_system_database());
             assert!(users.is_empty());
             users.create("alice", "pw1", &[Role::Admin], ExistingDatabase::Fail).unwrap();
@@ -769,7 +910,7 @@ mod tests {
 
     #[test]
     fn commands_check_access() {
-        let users = Users::in_memory().with_iterations(10);
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING);
         let admin = Principal::User("root".into());
         let params = BTreeMap::from([("pw".to_string(), Value::String("s3cret".into()))]);
         let run_as = |who: &Principal, access, text: &str| match graphbuff::cypher::parse_statement(text).unwrap() {

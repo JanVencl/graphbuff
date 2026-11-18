@@ -1,6 +1,7 @@
-//! The little cryptography user accounts need, with the standard library only:
-//! SHA-256, HMAC-SHA-256, PBKDF2-HMAC-SHA-256 (password hashes), base64 (HTTP Basic
-//! authentication), hex, random salts and constant-time comparison.
+//! The little cryptography the server needs besides Argon2id (password hashes, from the
+//! `argon2` crate), with the standard library only: SHA-256 (the cache of verified
+//! logins), base64 (HTTP Basic authentication, PHC hash strings), random salts and
+//! constant-time comparison.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -76,6 +77,7 @@ impl Sha256 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
@@ -114,70 +116,27 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 }
 
-/// HMAC-SHA-256 with a fixed key: the inner and outer hashes are keyed once and cloned
-/// for each message, which PBKDF2 needs many times over.
-#[derive(Clone)]
-pub(crate) struct Hmac {
-    inner: Sha256,
-    outer: Sha256,
-}
-
-impl Hmac {
-    pub(crate) fn new(key: &[u8]) -> Self {
-        let mut k = [0u8; 64];
-        if key.len() > 64 {
-            k[..32].copy_from_slice(&sha256(key));
-        } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-        let (mut inner, mut outer) = (Sha256::new(), Sha256::new());
-        inner.update(&k.map(|b| b ^ 0x36));
-        outer.update(&k.map(|b| b ^ 0x5c));
-        Hmac { inner, outer }
-    }
-
-    pub(crate) fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
-        let mut inner = self.inner.clone();
-        for p in parts {
-            inner.update(p);
-        }
-        let mut outer = self.outer.clone();
-        outer.update(&inner.finish());
-        outer.finish()
-    }
-}
-
-/// PBKDF2-HMAC-SHA-256 with a 32-byte output (one block).
-pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    let prf = Hmac::new(password);
-    let mut u = prf.mac(&[salt, &1u32.to_be_bytes()]);
-    let mut out = u;
-    for _ in 1..iterations {
-        u = prf.mac(&[&u]);
-        for (o, x) in out.iter_mut().zip(u) {
-            *o ^= x;
-        }
-    }
-    out
-}
-
 /// Compares in constant time (for equal lengths), so timing reveals no matching prefix.
 pub(crate) fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+#[cfg(test)]
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
+/// Encodes standard base64 without padding (as PHC strings use it).
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
+    out
 }
 
 /// Decodes standard base64 (with or without padding).
@@ -260,40 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn hmac_vectors() {
-        // RFC 4231, test cases 1, 2 and 6 (a key longer than a block).
-        assert_eq!(
-            hex(&Hmac::new(&[0x0b; 20]).mac(&[b"Hi There"])),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-        assert_eq!(
-            hex(&Hmac::new(b"Jefe").mac(&[b"what do ya want ", b"for nothing?"])),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-        assert_eq!(
-            hex(&Hmac::new(&[0xaa; 131]).mac(&[b"Test Using Larger Than Block-Size Key - Hash Key First"])),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
-    }
-
-    #[test]
-    fn pbkdf2_vectors() {
-        assert_eq!(
-            hex(&pbkdf2_sha256(b"password", b"salt", 1)),
-            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
-        );
-        assert_eq!(
-            hex(&pbkdf2_sha256(b"password", b"salt", 2)),
-            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
-        );
-        assert_eq!(
-            hex(&pbkdf2_sha256(b"password", b"salt", 4096)),
-            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
-        );
-    }
-
-    #[test]
-    fn base64_and_hex() {
+    fn base64_and_salts() {
         assert_eq!(base64_decode("YWxpY2U6c2VjcmV0").unwrap(), b"alice:secret");
         assert_eq!(base64_decode("YQ==").unwrap(), b"a");
         assert_eq!(base64_decode("YWI=").unwrap(), b"ab");
@@ -301,9 +227,10 @@ mod tests {
         assert_eq!(base64_decode("").unwrap(), b"");
         assert!(base64_decode("Y").is_none());
         assert!(base64_decode("YW!=").is_none());
-        assert_eq!(unhex(&hex(&[0, 1, 0xab, 0xff])).unwrap(), [0, 1, 0xab, 0xff]);
-        assert!(unhex("abc").is_none());
-        assert!(unhex("zz").is_none());
+        for (data, text) in [(&b""[..], ""), (b"a", "YQ"), (b"ab", "YWI"), (b"abc", "YWJj"), (b"alice:secret", "YWxpY2U6c2VjcmV0")] {
+            assert_eq!(base64_encode(data), text);
+            assert_eq!(base64_decode(text).unwrap(), data);
+        }
         assert_ne!(random_bytes(), random_bytes());
         assert!(same_bytes(b"abc", b"abc"));
         assert!(!same_bytes(b"abc", b"abd"));

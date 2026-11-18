@@ -562,7 +562,7 @@ A query request is its own transaction. Database commands (`CREATE DATABASE`,
   log in as users (see
   [Users and TLS](#users-and-tls)). `LOAD CSV` is off unless `--import-dir DIR` is
   given; it then reads only files inside `DIR`.
-* **Implementation** (`crates/server`, standard library only, plus rustls with a TLS
+* **Implementation** (`crates/server`, standard library plus `argon2`, and rustls with a TLS
   feature): one thread per
   connection (at most 256), HTTP/1.1 keep-alive, `Content-Length` or chunked bodies,
   `Expect: 100-continue`. `Server::start` embeds it in a Rust program.
@@ -708,7 +708,8 @@ User accounts are on unless `--users off`: clients log in with a user name and p
 HTTP Basic authentication (`Authorization: Basic …`) or Bolt's `basic` scheme. A `--token`
 still works alongside, as an administrator. The accounts live in the system database of
 the data directory (`DATA/system/`, synced on every commit; in memory with
-`--in-memory`), as PBKDF2-HMAC-SHA-256 hashes (600,000 rounds, random salts).
+`--in-memory`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
+format. A hash made with other parameters is replaced at the user's next login.
 
 ```bash
 # the first administrator, offline, while no server uses the data directory (password
