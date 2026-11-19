@@ -56,10 +56,10 @@ impl Executor<'_> {
                 .with_hints(Rc::clone(&hints));
             let mut produced = false;
             self.match_parts(&scope, patterns, 0, &mut st, &mut |st| {
-                if let Some(w) = where_ {
-                    if !self.eval_predicate(w, &Env::new(&scope, &st.row))? {
-                        return Ok(true);
-                    }
+                if let Some(w) = where_
+                    && !self.eval_predicate(w, &Env::new(&scope, &st.row))?
+                {
+                    return Ok(true);
                 }
                 out.push(st.row.clone());
                 produced = true;

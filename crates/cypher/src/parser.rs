@@ -1761,10 +1761,10 @@ impl<'a> Parser<'a> {
             Tok::LParen => {
                 // Either a pattern predicate `(a)-->(b)` or a parenthesized expression.
                 let save = self.pos;
-                if let Ok(part) = self.parse_pattern_part() {
-                    if !part.chain.is_empty() {
-                        return Ok(Expr::PatternPredicate(Box::new(part)));
-                    }
+                if let Ok(part) = self.parse_pattern_part()
+                    && !part.chain.is_empty()
+                {
+                    return Ok(Expr::PatternPredicate(Box::new(part)));
                 }
                 self.pos = save;
                 self.advance();

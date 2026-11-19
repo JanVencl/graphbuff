@@ -145,15 +145,15 @@ pub(crate) fn extract_hints(where_: Option<&Expr>, node_vars: &HashSet<&str>) ->
             _ => Vec::new(),
         };
         for (prop, other, kind) in candidates {
-            if let Some((var, key)) = as_prop(prop) {
-                if !refs_var(other, &var) {
-                    hints.push(SeekHint {
-                        var,
-                        key,
-                        kind,
-                        expr: other.clone(),
-                    });
-                }
+            if let Some((var, key)) = as_prop(prop)
+                && !refs_var(other, &var)
+            {
+                hints.push(SeekHint {
+                    var,
+                    key,
+                    kind,
+                    expr: other.clone(),
+                });
             }
         }
     }

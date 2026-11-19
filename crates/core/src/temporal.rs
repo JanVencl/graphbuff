@@ -705,12 +705,11 @@ impl Temporal {
     pub fn construct(kind: TemporalKind, arg: Option<&Value>, now: (i64, i64)) -> Result<Value> {
         let what = kind.function();
         // `{timezone: …}` alone: the current time there.
-        if let (Some(Value::Map(m)), true) = (arg, kind != TemporalKind::Duration) {
-            if m.len() == 1 {
-                if let Some(z) = m.get("timezone") {
-                    return Self::now_in(kind, Some(z), now);
-                }
-            }
+        if let (Some(Value::Map(m)), true) = (arg, kind != TemporalKind::Duration)
+            && m.len() == 1
+            && let Some(z) = m.get("timezone")
+        {
+            return Self::now_in(kind, Some(z), now);
         }
         let t = match arg {
             None => Self::convert(kind, &Temporal::DateTime { days: now.0, nanos: now.1, offset: 0, zone: None })?,

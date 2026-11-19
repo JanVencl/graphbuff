@@ -673,10 +673,10 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             _ => {}
         }
         check_clause_types(clause, &kinds, ex)?;
-        if let Clause::Return(p) = clause {
-            if p.star && p.items.is_empty() && bound.is_empty() {
-                return Err(Error::Semantic("RETURN * needs at least one variable in scope".into()));
-            }
+        if let Clause::Return(p) = clause
+            && p.star && p.items.is_empty() && bound.is_empty()
+        {
+            return Err(Error::Semantic("RETURN * needs at least one variable in scope".into()));
         }
         let input = Box::new(op);
         op = match clause {
@@ -2142,11 +2142,11 @@ fn validate_aggregates(p: &Projection) -> Result<()> {
     let mut random = false;
     for e in p.items.iter().map(|it| &it.expr) {
         e.walk(&mut |x| {
-            if let Expr::Function { args, .. } = x {
-                if x.is_aggregate_call() {
-                    for a in args {
-                        a.walk(&mut |y| random |= matches!(y, Expr::Function { name, .. } if name == "rand"));
-                    }
+            if let Expr::Function { args, .. } = x
+                && x.is_aggregate_call()
+            {
+                for a in args {
+                    a.walk(&mut |y| random |= matches!(y, Expr::Function { name, .. } if name == "rand"));
                 }
             }
         });
@@ -2277,10 +2277,10 @@ fn validate_clause_order(q: &SingleQuery) -> Result<()> {
         if let Clause::With(p) | Clause::Return(p) = c {
             validate_aggregates(p)?;
         }
-        if let Clause::CallProcedure { args: Some(args), .. } = c {
-            if args.iter().any(Expr::contains_aggregate) {
-                return Err(Error::Semantic("aggregate functions are not allowed in procedure arguments".into()));
-            }
+        if let Clause::CallProcedure { args: Some(args), .. } = c
+            && args.iter().any(Expr::contains_aggregate)
+        {
+            return Err(Error::Semantic("aggregate functions are not allowed in procedure arguments".into()));
         }
     }
     let last = &q.clauses[n - 1];

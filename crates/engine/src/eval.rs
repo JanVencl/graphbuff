@@ -314,10 +314,10 @@ impl Executor<'_> {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
                     let child = env.with_local(var, item.clone());
-                    if let Some(f) = filter {
-                        if !self.eval_predicate(f, &child)? {
-                            continue;
-                        }
+                    if let Some(f) = filter
+                        && !self.eval_predicate(f, &child)?
+                    {
+                        continue;
                     }
                     out.push(match map {
                         Some(m) => self.eval(m, &child)?,

@@ -302,10 +302,10 @@ impl Accumulator {
             }
             return Ok(());
         }
-        if let Some(seen) = &mut self.seen {
-            if !seen.insert(v.clone()) {
-                return Ok(());
-            }
+        if let Some(seen) = &mut self.seen
+            && !seen.insert(v.clone())
+        {
+            return Ok(());
         }
         match &mut self.acc {
             Acc::Count(n) => *n += 1,
