@@ -1,9 +1,9 @@
 """User accounts, roles and TLS with the official Neo4j Python driver.
 
 Starts its own servers: one with user accounts in the system database of a data
-directory (made with the offline `graphbuff-server users` command) and, when the binary was built with TLS (`--features
-tls` or `tls-rustcrypto`), one serving Bolt over TLS with the test certificate in
-`crates/server/tests/tls/`.
+directory (made with the offline `graphbuff-server admin init` and `users` commands) and,
+when the binary was built with TLS (`--features tls` or `tls-rustcrypto`), one serving
+Bolt over TLS with the test certificate in `crates/server/tests/tls/`.
 """
 
 import os
@@ -42,24 +42,40 @@ def _clean_env(**extra):
     return env
 
 
+def _offline(data, *args, stdin=None, **env):
+    """`graphbuff-server ARGS…` on the data directory `data`, while no server uses it."""
+    command, rest = args[0], args[1:]
+    return subprocess.run([_server_binary(), command, "--data", data, *rest], input=stdin, text=True,
+                          capture_output=True, env=_clean_env(**env))
+
+
 def _add_user(data, name, password, *roles):
-    subprocess.run([_server_binary(), "users", "--data", data, "add", name, *roles],
-                   check=True, env=_clean_env(GRAPHBUFF_PASSWORD=password), stdout=subprocess.DEVNULL)
+    _offline(data, "users", "add", name, *roles, GRAPHBUFF_PASSWORD=password).check_returncode()
+
+
+def _serve(data, *args):
+    """A server on `data` with Bolt; returns the process and the Bolt URL."""
+    http_port, bolt_port = _free_port(), _free_port()
+    proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
+                   "--data", data, "--log-dir", "-", *args],
+                  f"http://127.0.0.1:{http_port}/health", env=_clean_env())
+    return proc, f"bolt://127.0.0.1:{bolt_port}"
+
+
+def _stop(proc):
+    proc.terminate()
+    proc.wait(10)
 
 
 @pytest.fixture(scope="module")
 def accounts():
     with tempfile.TemporaryDirectory() as tmp:
         data = os.path.join(tmp, "data")
-        _add_user(data, "root", "root-password", "admin")
+        _offline(data, "admin", "init", "root", GRAPHBUFF_ADMIN_PASSWORD="root-password").check_returncode()
         _add_user(data, "rita", "rita-password", "reader")
-        http_port, bolt_port = _free_port(), _free_port()
-        proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                       "--data", data, "--log-dir", "-"],
-                      f"http://127.0.0.1:{http_port}/health", env=_clean_env())
-        yield f"bolt://127.0.0.1:{bolt_port}"
-        proc.terminate()
-        proc.wait(10)
+        proc, url = _serve(data)
+        yield url
+        _stop(proc)
 
 
 def test_users_log_in_with_their_passwords(accounts):
@@ -106,6 +122,56 @@ def test_admins_manage_users(accounts):
         with GraphDatabase.driver(accounts, auth=("eve", "eve-password-2")) as eve:
             with pytest.raises(ex.AuthError):
                 eve.verify_connectivity()
+
+
+def test_the_last_administrator_cannot_go():
+    """Not even the token holder (an administrator, but no account) may leave none."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = os.path.join(tmp, "data")
+        _offline(data, "admin", "init", "root", GRAPHBUFF_ADMIN_PASSWORD="root-password").check_returncode()
+        proc, url = _serve(data, "--token", "tok")
+        try:
+            with GraphDatabase.driver(url, auth=("neo4j", "tok")) as token:
+                for statement in ("DROP USER root", "REVOKE ROLE admin FROM root"):
+                    with pytest.raises(ex.ClientError, match="no administrator"):
+                        token.execute_query(statement, database_="system")
+            with GraphDatabase.driver(url, auth=("root", "root-password")) as root:
+                records, _, _ = root.execute_query("SHOW CURRENT USER", database_="system")
+                assert records[0]["roles"] == ["admin"]
+        finally:
+            _stop(proc)
+
+
+def test_offline_admin_init_and_reset_password():
+    """`admin init` once, `admin reset-password` to get back in; neither while a server runs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = os.path.join(tmp, "data")
+        init = _offline(data, "admin", "init", stdin="first-password\n")
+        assert init.returncode == 0, init.stderr
+        again = _offline(data, "admin", "init", stdin="other-password\n")
+        assert again.returncode != 0 and "administrator already (admin)" in again.stderr
+
+        proc, url = _serve(data)
+        try:
+            busy = _offline(data, "admin", "reset-password", "admin", GRAPHBUFF_PASSWORD="second-password")
+            assert busy.returncode != 0 and "is a server using it" in busy.stderr
+            with GraphDatabase.driver(url, auth=("admin", "first-password")) as d:
+                d.verify_connectivity()
+        finally:
+            _stop(proc)
+
+        reset = _offline(data, "admin", "reset-password", "admin", GRAPHBUFF_PASSWORD="second-password")
+        assert reset.returncode == 0, reset.stderr
+        proc, url = _serve(data)
+        try:
+            with GraphDatabase.driver(url, auth=("admin", "second-password")) as d:
+                records, _, _ = d.execute_query("SHOW CURRENT USER", database_="system")
+                assert records[0]["roles"] == ["admin"]
+            with GraphDatabase.driver(url, auth=("admin", "first-password")) as d:
+                with pytest.raises(ex.AuthError):
+                    d.verify_connectivity()
+        finally:
+            _stop(proc)
 
 
 def test_first_admin_from_the_environment():
