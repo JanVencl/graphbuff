@@ -686,7 +686,11 @@ slow_query_ms = 500                   # log queries that take this long to query
 
 Upgrading from 0.3: the command-line options (`--bind`, `--data`, …), `graphbuff.conf`
 and the variables `GRAPHBUFF_DATA`, `GRAPHBUFF_LOG_DIR` and `GRAPHBUFF_LOG_LEVEL` are gone;
-an old option is refused with the setting that replaces it.
+an old option is refused with the setting that replaces it. Accounts are kept in the
+system database of the data directory (`DATA/system`); a 0.3 `users.txt` is not read, so
+create the administrator again (`GRAPHBUFF_ADMIN_PASSWORD` on the first start, or
+`graphbuff-server admin init`) and the other users with `CREATE USER`. Databases of 0.3
+open as they are.
 
 ### Data directory and logs
 
@@ -718,7 +722,7 @@ Logs go to `DATA/logs` (`dir` in `[logs]`; `"-"` for standard error, the default
   with its duration, protocol, database and user. Parameters are never logged.
 
 ```text
-2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.3.0 listening on http://127.0.0.1:7475 (data in /home/ann/.local/share/graphbuff)
+2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.4.0 listening on http://127.0.0.1:7475 (data in /home/ann/.local/share/graphbuff)
 2026-11-15T18:00:05.004Z WARN  failed login (bolt) from 10.0.0.7:51234 as `admin`
 2026-11-15T18:00:09.871Z SLOW  1532 ms bolt movies alice MATCH (a)-[*..6]->(b) RETURN count(b)
 ```
