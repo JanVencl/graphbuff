@@ -711,10 +711,14 @@ format. A hash made with other parameters is replaced at the user's next login.
 
 ```bash
 # the first administrator, offline, while no server uses the data directory (password
-# from GRAPHBUFF_PASSWORD, else asked for twice without echo on a terminal, else the
-# first line of standard input); it finds the data directory as the server does
-graphbuff-server users add root admin
+# from GRAPHBUFF_ADMIN_PASSWORD or _FILE, else asked for twice without echo on a
+# terminal, else the first line of standard input); it finds the data directory as the
+# server does, and refuses when there is an administrator already
+graphbuff-server admin init root
 graphbuff-server --bolt 127.0.0.1:7687
+
+# lost the password? set a new one, offline (from GRAPHBUFF_PASSWORD or asked for)
+graphbuff-server admin reset-password root
 ```
 
 Or let the server create the first administrator when it starts and no user has the
