@@ -567,29 +567,93 @@ fn overflow(what: &str) -> Error {
 
 /// The vectors of a vector index as rows of `f32`, for [`Kernels::vector_scores`]: unit
 /// length for cosine, as stored for euclidean. Each value has its own [`id`](Self::id), so
-/// that a backend can keep a copy (on a device) while it is in use.
-#[derive(Debug)]
+/// that a backend can keep a copy (on a device) while it is in use; a [`patch`](Self::patch)
+/// makes a new value that remembers which rows differ from the values before it, so that
+/// such a copy can be brought up to date by writing only those.
+#[derive(Clone, Debug)]
 pub struct VectorRows {
     id: u64,
     dims: usize,
     data: Vec<f32>,
+    /// At least the largest row norm.
     max_norm: f64,
+    /// Earlier values this one was patched from, newest first, each with the rows (sorted)
+    /// that differ from it.
+    history: Vec<(u64, Vec<u32>)>,
+}
+
+/// How many earlier values a [`VectorRows`] remembers.
+const VECTOR_HISTORY: usize = 4;
+
+fn next_rows_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn row_norm(row: &[f32]) -> f64 {
+    row.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt()
 }
 
 impl VectorRows {
     /// Rows of `dims` values each (`data.len()` a multiple of `dims`, `dims` > 0).
     pub fn new(dims: usize, data: Vec<f32>) -> VectorRows {
         assert!(dims > 0 && data.len().is_multiple_of(dims), "rows of {dims} values");
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let max_norm = data
-            .chunks_exact(dims)
-            .map(|r| r.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt())
-            .fold(0.0, f64::max);
-        VectorRows { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), dims, data, max_norm }
+        let max_norm = data.chunks_exact(dims).map(row_norm).fold(0.0, f64::max);
+        VectorRows { id: next_rows_id(), dims, data, max_norm, history: Vec::new() }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Sets the rows at `at` (sorted, distinct) to the rows of `data`, in order, making
+    /// this a new value with a new [`id`](Self::id). The number of rows stays the same.
+    pub fn patch(&mut self, at: &[u32], data: &[f32]) {
+        let d = self.dims;
+        assert_eq!(at.len() * d, data.len(), "rows of {d} values");
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "sorted rows");
+        if at.is_empty() {
+            return;
+        }
+        for (&i, row) in at.iter().zip(data.chunks_exact(d)) {
+            let i = i as usize;
+            self.data[i * d..(i + 1) * d].copy_from_slice(row);
+            self.max_norm = self.max_norm.max(row_norm(row));
+        }
+        let half = self.len() / 2;
+        let mut history = vec![(self.id, at.to_vec())];
+        for (id, rows) in self.history.drain(..) {
+            let mut merged = Vec::with_capacity(rows.len() + at.len());
+            let (mut a, mut b) = (rows.iter().peekable(), at.iter().peekable());
+            loop {
+                let next = match (a.peek(), b.peek()) {
+                    (Some(x), Some(y)) if x < y => a.next(),
+                    (Some(x), Some(y)) if x > y => b.next(),
+                    (Some(_), Some(_)) => {
+                        b.next();
+                        a.next()
+                    }
+                    (Some(_), None) => a.next(),
+                    (None, Some(_)) => b.next(),
+                    (None, None) => break,
+                };
+                merged.extend(next.copied());
+            }
+            // Past half the rows, a fresh copy costs about as much as the writes.
+            if merged.len() > half || history.len() == VECTOR_HISTORY {
+                break;
+            }
+            history.push((id, merged));
+        }
+        self.history = history;
+        self.id = next_rows_id();
+    }
+
+    /// The earlier values this one was [patched](Self::patch) from, newest first, each
+    /// with the rows (sorted) that differ from it; only the last few, while those rows
+    /// are few.
+    pub fn changed_since(&self) -> impl Iterator<Item = (u64, &[u32])> {
+        self.history.iter().map(|(id, rows)| (*id, rows.as_slice()))
     }
 
     pub fn dims(&self) -> usize {
@@ -609,7 +673,7 @@ impl VectorRows {
         &self.data
     }
 
-    /// The largest row norm.
+    /// The largest row norm, or more (after a patch replaced the largest).
     pub fn max_norm(&self) -> f64 {
         self.max_norm
     }
@@ -1229,6 +1293,27 @@ mod tests {
     use super::*;
     use crate::{MemoryGraph, NodeId};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn patched_vector_rows_remember_what_changed() {
+        let mut rows = VectorRows::new(2, vec![0.0; 2 * 10]);
+        let first = rows.id();
+        rows.patch(&[0, 7], &[1.0, 0.0, 3.0, 4.0]);
+        let second = rows.id();
+        assert_ne!(first, second);
+        assert_eq!(rows.max_norm(), 5.0);
+        rows.patch(&[2, 7], &[0.0, 1.0, 0.0, 0.0]);
+        rows.patch(&[], &[]);
+        let third = rows.id();
+        assert_eq!(&rows.data()[..6], &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(&rows.data()[14..16], &[0.0, 0.0]);
+        let since: Vec<(u64, Vec<u32>)> = rows.changed_since().map(|(id, at)| (id, at.to_vec())).collect();
+        assert_eq!(since, [(second, vec![2, 7]), (first, vec![0, 2, 7])]);
+        // Changes to more than half the rows since an earlier value are not worth writing.
+        rows.patch(&[1, 3, 4, 5], &[0.0; 8]);
+        let since: Vec<u64> = rows.changed_since().map(|(id, _)| id).collect();
+        assert_eq!(since, [third]);
+    }
 
     #[test]
     fn three_valued_masks() {

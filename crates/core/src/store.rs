@@ -290,6 +290,15 @@ pub trait GraphStore {
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self);
 
+    /// The entities that the commits since the last call created, deleted or changed
+    /// (labels, type, properties), for caches of the committed state kept outside the
+    /// store: the engine's vector index matrices. It may name more entities than changed
+    /// (ones a rolled-back transaction touched, say), never fewer; [`Changes::unknown`]
+    /// if the store cannot tell. Called between transactions.
+    fn take_changes(&mut self) -> Changes {
+        Changes::unknown()
+    }
+
     // ---- lifecycle --------------------------------------------------------------------
 
     /// Compacts durable state (e.g. writes a snapshot and truncates the write-ahead log).
@@ -336,6 +345,112 @@ pub type Scan<'a, T> = Box<dyn Iterator<Item = Result<T>> + 'a>;
 /// A lazily evaluated expansion: the relationships of one node, with their other ends.
 /// Like [`Scan`], it borrows the store immutably and reports a failed read as an `Err`.
 pub type Adjacency<'a> = Box<dyn Iterator<Item = Result<Expansion>> + 'a>;
+
+/// The entities changed by a store's commits ([`GraphStore::take_changes`]): node and
+/// relationship ids, possibly repeated, or `unknown`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    pub nodes: Vec<u64>,
+    pub rels: Vec<u64>,
+    /// The store cannot tell what changed (it does not keep track, or too much did).
+    pub unknown: bool,
+}
+
+impl Changes {
+    /// More ids than a store records before it gives up and reports [`Changes::unknown`]:
+    /// past this a cache does better to rebuild than to apply the changes one by one.
+    pub const LIMIT: usize = 1 << 20;
+
+    pub fn unknown() -> Changes {
+        Changes { unknown: true, ..Changes::default() }
+    }
+
+    /// The number of ids recorded.
+    pub fn len(&self) -> usize {
+        self.nodes.len() + self.rels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0 && !self.unknown
+    }
+
+    /// Adds the changes of later commits.
+    pub fn extend(&mut self, later: Changes) {
+        if self.unknown || later.unknown || self.len() + later.len() > Changes::LIMIT {
+            *self = Changes::unknown();
+        } else {
+            self.nodes.extend(later.nodes);
+            self.rels.extend(later.rels);
+        }
+    }
+
+    /// Sorts the ids and drops repeats.
+    pub fn normalize(&mut self) {
+        for ids in [&mut self.nodes, &mut self.rels] {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+    }
+}
+
+/// What a store records for [`GraphStore::take_changes`]: the ids its writes touch, in
+/// order, with the position at `begin` so that a rollback can forget the transaction's.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChangeLog {
+    changes: Changes,
+    /// Lengths of the lists and the `unknown` flag at `begin`.
+    mark: Option<(usize, usize, bool)>,
+}
+
+impl ChangeLog {
+    pub fn node(&mut self, id: NodeId) {
+        if !self.changes.unknown {
+            self.changes.nodes.push(id.0);
+            self.check();
+        }
+    }
+
+    pub fn rel(&mut self, id: RelId) {
+        if !self.changes.unknown {
+            self.changes.rels.push(id.0);
+            self.check();
+        }
+    }
+
+    /// Gives up past [`Changes::LIMIT`] ids, so that a store nobody takes changes from
+    /// does not grow a log without end.
+    fn check(&mut self) {
+        if self.changes.len() > Changes::LIMIT {
+            self.changes = Changes::unknown();
+        }
+    }
+
+    pub fn begin(&mut self) {
+        let c = &self.changes;
+        self.mark = Some((c.nodes.len(), c.rels.len(), c.unknown));
+    }
+
+    pub fn commit(&mut self) {
+        self.mark = None;
+    }
+
+    pub fn rollback(&mut self) {
+        // A log that gave up inside the transaction stays given up: it no longer has
+        // the ids from before.
+        if let Some((nodes, rels, unknown)) = self.mark.take()
+            && !self.changes.unknown
+        {
+            self.changes.nodes.truncate(nodes);
+            self.changes.rels.truncate(rels);
+            self.changes.unknown = unknown;
+        }
+    }
+
+    pub fn take(&mut self) -> Changes {
+        self.mark = None;
+        std::mem::take(&mut self.changes)
+    }
+}
 
 /// A type-erased store, used when the storage mode is chosen at runtime.
 pub type BoxedStore = Box<dyn GraphStore + Send + Sync>;
@@ -494,6 +609,9 @@ impl<T: GraphStore + ?Sized> GraphStore for Box<T> {
     }
     fn rollback(&mut self) {
         (**self).rollback()
+    }
+    fn take_changes(&mut self) -> Changes {
+        (**self).take_changes()
     }
     fn checkpoint(&mut self) -> Result<()> {
         (**self).checkpoint()

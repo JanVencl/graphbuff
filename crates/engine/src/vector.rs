@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 
 use graphbuff_core::{
-    Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result, Snapshot,
+    Changes, Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result, Snapshot,
     Value, VectorRows, VectorSimilarity as Similarity,
 };
 
@@ -222,33 +222,177 @@ fn for_each_entity(
     Ok(())
 }
 
-/// A vector index's vectors in one committed state: one f32 row per indexed entity, in
-/// id order (unit length for cosine).
+/// The f32 row of a vector `value` as a [`Matrix`] keeps it (unit length for cosine), or
+/// `None` if the index skips it.
+fn matrix_row(value: &Value, dimensions: u32, similarity: Similarity) -> Option<Vec<f32>> {
+    let v = indexed_vector(value, dimensions, similarity)?;
+    let scale = match similarity {
+        Similarity::Cosine => 1.0 / v.iter().map(|x| x * x).sum::<f64>().sqrt(),
+        Similarity::Euclidean => 1.0,
+    };
+    Some(v.iter().map(|x| (x * scale) as f32).collect())
+}
+
+/// [`Matrix::ids`] of a row not in use.
+const FREE: u64 = u64::MAX;
+
+/// A vector index's vectors in one committed state: one f32 row per indexed entity (unit
+/// length for cosine), in no particular order, plus rows not in use (all zeros), so that
+/// a commit's changes are written into rows in place ([`Matrix::apply`]) and the number
+/// of rows (the layout of a GPU copy) seldom changes.
+#[derive(Clone)]
 pub(crate) struct Matrix {
     def: IndexDef,
+    /// The entity of each row; [`FREE`] for a row not in use.
     ids: Vec<u64>,
+    /// The row of each entity.
+    row_of: HashMap<u64, u32>,
+    /// The rows not in use.
+    free: Vec<u32>,
     rows: VectorRows,
 }
 
 impl Matrix {
     fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Matrix> {
         let (dimensions, similarity) = vector_params(def);
-        let (mut ids, mut data) = (Vec::new(), Vec::new());
+        let mut entries = Vec::new();
         for_each_entity(store, def, interrupt, |id, value| {
-            let Some(v) = indexed_vector(&value, dimensions, similarity) else { return };
-            let scale = match similarity {
-                Similarity::Cosine => 1.0 / v.iter().map(|x| x * x).sum::<f64>().sqrt(),
-                Similarity::Euclidean => 1.0,
-            };
-            ids.push(id);
-            data.extend(v.iter().map(|x| (x * scale) as f32));
+            if let Some(row) = matrix_row(&value, dimensions, similarity) {
+                entries.push((id, row));
+            }
         })?;
-        Ok(Matrix { def: def.clone(), ids, rows: VectorRows::new(dimensions as usize, data) })
+        Ok(Matrix::layout(def, entries))
+    }
+
+    /// The rows of `entries`, then rows not in use (an eighth more, at least 16).
+    fn layout(def: &IndexDef, entries: Vec<(u64, Vec<f32>)>) -> Matrix {
+        let (dimensions, _) = vector_params(def);
+        let d = dimensions as usize;
+        let n = entries.len();
+        let capacity = n + (n / 8).max(16);
+        let mut ids = Vec::with_capacity(capacity);
+        let mut row_of = HashMap::with_capacity(n);
+        let mut data = Vec::with_capacity(capacity * d);
+        for (i, (id, row)) in entries.into_iter().enumerate() {
+            ids.push(id);
+            row_of.insert(id, i as u32);
+            data.extend(row);
+        }
+        ids.resize(capacity, FREE);
+        data.resize(capacity * d, 0.0);
+        Matrix {
+            def: def.clone(),
+            ids,
+            row_of,
+            free: (n as u32..capacity as u32).rev().collect(),
+            rows: VectorRows::new(d, data),
+        }
+    }
+
+    /// The row entity `id` has in `store`, or `None` if the index skips it (or it is gone).
+    fn current(&self, store: &dyn GraphStore, id: u64) -> Result<Option<Vec<f32>>> {
+        let (dimensions, similarity) = vector_params(&self.def);
+        let key = &self.def.properties[0];
+        let value = match self.def.entity {
+            IndexEntity::Node => {
+                let n = NodeId(id);
+                if store.node_exists(n)? && store.node_has_label(n, &self.def.label)? {
+                    store.node_property(n, key)?
+                } else {
+                    None
+                }
+            }
+            IndexEntity::Relationship => {
+                let r = RelId(id);
+                if store.relationship_exists(r)?
+                    && store.relationship_type(r)?.as_deref() == Some(self.def.label.as_str())
+                {
+                    store.relationship_property(r, key)?
+                } else {
+                    None
+                }
+            }
+        };
+        Ok(value.and_then(|v| matrix_row(&v, dimensions, similarity)))
+    }
+
+    /// Brings the matrix to `store`, a later committed state, given (a superset of) the
+    /// entities changed since: their rows are rewritten, freed or taken from the free
+    /// ones. Laid out anew when the free rows run out or most rows are free.
+    fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
+        let changed = match self.def.entity {
+            IndexEntity::Node => &changes.nodes,
+            IndexEntity::Relationship => &changes.rels,
+        };
+        let mut updates = Vec::new();
+        for (n, &id) in changed.iter().enumerate() {
+            if n % 4096 == 4095 {
+                interrupt()?;
+            }
+            let row = self.current(store, id)?;
+            if row.is_some() || self.row_of.contains_key(&id) {
+                updates.push((id, row));
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let removed = updates.iter().filter(|(id, r)| r.is_none() && self.row_of.contains_key(id)).count();
+        let added = updates.iter().filter(|(id, r)| r.is_some() && !self.row_of.contains_key(id)).count();
+        let live = self.row_of.len() + added - removed;
+        if added > self.free.len() + removed || (self.ids.len() > 64 && live < self.ids.len() / 2) {
+            self.relayout(updates);
+            return Ok(());
+        }
+        let d = self.rows.dims();
+        let mut writes: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
+        // Free rows first, so that new entities can take them.
+        for (id, row) in &updates {
+            if row.is_none()
+                && let Some(r) = self.row_of.remove(id)
+            {
+                self.ids[r as usize] = FREE;
+                self.free.push(r);
+                writes.insert(r, vec![0.0; d]);
+            }
+        }
+        for (id, row) in updates {
+            let Some(row) = row else { continue };
+            let r = match self.row_of.get(&id) {
+                Some(&r) => r,
+                None => {
+                    let r = self.free.pop().expect("free rows counted above");
+                    self.ids[r as usize] = id;
+                    self.row_of.insert(id, r);
+                    r
+                }
+            };
+            writes.insert(r, row);
+        }
+        let at: Vec<u32> = writes.keys().copied().collect();
+        let data: Vec<f32> = writes.into_values().flatten().collect();
+        self.rows.patch(&at, &data);
+        Ok(())
+    }
+
+    /// Lays the matrix out anew with `updates` applied.
+    fn relayout(&mut self, updates: Vec<(u64, Option<Vec<f32>>)>) {
+        let d = self.rows.dims();
+        let updated: HashMap<u64, Option<Vec<f32>>> = updates.into_iter().collect();
+        let mut entries: Vec<(u64, Vec<f32>)> = Vec::with_capacity(self.row_of.len() + updated.len());
+        for (i, &id) in self.ids.iter().enumerate() {
+            if id != FREE && !updated.contains_key(&id) {
+                entries.push((id, self.rows.data()[i * d..(i + 1) * d].to_vec()));
+            }
+        }
+        entries.extend(updated.into_iter().filter_map(|(id, row)| row.map(|r| (id, r))));
+        entries.sort_unstable_by_key(|e| e.0);
+        *self = Matrix::layout(&self.def, entries);
     }
 
     /// Approximate scores of every row against `q`, from `kernels` (the GPU, when the
     /// database has one), and a bound on how far one may be from the exact score of the
-    /// stored vector.
+    /// stored vector. Rows not in use are scored too; [`Matrix::ids`] tells them apart.
     fn approximate(&self, q: &[f64], kernels: &dyn Kernels) -> (Vec<f64>, f64) {
         let (_, similarity) = vector_params(&self.def);
         let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -270,7 +414,16 @@ impl Matrix {
     }
 }
 
-/// The vector index matrices of one committed state, built on first use after a commit.
+type WeakSnapshot = Weak<dyn GraphStore + Send + Sync>;
+
+fn is(w: &WeakSnapshot, snapshot: &Snapshot) -> bool {
+    std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(snapshot))
+}
+
+/// The vector index matrices of one committed state, kept up to date with later commits:
+/// [`Database`](crate::Database) reports each commit's changes ([`VectorCache::published`]),
+/// and the first query on a later state applies them to the matrices instead of building
+/// them again.
 #[derive(Default)]
 pub(crate) struct VectorCache {
     state: Mutex<CacheState>,
@@ -278,20 +431,89 @@ pub(crate) struct VectorCache {
 
 #[derive(Default)]
 struct CacheState {
-    snapshot: Option<Weak<dyn GraphStore + Send + Sync>>,
+    /// The last committed state published.
+    latest: Option<WeakSnapshot>,
+    /// The state the matrices are of.
+    base: Option<WeakSnapshot>,
     matrices: HashMap<String, Arc<Matrix>>,
+    /// The states published after `base`, oldest first, with what each commit changed.
+    log: Vec<(WeakSnapshot, Changes)>,
+    /// The ids in `log`.
+    logged: usize,
+}
+
+impl CacheState {
+    /// Forgets the matrices (and the log, of no use without them).
+    fn clear(&mut self) {
+        self.base = None;
+        self.matrices.clear();
+        self.log.clear();
+        self.logged = 0;
+    }
+
+    /// Makes the matrices those of `snapshot`, entry `at` of the log, applying the
+    /// changes of the commits up to it.
+    fn advance(&mut self, snapshot: &Snapshot, at: usize, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
+        let mut changes = Changes::default();
+        for (_, c) in self.log.drain(..=at) {
+            changes.extend(c);
+        }
+        self.logged = self.log.iter().map(|(_, c)| c.len()).sum();
+        self.base = Some(Arc::downgrade(snapshot));
+        if changes.unknown {
+            self.matrices.clear();
+            return Ok(());
+        }
+        changes.normalize();
+        let names: Vec<String> = self.matrices.keys().cloned().collect();
+        for name in names {
+            let m = self.matrices.remove(&name).expect("listed above");
+            // In place, unless a query still reads it.
+            let mut m = Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone());
+            m.apply(&**snapshot, &changes, interrupt)?;
+            self.matrices.insert(name, Arc::new(m));
+        }
+        Ok(())
+    }
 }
 
 impl VectorCache {
+    /// Records a commit: `snapshot` is the new committed state, `changes` what the store
+    /// says changed since the state published before it.
+    pub fn published(&self, snapshot: &Snapshot, changes: Changes) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.latest = Some(Arc::downgrade(snapshot));
+        if !st.matrices.is_empty() {
+            // Drop the matrices of indexes that are gone.
+            let defs = snapshot.indexes();
+            st.matrices.retain(|_, m| defs.contains(&m.def));
+        }
+        if st.matrices.is_empty() || changes.unknown || st.logged + changes.len() > Changes::LIMIT {
+            // Nothing to keep up to date, or more changes than are worth applying.
+            st.clear();
+            return;
+        }
+        st.logged += changes.len();
+        st.log.push((Arc::downgrade(snapshot), changes));
+    }
+
     /// The matrix of index `def` in `snapshot`.
     fn matrix(&self, snapshot: &Snapshot, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Arc<Matrix>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let current = st.snapshot.as_ref().is_some_and(|w| std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(snapshot)));
-        if !current {
-            *st = CacheState {
-                snapshot: Some(Arc::downgrade(snapshot)),
-                matrices: HashMap::new(),
-            };
+        if !st.base.as_ref().is_some_and(|b| is(b, snapshot)) {
+            if let Some(at) = st.log.iter().position(|(w, _)| is(w, snapshot)) {
+                if let Err(e) = st.advance(snapshot, at, interrupt) {
+                    st.clear();
+                    return Err(e);
+                }
+            } else if st.latest.as_ref().is_some_and(|l| is(l, snapshot)) {
+                st.clear();
+                st.base = Some(Arc::downgrade(snapshot));
+            } else {
+                // An earlier state, read by a query that began before the last commits.
+                drop(st);
+                return Ok(Arc::new(Matrix::build(&**snapshot, def, interrupt)?));
+            }
         }
         if let Some(m) = st.matrices.get(&def.name)
             && m.def == *def
@@ -301,6 +523,13 @@ impl VectorCache {
         let m = Arc::new(Matrix::build(&**snapshot, def, interrupt)?);
         st.matrices.insert(def.name.clone(), m.clone());
         Ok(m)
+    }
+
+    /// The rows of the matrix of index `name`, if one is kept: for tests.
+    #[cfg(test)]
+    fn rows(&self, name: &str) -> Option<VectorRows> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.matrices.get(name).map(|m| m.rows.clone())
     }
 }
 
@@ -360,23 +589,24 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
         // A committed state: the cached matrix, then exact scores near the cut.
         Some((cache, snapshot)) => {
             let m = cache.matrix(snapshot, &def, &interrupt)?;
-            let (approx, tolerance) = m.approximate(&q, &*ctx.kernels());
+            let (all, tolerance) = m.approximate(&q, &*ctx.kernels());
+            let approx: Vec<(f64, u64)> =
+                all.into_iter().zip(&m.ids).filter(|(_, id)| **id != FREE).map(|(s, id)| (s, *id)).collect();
             if approx.is_empty() {
                 return Ok(Vec::new());
             }
             let cut = if approx.len() <= k {
                 f64::NEG_INFINITY
             } else {
-                let mut sorted = approx.clone();
+                let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
                 let i = sorted.len() - k;
                 *sorted.select_nth_unstable_by(i, f64::total_cmp).1 - tolerance
             };
             let mut out = Vec::new();
-            for (i, s) in approx.iter().enumerate() {
-                if *s < cut {
+            for &(s, id) in &approx {
+                if s < cut {
                     continue;
                 }
-                let id = m.ids[i];
                 let value = match entity {
                     IndexEntity::Node => store.node_property(NodeId(id), &def.properties[0])?,
                     IndexEntity::Relationship => store.relationship_property(RelId(id), &def.properties[0])?,
@@ -430,5 +660,38 @@ mod tests {
         let e = Similarity::Euclidean;
         assert!(close(e.score(&[1.0, 2.0], &[1.0, 2.0]).unwrap(), 1.0));
         assert!(close(e.score(&[0.0, 0.0], &[3.0, 4.0]).unwrap(), 1.0 / 26.0));
+    }
+
+    #[test]
+    fn commits_patch_the_matrix() {
+        let db = crate::Database::in_memory();
+        let q = "CALL db.index.vector.queryNodes('v', 2, [1, 0]) YIELD node RETURN node.k";
+        db.execute("CREATE VECTOR INDEX v FOR (n:V) ON n.e OPTIONS {indexConfig: {`vector.dimensions`: 2}}").unwrap();
+        db.execute("UNWIND range(1, 100) AS i CREATE (:V {k: i, e: [0, 1]})").unwrap();
+        db.execute(q).unwrap();
+        let first = db.vector_cache.rows("v").expect("built");
+        assert_eq!(first.len(), 100 + 16);
+        // Two commits, then a query: the rows they changed are written in place.
+        db.execute("MATCH (n:V {k: 7}) SET n.e = [1, 0]").unwrap();
+        db.execute("CREATE (:V {k: 0, e: [1, 0.1]})").unwrap();
+        let r = db.execute(q).unwrap();
+        assert_eq!(r.rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>(), ["7", "0"]);
+        let patched = db.vector_cache.rows("v").expect("kept");
+        assert_eq!(patched.len(), first.len());
+        let since: Vec<(u64, Vec<u32>)> = patched.changed_since().map(|(id, rows)| (id, rows.to_vec())).collect();
+        assert_eq!(since, [(first.id(), vec![6, 100])]);
+        // A commit that changes no indexed entity leaves the rows as they are.
+        db.execute("CREATE (:W {e: [1, 0]})").unwrap();
+        db.execute(q).unwrap();
+        assert_eq!(db.vector_cache.rows("v").unwrap().id(), patched.id());
+        // More new entities than free rows: laid out anew.
+        db.execute("UNWIND range(1, 40) AS i CREATE (:V {k: 1000 + i, e: [0, 1]})").unwrap();
+        db.execute(q).unwrap();
+        let grown = db.vector_cache.rows("v").unwrap();
+        assert_eq!(grown.len(), 141 + 141 / 8);
+        assert_eq!(grown.changed_since().count(), 0);
+        // A dropped index's matrix goes with it.
+        db.execute("DROP INDEX v").unwrap();
+        assert!(db.vector_cache.rows("v").is_none());
     }
 }

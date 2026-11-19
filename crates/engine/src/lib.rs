@@ -173,16 +173,23 @@ impl Default for Database<MemoryGraph> {
 
 impl<S: GraphStore> Database<S> {
     /// Wraps an existing store.
-    pub fn with_store(store: S) -> Self {
+    pub fn with_store(mut store: S) -> Self {
+        // What was written before is in the first snapshot.
+        drop(store.take_changes());
+        let committed = store.snapshot();
+        let vector_cache = Arc::<vector::VectorCache>::default();
+        if let Some(s) = &committed {
+            vector_cache.published(s, graphbuff_core::Changes::unknown());
+        }
         Database {
-            committed: RwLock::new(store.snapshot()),
+            committed: RwLock::new(committed),
             description: store.describe(),
             store: RwLock::new(store),
             import_dir: RwLock::new(None),
             procedures: RwLock::new(Procedures::builtin()),
             tx_thread: Mutex::new(None),
             kernel_cache: Arc::default(),
-            vector_cache: Arc::default(),
+            vector_cache,
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
         }
     }
@@ -325,7 +332,7 @@ impl<S: GraphStore> Database<S> {
             // A failed commit has already rolled the transaction back.
             Ok(r) => {
                 guard.commit()?;
-                let old = self.publish(&guard);
+                let old = self.publish(&mut guard);
                 // The old snapshot may be the last owner of the versions this query
                 // replaced: free them without holding the store.
                 drop(guard);
@@ -424,8 +431,10 @@ impl<S: GraphStore> Database<S> {
     /// Makes the store's committed state the one read queries see, returning the snapshot
     /// it replaces. Called with the store locked for writing, so snapshots are published
     /// in commit order.
-    fn publish(&self, store: &S) -> Option<Snapshot> {
+    fn publish(&self, store: &mut S) -> Option<Snapshot> {
+        let changes = store.take_changes();
         let snapshot = store.snapshot()?;
+        self.vector_cache.published(&snapshot, changes);
         self.committed.write().unwrap_or_else(|e| e.into_inner()).replace(snapshot)
     }
 

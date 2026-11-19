@@ -289,6 +289,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 /// neighbouring invocations read neighbouring values), the dot product with the query
 /// (`p.slot` 0, cosine) or the squared distance to it (`p.slot` 1, euclidean), summed in
 /// `f32` in index order.
+// Writes rows into vector rows laid out column by column (see VECTORS): `p.n` values,
+// `p.arg` per row, the row of each in `at`, `p.slot` rows in all.
+const VECTOR_PATCH: &str = r"
+@group(0) @binding(1) var<storage, read_write> rows: array<f32>;
+@group(0) @binding(2) var<storage, read> at: array<u32>;
+@group(0) @binding(3) var<storage, read> values: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let j = idx(wg, nwg, lid);
+    if (j >= p.n) {
+        return;
+    }
+    let d = p.arg;
+    let r = j / d;
+    let k = j - r * d;
+    rows[k * p.slot + at[r]] = values[j];
+}
+";
+
 const VECTORS: &str = r"
 @group(0) @binding(1) var<storage, read> rows: array<f32>;
 @group(0) @binding(2) var<storage, read> query: array<f32>;
@@ -319,6 +340,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 pub(crate) fn vectors() -> String {
     format!("{COMMON}{VECTORS}")
+}
+
+pub(crate) fn vector_patch() -> String {
+    format!("{COMMON}{VECTOR_PATCH}")
 }
 
 pub(crate) fn propagate() -> String {

@@ -44,6 +44,11 @@ const KEPT_EXPORTS: usize = 2;
 /// Buffers kept for reuse between kernel calls.
 const POOLED: usize = 16;
 
+/// The usage of device copies of vector rows: a patched copy is copied from an earlier one.
+const VECTOR_ROWS: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+
 /// The usage of buffers a kernel call reads, writes and copies out.
 const SCRATCH: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_SRC)
@@ -79,6 +84,7 @@ struct Gpu {
     /// `None` without 64-bit float support.
     page_rank: Option<wgpu::ComputePipeline>,
     vectors: wgpu::ComputePipeline,
+    vector_patch: wgpu::ComputePipeline,
     exports: Mutex<Vec<(u64, Arc<DeviceCsr>)>>,
     /// Vector rows copied to the device, by [`VectorRows::id`], most recent last.
     vector_rows: Mutex<Vec<(u64, Arc<wgpu::Buffer>)>>,
@@ -475,6 +481,7 @@ impl Gpu {
             triangles: pipeline(shaders::triangles(), "main"),
             page_rank: f64.then(|| pipeline(shaders::page_rank(), "main")),
             vectors: pipeline(shaders::vectors(), "main"),
+            vector_patch: pipeline(shaders::vector_patch(), "main"),
             vector_rows: Mutex::new(Vec::new()),
             max_binding: limits.max_storage_buffer_binding_size.min(limits.max_buffer_size),
             device,
@@ -510,6 +517,16 @@ impl Gpu {
             contents,
             usage: wgpu::BufferUsages::STORAGE,
         }))
+    }
+
+    /// [`upload`](Self::upload) with `usage`.
+    fn upload_with(&self, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+        if data.len() as u64 > self.max_binding {
+            return None;
+        }
+        let pad = [0u8; 4];
+        let contents = if data.is_empty() { &pad[..] } else { data };
+        Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage }))
     }
 
     /// A buffer of at least `len` bytes with `usage`, from the pool if it has one.
@@ -690,19 +707,60 @@ impl Gpu {
             kept.push(entry);
             return Some(b);
         }
-        // Column by column (see the shader).
-        let (n, d) = (rows.len(), rows.dims());
-        let mut columns = vec![0f32; n * d];
-        for (i, row) in rows.data().chunks_exact(d).enumerate() {
-            for (k, x) in row.iter().enumerate() {
-                columns[k * n + i] = *x;
+        // A copy of an earlier value, brought up to date with the rows changed since.
+        let earlier = rows
+            .changed_since()
+            .find_map(|(id, at)| kept.iter().find(|(k, _)| *k == id).map(|(_, b)| (b.clone(), at)));
+        let b = match earlier {
+            Some((earlier, at)) => self.patched_rows(&earlier, rows, at)?,
+            None => {
+                // Column by column (see the shader).
+                let (n, d) = (rows.len(), rows.dims());
+                let mut columns = vec![0f32; n * d];
+                for (i, row) in rows.data().chunks_exact(d).enumerate() {
+                    for (k, x) in row.iter().enumerate() {
+                        columns[k * n + i] = *x;
+                    }
+                }
+                self.upload_with("vector rows", bytes(&columns), VECTOR_ROWS)?
             }
-        }
-        let b = Arc::new(self.upload("vector rows", bytes(&columns))?);
+        };
+        let b = Arc::new(b);
         kept.push((rows.id(), b.clone()));
         if kept.len() > KEPT_EXPORTS {
             kept.remove(0);
         }
+        Some(b)
+    }
+
+    /// A device copy of `rows` made from `earlier`, the copy of a value it was patched
+    /// from: copied on the device, then the rows at `at` written.
+    fn patched_rows(&self, earlier: &wgpu::Buffer, rows: &VectorRows, at: &[u32]) -> Option<wgpu::Buffer> {
+        let (n, d) = (rows.len(), rows.dims());
+        let len = (n * d * 4) as u64;
+        if len > self.max_binding || earlier.size() != len.max(4) {
+            return None;
+        }
+        let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vector rows"),
+            size: len,
+            usage: VECTOR_ROWS,
+            mapped_at_creation: false,
+        });
+        let mut values = Vec::with_capacity(at.len() * d);
+        for &r in at {
+            values.extend_from_slice(&rows.data()[r as usize * d..(r as usize + 1) * d]);
+        }
+        let at_buf = self.input("vector patch rows", bytes(at))?;
+        let values_buf = self.input("vector patch values", bytes(&values))?;
+        let writes = (at.len() * d) as u32;
+        let params = self.params(writes, d as u32, false, n as u32);
+        let mut enc = self.encoder();
+        enc.copy_buffer_to_buffer(earlier, 0, &b, 0, len);
+        self.dispatch(&mut enc, &self.vector_patch, &params, &[&b, &at_buf, &values_buf], writes);
+        self.queue.submit([enc.finish()]);
+        // Later work runs after this submission, so the buffers can be reused.
+        self.recycle([at_buf, values_buf]);
         Some(b)
     }
 

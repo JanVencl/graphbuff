@@ -2086,6 +2086,8 @@ pub struct PersistentGraph {
     pager: Arc<Shared>,
     /// Set by [`PersistentGraph::abandon`]: drop without a checkpoint.
     abandoned: bool,
+    /// The entities written since [`GraphStore::take_changes`].
+    changes: crate::store::ChangeLog,
     _lock: File,
 }
 
@@ -2312,6 +2314,7 @@ impl PersistentGraph {
                 waiting: AtomicUsize::new(0),
             }),
             abandoned: false,
+            changes: Default::default(),
             _lock: lock,
         };
         if g.meta.index_format < INDEX_FORMAT {
@@ -2694,7 +2697,9 @@ impl GraphStore for PersistentGraph {
     persistent_reads!();
 
     fn create_node(&mut self, labels: &[String], props: BTreeMap<String, Value>) -> Result<NodeId> {
-        self.writer(|t| t.create_node(labels, props))
+        let id = self.writer(|t| t.create_node(labels, props))?;
+        self.changes.node(id);
+        Ok(id)
     }
 
     fn create_relationship(
@@ -2704,31 +2709,58 @@ impl GraphStore for PersistentGraph {
         rel_type: &str,
         props: BTreeMap<String, Value>,
     ) -> Result<RelId> {
-        self.writer(|t| t.create_rel(start, end, rel_type, props))
+        let id = self.writer(|t| t.create_rel(start, end, rel_type, props))?;
+        self.changes.rel(id);
+        Ok(id)
     }
 
     fn delete_node(&mut self, id: NodeId, detach: bool) -> Result<bool> {
-        self.writer(|t| t.delete_node(id, detach))
+        // A detaching delete removes the relationships inside the transaction.
+        let attached = if detach { self.expand_all(id, Direction::Both, &[])? } else { Vec::new() };
+        let deleted = self.writer(|t| t.delete_node(id, detach))?;
+        if deleted {
+            self.changes.node(id);
+            for e in attached {
+                self.changes.rel(e.rel);
+            }
+        }
+        Ok(deleted)
     }
 
     fn delete_relationship(&mut self, id: RelId) -> Result<bool> {
-        self.writer(|t| t.delete_rel(id))
+        let deleted = self.writer(|t| t.delete_rel(id))?;
+        if deleted {
+            self.changes.rel(id);
+        }
+        Ok(deleted)
     }
 
     fn set_node_property(&mut self, id: NodeId, key: &str, value: Value) -> Result<()> {
-        self.writer(|t| t.set_node_prop(id, key, value))
+        self.writer(|t| t.set_node_prop(id, key, value))?;
+        self.changes.node(id);
+        Ok(())
     }
 
     fn set_relationship_property(&mut self, id: RelId, key: &str, value: Value) -> Result<()> {
-        self.writer(|t| t.set_rel_prop(id, key, value))
+        self.writer(|t| t.set_rel_prop(id, key, value))?;
+        self.changes.rel(id);
+        Ok(())
     }
 
     fn add_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
-        self.writer(|t| t.add_label(id, label))
+        let added = self.writer(|t| t.add_label(id, label))?;
+        if added {
+            self.changes.node(id);
+        }
+        Ok(added)
     }
 
     fn remove_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
-        self.writer(|t| t.remove_label(id, label))
+        let removed = self.writer(|t| t.remove_label(id, label))?;
+        if removed {
+            self.changes.node(id);
+        }
+        Ok(removed)
     }
 
     fn create_index(&mut self, def: IndexDef) -> Result<()> {
@@ -2774,6 +2806,7 @@ impl GraphStore for PersistentGraph {
         }
         self.saved = Some(self.meta.clone());
         self.pager_mut().begin();
+        self.changes.begin();
         Ok(())
     }
 
@@ -2781,6 +2814,7 @@ impl GraphStore for PersistentGraph {
         let Some(saved) = self.saved.take() else {
             return Ok(());
         };
+        self.changes.commit();
         if !self.pager_mut().changed() && self.meta == saved {
             self.pager_mut().rollback(); // nothing to undo; just ends the transaction
             return Ok(());
@@ -2808,6 +2842,11 @@ impl GraphStore for PersistentGraph {
             self.meta = saved;
         }
         self.pager_mut().rollback();
+        self.changes.rollback();
+    }
+
+    fn take_changes(&mut self) -> crate::Changes {
+        self.changes.take()
     }
 
     fn checkpoint(&mut self) -> Result<()> {

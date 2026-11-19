@@ -231,3 +231,37 @@ fn vector_scores_are_within_their_bound() {
     assert_eq!(gpu.vector_scores(&rows, &[0.0; 4], VectorSimilarity::Euclidean).f32_terms, 0);
     assert_eq!(gpu.gpu_runs(), before);
 }
+
+/// A patched value's device copy (made from the copy of an earlier value) scores as the
+/// rows are now: after one patch, and after two with no scoring in between.
+#[test]
+fn patched_vector_rows_score_as_they_are() {
+    let Some(gpu) = gpu() else { return };
+    let cpu = CpuKernels::new();
+    let mut rng = Rng(0x2545f4914f6cdd1d);
+    let dims = 24;
+    let (mut rows, _) = vector_rows(&mut rng, 500, dims, false, 1.0);
+    let (_, q) = vector_rows(&mut rng, 1, dims, false, 1.0);
+    let q = &q[0];
+    let check = |rows: &VectorRows, what: &str| {
+        let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let before = gpu.gpu_runs();
+        let on_gpu = gpu.vector_scores(rows, q, VectorSimilarity::Euclidean);
+        assert_eq!(gpu.gpu_runs(), before + 1, "{what}: ran on the GPU");
+        let on_cpu = cpu.vector_scores(rows, q, VectorSimilarity::Euclidean);
+        let bound = on_gpu.error_bound(VectorSimilarity::Euclidean, rows.max_norm(), qn);
+        for (i, (g, c)) in on_gpu.values.iter().zip(&on_cpu.values).enumerate() {
+            assert!((g - c).abs() <= bound, "{what}, row {i}: GPU {g} vs CPU {c}");
+        }
+    };
+    check(&rows, "first");
+    let mut patch = |rows: &mut VectorRows, at: &[u32]| {
+        let (fresh, _) = vector_rows(&mut rng, at.len(), dims, false, 3.0);
+        rows.patch(at, fresh.data());
+    };
+    patch(&mut rows, &[0, 17, 499]);
+    check(&rows, "one patch");
+    patch(&mut rows, &[3, 17]);
+    patch(&mut rows, &[250]);
+    check(&rows, "two patches");
+}

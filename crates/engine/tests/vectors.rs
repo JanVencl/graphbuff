@@ -385,3 +385,131 @@ fn exact_on_the_gpu() {
         }
     }
 }
+
+/// `queryRelationships` on index `r` (type `NEAR`, property `e`) gives what `ORDER BY` gives.
+fn rels_same_as_order_by(db: &Db, function: &str, dims: usize, q: &[f64], k: usize) {
+    let ql = vec_lit(q);
+    let via_index = rows(
+        db,
+        &format!(
+            "CALL db.index.vector.queryRelationships('r', {k}, {ql}) YIELD relationship, score \
+             RETURN id(relationship), score"
+        ),
+    );
+    let validity = if function.ends_with("cosine") { "AND any(x IN r.e WHERE x <> 0)" } else { "" };
+    let via_scan = rows(
+        db,
+        &format!(
+            "MATCH ()-[r:NEAR]->() WHERE valueType(r.e) STARTS WITH 'LIST' AND size(r.e) = {dims} \
+             AND all(x IN r.e WHERE valueType(x) IN ['INTEGER NOT NULL', 'FLOAT NOT NULL']) {validity} \
+             WITH r, {function}(r.e, {ql}) AS score \
+             RETURN id(r), score ORDER BY score DESC, id(r) LIMIT {k}"
+        ),
+    );
+    assert_eq!(via_index, via_scan, "{function}: q = {ql}, k = {k}");
+}
+
+/// Random commits of every kind of change a vector index sees: new, changed, invalid and
+/// deleted vectors (of nodes and relationships), labels added and removed, nodes deleted
+/// with their relationships, rolled-back transactions, and batches larger than the
+/// matrix's free rows or deleting most of it. Queries after some commits only, so that
+/// the changes of several commits apply at once too; each answer is checked against
+/// `ORDER BY`. `reopen` (when given) closes and reopens the database halfway.
+fn churn(mut db: Db, function: &str, similarity: &str, dims: usize, seed: u64, reopen: Option<&dyn Fn(Db) -> Db>) {
+    for (name, target) in [("v", "(n:V) ON n.e"), ("r", "()-[n:NEAR]-() ON n.e")] {
+        run(
+            &db,
+            &format!(
+                "CREATE VECTOR INDEX {name} FOR {target} OPTIONS {{indexConfig: \
+                 {{`vector.dimensions`: {dims}, `vector.similarity_function`: '{similarity}'}}}}"
+            ),
+        );
+    }
+    let mut rng = Lcg(seed);
+    let computed = |salt: u64| format!("[x IN range(1, {dims}) | toFloat((id(n) * x + {salt}) % 7) - 3.0]");
+    let invalid = ["null", "[1, 2]", "'text'", &format!("[x IN range(1, {dims}) | 0]"), &format!("[x IN range(1, {dims}) | 'a']")];
+    for round in 0..80 {
+        let m = rng.next() % 11 + 2;
+        let r = rng.next() % m;
+        let salt = rng.next();
+        let q = match rng.next() % 12 {
+            0 => {
+                let e = vec_lit(&(0..dims).map(|_| rng.coord()).collect::<Vec<_>>());
+                format!("CREATE (:V {{e: {e}}}), (:W {{e: {e}}}), (:V {{e: [1]}}), (n:V) SET n.e = {}", computed(salt))
+            }
+            1 => format!("MATCH (n) WHERE id(n) % {m} = {r} SET n.e = {}", computed(salt)),
+            2 => format!("MATCH (n:V) WHERE id(n) % {m} = {r} REMOVE n:V"),
+            3 => format!("MATCH (n) WHERE id(n) % {m} = {r} SET n:V"),
+            4 => format!("MATCH (n) WHERE id(n) % {} = {r} DETACH DELETE n", m + 20),
+            5 => format!("MATCH (n) WHERE id(n) % {m} = {r} SET n.e = {}", invalid[(salt % 5) as usize]),
+            6 => format!(
+                "MATCH (a), (b) WHERE id(a) % {m} = {r} AND id(b) % {} = 1 WITH a, b LIMIT 12 \
+                 CREATE (a)-[n:NEAR]->(b) SET n.e = {}",
+                m + 3,
+                computed(salt)
+            ),
+            7 => format!("MATCH ()-[n:NEAR]->() WHERE id(n) % {m} = {r} SET n.e = {}", computed(salt)),
+            8 => format!("MATCH ()-[n:NEAR]->() WHERE id(n) % {} = {r} DELETE n", m + 5),
+            9 => {
+                // Rolled back.
+                let mut tx = db.begin().unwrap();
+                tx.execute(&format!("MATCH (n) WHERE id(n) % {m} = {r} SET n.e = {}, n:V", computed(salt))).unwrap();
+                tx.execute("UNWIND range(1, 30) AS i CREATE (n:V {e: [1]})").unwrap();
+                tx.rollback();
+                continue;
+            }
+            10 => format!("UNWIND range(1, {}) AS i CREATE (n:V) SET n.e = {}", 40 + salt % 120, computed(salt)),
+            _ if salt.is_multiple_of(4) => "MATCH (n:V) WITH n ORDER BY id(n) LIMIT 150 DETACH DELETE n".to_string(),
+            _ => "MATCH (n:V) WITH n LIMIT 1 SET n.e = n.e".to_string(),
+        };
+        run(&db, &q);
+        if round == 40
+            && let Some(reopen) = reopen
+        {
+            db = reopen(db);
+        }
+        if rng.next().is_multiple_of(3) {
+            continue;
+        }
+        for _ in 0..2 {
+            let q: Vec<f64> = (0..dims).map(|_| rng.coord()).collect();
+            if q.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            let k = [1, 4, 30, 1000][(rng.next() % 4) as usize];
+            same_as_order_by(&db, function, dims, &q, k);
+            rels_same_as_order_by(&db, function, dims, &q, k);
+        }
+    }
+}
+
+#[test]
+fn kept_up_to_date_with_commits() {
+    on_every_store(|store, db, reopen| {
+        eprintln!("{store}");
+        churn(db, "vector.similarity.cosine", "cosine", 3, 11, Some(reopen));
+    });
+    churn(mem(), "vector.similarity.euclidean", "euclidean", 5, 12, None);
+    churn(mem(), "vector.similarity.cosine", "cosine", 2, 13, None);
+}
+
+/// The same with the scores on the GPU, whose copy of the vectors is patched with the
+/// rows each commit changed. Skipped without a usable GPU.
+#[cfg(feature = "gpu")]
+#[test]
+fn kept_up_to_date_on_the_gpu() {
+    let gpu = match graphbuff_gpu::WgpuKernels::new() {
+        Ok(k) => std::sync::Arc::new(k.with_min_work(0)),
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    for (similarity, function, dims) in [("cosine", "vector.similarity.cosine", 3), ("euclidean", "vector.similarity.euclidean", 6)] {
+        let db = mem();
+        db.set_kernels(gpu.clone());
+        let before = gpu.gpu_runs();
+        churn(db, function, similarity, dims, 21, None);
+        assert!(gpu.gpu_runs() > before, "{similarity}: the scores ran on the GPU");
+    }
+}
