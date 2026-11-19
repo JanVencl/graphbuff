@@ -67,7 +67,7 @@ error (`docker logs`); anything after the image name is added to that command li
 is compiled into the binary, into the default database (unless it already holds data).
 
 User accounts are on, kept in the system database in the `/data` volume, so clients log
-in. On the first start, while there are no accounts, the server creates the administrator
+in. On the first start, while there is no administrator, the server creates the administrator
 `GRAPHBUFF_ADMIN_USER` (default `admin`) with the password in `GRAPHBUFF_ADMIN_PASSWORD`;
 later starts ignore both, and the password is changed with Cypher (`ALTER CURRENT USER SET
 PASSWORD FROM … TO …`). To keep the password out of the environment, use a secret file
@@ -98,11 +98,22 @@ volumes:
 
 Without either, the server asks for the administrator when it runs in a terminal
 (`docker run -it`), and otherwise stops with a message. The administrator can also be
-added offline (the image has no shell, so name the binary):
+created offline, before the first start (the image has no shell, so name the binary; it
+asks for the name and password, or takes them from `GRAPHBUFF_ADMIN_USER` and
+`GRAPHBUFF_ADMIN_PASSWORD` / `_FILE`):
 
 ```bash
 docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
-       ghcr.io/janvencl/graphbuff users add admin admin
+       ghcr.io/janvencl/graphbuff admin init
+```
+
+Lost the administrator's password? Stop the container, then set a new one the same way:
+
+```bash
+docker stop graphbuff
+docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server \
+       ghcr.io/janvencl/graphbuff admin reset-password admin
+docker start graphbuff
 ```
 
 `-e GRAPHBUFF_TOKEN=s3cret` adds a token that logs in as an administrator, besides the

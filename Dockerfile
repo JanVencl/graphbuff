@@ -12,6 +12,12 @@
 # when run with `-it`, and otherwise stops. `-e GRAPHBUFF_TOKEN=...` adds a token that
 # logs in as an administrator.
 #
+# Offline, while no server uses the volume (the image has no shell, so name the binary):
+#
+#   docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server graphbuff admin init
+#   docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server graphbuff \
+#     admin reset-password admin
+#
 # The build stage runs on the build machine's own architecture and cross-compiles for
 # the target platform, so `docker buildx build --platform linux/amd64,linux/arm64` needs
 # no emulation.
