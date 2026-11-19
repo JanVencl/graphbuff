@@ -18,6 +18,8 @@ usage: graphbuff-server [options]
        graphbuff-server users [--data DIR] [--config FILE]
                         (list | add NAME [ROLE...] | password NAME
                          | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
+       graphbuff-server admin [--data DIR] [--config FILE]
+                        (init [NAME] | reset-password NAME)
 
 Options:
   --config FILE        read settings from FILE (also: env GRAPHBUFF_CONFIG; `-` for none);
@@ -112,6 +114,12 @@ User accounts:
   it starts anyway (the token holder can create users). Once there is an administrator,
   these variables are ignored, and no change may leave none.
 
+  Offline, while no server uses the data directory: `graphbuff-server admin init [NAME]`
+  creates the first administrator (NAME, else GRAPHBUFF_ADMIN_USER, else asked for on a
+  terminal, else admin; the password from GRAPHBUFF_ADMIN_PASSWORD or _FILE, else asked
+  for like the users command), and refuses when there is one already. Lost the
+  administrator's password? `graphbuff-server admin reset-password NAME` sets a new one.
+
   Passwords need at least 8 characters and must differ from the user name.";
 
 fn fail(msg: &str) -> ! {
@@ -178,9 +186,14 @@ fn default_storage(settings: &Settings) -> StorageKind {
     storage
 }
 
-/// `graphbuff-server users [--data DIR] [--config FILE] …`: manages the accounts in the
-/// system database of the data directory, while no server uses it.
-fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+/// The accounts in the system database of the data directory, for the offline command
+/// `what` with `[--data DIR] [--config FILE]` options, while no server uses it; also the
+/// command word and the arguments after it. The manager holds the data directory's lock.
+fn offline_users(
+    what: &str,
+    commands: &str,
+    args: impl Iterator<Item = String>,
+) -> Result<(DatabaseManager, Users, String, Vec<String>), String> {
     let mut args = args.peekable();
     let mut options = Vec::new();
     while let Some(opt) = args.next_if(|a| a == "--data" || a == "--config") {
@@ -189,14 +202,21 @@ fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
     let command_line = Settings::command_line(options.into_iter())?;
     let (settings, _) = load_settings(&command_line, false);
-    let command = args.next().ok_or("users needs a command: list, add, password, grant, revoke or remove")?;
+    let command = args.next().ok_or(format!("{what} needs a command: {commands}"))?;
     let data = data_dir(&settings)
-        .ok_or("users works on a data directory, but the settings say in-memory; use --data DIR")?;
+        .ok_or(format!("{what} works on a data directory, but the settings say in-memory; use --data DIR"))?;
     let mgr = DatabaseManager::open_with(&data, default_storage(&settings))
         .map_err(|e| format!("cannot open the data directory {} (is a server using it?): {e}", data.display()))?;
     let system = mgr.system_database().ok_or("this build has no system database")?;
     let users = Users::system(system).map_err(|e| e.to_string())?;
-    let rest: Vec<String> = args.collect();
+    Ok((mgr, users, command, args.collect()))
+}
+
+/// `graphbuff-server users [--data DIR] [--config FILE] …`: manages the accounts in the
+/// system database of the data directory, while no server uses it.
+fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let (_mgr, users, command, rest) =
+        offline_users("users", "list, add, password, grant, revoke or remove", args)?;
     let name = || rest.first().cloned().ok_or(format!("users {command} needs a user NAME"));
     let roles = || -> Result<Vec<Role>, String> {
         rest[1..].iter().map(|r| Role::parse(r).map_err(|e| e.to_string())).collect()
@@ -252,12 +272,86 @@ fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Asks on the terminal for the first administrator's name and password, and creates
-/// the account; a refused password is asked for again, at most three times.
-fn ask_for_admin(users: &Users) -> Result<(), String> {
+/// The names of the users with the admin role.
+fn admins(users: &Users) -> Vec<String> {
+    users.list().into_iter().filter(|(_, roles)| roles.contains(&Role::Admin)).map(|(n, _)| n).collect()
+}
+
+/// `graphbuff-server admin [--data DIR] [--config FILE] (init [NAME] | reset-password NAME)`:
+/// creates the first administrator, or sets a new password for a user, offline.
+fn admin_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let (_mgr, users, command, rest) = offline_users("admin", "init or reset-password", args)?;
+    let err = |e: graphbuff::Error| e.to_string();
+    match (command.as_str(), rest.as_slice()) {
+        ("init", [] | [_]) => {
+            if users.has_admin() {
+                return Err(format!(
+                    "there is an administrator already ({}); to get in again, use \
+                     `graphbuff-server admin reset-password NAME`",
+                    admins(&users).join(", ")
+                ));
+            }
+            let from_env = first_admin()?;
+            let name = rest.first().cloned().or_else(|| from_env.as_ref().map(|(n, _)| n.clone()));
+            let existing = name.as_deref().unwrap_or("admin");
+            if users.roles(existing).is_some() {
+                return Err(format!(
+                    "user `{existing}` exists already; give it the admin role with \
+                     `graphbuff-server users grant {existing} admin`"
+                ));
+            }
+            let name = match from_env {
+                Some((_, password)) => {
+                    let name = name.unwrap_or_else(|| "admin".into());
+                    users.create(&name, &password, &[Role::Admin], ExistingDatabase::Fail).map_err(err)?;
+                    name
+                }
+                None if prompt::interactive() => ask_for_admin(&users, name)?,
+                None => {
+                    let name = name.unwrap_or_else(|| "admin".into());
+                    let password = prompt::new_password().map_err(|e| format!("cannot read the password: {e}"))?;
+                    users.create(&name, &password, &[Role::Admin], ExistingDatabase::Fail).map_err(err)?;
+                    name
+                }
+            };
+            println!("created the administrator {name}");
+        }
+        ("init", _) => return Err("admin init takes at most one NAME".into()),
+        ("reset-password", [name]) => {
+            if users.roles(name).is_none() {
+                return Err(format!(
+                    "user `{name}` does not exist; administrators: {}",
+                    match admins(&users) {
+                        a if a.is_empty() => "none (create one with `graphbuff-server admin init`)".into(),
+                        a => a.join(", "),
+                    }
+                ));
+            }
+            let password = match std::env::var("GRAPHBUFF_PASSWORD") {
+                Ok(p) => p,
+                Err(_) => prompt::new_password().map_err(|e| format!("cannot read the password: {e}"))?,
+            };
+            users.set_password(name, &password).map_err(err)?;
+            println!("reset the password of {name}");
+        }
+        ("reset-password", _) => return Err("admin reset-password needs one user NAME".into()),
+        (other, _) => return Err(format!("unknown admin command `{other}`")),
+    }
+    Ok(())
+}
+
+/// Asks on the terminal for the first administrator's name (unless given) and password,
+/// and creates the account; a refused password is asked for again, at most three times.
+/// Returns the name.
+fn ask_for_admin(users: &Users, name: Option<String>) -> Result<String, String> {
     eprintln!("There is no administrator yet. Create one now (Ctrl-C to stop).");
-    let name = prompt::line("administrator name [admin]: ").map_err(|e| e.to_string())?;
-    let name = if name.trim().is_empty() { "admin".to_string() } else { name.trim().to_string() };
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let n = prompt::line("administrator name [admin]: ").map_err(|e| e.to_string())?;
+            if n.trim().is_empty() { "admin".to_string() } else { n.trim().to_string() }
+        }
+    };
     graphbuff_server::users::check_name(&name).map_err(|e| e.to_string())?;
     eprintln!("password (at least {} characters, not the name):", graphbuff_server::MIN_PASSWORD_LENGTH);
     let mut last = String::new();
@@ -268,7 +362,7 @@ fn ask_for_admin(users: &Users) -> Result<(), String> {
         match created {
             Ok(_) => {
                 eprintln!("created the administrator `{name}`");
-                return Ok(());
+                return Ok(name);
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -304,9 +398,18 @@ fn first_admin() -> Result<Option<(String, String)>, String> {
     Ok(Some((env("GRAPHBUFF_ADMIN_USER").unwrap_or_else(|| "admin".into()), password)))
 }
 
+/// An offline command (`users`, `admin`) on its arguments.
+type OfflineCommand = fn(std::iter::Skip<std::env::Args>) -> Result<(), String>;
+
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("users") {
-        if let Err(e) = users_command(std::env::args().skip(2)) {
+    let offline: Option<OfflineCommand> =
+        match std::env::args().nth(1).as_deref() {
+            Some("users") => Some(users_command),
+            Some("admin") => Some(admin_command),
+            _ => None,
+        };
+    if let Some(command) = offline {
+        if let Err(e) = command(std::env::args().skip(2)) {
             eprintln!("{e}");
             std::process::exit(2);
         }
@@ -454,13 +557,13 @@ fn main() {
                  GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), or start with --token",
             );
         } else if prompt::interactive() {
-            if let Err(e) = ask_for_admin(&users) {
+            if let Err(e) = ask_for_admin(&users, None) {
                 fatal(&format!("no administrator was created: {e}"));
             }
         } else {
             fatal(
                 "there is no administrator yet and no terminal to ask for one: set GRAPHBUFF_ADMIN_PASSWORD (or \
-                 GRAPHBUFF_ADMIN_PASSWORD_FILE), add one with `graphbuff-server users add NAME admin` while the \
+                 GRAPHBUFF_ADMIN_PASSWORD_FILE), create one with `graphbuff-server admin init` while the \
                  server is stopped, start the server in a terminal to be asked, or start with --token",
             );
         }

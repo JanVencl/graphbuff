@@ -1,6 +1,6 @@
 //! The real binary: user accounts in the system database, the first administrator from
 //! GRAPHBUFF_ADMIN_USER and GRAPHBUFF_ADMIN_PASSWORD (or _FILE) when there are no
-//! accounts yet, and the offline `graphbuff-server users` command.
+//! accounts yet, and the offline `graphbuff-server users` and `admin` commands.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -43,10 +43,24 @@ fn command(args: &[&str], env: &[(&str, &str)]) -> Command {
 /// `graphbuff-server users ARGS…` in a clean environment; returns standard output, or
 /// standard error on failure.
 fn users(args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    offline("users", args, env, None)
+}
+
+/// `graphbuff-server admin ARGS…`, like [`users`]; `stdin` is standard input's text.
+fn admin(args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
+    offline("admin", args, env, stdin)
+}
+
+fn offline(command: &str, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(BIN);
-    cmd.arg("users").args(args).stdin(Stdio::null());
+    cmd.arg(command).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     clean(&mut cmd, env);
-    let out = cmd.output().unwrap();
+    let mut child = cmd.spawn().unwrap();
+    if let Some(text) = stdin {
+        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -232,6 +246,68 @@ fn the_offline_command_works_on_the_data_directory() {
     });
     let err = users(&["--data", data, "remove", "ghost"], &[]).unwrap_err();
     assert!(err.contains("does not exist"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn admin_init_creates_the_first_administrator_once() {
+    let dir = temp_dir("admin-init");
+    let data = dir.join("data");
+    let data = data.to_str().unwrap();
+    // Without a terminal the password is the first line of standard input.
+    assert_eq!(admin(&["--data", data, "init"], &[], Some("stdin-password\n")).unwrap().trim(), "created the administrator admin");
+    let err = admin(&["--data", data, "init", "other"], &[], Some("other-password\n")).unwrap_err();
+    assert!(err.contains("there is an administrator already (admin)"), "{err}");
+    assert_eq!(users(&["--data", data, "list"], &[]).unwrap().trim(), "admin\tadmin");
+    logins(&["--data", data], &[], &[("admin", "stdin-password", 200)]);
+
+    // A name on the command line; the password from the environment.
+    let data2 = dir.join("data2");
+    let data2 = data2.to_str().unwrap();
+    let env = [("GRAPHBUFF_ADMIN_USER", "ignored"), ("GRAPHBUFF_ADMIN_PASSWORD", "env-password")];
+    assert_eq!(admin(&["--data", data2, "init", "root"], &env, None).unwrap().trim(), "created the administrator root");
+    // GRAPHBUFF_ADMIN_USER names it when the command line does not.
+    let data3 = dir.join("data3");
+    let data3 = data3.to_str().unwrap();
+    let env = [("GRAPHBUFF_ADMIN_USER", "boss"), ("GRAPHBUFF_ADMIN_PASSWORD", "env-password")];
+    assert_eq!(admin(&["--data", data3, "init"], &env, None).unwrap().trim(), "created the administrator boss");
+
+    // An existing user without the admin role is not taken over.
+    let data4 = dir.join("data4");
+    let data4 = data4.to_str().unwrap();
+    users(&["--data", data4, "add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
+    let err = admin(&["--data", data4, "init", "kim"], &[], Some("new-password\n")).unwrap_err();
+    assert!(err.contains("users grant kim admin"), "{err}");
+    // The password policy holds.
+    let err = admin(&["--data", data4, "init"], &[], Some("short\n")).unwrap_err();
+    assert!(err.contains("at least 8 characters"), "{err}");
+    let err = admin(&["--data", data4, "init", "a", "b"], &[], None).unwrap_err();
+    assert!(err.contains("at most one NAME"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn admin_reset_password_recovers_access() {
+    let dir = temp_dir("admin-reset");
+    let data = dir.join("data");
+    let data = data.to_str().unwrap();
+    admin(&["--data", data, "init"], &[("GRAPHBUFF_ADMIN_PASSWORD", "forgotten-pw")], None).unwrap();
+    let out = admin(&["--data", data, "reset-password", "admin"], &[], Some("brand-new-pw\n")).unwrap();
+    assert_eq!(out.trim(), "reset the password of admin");
+    admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "from-env-pw")], None).unwrap();
+    logins_while(&["--data", data], &[], &[("admin", "from-env-pw", 200), ("admin", "forgotten-pw", 401)], || {
+        // Refused while a server holds the data directory.
+        let err = admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "x-password")], None).unwrap_err();
+        assert!(err.contains("is a server using it"), "{err}");
+    });
+    let err = admin(&["--data", data, "reset-password", "ghost"], &[], Some("whatever-pw\n")).unwrap_err();
+    assert!(err.contains("`ghost` does not exist; administrators: admin"), "{err}");
+    let err = admin(&["--data", data, "reset-password"], &[], None).unwrap_err();
+    assert!(err.contains("needs one user NAME"), "{err}");
+    let err = admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "short")], None).unwrap_err();
+    assert!(err.contains("at least 8 characters"), "{err}");
+    let err = admin(&["--data", data, "nope"], &[], None).unwrap_err();
+    assert!(err.contains("unknown admin command"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
