@@ -13,7 +13,7 @@ pub(crate) fn resolve(dir: Option<&Path>, url: &str) -> Result<PathBuf> {
     let Some(dir) = dir else {
         return Err(Error::Runtime(
             "LOAD CSV is disabled: no import directory is set \
-             (Database::set_import_dir, or --import-dir for the CLI and server)"
+             (Database::set_import_dir, or import_dir in [storage] of the server's config file)"
                 .into(),
         ));
     };

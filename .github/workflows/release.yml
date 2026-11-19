@@ -55,8 +55,9 @@ jobs:
         shell: bash
         run: |
           dir=graphbuff-${GITHUB_REF_NAME#v}-${{ matrix.name }}
-          mkdir -p "$dir" dist
+          mkdir -p "$dir/config" dist
           cp README.md "$dir/"
+          cp packaging/config/graphbuff.toml "$dir/config/"
           bin=target/${{ matrix.target }}/release
           if [ "${{ runner.os }}" = Windows ]; then
             cp "$bin/graphbuff-server.exe" "$dir/"

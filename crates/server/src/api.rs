@@ -444,7 +444,7 @@ fn backup_path(ctx: &Ctx, fields: &BTreeMap<String, Json>) -> Result<std::path::
         return Err(error(
             400,
             "Unsupported",
-            "backups are off; start graphbuff-server with --backup-dir DIR",
+            "backups are off; set backup_dir in [storage] of the server's config file",
         ));
     };
     let name = match fields.get("backup") {

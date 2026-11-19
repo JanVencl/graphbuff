@@ -1,5 +1,9 @@
-# Only the workspace manifests, crates/ and examples/movies.cypher go into the build.
+# Only the workspace manifests, crates/, examples/movies.cypher and the image's config
+# file go into the build.
 *
+!packaging
+packaging/*
+!packaging/docker
 !Cargo.toml
 !Cargo.lock
 !crates

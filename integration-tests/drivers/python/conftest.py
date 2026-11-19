@@ -16,7 +16,8 @@ TOKEN = "smoke-secret"
 def server():
     bolt_port = free_port()
     try:
-        srv = Server(["--bolt", f"127.0.0.1:{bolt_port}", "--token", TOKEN, "--tx-timeout", "5"]).start()
+        srv = Server({"server.bolt": f"127.0.0.1:{bolt_port}", "security.token": TOKEN,
+                      "queries.transaction_timeout_seconds": 5}).start()
     except RuntimeError as e:
         pytest.exit(str(e), returncode=2)
     yield {"bolt": f"bolt://127.0.0.1:{bolt_port}",

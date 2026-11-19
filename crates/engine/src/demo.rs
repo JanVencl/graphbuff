@@ -1,4 +1,4 @@
-//! Demo graphs compiled into the binaries (`--demo NAME` of `graphbuff` and
+//! Demo graphs compiled into the binaries (`demo = "NAME"` in the config file of
 //! `graphbuff-server`), so a first run needs no files on disk.
 
 use crate::{DatabaseManager, Error, Result};
@@ -29,7 +29,7 @@ pub fn demo_script(name: &str) -> Result<&'static str> {
 }
 
 /// Loads the demo graph `name` into the default database of `mgr`. A default database
-/// that already holds nodes (a `--data` directory from an earlier run) is left as it is.
+/// that already holds nodes (a data directory from an earlier run) is left as it is.
 pub fn load_demo(mgr: &DatabaseManager, name: &str) -> Result<DemoSummary> {
     let script = demo_script(name)?;
     let db = mgr.database(&mgr.default_database())?;

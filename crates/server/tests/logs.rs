@@ -1,11 +1,15 @@
-//! The real binary: the data directory from GRAPHBUFF_DATA, the logs under it, and what
-//! they record (start-up, failed logins, slow queries).
+//! The real binary and its config file: the data folder and logs it names, what the logs
+//! record (start-up, failed logins, slow queries), where the file is looked for and
+//! created, and its errors.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+mod common;
+use common::{toml_path, toml_str};
 
 const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 
@@ -15,17 +19,17 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Starts the server with `args` and the environment `env`; returns it and its address.
-fn start(args: &[&str], env: &[(&str, &Path)]) -> (Child, String) {
-    let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0"]).args(args);
-    cmd.env("GRAPHBUFF_CONFIG", "-").env("GRAPHBUFF_ADMIN_PASSWORD", "admin-password");
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
+/// Variables that would change where the server looks for its config file or what it
+/// does: none of the caller's.
+fn clean(cmd: &mut Command) -> &mut Command {
+    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_CONFIG", "GRAPHBUFF_ADMIN_USER", "GRAPHBUFF_ADMIN_PASSWORD_FILE"] {
         cmd.env_remove(key);
     }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    cmd.env("GRAPHBUFF_ADMIN_PASSWORD", "admin-password")
+}
+
+/// Starts `cmd`; returns it and the address of its first output line.
+fn spawn(cmd: &mut Command) -> (Child, String) {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut listening = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut listening).unwrap();
@@ -36,6 +40,11 @@ fn start(args: &[&str], env: &[(&str, &Path)]) -> (Child, String) {
         .unwrap_or_else(|| panic!("no address in {listening:?}"))
         .to_string();
     (child, addr)
+}
+
+/// Starts the server with the config file `config`.
+fn start(config: &Path) -> (Child, String) {
+    spawn(clean(Command::new(BIN).arg("--config").arg(config)))
 }
 
 /// Sends a query; returns the status line.
@@ -51,7 +60,7 @@ fn query(addr: &str, auth: Option<&str>, body: &str) -> String {
     .unwrap();
     let mut reply = String::new();
     conn.read_to_string(&mut reply).unwrap();
-    reply.lines().next().unwrap_or_default().to_string()
+    reply
 }
 
 fn stop(mut child: Child) {
@@ -59,10 +68,25 @@ fn stop(mut child: Child) {
     child.wait().unwrap();
 }
 
+/// Runs the binary with `args` and a clean environment, expecting it to fail with exit
+/// code 2; returns standard error.
+fn refused(args: &[&std::ffi::OsStr]) -> String {
+    let out = clean(&mut Command::new(BIN)).args(args).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 #[test]
-fn data_and_logs_go_to_graphbuff_data() {
-    let data = temp_dir("data-env");
-    let (child, addr) = start(&["--slow-query", "0", "--token", "secret"], &[("GRAPHBUFF_DATA", &data)]);
+fn data_and_logs_go_to_the_data_folder() {
+    let data = temp_dir("data-config");
+    // Without logs.dir the logs go to DATA/logs.
+    let config = common::config_file(&common::toml(&[
+        ("server.bind", toml_str("127.0.0.1:0")),
+        ("storage.data", toml_path(&data)),
+        ("security.token", toml_str("secret")),
+        ("logs.slow_query_ms", "0".into()),
+    ]));
+    let (child, addr) = start(&config);
     let result = std::panic::catch_unwind(|| {
         let ok = query(&addr, Some("Bearer secret"), r#"{"query": "CREATE (:Person {name: 'Ann'})"}"#);
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
@@ -76,26 +100,19 @@ fn data_and_logs_go_to_graphbuff_data() {
     let events = std::fs::read_to_string(data.join("logs/graphbuff.log")).unwrap();
     assert!(events.contains(" INFO  graphbuff-server "), "{events}");
     assert!(events.contains(&format!("data in {}", data.display())), "{events}");
+    assert!(events.contains(&format!("config: {}", config.display())), "{events}");
     assert!(events.contains(" WARN  failed login (http) from 127.0.0.1:"), "{events}");
     let queries = std::fs::read_to_string(data.join("logs/query.log")).unwrap();
     assert!(queries.contains(" http graphbuff token CREATE (:Person {name: 'Ann'})"), "{queries}");
     assert!(!queries.contains("RETURN 1"), "{queries}");
 
-    // The data is still there after a restart.
-    let (child, addr) = start(&["--token", "secret"], &[("GRAPHBUFF_DATA", &data)]);
+    // The data is still there after a restart; GRAPHBUFF_TOKEN overrides the file's token.
+    let (child, addr) = spawn(clean(Command::new(BIN).arg("--config").arg(&config)).env("GRAPHBUFF_TOKEN", "from-env"));
     let result = std::panic::catch_unwind(|| {
-        let mut conn = TcpStream::connect(&addr).unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let body = r#"{"query": "MATCH (p:Person) RETURN p.name AS name"}"#;
-        write!(
-            conn,
-            "POST /query HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        let mut reply = String::new();
-        conn.read_to_string(&mut reply).unwrap();
+        let reply = query(&addr, Some("Bearer from-env"), r#"{"query": "MATCH (p:Person) RETURN p.name AS name"}"#);
         assert!(reply.contains("Ann"), "{reply}");
+        let old = query(&addr, Some("Bearer secret"), r#"{"query": "RETURN 1"}"#);
+        assert!(old.starts_with("HTTP/1.1 401"), "{old}");
     });
     stop(child);
     result.unwrap();
@@ -103,70 +120,97 @@ fn data_and_logs_go_to_graphbuff_data() {
 }
 
 #[test]
-fn log_dir_can_be_elsewhere_and_in_memory_writes_no_files() {
-    let data = temp_dir("data-flag");
-    let logs = temp_dir("logs-flag");
-    let (child, _) = start(
-        &["--data", data.to_str().unwrap(), "--log-dir", logs.to_str().unwrap(), "--log-level", "warn"],
-        &[],
-    );
-    stop(child);
-    assert!(logs.join("graphbuff.log").exists());
-    assert!(!data.join("logs").exists());
-    // At level warn, the start-up lines are not written.
-    assert_eq!(std::fs::read_to_string(logs.join("graphbuff.log")).unwrap(), "");
-
-    let empty = temp_dir("in-memory");
-    let (child, _) = start(&["--in-memory"], &[("GRAPHBUFF_DATA", &empty)]);
-    stop(child);
-    assert!(!empty.exists(), "--in-memory created {}", empty.display());
-
-    for dir in [data, logs] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
-#[test]
-fn in_memory_and_data_exclude_each_other() {
-    let out = Command::new(BIN).args(["--in-memory", "--data", "x"]).env("GRAPHBUFF_CONFIG", "-").output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--in-memory and --data exclude each other"));
-}
-
-#[test]
-fn config_file_sets_data_and_logs_and_is_created_when_missing() {
-    let dir = temp_dir("config");
+fn paths_are_relative_to_the_file_and_memory_mode_writes_no_files() {
+    let dir = temp_dir("relative");
     std::fs::create_dir_all(&dir).unwrap();
-    let conf = dir.join("graphbuff.conf");
-    std::fs::write(&conf, "data = db   # relative to the file\nlog-dir = mylogs\nlog-level = warn\n").unwrap();
-    let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--config"]).arg(&conf).env("GRAPHBUFF_ADMIN_PASSWORD", "admin-password");
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL", "GRAPHBUFF_CONFIG"] {
-        cmd.env_remove(key);
-    }
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let config = dir.join("graphbuff.toml");
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"127.0.0.1:0\"\n\n[storage]\ndata = \"db\"   # relative to this file\n\n\
+         [logs]\ndir = \"mylogs\"\nlevel = \"warn\"\n",
+    )
+    .unwrap();
+    let (child, _) = start(&config);
     stop(child);
-    assert!(line.contains(&format!("data in {}", dir.join("db").display())), "{line}");
     assert!(dir.join("db").join("catalog").exists());
-    assert!(dir.join("mylogs").join("graphbuff.log").exists());
+    assert!(!dir.join("db").join("logs").exists());
+    // At level warn, the start-up lines are not written.
+    assert_eq!(std::fs::read_to_string(dir.join("mylogs").join("graphbuff.log")).unwrap(), "");
 
-    // A missing config file is created with every setting commented out.
-    let fresh = dir.join("new").join("graphbuff.conf");
-    let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--in-memory"]).env("GRAPHBUFF_CONFIG", &fresh).env("GRAPHBUFF_ADMIN_PASSWORD", "admin-password");
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let memory = dir.join("memory.toml");
+    std::fs::write(&memory, "[server]\nbind = \"127.0.0.1:0\"\n[storage]\nmode = \"memory\"\n").unwrap();
+    let before: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let (child, _) = start(&memory);
     stop(child);
-    let text = std::fs::read_to_string(&fresh).unwrap();
-    assert!(text.contains("# bind = 127.0.0.1:7475"), "{text}");
+    let after: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(before.len(), after.len(), "memory mode wrote files");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-    let bad = dir.join("bad.conf");
-    std::fs::write(&bad, "nope = 1\n").unwrap();
-    let out = Command::new(BIN).arg("--config").arg(&bad).output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown setting `nope`"));
+/// The layout of the release archives: the program, and its config file in `config/`
+/// next to it. Started without one, the program creates it there from the template; with
+/// it, the data folder is `data/` beside the program.
+#[test]
+fn the_config_file_next_to_the_program_is_created_and_used() {
+    let dir = temp_dir("portable");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(Path::new(BIN).file_name().unwrap());
+    std::fs::copy(BIN, &exe).unwrap();
+    // No per-user config file either: the per-user folders point into the test folder.
+    let home = dir.join("home");
+    let program = || {
+        let mut cmd = Command::new(&exe);
+        clean(&mut cmd)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_DATA_HOME", &home)
+            .env("LOCALAPPDATA", &home);
+        cmd
+    };
+    // The first start creates the file (whether or not port 7475 is free here).
+    let out = program().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let file = dir.join("config").join("graphbuff.toml");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop(out);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[storage]") && text.contains("data = \"../data\""), "{text}");
+    assert!(!home.join("graphbuff").exists(), "no per-user file when the program's folder is writable");
+    // Used: on a free port, with the data folder next to the program.
+    std::fs::write(&file, text.replace("bind = \"127.0.0.1:7475\"", "bind = \"127.0.0.1:0\"")).unwrap();
+    let _ = std::fs::remove_dir_all(dir.join("data"));
+    let (child, _) = spawn(&mut program());
+    stop(child);
+    assert!(dir.join("data").join("catalog").exists());
+    assert!(dir.join("data").join("logs").join("graphbuff.log").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bad_config_files_and_old_options_are_refused() {
+    let dir = temp_dir("bad-config");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.toml");
+    std::fs::write(&bad, "[server]\nnope = 1\n").unwrap();
+    let err = refused(&["--config".as_ref(), bad.as_os_str()]);
+    assert!(err.contains("bad.toml:2: unknown setting `nope` in [server]"), "{err}");
+    std::fs::write(&bad, "[storage]\nmode = \"memory\"\ndata = \"x\"\n").unwrap();
+    let err = refused(&["--config".as_ref(), bad.as_os_str()]);
+    assert!(err.contains("keeps no data on disk"), "{err}");
+    // A file named on the command line must exist.
+    let missing = dir.join("missing.toml");
+    let err = refused(&["--config".as_ref(), missing.as_os_str()]);
+    assert!(err.contains("cannot read the config file"), "{err}");
+    // The old command-line options name their setting.
+    let err = refused(&["--in-memory".as_ref()]);
+    assert!(err.contains("`--in-memory` is gone") && err.contains("mode = \"memory\" in [storage]"), "{err}");
+    let err = refused(&["--bind".as_ref(), "0.0.0.0:7475".as_ref()]);
+    assert!(err.contains("set bind in [server]"), "{err}");
+    let err = refused(&["--nope".as_ref()]);
+    assert!(err.contains("unknown option `--nope`"), "{err}");
+    let err = refused(&["--config".as_ref(), "-".as_ref(), "extra".as_ref()]);
+    assert!(err.contains("unexpected `extra`"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

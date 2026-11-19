@@ -10,25 +10,27 @@
 
 ## Quick start
 
-Without a Rust toolchain, start the server with the movies demo graph loaded:
+Without a Rust toolchain, start the server in Docker:
 
 ```bash
 docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
-       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff --demo movies
+       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff
 ```
 
 HTTP/JSON is then on `http://127.0.0.1:7475` and Bolt on `bolt://127.0.0.1:7687`, for the
 user `admin` with the password `change-me`; see
-[Install without Rust](#install-without-rust) for prebuilt binaries and
-[Data directory and logs](#data-directory-and-logs) for where the server keeps your data.
+[Install without Rust](#install-without-rust) for prebuilt binaries.
+
+The server takes every setting from its config file, `config/graphbuff.toml` next to the
+program, which it creates with every setting and its default on the first start; see
+[Configuration](#configuration).
 
 From source:
 
 ```bash
-cargo run --release -p graphbuff-server                            # HTTP/JSON server on 127.0.0.1:7475, durable
-cargo run --release -p graphbuff-server -- --demo movies           # ... with the built-in movies graph
-cargo run --release -p graphbuff-server -- --bolt 127.0.0.1:7687   # ... plus Bolt for Neo4j drivers
-cargo run --release -p graphbuff-server -- --data ./data --persistent # durable in ./data, disk-resident storage
+cargo run --release -p graphbuff-server                 # HTTP/JSON on 127.0.0.1:7475, durable;
+                                                        # creates target/release/config/graphbuff.toml
+cargo run --release -p graphbuff-server -- --config my.toml   # another config file
 cargo test --workspace
 ```
 
@@ -52,19 +54,31 @@ println!("{}", r.to_table());
 
 ```bash
 docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
-       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff --demo movies
+       -e GRAPHBUFF_ADMIN_PASSWORD=change-me ghcr.io/janvencl/graphbuff
 ```
 
 ```bash
-curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: application/json'      -d '{"query": "MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name, m.title"}'
+curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: application/json' \
+     -d '{"query": "CREATE (:Person {name: \"Ann\"}) RETURN 1"}'
 ```
 
 The image `ghcr.io/janvencl/graphbuff` (tags: `latest` and each version, such as `0.1.0`;
-linux/amd64 and linux/arm64) runs `graphbuff-server --bind 0.0.0.0:7475 --bolt 0.0.0.0:7687`
-as an unprivileged user, with its databases in the volume `/data` and its log on standard
-error (`docker logs`); anything after the image name is added to that command line.
-`--demo movies` loads the graph of [examples/movies.cypher](examples/movies.cypher), which
-is compiled into the binary, into the default database (unless it already holds data).
+linux/amd64 and linux/arm64) runs `graphbuff-server` as an unprivileged user with the
+config file `/etc/graphbuff/graphbuff.toml`
+([packaging/docker/graphbuff.toml](packaging/docker/graphbuff.toml)): HTTP/JSON on
+`0.0.0.0:7475`, Bolt on `0.0.0.0:7687`, its databases in the volume `/data` and its log on
+standard error (`docker logs`). To change a setting, mount your own copy of that file
+over it (keep `data = "/data"`):
+
+```bash
+docker run -d --name graphbuff -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
+       -v graphbuff-data:/data -v ./graphbuff.toml:/etc/graphbuff/graphbuff.toml:ro \
+       ghcr.io/janvencl/graphbuff
+```
+
+With `demo = "movies"` in `[storage]`, the graph of [examples/movies.cypher](examples/movies.cypher),
+which is compiled into the binary, is loaded into the default database (unless it already
+holds data).
 
 User accounts are on, kept in the system database in the `/data` volume, so clients log
 in. On the first start, while there is no administrator, the server creates the administrator
@@ -130,16 +144,24 @@ docker run -d --name graphbuff -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
 docker logs -f graphbuff                        # start-up, failed logins, errors
 ```
 
-Add `--slow-query 500` to log queries that take 500 ms or more, `--in-memory` for a
-throwaway server, or `-e GRAPHBUFF_LOG_DIR=/data/logs` to write log files into the volume.
+In your own config file, `slow_query_ms = 500` in `[logs]` logs queries that take 500 ms
+or more, `mode = "memory"` in `[storage]` (without `data`) makes a throwaway server, and
+`dir = "/data/logs"` in `[logs]` writes log files into the volume.
 
 Build the image yourself with `docker build -t graphbuff .`.
 
 ### Prebuilt binaries
 
 Each [release](https://github.com/JanVencl/graphbuff/releases) carries one archive per
-platform, with `graphbuff-server` inside a folder
-`graphbuff-VERSION-PLATFORM/`:
+platform, with a folder `graphbuff-VERSION-PLATFORM/` inside:
+
+```text
+graphbuff-VERSION-PLATFORM/
+  graphbuff-server            the server (graphbuff-server.exe on Windows)
+  config/graphbuff.toml       its settings: edit, then restart the server
+  README.md
+  data/                       created on the first start: databases, accounts, logs
+```
 
 | Platform | Archive |
 |----------|---------|
@@ -155,8 +177,11 @@ always points at the newest release (a specific one: `.../releases/download/v0.1
 ```bash
 curl -LO https://github.com/JanVencl/graphbuff/releases/latest/download/graphbuff-linux-x86_64.tar.gz
 tar -xzf graphbuff-linux-x86_64.tar.gz
-./graphbuff-*/graphbuff-server --demo movies    # http://127.0.0.1:7475
+./graphbuff-*/graphbuff-server    # http://127.0.0.1:7475, data in graphbuff-*/data
 ```
+
+To load the movies demo graph, set `demo = "movies"` in `[storage]` of
+`config/graphbuff.toml` first.
 
 The binaries are plain builds: no `gpu` and no `tls` feature. Releases are cut by pushing a
 tag `vX.Y.Z` that matches the workspace version ([release.yml](.github/workflows/release.yml)).
@@ -290,7 +315,8 @@ s.execute("CREATE (:Movie {title: 'Heat'})")?;
   `sync` (`'commit'` or `'os'`) and `checkpointAfterBytes` apply to hybrid and persistent
   storage, `cacheBytes` and `maxTransactionBytes` (the transaction size cap) to persistent
   storage. Without `OPTIONS`, a manager opened on a
-  directory creates hybrid databases (persistent ones with `graphbuff-server --persistent`, or
+  directory creates hybrid databases (persistent ones with `mode = "persistent"` in the
+  server's config file, or
   `DatabaseManager::open_with(dir, StorageKind::persistent())`) and an in-memory manager
   creates memory databases. `OPTIONS $map` works too, as does `$name`
   for the database name. `WAIT`/`NOWAIT` and `DESTROY DATA` are accepted and ignored.
@@ -348,7 +374,7 @@ reads a snapshot, copying pages a batch at a time without filling the page cache
 Persistent databases back up as persistent stores (their pages and metadata); in-memory
 and hybrid ones as hybrid stores (a snapshot file).
 
-Start the server with `--backup-dir DIR`; then admins can:
+Set `backup_dir = "DIR"` in `[storage]` of the server's config file; then admins can:
 
 * **Back up:** `POST /db/{name}/backup` with `{"backup": "monday"}` writes `DIR/monday`.
 * **Restore:** `POST /db/{name}/restore` with `{"backup": "monday", "overwrite": false}`
@@ -480,10 +506,10 @@ The `gpu` feature adds `WgpuKernels` (crate `graphbuff-gpu`), a backend on
 [wgpu](https://wgpu.rs): Vulkan, Direct3D 12 or Metal, whichever the machine has.
 
 ```bash
-cargo run --release -p graphbuff-server --features gpu -- --gpu
+cargo run --release -p graphbuff-server --features gpu   # with gpu = true in [queries]
 ```
 
-`--gpu` (`graphbuff-server`) puts every database on the GPU backend; in code,
+`gpu = true` in `[queries]` of the server's config file puts every database on the GPU backend; in code,
 `DatabaseManager::set_kernels(graphbuff::gpu_kernels()?)` or `Database::set_kernels`.
 `EXPLAIN` then shows `(wgpu; …)`. Walk counts (multi-hop aggregates, `walk` / `propagate`),
 BFS, connected components, triangle counts and, on devices with 64-bit floats, PageRank
@@ -512,12 +538,14 @@ The MSVC toolchain and other platforms need nothing extra.
 Cypher against graphbuff:
 
 ```bash
-cargo run --release -p graphbuff-server                                  # durable, in the default data directory
-cargo run --release -p graphbuff-server -- --data ./data --persistent    # in ./data, disk-resident storage
-cargo run --release -p graphbuff-server -- --in-memory                   # nothing written to disk
-cargo run --release -p graphbuff-server -- --bind 0.0.0.0:7475 --token s3cret
-cargo run --release -p graphbuff-server -- --demo movies                 # start with the movies demo graph
+cargo run --release -p graphbuff-server     # settings from target/release/config/graphbuff.toml
 ```
+
+What it serves, where it keeps its data and who may log in is set in its config file (see
+[Configuration](#configuration)): for example `mode = "persistent"` (disk-resident) or
+`mode = "memory"` (nothing written to disk) in `[storage]`, `bind = "0.0.0.0:7475"` in
+`[server]`, `token = "s3cret"` in `[security]`, `demo = "movies"` in `[storage]` to start
+with the movies demo graph.
 
 | Request | Answer |
 |---------|--------|
@@ -530,7 +558,7 @@ cargo run --release -p graphbuff-server -- --demo movies                 # start
 | `POST /db/{name}/tx/{id}/commit` | commits: `{"committed":true}` |
 | `DELETE /db/{name}/tx/{id}` | rolls back (cancelling a running statement): `{"rolledBack":true}` |
 | `/tx`, `/tx/{id}`, `/tx/{id}/commit` | the same, against the default database |
-| `POST /db/{name}/backup` | online backup into `--backup-dir`: `{"backup": "name"}`; admins only ([details](#backup-restore-and-consistency-checks)) |
+| `POST /db/{name}/backup` | online backup into `storage.backup_dir`: `{"backup": "name"}`; admins only ([details](#backup-restore-and-consistency-checks)) |
 | `POST /db/{name}/restore` | creates the database from a backup: `{"backup": "name", "overwrite": false}`; admins only |
 | `POST /db/{name}/check` | consistency check of a persistent database: `{"check":{"consistent","errors",...}}`; admins only |
 
@@ -544,10 +572,10 @@ A query request is its own transaction. Database commands (`CREATE DATABASE`,
   `begin`), readers do not. A statement that fails rolls the whole transaction back, and
   its error carries `"rolledBack":true`. A statement that does not parse, a database
   command, or `USE` of another database is rejected and the transaction stays open. A
-  transaction that gets no request for `--tx-timeout` seconds (default 60) is rolled
+  transaction that gets no request for `queries.transaction_timeout_seconds` (default 60) is rolled
   back; requests to a transaction that has ended answer `404 TransactionNotFound`.
   Shutting the server down rolls back open transactions.
-* **Timeouts:** `--query-timeout MS` stops a query that runs longer (default: no limit);
+* **Timeouts:** `queries.query_timeout_ms` stops a query that runs longer (default: no limit);
   a request may ask for less with `"timeoutMs"`. The limit also covers the wait for
   another writer, and the wait to begin a transaction. A query that runs out of time is
   rolled back and answers `408 Timeout`; in a transaction the whole transaction rolls
@@ -569,9 +597,9 @@ A query request is its own transaction. Database commands (`CREATE DATABASE`,
   rolled back), 500 (`StorageError`).
 * **Security:** the server listens on localhost by default. Every request except
   `/health` needs a login: a user's name and password (see
-  [Users and TLS](#users-and-tls)), or, with `--token` (or the `GRAPHBUFF_TOKEN`
-  environment variable), `Authorization: Bearer <token>`. `LOAD CSV` is off unless `--import-dir DIR` is
-  given; it then reads only files inside `DIR`.
+  [Users and TLS](#users-and-tls)), or, with `security.token` (or the `GRAPHBUFF_TOKEN`
+  environment variable), `Authorization: Bearer <token>`. `LOAD CSV` is off unless
+  `storage.import_dir` is set; it then reads only files inside that folder.
 * **Implementation** (`crates/server`, standard library plus `argon2`, and rustls with a TLS
   feature): one thread per
   connection (at most 256), HTTP/1.1 keep-alive, `Content-Length` or chunked bodies,
@@ -596,10 +624,73 @@ long age = (Long) r.get(0, "age");          // INTEGER -> Long, FLOAT -> Double
 With Jackson or Gson in the project, `HttpClient` plus your JSON library is all you need.
 Send `{"query": ..., "params": ...}` and read `columns` / `rows`.
 
+### Configuration
+
+`graphbuff-server` takes its settings from one file, `graphbuff.toml` (TOML), not from
+command-line options. It reads the first of:
+
+1. the file named by `--config FILE` (or env `GRAPHBUFF_CONFIG`; `-` for the built-in
+   defaults);
+2. `config/graphbuff.toml` in the program's folder: the release archives ship it there;
+3. the per-user (system) file:
+
+| Platform | Config file |
+|----------|-------------|
+| Linux | `$XDG_CONFIG_HOME/graphbuff/graphbuff.toml`, usually `~/.config/graphbuff/graphbuff.toml`; `/etc/graphbuff/graphbuff.toml` when run as root |
+| macOS | `~/Library/Application Support/graphbuff/graphbuff.toml` |
+| Windows | `%LOCALAPPDATA%\graphbuff\graphbuff.toml` |
+| Docker image | `/etc/graphbuff/graphbuff.toml` |
+
+Without any of them, the server creates `config/graphbuff.toml` next to the program (or,
+if that folder cannot be written, the per-user file) with every setting, its default and
+what it does ([packaging/config/graphbuff.toml](packaging/config/graphbuff.toml)). Edit a
+line, or remove the `#` in front of one, and restart the server. Relative paths are
+relative to the file's folder, so the shipped `data = "../data"` puts the data folder next
+to the program. A misspelt section or setting, or a value of the wrong kind, stops the
+server with the file and line. The only settings outside the file are secrets for
+containers: env `GRAPHBUFF_TOKEN` overrides `security.token`, and the first
+administrator's `GRAPHBUFF_ADMIN_*` (see [Users and TLS](#users-and-tls)).
+
+```toml
+[server]
+bind = "0.0.0.0:7475"                 # HTTP/JSON; 127.0.0.1 (default) for this machine only
+bolt = "0.0.0.0:7687"                 # also Bolt, for Neo4j drivers (off when not set)
+max_connections = 256
+keep_alive_seconds = 30
+shutdown_timeout_seconds = 5
+
+[storage]
+mode = "hybrid"                       # hybrid (default), persistent or memory
+data = "/srv/graphbuff"               # databases, user accounts and (by default) logs
+fsync = true                          # false: faster commits, the last ones may be lost in a crash
+import_dir = "/srv/import"            # LOAD CSV reads files here (off when not set)
+backup_dir = "/srv/backups"           # online backups and restores (off when not set)
+# demo = "movies"                     # load the movies demo graph into an empty default database
+
+[security]
+# token = "change-me"                 # also log in with this token, as an administrator
+tls_cert = "/etc/graphbuff/cert.pem"  # HTTPS and Bolt over TLS
+tls_key = "/etc/graphbuff/key.pem"
+tls_allow_plain = false
+
+[queries]
+transaction_timeout_seconds = 60
+query_timeout_ms = 30000              # no limit when not set
+gpu = false                           # graph kernels on the GPU (`gpu` build feature)
+
+[logs]
+dir = "/var/log/graphbuff"            # "-" for standard error; default: DATA/logs
+level = "info"                        # error, warn, info or debug
+slow_query_ms = 500                   # log queries that take this long to query.log
+```
+
+Upgrading from 0.3: the command-line options (`--bind`, `--data`, …), `graphbuff.conf`
+and the variables `GRAPHBUFF_DATA`, `GRAPHBUFF_LOG_DIR` and `GRAPHBUFF_LOG_LEVEL` are gone;
+an old option is refused with the setting that replaces it.
+
 ### Data directory and logs
 
-The server keeps its databases on disk. Without `--data DIR` (or env `GRAPHBUFF_DATA`)
-it uses:
+Without `storage.data` the server keeps its databases in:
 
 | Platform | Data directory |
 |----------|----------------|
@@ -608,45 +699,22 @@ it uses:
 | Windows | `%LOCALAPPDATA%\graphbuff` |
 | Docker image | `/data` (a volume) |
 
-The start-up line names the directory in use. `DATA/system/` holds the user accounts (the
-system database; see [Users and TLS](#users-and-tls)). One process at a time uses a data
-directory: a second server, or an offline `users` / `admin` command, is refused while it
-is locked. New databases there use hybrid storage
-(`--persistent`: disk-resident, for graphs larger than RAM). `--in-memory` keeps everything
-in memory and writes nothing. Back up databases with the server's backup endpoint (see
+The shipped config file sets it to the `data` folder next to the program. The start-up line
+names the directory in use. `DATA/system/` holds the user accounts (the system database;
+see [Users and TLS](#users-and-tls)). One process at a time uses a data directory: a
+second server, or an offline `users` / `admin` command, is refused while it is locked. New
+databases there use hybrid storage (`mode = "persistent"`: disk-resident, for graphs
+larger than RAM). `mode = "memory"` keeps everything in memory and writes nothing. Back up
+databases with the server's backup endpoint (see
 [Backup, restore and consistency checks](#backup-restore-and-consistency-checks)).
 
-Settings can also live in a config file, `graphbuff.conf`: one `key = value` per line, the
-keys being the command-line options without `--`, `#` for comments, relative paths
-relative to the file. The command line overrides the environment, which overrides the
-file. `--config FILE` (or env `GRAPHBUFF_CONFIG`; `-` for none) picks the file; by default
-it is:
+Logs go to `DATA/logs` (`dir` in `[logs]`; `"-"` for standard error, the default with
+`mode = "memory"` and in the Docker image):
 
-| Platform | Config file |
-|----------|-------------|
-| Linux | `$XDG_CONFIG_HOME/graphbuff/graphbuff.conf`, usually `~/.config/graphbuff/graphbuff.conf`; `/etc/graphbuff/graphbuff.conf` when run as root |
-| macOS | `~/Library/Application Support/graphbuff/graphbuff.conf` |
-| Windows | `%LOCALAPPDATA%\graphbuff\graphbuff.conf` |
-| Docker image | `/data/graphbuff.conf` |
-
-A missing config file is created with every setting commented out. Example:
-
-```text
-data = /srv/graphbuff
-log-dir = /var/log/graphbuff
-bind = 0.0.0.0:7475
-bolt = 0.0.0.0:7687
-slow-query = 500
-```
-
-Logs go to `DATA/logs` (`--log-dir DIR` or env `GRAPHBUFF_LOG_DIR`; `-` for standard
-error, the default with `--in-memory` and in the Docker image):
-
-* `graphbuff.log`: start-up and settings, failed logins (with the client's address and
-  user name), refused connections and storage errors; with `--log-level debug` also every
-  connection. Levels: `error`, `warn`, `info` (default), `debug`; also env
-  `GRAPHBUFF_LOG_LEVEL`.
-* `query.log`: with `--slow-query MS`, every query that took at least `MS` milliseconds,
+* `graphbuff.log`: start-up and settings (with the config file read), failed logins (with
+  the client's address and user name), refused connections and storage errors; with
+  `level = "debug"` also every connection. Levels: `error`, `warn`, `info` (default), `debug`.
+* `query.log`: with `slow_query_ms`, every query that took at least that many milliseconds,
   with its duration, protocol, database and user. Parameters are never logged.
 
 ```text
@@ -663,7 +731,7 @@ Each file moves to `.1` (older ones to `.2`, …) at 10 MiB; five old files are 
 SIGTERM or SIGINT (`docker stop`, `systemctl stop`, `kill`, Ctrl-C), or on Windows Ctrl-C,
 Ctrl-Break or closing the console, stops the server cleanly: it stops accepting
 connections, rolls back open explicit transactions, gives queries already running
-`--shutdown-timeout SECS` (default 5) to finish and then cancels (and rolls back) the rest,
+`server.shutdown_timeout_seconds` (default 5) to finish and then cancels (and rolls back) the rest,
 checkpoints every durable database so the next start has no log to replay, and exits 0 (1 if a checkpoint failed; that
 database's log is kept and replayed on the next start). A
 second signal ends it at once; committed data is safe either way, since every commit is in
@@ -672,11 +740,15 @@ with `ServerConfig::shutdown_grace`, followed by `DatabaseManager::checkpoint_al
 
 ## Bolt (Neo4j drivers)
 
-With `--bolt ADDR` the server also speaks Bolt 4.4 and 5.0–5.4, the protocol of the
-official Neo4j drivers:
+With `bolt = "ADDR"` in `[server]` the server also speaks Bolt 4.4 and 5.0–5.4, the
+protocol of the official Neo4j drivers:
 
-```bash
-cargo run --release -p graphbuff-server -- --bolt 127.0.0.1:7687 --token s3cret
+```toml
+[server]
+bolt = "127.0.0.1:7687"
+
+[security]
+token = "s3cret"
 ```
 
 ```python
@@ -696,11 +768,12 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   `elementId()` returns) and paths,
   dates, times, date-times with offsets or named time zones, durations and points, in both
   directions. Byte arrays are refused.
-* **Authentication:** `basic` with a user's name and password; with `--token`, also
+* **Authentication:** `basic` with a user's name and password; with `security.token`, also
   `basic` with the token as the password (any user name) or `bearer` with the token.
 * **Transactions and limits** behave as over HTTP: an explicit transaction holds its
-  database's write lock until it ends, and is rolled back after `--tx-timeout` seconds
-  without a message or when its connection closes; `--query-timeout` caps every statement.
+  database's write lock until it ends, and is rolled back after
+  `queries.transaction_timeout_seconds` without a message or when its connection closes;
+  `queries.query_timeout_ms` caps every statement.
   Error codes follow Neo4j's (`Neo.ClientError.Statement.SyntaxError`,
   `Neo.ClientError.Transaction.TransactionTimedOut`, ...).
 * **Administration** goes to the `system` database, as with Neo4j (the name is
@@ -718,18 +791,18 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
 
 Clients log in with a user name and password: HTTP Basic authentication
 (`Authorization: Basic …`) or Bolt's `basic` scheme. Accounts cannot be turned off; a
-`--token` works alongside them, as an administrator. The accounts live in the system database of
+`security.token` works alongside them, as an administrator. The accounts live in the system database of
 the data directory (`DATA/system/`, synced on every commit; in memory with
-`--in-memory`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
+`mode = "memory"`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
 format. A hash made with other parameters is replaced at the user's next login.
 
 ```bash
 # the first administrator, offline, while no server uses the data directory (password
 # from GRAPHBUFF_ADMIN_PASSWORD or _FILE, else asked for twice without echo on a
-# terminal, else the first line of standard input); it finds the data directory as the
-# server does, and refuses when there is an administrator already
+# terminal, else the first line of standard input); it reads the same config file as
+# the server (or --config FILE), and refuses when there is an administrator already
 graphbuff-server admin init root
-graphbuff-server --bolt 127.0.0.1:7687
+graphbuff-server
 
 # lost the password? set a new one, offline (from GRAPHBUFF_PASSWORD or asked for)
 graphbuff-server admin reset-password root
@@ -749,8 +822,8 @@ ignored, so they may stay set.
 Without these variables, a server started in a terminal asks for the administrator's
 name and password (twice, without echo). Without a terminal (a service, a container
 without `-it`, CI) it does not start, and says what to do; neither does a server with
-`--in-memory`, whose accounts would be lost at every stop. With `--token` it starts
-anyway, and the token holder creates the users.
+`mode = "memory"`, whose accounts would be lost at every stop. With `security.token` it
+starts anyway, and the token holder creates the users.
 
 ```powershell
 # Windows: the same, asking without echo (PowerShell 7)
@@ -785,11 +858,20 @@ optional build feature, with two choices of crypto provider for rustls:
 ```bash
 cargo build --release -p graphbuff-server --features tls             # ring (needs a C compiler)
 cargo build --release -p graphbuff-server --features tls-rustcrypto  # pure Rust (pre-release)
-graphbuff-server --tls-cert cert.pem --tls-key key.pem --bolt 0.0.0.0:7687
+```
+
+```toml
+[server]
+bind = "0.0.0.0:7475"
+bolt = "0.0.0.0:7687"
+
+[security]
+tls_cert = "cert.pem"   # relative to the config file's folder
+tls_key = "key.pem"
 ```
 
 Drivers then connect with `bolt+s://` (or `bolt+ssc://` for a self-signed certificate).
-`--tls-allow-plain` also accepts clients without TLS on the same ports (the first byte
+`tls_allow_plain = true` also accepts clients without TLS on the same ports (the first byte
 tells them apart); without it, plain HTTP requests get a `400` and plain Bolt
 connections are closed.
 
@@ -989,7 +1071,7 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   `FOREACH (x IN list | updates)`,
   `LOAD CSV [WITH HEADERS] FROM 'file:///data.csv' AS row [FIELDTERMINATOR ';']` (files inside
   the import directory only: `Database::set_import_dir` / `DatabaseManager::set_import_dir`,
-  `--import-dir` for the server, the current directory by default in the CLI; each record is a
+  `storage.import_dir` for the server, the current directory by default in the CLI; each record is a
   list of strings, or a map by header; an unquoted empty field is `null`, `""` an empty string),
   `CALL { … }` subqueries (run once per row; import outer variables with `CALL (a, b) { … }`,
   `CALL (*) { … }` or a leading `WITH a, b`; they may change the graph, and a subquery without
@@ -1111,7 +1193,7 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   best first. The index is exact: the same entities and scores as `ORDER BY
   vector.similarity.cosine(n.p, $vector) DESC LIMIT k`. Read queries share an f32 copy of the
   vectors of the last commit (about 4 bytes per dimension per entity, built on the first query
-  after a commit); inside a transaction the query scans what the transaction sees. With `--gpu`
+  after a commit); inside a transaction the query scans what the transaction sees. With `gpu = true` in `[queries]`
   the scores are computed on the GPU (the vectors stay on the device between queries), then the
   rows near the cut are re-scored exactly, so the results do not change: on an RX 5700 XT,
   200,000 768-dimensional vectors answer in about 6 ms against 43 ms on 4 CPU threads

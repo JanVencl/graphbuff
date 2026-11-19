@@ -16,14 +16,17 @@ import pytest
 from neo4j import GraphDatabase, TrustCustomCAs
 from neo4j import exceptions as ex
 
-from graphbuff_server import ROOT, free_port as _free_port, server_binary as _server_binary
+from graphbuff_server import ROOT, clean_env as _clean_env, free_port as _free_port, \
+    server_binary as _server_binary, write_config
 
 CERTS = os.path.join(ROOT, "crates", "server", "tests", "tls")
 
 
-def _start(args, health_url, context=None, env=None):
-    proc = subprocess.Popen([_server_binary(), *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            env=env)
+def _start(settings, health_url, context=None, env=None):
+    """A server with the config `settings` ({"section.key": value})."""
+    settings = {"logs.dir": "-", **settings}
+    proc = subprocess.Popen([_server_binary(), "--config", write_config(settings)], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, env=env if env is not None else _clean_env())
     deadline = time.time() + 20
     while True:
         try:
@@ -36,16 +39,11 @@ def _start(args, health_url, context=None, env=None):
             time.sleep(0.1)
 
 
-def _clean_env(**extra):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
-    env.update(GRAPHBUFF_CONFIG="-", **extra)
-    return env
-
-
 def _offline(data, *args, stdin=None, **env):
     """`graphbuff-server ARGS…` on the data directory `data`, while no server uses it."""
     command, rest = args[0], args[1:]
-    return subprocess.run([_server_binary(), command, "--data", data, *rest], input=stdin, text=True,
+    config = write_config({"storage.data": os.path.abspath(data)})
+    return subprocess.run([_server_binary(), command, "--config", config, *rest], input=stdin, text=True,
                           capture_output=True, env=_clean_env(**env))
 
 
@@ -53,12 +51,12 @@ def _add_user(data, name, password, *roles):
     _offline(data, "users", "add", name, *roles, GRAPHBUFF_PASSWORD=password).check_returncode()
 
 
-def _serve(data, *args):
-    """A server on `data` with Bolt; returns the process and the Bolt URL."""
+def _serve(data, **settings):
+    """A server on `data` with Bolt and more `settings`; returns the process and the Bolt URL."""
     http_port, bolt_port = _free_port(), _free_port()
-    proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                   "--data", data, "--log-dir", "-", *args],
-                  f"http://127.0.0.1:{http_port}/health", env=_clean_env())
+    proc = _start({"server.bind": f"127.0.0.1:{http_port}", "server.bolt": f"127.0.0.1:{bolt_port}",
+                   "storage.data": os.path.abspath(data), **settings},
+                  f"http://127.0.0.1:{http_port}/health")
     return proc, f"bolt://127.0.0.1:{bolt_port}"
 
 
@@ -129,7 +127,7 @@ def test_the_last_administrator_cannot_go():
     with tempfile.TemporaryDirectory() as tmp:
         data = os.path.join(tmp, "data")
         _offline(data, "admin", "init", "root", GRAPHBUFF_ADMIN_PASSWORD="root-password").check_returncode()
-        proc, url = _serve(data, "--token", "tok")
+        proc, url = _serve(data, **{"security.token": "tok"})
         try:
             with GraphDatabase.driver(url, auth=("neo4j", "tok")) as token:
                 for statement in ("DROP USER root", "REVOKE ROLE admin FROM root"):
@@ -182,8 +180,8 @@ def test_first_admin_from_the_environment():
             f.write("boot-password\n")
         env = _clean_env(GRAPHBUFF_ADMIN_USER="boot", GRAPHBUFF_ADMIN_PASSWORD_FILE=secret)
         http_port, bolt_port = _free_port(), _free_port()
-        proc = _start(["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}",
-                       "--in-memory", "--config", "-"],
+        proc = _start({"server.bind": f"127.0.0.1:{http_port}", "server.bolt": f"127.0.0.1:{bolt_port}",
+                       "storage.mode": "memory"},
                       f"http://127.0.0.1:{http_port}/health", env=env)
         try:
             url = f"bolt://127.0.0.1:{bolt_port}"
@@ -204,8 +202,9 @@ def test_first_admin_from_the_environment():
 def tls_server():
     import ssl
     http_port, bolt_port = _free_port(), _free_port()
-    args = ["--bind", f"127.0.0.1:{http_port}", "--bolt", f"127.0.0.1:{bolt_port}", "--in-memory",
-            "--token", "x", "--tls-cert", os.path.join(CERTS, "cert.pem"), "--tls-key", os.path.join(CERTS, "key.pem")]
+    args = {"server.bind": f"127.0.0.1:{http_port}", "server.bolt": f"127.0.0.1:{bolt_port}",
+            "storage.mode": "memory", "security.token": "x",
+            "security.tls_cert": os.path.join(CERTS, "cert.pem"), "security.tls_key": os.path.join(CERTS, "key.pem")}
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "ca.pem"))
     try:
         proc = _start(args, f"https://localhost:{http_port}/health", context)

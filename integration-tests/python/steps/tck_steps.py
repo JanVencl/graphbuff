@@ -125,7 +125,7 @@ def parameters(context):
 @step(r"there exists a procedure (?P<signature>.+):")
 def procedure(context, signature):
     """`test.my.proc(in :: INTEGER?) :: (out :: STRING?)` with a table of inputs and
-    outputs, added through the server's test-procedure endpoint (--test-procedures)."""
+    outputs, added through the server's test-procedure endpoint (queries.test_procedures)."""
     m = re.fullmatch(r"\s*([\w.]+)\((.*)\)\s*::\s*\((.*)\)\s*", signature)
     if not m:
         raise ValueError(f"cannot read the procedure signature `{signature}`")
