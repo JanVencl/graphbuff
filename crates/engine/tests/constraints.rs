@@ -83,7 +83,7 @@ fn unique_constraints() {
         let r = run(&db, "CREATE CONSTRAINT p_id FOR (p:P) REQUIRE p.id IS UNIQUE");
         assert_eq!((r.stats.constraints_added, r.stats.indexes_added), (1, 1), "{store}");
         assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"p_id\", \"UNIQUE\", \"P\", [\"id\"]"]);
-        assert_eq!(rows(&db, "SHOW INDEXES"), ["\"p_id\", \"NODE\", \"P\", [\"id\"]"], "{store}: backing index");
+        assert_eq!(rows(&db, "SHOW INDEXES"), ["\"p_id\", \"NODE\", \"P\", [\"id\"], \"RANGE\", {}"], "{store}: backing index");
 
         violates(store, &db, "CREATE (:P {id: 1})", "both have id = 1");
         violates(store, &db, "CREATE (:P {id: 1.0})", "constraint `p_id`"); // 1 = 1.0
@@ -195,7 +195,7 @@ fn schema_commands() {
         assert_eq!((r.stats.constraints_removed, r.stats.indexes_removed), (1, 1));
         let r = run(&db, "DROP CONSTRAINT u");
         assert_eq!((r.stats.constraints_removed, r.stats.indexes_removed), (1, 0));
-        assert_eq!(rows(&db, "SHOW INDEXES"), ["\"by_id\", \"NODE\", \"P\", [\"id\"]"]);
+        assert_eq!(rows(&db, "SHOW INDEXES"), ["\"by_id\", \"NODE\", \"P\", [\"id\"], \"RANGE\", {}"]);
         run(&db, "DROP INDEX by_id");
         assert!(db.execute("DROP CONSTRAINT u").is_err());
         assert!(!run(&db, "DROP CONSTRAINT u IF EXISTS").stats.contains_updates());

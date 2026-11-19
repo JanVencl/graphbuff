@@ -10,13 +10,14 @@
 //!
 //! ```text
 //! <dir>/LOCK            held for as long as the store is open (one process at a time)
-//! <dir>/graph.snapshot  "GBSNAPv5", last covered sequence number, graph, CRC-32
-//! <dir>/graph.wal       "GBWAL_v5", then records: len u32 | crc u32 | seq u64, ops…
+//! <dir>/graph.snapshot  "GBSNAPv6", last covered sequence number, graph, CRC-32
+//! <dir>/graph.wal       "GBWAL_v6", then records: len u32 | crc u32 | seq u64, ops…
 //! ```
 //!
 //! Version 2 added constraint definitions (to the snapshot, and as log operations).
 //! Version 3 added full index definitions (relationship and composite indexes).
-//! Version 4 added temporal property values (a new value tag), version 5 points (another).
+//! Version 4 added temporal property values (a new value tag), version 5 points (another),
+//! version 6 vector index definitions (and log operation 14 creates one).
 //! Older files are read; an older log is replayed, then the store writes a current
 //! snapshot and starts a current log, so older software rejects the upgraded store
 //! instead of misreading it.
@@ -36,12 +37,14 @@ use crate::memory::SNAPSHOT_VERSION;
 use crate::store::{Adjacency, ConstraintDef, Direction, GraphStore, IndexDef, Scan, Snapshot};
 use crate::{Error, MemoryGraph, NodeId, RelId, Result, Value};
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"GBSNAPv5";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"GBSNAPv6";
+const SNAPSHOT_MAGIC_V5: &[u8; 8] = b"GBSNAPv5";
 const SNAPSHOT_MAGIC_V4: &[u8; 8] = b"GBSNAPv4";
 const SNAPSHOT_MAGIC_V3: &[u8; 8] = b"GBSNAPv3";
 const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"GBSNAPv2";
 const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"GBSNAPv1";
-const WAL_MAGIC: &[u8; 8] = b"GBWAL_v5";
+const WAL_MAGIC: &[u8; 8] = b"GBWAL_v6";
+const WAL_MAGIC_V5: &[u8; 8] = b"GBWAL_v5";
 const WAL_MAGIC_V4: &[u8; 8] = b"GBWAL_v4";
 const WAL_MAGIC_V3: &[u8; 8] = b"GBWAL_v3";
 const WAL_MAGIC_V2: &[u8; 8] = b"GBWAL_v2";
@@ -193,6 +196,10 @@ impl Op {
                 e.u64(id.0);
                 e.str(label);
             }
+            Op::CreateIndex(def) if def.is_vector() => {
+                e.u8(14);
+                def.encode_vector(e);
+            }
             Op::CreateIndex(def) => {
                 e.u8(13);
                 def.encode(e);
@@ -251,6 +258,7 @@ impl Op {
             },
             9 => Op::CreateIndex(IndexDef::decode_v1(d)?),
             13 => Op::CreateIndex(IndexDef::decode(d)?),
+            14 => Op::CreateIndex(IndexDef::decode_vector(d)?),
             10 => Op::DropIndex(d.str()?),
             11 => Op::CreateConstraint(ConstraintDef::decode(d)?),
             12 => Op::DropConstraint(d.str()?),
@@ -390,7 +398,7 @@ impl HybridGraph {
                 .map_err(io(&wal_path, "initializing"))?;
             WAL_MAGIC.len() as u64
         } else {
-            if [WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3, WAL_MAGIC_V4].contains(&&bytes[..8].try_into().unwrap()) {
+            if [WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3, WAL_MAGIC_V4, WAL_MAGIC_V5].contains(&&bytes[..8].try_into().unwrap()) {
                 upgrade = true;
             } else if &bytes[..8] != WAL_MAGIC {
                 return Err(Error::Storage(format!(
@@ -443,6 +451,7 @@ impl HybridGraph {
         let what = path.display().to_string();
         let version = match bytes.get(..8) {
             Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC => SNAPSHOT_VERSION,
+            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V5 => 5,
             Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V4 => 4,
             Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V3 => 3,
             Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V2 => 2,
@@ -1011,16 +1020,17 @@ mod tests {
     }
 
     /// Rewrites the snapshot and log of a closed store as version 1, which had no
-    /// constraint definitions.
+    /// constraint (nor vector index) definitions.
     fn downgrade_to_v1(dir: &Path) {
         let path = dir.join(SNAPSHOT_FILE);
         let bytes = fs::read(&path).unwrap();
         assert_eq!(&bytes[..8], SNAPSHOT_MAGIC);
-        // The body ends with the (empty) constraint list: a u64 length of 0.
+        // The body ends with the (empty) constraint and vector index lists: two u64
+        // lengths of 0.
         let body = &bytes[8..bytes.len() - 4];
-        assert_eq!(&body[body.len() - 8..], &[0u8; 8]);
+        assert_eq!(&body[body.len() - 16..], &[0u8; 16]);
         let mut out = SNAPSHOT_MAGIC_V1.to_vec();
-        out.extend_from_slice(&body[..body.len() - 8]);
+        out.extend_from_slice(&body[..body.len() - 16]);
         let crc = crc32(&out);
         out.extend(crc.to_le_bytes());
         fs::write(&path, out).unwrap();

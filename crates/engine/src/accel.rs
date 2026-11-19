@@ -163,6 +163,8 @@ impl KernelCache {
 #[derive(Clone)]
 pub(crate) struct Accel {
     pub cache: Arc<KernelCache>,
+    /// The vector index matrices of the same committed state.
+    pub vectors: Arc<crate::vector::VectorCache>,
     pub snapshot: Snapshot,
     pub kernels: Arc<dyn Kernels>,
     pub mode: KernelMode,

@@ -45,7 +45,8 @@ pub use persistent::{BulkLoader, DEFAULT_MAX_TRANSACTION_BYTES, PersistentGraph,
 pub use storage::{StorageMode, open_store};
 pub use store::{
     Adjacency, BoxedStore, ConstraintDef, ConstraintKind, Direction, Expansion, GraphStore,
-    IndexDef, IndexEntity, IndexStats, MAX_INDEX_PROPERTIES, Scan, Snapshot, ValueRange,
+    IndexDef, IndexEntity, IndexKind, IndexStats, MAX_INDEX_PROPERTIES, MAX_VECTOR_DIMENSIONS, Scan, Snapshot,
+    ValueRange, VectorSimilarity,
 };
 pub use spatial::{Crs, Point};
 pub use temporal::{Duration, Temporal, TemporalKind};

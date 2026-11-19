@@ -97,7 +97,7 @@ fn composite_node_indexes() {
         assert_eq!(r.stats.indexes_added, 1);
         assert_eq!(
             rows(&db, "SHOW INDEXES"),
-            ["\"p_ab\", \"NODE\", \"P\", [\"a\", \"b\"]"],
+            ["\"p_ab\", \"NODE\", \"P\", [\"a\", \"b\"], \"RANGE\", {}"],
             "{store}"
         );
         // Order matters: (b, a) is another index; (a, b) again is a duplicate.
@@ -156,7 +156,7 @@ fn composite_node_indexes() {
         run(&db, "CREATE INDEX ON :P(b, a)");
         assert_eq!(
             rows(&db, "SHOW INDEXES"),
-            ["\"index_P_b_a\", \"NODE\", \"P\", [\"b\", \"a\"]"],
+            ["\"index_P_b_a\", \"NODE\", \"P\", [\"b\", \"a\"], \"RANGE\", {}"],
             "{store}"
         );
     });
@@ -202,8 +202,8 @@ fn relationship_indexes() {
         assert_eq!(
             rows(&db, "SHOW INDEXES"),
             [
-                "\"road_km\", \"RELATIONSHIP\", \"ROAD\", [\"km\"]",
-                "\"road_name\", \"RELATIONSHIP\", \"ROAD\", [\"name\"]",
+                "\"road_km\", \"RELATIONSHIP\", \"ROAD\", [\"km\"], \"RANGE\", {}",
+                "\"road_name\", \"RELATIONSHIP\", \"ROAD\", [\"name\"], \"RANGE\", {}",
             ],
             "{store}"
         );

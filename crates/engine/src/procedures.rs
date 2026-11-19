@@ -180,6 +180,12 @@ impl<'a> ProcedureContext<'a> {
         }
     }
 
+    /// The vector index cache and the committed state the call reads, if it reads one
+    /// (not inside a transaction).
+    pub(crate) fn vectors(&self) -> Option<(&'a crate::vector::VectorCache, &'a graphbuff_core::Snapshot)> {
+        self.accel.map(|a| (&*a.vectors, &a.snapshot))
+    }
+
     /// Fails if the query ran out of time or was cancelled; long procedures call it
     /// between steps.
     pub fn check_interrupt(&self) -> Result<()> {
@@ -498,23 +504,27 @@ fn register_builtins(p: &mut Procedures) {
         },
     );
     add(
-        ProcedureSignature::new("db.indexes", NONE, ["name", "entityType", "labelOrType", "properties"])
-            .description("The property indexes (as SHOW INDEXES)."),
-        |ctx, _| {
-            Ok(ctx
-                .store()
-                .indexes()
-                .into_iter()
-                .map(|d| {
-                    vec![
-                        Value::String(d.name),
-                        Value::String(d.entity.text().into()),
-                        Value::String(d.label),
-                        strings(d.properties),
-                    ]
-                })
-                .collect())
-        },
+        ProcedureSignature::new(
+            "db.indexes",
+            NONE,
+            ["name", "entityType", "labelOrType", "properties", "type", "options"],
+        )
+        .description("The property and vector indexes (as SHOW INDEXES)."),
+        |ctx, _| Ok(ctx.store().indexes().into_iter().map(crate::vector::index_row).collect()),
+    );
+    add(
+        ProcedureSignature::new("db.index.vector.queryNodes", ["indexName", "numberOfNearestNeighbours", "query"], ["node", "score"])
+            .description("The nodes of a vector index most similar to a vector, best first, with their scores."),
+        |ctx, args| crate::vector::query_index(ctx, graphbuff_core::IndexEntity::Node, args),
+    );
+    add(
+        ProcedureSignature::new(
+            "db.index.vector.queryRelationships",
+            ["indexName", "numberOfNearestNeighbours", "query"],
+            ["relationship", "score"],
+        )
+        .description("The relationships of a vector index most similar to a vector, best first, with their scores."),
+        |ctx, args| crate::vector::query_index(ctx, graphbuff_core::IndexEntity::Relationship, args),
     );
     add(
         ProcedureSignature::new("db.constraints", NONE, ["name", "type", "label", "properties"])

@@ -74,9 +74,9 @@ Feature: Indexes
     And the response body should contain JSON:
       """
       {
-        "columns": ["name", "entityType", "labelOrType", "properties"],
+        "columns": ["name", "entityType", "labelOrType", "properties", "type", "options"],
         "rows": [
-          ["person_idx", "NODE", "Person", ["email"]]
+          ["person_idx", "NODE", "Person", ["email"], "RANGE", {}]
         ]
       }
       """

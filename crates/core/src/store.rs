@@ -529,8 +529,84 @@ impl IndexEntity {
 /// Most properties a composite index may have (its keys must fit a B+tree key).
 pub const MAX_INDEX_PROPERTIES: usize = 16;
 
-/// A property index: on one or more properties of the nodes with a label, or of the
-/// relationships of a type.
+/// Most dimensions a vector index may have.
+pub const MAX_VECTOR_DIMENSIONS: u32 = 4096;
+
+/// How vectors are compared. Scores are normalized to [0, 1] as Neo4j does, higher
+/// meaning more similar: cosine `(1 + cos) / 2`, euclidean `1 / (1 + d²)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VectorSimilarity {
+    Cosine,
+    Euclidean,
+}
+
+impl VectorSimilarity {
+    /// `'cosine'` or `'euclidean'` (any case), as in index options.
+    pub fn parse(name: &str) -> Option<VectorSimilarity> {
+        match name.to_ascii_lowercase().as_str() {
+            "cosine" => Some(VectorSimilarity::Cosine),
+            "euclidean" => Some(VectorSimilarity::Euclidean),
+            _ => None,
+        }
+    }
+
+    /// `COSINE` or `EUCLIDEAN`, as `SHOW INDEXES` shows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            VectorSimilarity::Cosine => "COSINE",
+            VectorSimilarity::Euclidean => "EUCLIDEAN",
+        }
+    }
+
+    /// The normalized score of `a` and `b` (same length); `None` for cosine with a zero
+    /// vector.
+    pub fn score(self, a: &[f64], b: &[f64]) -> Option<f64> {
+        match self {
+            VectorSimilarity::Cosine => {
+                let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
+                for (x, y) in a.iter().zip(b) {
+                    dot += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                if na == 0.0 || nb == 0.0 {
+                    return None;
+                }
+                let cos = (dot / (na * nb).sqrt()).clamp(-1.0, 1.0);
+                Some((1.0 + cos) / 2.0)
+            }
+            VectorSimilarity::Euclidean => {
+                let d2: f64 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+                Some(1.0 / (1.0 + d2))
+            }
+        }
+    }
+}
+
+/// What an index is: a property index answering seeks, or a vector index answering
+/// nearest-neighbour queries over one list-of-numbers property.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum IndexKind {
+    #[default]
+    Range,
+    Vector {
+        dimensions: u32,
+        similarity: VectorSimilarity,
+    },
+}
+
+impl IndexKind {
+    /// `RANGE` or `VECTOR`, as `SHOW INDEXES` lists it.
+    pub fn text(self) -> &'static str {
+        match self {
+            IndexKind::Range => "RANGE",
+            IndexKind::Vector { .. } => "VECTOR",
+        }
+    }
+}
+
+/// An index on one or more properties of the nodes with a label, or of the
+/// relationships of a type: a property (range) index, or a vector index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDef {
     pub name: String,
@@ -539,6 +615,7 @@ pub struct IndexDef {
     pub label: String,
     /// One property, or several for a composite index (in order).
     pub properties: Vec<String>,
+    pub kind: IndexKind,
 }
 
 impl IndexDef {
@@ -549,7 +626,31 @@ impl IndexDef {
             entity: IndexEntity::Node,
             label: label.into(),
             properties: vec![property.into()],
+            kind: IndexKind::Range,
         }
+    }
+
+    /// A vector index on one property of the nodes with `label`, or of the relationships
+    /// of a type (`entity`).
+    pub fn vector(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        label: impl Into<String>,
+        property: impl Into<String>,
+        dimensions: u32,
+        similarity: VectorSimilarity,
+    ) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            entity,
+            label: label.into(),
+            properties: vec![property.into()],
+            kind: IndexKind::Vector { dimensions, similarity },
+        }
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self.kind, IndexKind::Vector { .. })
     }
 
     /// A single-property relationship index.
@@ -563,11 +664,18 @@ impl IndexDef {
             entity: IndexEntity::Relationship,
             label: rel_type.into(),
             properties: vec![property.into()],
+            kind: IndexKind::Range,
         }
     }
 
-    /// Whether `self` indexes exactly these properties of `label` (a label or type).
+    /// Whether `self` is a property (range) index on exactly these properties of
+    /// `label` (a label or type). Vector indexes cover nothing: they answer no seeks.
     pub fn covers(&self, entity: IndexEntity, label: &str, properties: &[String]) -> bool {
+        self.kind == IndexKind::Range && self.same_schema(entity, label, properties)
+    }
+
+    /// Whether `self` is on exactly these properties of `label`, whatever its kind.
+    pub fn same_schema(&self, entity: IndexEntity, label: &str, properties: &[String]) -> bool {
         self.entity == entity && self.label == label && self.properties == properties
     }
 
@@ -584,6 +692,16 @@ impl IndexDef {
     pub fn check_new(&self, existing: &[IndexDef]) -> Result<()> {
         if self.properties.is_empty() {
             return Err(Error::Semantic("an index needs at least one property".into()));
+        }
+        if let IndexKind::Vector { dimensions, .. } = self.kind {
+            if self.properties.len() != 1 {
+                return Err(Error::Semantic("a vector index is on exactly one property".into()));
+            }
+            if dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
+                return Err(Error::Semantic(format!(
+                    "a vector index needs 1 to {MAX_VECTOR_DIMENSIONS} dimensions, not {dimensions}"
+                )));
+            }
         }
         if self.properties.len() > MAX_INDEX_PROPERTIES {
             return Err(Error::Semantic(format!(
@@ -604,9 +722,10 @@ impl IndexDef {
                     self.name
                 )));
             }
-            if ix.covers(self.entity, &self.label, &self.properties) {
+            if ix.is_vector() == self.is_vector() && ix.same_schema(self.entity, &self.label, &self.properties) {
                 return Err(Error::Constraint(format!(
-                    "an index on {} already exists",
+                    "{} index on {} already exists",
+                    if self.is_vector() { "a vector" } else { "an" },
                     self.target()
                 )));
             }
@@ -642,7 +761,50 @@ impl IndexDef {
             entity,
             label,
             properties,
+            kind: IndexKind::Range,
         })
+    }
+
+    /// Encodes a vector index: the definition as [`encode`](Self::encode) writes it, then
+    /// its dimensions and similarity (persistent format 9, hybrid log op 14, memory
+    /// snapshot 6).
+    pub(crate) fn encode_vector(&self, e: &mut Encoder) {
+        let IndexKind::Vector { dimensions, similarity } = self.kind else {
+            unreachable!("encode_vector of a range index")
+        };
+        self.encode(e);
+        e.u32(dimensions);
+        e.u8(match similarity {
+            VectorSimilarity::Cosine => 1,
+            VectorSimilarity::Euclidean => 2,
+        });
+    }
+
+    pub(crate) fn decode_vector(d: &mut Decoder) -> Result<IndexDef> {
+        let mut def = IndexDef::decode(d)?;
+        let dimensions = d.u32()?;
+        let similarity = match d.u8()? {
+            1 => VectorSimilarity::Cosine,
+            2 => VectorSimilarity::Euclidean,
+            t => return Err(d.corrupt(format!("unknown vector similarity {t}"))),
+        };
+        if def.properties.len() != 1 || dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
+            return Err(d.corrupt(format!("bad vector index `{}`", def.name)));
+        }
+        def.kind = IndexKind::Vector { dimensions, similarity };
+        Ok(def)
+    }
+
+    pub(crate) fn encode_vector_list(defs: &[IndexDef], e: &mut Encoder) {
+        e.len(defs.len());
+        for d in defs {
+            d.encode_vector(e);
+        }
+    }
+
+    pub(crate) fn decode_vector_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
+        let n = d.len(8)?;
+        (0..n).map(|_| IndexDef::decode_vector(d)).collect()
     }
 
     /// Decodes a single-property node index as older formats wrote it: name, label,
