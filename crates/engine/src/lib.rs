@@ -69,7 +69,7 @@ pub use graphbuff_core::maintenance::BACKUP_MARKER;
 pub use graphbuff_cypher as cypher;
 pub use graphbuff_cypher::ast::{ExistingDatabase, QueryMode};
 pub use procedures::{
-    Procedure, ProcedureContext, ProcedureFn, ProcedureParam, ProcedureRows, ProcedureSignature, Procedures,
+    Procedure, ProcedureContext, ProcedureFn, ProcedureParam, ProcedureRows, ProcedureSignature, ProcedureType, Procedures,
 };
 pub use transaction::Transaction;
 pub use accel::{KernelMode, KernelStats, kernel_stats};

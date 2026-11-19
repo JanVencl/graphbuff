@@ -56,11 +56,89 @@ pub struct ProcedureSignature {
     pub description: String,
 }
 
-/// A procedure parameter: its name and, if it is optional, its default.
+/// A procedure parameter: its name, its type and, if it is optional, its default.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcedureParam {
     pub name: String,
+    pub ty: ProcedureType,
     pub default: Option<Value>,
+}
+
+/// The type of a procedure parameter. Every type takes `null`; `FLOAT` and `NUMBER` take
+/// integers too. An argument of another type fails the call: at compile time when its
+/// type is known then (a literal), else when the call runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProcedureType {
+    #[default]
+    Any,
+    Boolean,
+    Integer,
+    Float,
+    Number,
+    String,
+    List,
+    Map,
+    Node,
+    Relationship,
+    Path,
+}
+
+impl ProcedureType {
+    /// The type named `text` as signatures write it (`INTEGER`, `INTEGER?`, `LIST OF ANY?`,
+    /// case-insensitive); `None` for an unknown name.
+    pub fn parse(text: &str) -> Option<ProcedureType> {
+        let t = text.trim().trim_end_matches('?').trim().to_ascii_uppercase();
+        let t = if t.starts_with("LIST") { "LIST" } else { t.as_str() };
+        Some(match t {
+            "ANY" => ProcedureType::Any,
+            "BOOLEAN" => ProcedureType::Boolean,
+            "INTEGER" => ProcedureType::Integer,
+            "FLOAT" => ProcedureType::Float,
+            "NUMBER" => ProcedureType::Number,
+            "STRING" => ProcedureType::String,
+            "LIST" => ProcedureType::List,
+            "MAP" => ProcedureType::Map,
+            "NODE" => ProcedureType::Node,
+            "RELATIONSHIP" => ProcedureType::Relationship,
+            "PATH" => ProcedureType::Path,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ProcedureType::Any => "ANY",
+            ProcedureType::Boolean => "BOOLEAN",
+            ProcedureType::Integer => "INTEGER",
+            ProcedureType::Float => "FLOAT",
+            ProcedureType::Number => "NUMBER",
+            ProcedureType::String => "STRING",
+            ProcedureType::List => "LIST",
+            ProcedureType::Map => "MAP",
+            ProcedureType::Node => "NODE",
+            ProcedureType::Relationship => "RELATIONSHIP",
+            ProcedureType::Path => "PATH",
+        }
+    }
+
+    /// Whether an argument of this type may be `v`.
+    pub fn accepts(self, v: &Value) -> bool {
+        use ProcedureType as P;
+        matches!(
+            (self, v),
+            (P::Any, _)
+                | (_, Value::Null)
+                | (P::Boolean, Value::Bool(_))
+                | (P::Integer, Value::Int(_))
+                | (P::Float | P::Number, Value::Int(_) | Value::Float(_))
+                | (P::String, Value::String(_))
+                | (P::List, Value::List(_))
+                | (P::Map, Value::Map(_))
+                | (P::Node, Value::Node(_))
+                | (P::Relationship, Value::Rel(_))
+                | (P::Path, Value::Path(_))
+        )
+    }
 }
 
 impl ProcedureSignature {
@@ -78,6 +156,7 @@ impl ProcedureSignature {
                 .into_iter()
                 .map(|n| ProcedureParam {
                     name: n.into(),
+                    ty: ProcedureType::Any,
                     default: None,
                 })
                 .collect(),
@@ -90,8 +169,17 @@ impl ProcedureSignature {
     pub fn optional(mut self, name: &str, default: impl Into<Value>) -> Self {
         self.inputs.push(ProcedureParam {
             name: name.to_string(),
+            ty: ProcedureType::Any,
             default: Some(default.into()),
         });
+        self
+    }
+
+    /// Gives the parameters types, in order (the rest stay `ANY`).
+    pub fn input_types(mut self, types: impl IntoIterator<Item = ProcedureType>) -> Self {
+        for (p, ty) in self.inputs.iter_mut().zip(types) {
+            p.ty = ty;
+        }
         self
     }
 
@@ -110,9 +198,15 @@ impl ProcedureSignature {
         let inputs: Vec<String> = self
             .inputs
             .iter()
-            .map(|p| match &p.default {
-                Some(d) => format!("{} = {d}", p.name),
-                None => p.name.clone(),
+            .map(|p| {
+                let typed = match p.ty {
+                    ProcedureType::Any => p.name.clone(),
+                    t => format!("{} :: {}", p.name, t.name()),
+                };
+                match &p.default {
+                    Some(d) => format!("{typed} = {d}"),
+                    None => typed,
+                }
             })
             .collect();
         let outputs = if self.outputs.is_empty() {
@@ -206,6 +300,17 @@ impl Procedure {
     /// Runs the procedure with `args` (one per parameter, defaults filled in) and checks
     /// that every row has one value per output field.
     pub(crate) fn call(&self, ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<ProcedureRows> {
+        for (p, a) in self.signature.inputs.iter().zip(args) {
+            if !p.ty.accepts(a) {
+                return Err(Error::Type(format!(
+                    "procedure `{}` expects {} for `{}`, got {}",
+                    self.signature.name,
+                    p.ty.name(),
+                    p.name,
+                    a.type_name()
+                )));
+            }
+        }
         let rows = (self.body)(ctx, args)?;
         let width = self.signature.outputs.len();
         if let Some(r) = rows.iter().find(|r| r.len() != width) {

@@ -130,10 +130,12 @@ def procedure(context, signature):
     if not m:
         raise ValueError(f"cannot read the procedure signature `{signature}`")
     name, inputs, outputs = m.group(1), _field_names(m.group(2)), _field_names(m.group(3))
+    types = _field_types(m.group(2))
     rows = _rows(context.table)[1:] if context.table is not None else []
     body = {
         "name": name,
         "inputs": inputs,
+        "types": types,
         "outputs": outputs,
         "rows": [[tck_values.to_param(tck_values.parse(c)) for c in row] for row in rows],
     }
@@ -141,6 +143,11 @@ def procedure(context, signature):
     answer = server.http.post(f"{server.url}/db/{DB}/test-procedure", json=body, timeout=30).json()
     if "error" in answer:
         raise AssertionError(f"registering {name} failed: {answer['error']}")
+
+
+def _field_types(text):
+    """`a :: INTEGER?, b :: STRING?` → ['INTEGER?', 'STRING?']."""
+    return [f.split("::")[1].strip() for f in text.split(",") if f.strip()]
 
 
 def _field_names(text):

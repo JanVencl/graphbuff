@@ -978,10 +978,8 @@ DROP CONSTRAINT user_id;
 
 ## Supported Cypher
 
-**openCypher TCK:** 3,894 of the 3,896 scenarios in the openCypher TCK 2024.3 pass (99.9 %).
-The TCK is the official compatibility suite for openCypher. The two that fail expect a
-compile-time error for a procedure argument of the wrong type; procedure arguments have no
-declared types in graphbuff. The TCK
+**openCypher TCK:** all 3,896 scenarios in the openCypher TCK 2024.3 pass (100 %).
+The TCK is the official compatibility suite for openCypher. The TCK
 checks errors only by category, not by detail code. The suite and the full table per
 feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
 
@@ -1006,15 +1004,21 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   `DatabaseManager::register_procedure` for every database):
 
   ```rust
-  use graphbuff::{ProcedureSignature, Value};
+  use graphbuff::{ProcedureSignature, ProcedureType, Value};
   db.register_procedure(
-      ProcedureSignature::new("my.range", ["n"], ["i"]).description("0 .. n-1"),
+      ProcedureSignature::new("my.range", ["n"], ["i"])
+          .input_types([ProcedureType::Integer])
+          .description("0 .. n-1"),
       |_ctx, args| {
           let n = match args[0] { Value::Int(n) => n, _ => 0 };
           Ok((0..n).map(|i| vec![Value::Int(i)]).collect())
       },
   )?;
   ```
+
+  Parameters are `ANY` unless given types (`input_types`); an argument of another type
+  fails the call, at compile time when it is a literal (`null` fits every type, an integer
+  fits `FLOAT` and `NUMBER`).
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity

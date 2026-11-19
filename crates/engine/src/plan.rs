@@ -949,6 +949,9 @@ fn plan_procedure_call(
             sig.text()
         )));
     }
+    for (a, p) in args.iter().zip(&sig.inputs) {
+        typecheck::check_procedure_arg(a, p.ty, &sig.name, &p.name)?;
+    }
     for p in &sig.inputs[args.len()..] {
         args.push(Expr::Literal(p.default.clone().expect("only optional parameters are left")));
     }

@@ -86,6 +86,38 @@ fn common(tys: impl Iterator<Item = Ty>) -> Ty {
     out.unwrap_or(Ty::Any)
 }
 
+/// Fails if an argument whose type is known at compile time cannot be a `ty` argument of
+/// procedure `procedure`, parameter `param`.
+pub(crate) fn check_procedure_arg(
+    e: &Expr,
+    ty: crate::procedures::ProcedureType,
+    procedure: &str,
+    param: &str,
+) -> Result<()> {
+    use crate::procedures::ProcedureType as P;
+    // Only what is known without variables: their types come from the rows.
+    let t = check(e, &TyEnv::new()).unwrap_or(Ty::Any);
+    let fits = matches!(
+        (ty, &t),
+        (P::Any, _)
+            | (_, Ty::Any | Ty::Null)
+            | (P::Boolean, Ty::Bool)
+            | (P::Integer, Ty::Int)
+            | (P::String, Ty::Str)
+            | (P::Float | P::Number, Ty::Int | Ty::Float)
+            | (P::List, Ty::List(_))
+            | (P::Map, Ty::Map)
+            | (P::Node, Ty::Node)
+            | (P::Relationship, Ty::Rel)
+            | (P::Path, Ty::Path)
+    );
+    if fits {
+        Ok(())
+    } else {
+        Err(invalid(&format!("procedure `{procedure}` expects {} for `{param}`", ty.name()), &t))
+    }
+}
+
 fn invalid(what: &str, t: &Ty) -> Error {
     Error::Semantic(format!("type mismatch: {what}, got {}", t.name()))
 }
