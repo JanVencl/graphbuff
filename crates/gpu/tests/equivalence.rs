@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use graphbuff_core::{Bits, CpuKernels, Csr, Direction, GraphStore, Hop, Kernels, MemoryGraph, NodeId};
+use graphbuff_core::{
+    Bits, CpuKernels, Csr, Direction, GraphStore, Hop, Kernels, MemoryGraph, NodeId, VectorRows, VectorSimilarity,
+};
 use graphbuff_gpu::WgpuKernels;
 
 fn gpu() -> Option<WgpuKernels> {
@@ -171,4 +173,61 @@ fn small_work_stays_on_the_cpu() {
     gpu.wcc(&csr, &all);
     gpu.propagate(&csr, &vec![1; csr.node_count()], Direction::Both, &all).unwrap();
     assert_eq!(gpu.gpu_runs(), 0);
+}
+
+/// Random rows of `dims` values in [-1, 1) (unit length with `unit`).
+fn vector_rows(rng: &mut Rng, n: usize, dims: usize, unit: bool, scale: f64) -> (VectorRows, Vec<Vec<f64>>) {
+    let mut exact = Vec::new();
+    let mut data = Vec::new();
+    for _ in 0..n {
+        let mut v: Vec<f64> = (0..dims).map(|_| (rng.below(2001) as f64 / 1000.0 - 1.0) * scale).collect();
+        if unit {
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-9);
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        data.extend(v.iter().map(|x| *x as f32));
+        exact.push(v);
+    }
+    (VectorRows::new(dims, data), exact)
+}
+
+#[test]
+fn vector_scores_are_within_their_bound() {
+    let Some(gpu) = gpu() else { return };
+    let cpu = CpuKernels::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    for (dims, scale) in [(3, 1.0), (64, 1.0), (768, 1.0), (128, 1000.0)] {
+        for similarity in [VectorSimilarity::Cosine, VectorSimilarity::Euclidean] {
+            let unit = similarity == VectorSimilarity::Cosine;
+            let (rows, exact) = vector_rows(&mut rng, 3000, dims, unit, scale);
+            let (_, q) = vector_rows(&mut rng, 1, dims, unit, scale);
+            let q = &q[0];
+            let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let before = gpu.gpu_runs();
+            let on_gpu = gpu.vector_scores(&rows, q, similarity);
+            assert_eq!(gpu.gpu_runs(), before + 1, "ran on the GPU");
+            assert_eq!(on_gpu.f32_terms, dims as u32);
+            let on_cpu = cpu.vector_scores(&rows, q, similarity);
+            assert_eq!(on_cpu.f32_terms, 0);
+            let (gb, cb) = (
+                on_gpu.error_bound(similarity, rows.max_norm(), qn),
+                on_cpu.error_bound(similarity, rows.max_norm(), qn),
+            );
+            for (i, row) in exact.iter().enumerate() {
+                // In exact arithmetic, on the unrounded vectors.
+                let truth: f64 = match similarity {
+                    VectorSimilarity::Cosine => row.iter().zip(q).map(|(a, b)| a * b).sum(),
+                    VectorSimilarity::Euclidean => row.iter().zip(q).map(|(a, b)| (a - b).powi(2)).sum(),
+                };
+                let what = format!("{similarity:?}, {dims} dims, scale {scale}, row {i}");
+                assert!((on_gpu.values[i] - truth).abs() <= gb, "{what}: GPU {} vs {truth} (bound {gb})", on_gpu.values[i]);
+                assert!((on_cpu.values[i] - truth).abs() <= cb, "{what}: CPU {} vs {truth} (bound {cb})", on_cpu.values[i]);
+            }
+        }
+    }
+    // Squared distances that f32 cannot hold stay on the CPU.
+    let (rows, _) = vector_rows(&mut rng, 10, 4, false, 1e20);
+    let before = gpu.gpu_runs();
+    assert_eq!(gpu.vector_scores(&rows, &[0.0; 4], VectorSimilarity::Euclidean).f32_terms, 0);
+    assert_eq!(gpu.gpu_runs(), before);
 }

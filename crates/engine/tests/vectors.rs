@@ -344,3 +344,44 @@ fn exact_like_order_by() {
         }
     }
 }
+
+/// The same differential check with the scores computed on the GPU (f32 sums), on
+/// tie-heavy data. Skipped without a usable GPU.
+#[cfg(feature = "gpu")]
+#[test]
+fn exact_on_the_gpu() {
+    let gpu = match graphbuff_gpu::WgpuKernels::new() {
+        Ok(k) => std::sync::Arc::new(k.with_min_work(0)),
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    for (similarity, function) in [("cosine", "vector.similarity.cosine"), ("euclidean", "vector.similarity.euclidean")] {
+        for dims in [4, 48] {
+            let db = mem();
+            db.set_kernels(gpu.clone());
+            run(
+                &db,
+                &format!(
+                    "CREATE VECTOR INDEX v FOR (n:V) ON n.e OPTIONS {{indexConfig: \
+                     {{`vector.dimensions`: {dims}, `vector.similarity_function`: '{similarity}'}}}}"
+                ),
+            );
+            let mut rng = Lcg(7 + dims as u64);
+            let creates: Vec<String> = (0..600)
+                .map(|_| format!("(:V {{e: {}}})", vec_lit(&(0..dims).map(|_| rng.coord()).collect::<Vec<_>>())))
+                .collect();
+            run(&db, &format!("CREATE {}", creates.join(", ")));
+            let before = gpu.gpu_runs();
+            for round in 0..12 {
+                let q: Vec<f64> = (0..dims).map(|_| rng.coord()).collect();
+                if q.iter().all(|x| *x == 0.0) {
+                    continue;
+                }
+                same_as_order_by(&db, function, dims, &q, [1, 5, 40, 1000][round % 4]);
+            }
+            assert!(gpu.gpu_runs() > before, "{similarity}: the scores ran on the GPU");
+        }
+    }
+}

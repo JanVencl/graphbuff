@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 
 use graphbuff_core::{
-    Aggregates, CmpOp, Column, CpuKernels, Csr, Direction, Error, ExpandBatch, Hop, Kernels, Mask, Result, Value,
+    Aggregates, CmpOp, Column, CpuKernels, Csr, Direction, Error, ExpandBatch, Hop, Kernels, Mask, Result, Value, VectorRows,
+    VectorScores, VectorSimilarity,
 };
 use wgpu::util::DeviceExt;
 
@@ -77,7 +78,10 @@ struct Gpu {
     triangles: wgpu::ComputePipeline,
     /// `None` without 64-bit float support.
     page_rank: Option<wgpu::ComputePipeline>,
+    vectors: wgpu::ComputePipeline,
     exports: Mutex<Vec<(u64, Arc<DeviceCsr>)>>,
+    /// Vector rows copied to the device, by [`VectorRows::id`], most recent last.
+    vector_rows: Mutex<Vec<(u64, Arc<wgpu::Buffer>)>>,
     /// Buffers a kernel call is done with, for the next to reuse (allocating a large
     /// buffer, and the first touch of its pages, cost more than the kernels do).
     pool: Mutex<Vec<wgpu::Buffer>>,
@@ -313,6 +317,19 @@ impl Kernels for WgpuKernels {
         self.cpu.wcc(csr, types)
     }
 
+    fn vector_scores(&self, rows: &VectorRows, query: &[f64], similarity: VectorSimilarity) -> VectorScores {
+        // f32 sums cannot hold squared distances near f32::MAX: those stay on the CPU.
+        let query_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let in_range = (rows.max_norm() + query_norm).powi(2) < 1e30;
+        if in_range && self.on_gpu(rows.data().len()) {
+            let scores = self.ran(self.gpu.vector_scores(rows, query, similarity));
+            if let Some(values) = scores {
+                return VectorScores { values, f32_terms: rows.dims() as u32 };
+            }
+        }
+        self.cpu.vector_scores(rows, query, similarity)
+    }
+
     fn triangles(&self, csr: &Csr, types: &[u32]) -> Vec<u64> {
         if self.on_gpu(pull_work(csr, Direction::Outgoing, types)) {
             let (offsets, targets) = self.cpu.oriented_neighbours(csr, types);
@@ -457,6 +474,8 @@ impl Gpu {
             wcc_jump: pipeline(shaders::wcc(), "jump"),
             triangles: pipeline(shaders::triangles(), "main"),
             page_rank: f64.then(|| pipeline(shaders::page_rank(), "main")),
+            vectors: pipeline(shaders::vectors(), "main"),
+            vector_rows: Mutex::new(Vec::new()),
             max_binding: limits.max_storage_buffer_binding_size.min(limits.max_buffer_size),
             device,
             queue,
@@ -659,6 +678,55 @@ impl Gpu {
             return None;
         }
         Some(staging.into_iter().map(|(b, len)| Readback { gpu: self, buffer: Some(b), len: len as usize }).collect())
+    }
+
+    /// The device copy of `rows` (the last [`KEPT_EXPORTS`] are kept), or `None` if it is
+    /// too large.
+    fn vector_rows(&self, rows: &VectorRows) -> Option<Arc<wgpu::Buffer>> {
+        let mut kept = self.vector_rows.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = kept.iter().position(|(id, _)| *id == rows.id()) {
+            let entry = kept.remove(k);
+            let b = entry.1.clone();
+            kept.push(entry);
+            return Some(b);
+        }
+        // Column by column (see the shader).
+        let (n, d) = (rows.len(), rows.dims());
+        let mut columns = vec![0f32; n * d];
+        for (i, row) in rows.data().chunks_exact(d).enumerate() {
+            for (k, x) in row.iter().enumerate() {
+                columns[k * n + i] = *x;
+            }
+        }
+        let b = Arc::new(self.upload("vector rows", bytes(&columns))?);
+        kept.push((rows.id(), b.clone()));
+        if kept.len() > KEPT_EXPORTS {
+            kept.remove(0);
+        }
+        Some(b)
+    }
+
+    fn vector_scores(&self, rows: &VectorRows, query: &[f64], similarity: VectorSimilarity) -> Option<Vec<f64>> {
+        let n = rows.len();
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        let device_rows = self.vector_rows(rows)?;
+        let q: Vec<f32> = query.iter().map(|x| *x as f32).collect();
+        let query_buf = self.input("vector query", bytes(&q))?;
+        let out = self.zeroed("vector scores", n as u64 * 4)?;
+        let slot = match similarity {
+            VectorSimilarity::Cosine => 0,
+            VectorSimilarity::Euclidean => 1,
+        };
+        let params = self.params(n as u32, rows.dims() as u32, false, slot);
+        let mut enc = self.encoder();
+        self.dispatch(&mut enc, &self.vectors, &params, &[&device_rows, &query_buf, &out], n as u32);
+        let read = self.finish(enc, &[(&out, n as u64 * 4)])?;
+        let values: Vec<f32> = read[0].get();
+        drop(read);
+        self.recycle([query_buf, out]);
+        Some(values.into_iter().map(f64::from).collect())
     }
 
     fn fail(&self, m: &str) {

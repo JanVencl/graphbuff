@@ -1107,7 +1107,11 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   best first. The index is exact: the same entities and scores as `ORDER BY
   vector.similarity.cosine(n.p, $vector) DESC LIMIT k`. Read queries share an f32 copy of the
   vectors of the last commit (about 4 bytes per dimension per entity, built on the first query
-  after a commit); inside a transaction the query scans what the transaction sees.
+  after a commit); inside a transaction the query scans what the transaction sees. With `--gpu`
+  the scores are computed on the GPU (the vectors stay on the device between queries), then the
+  rows near the cut are re-scored exactly, so the results do not change: on an RX 5700 XT,
+  200,000 768-dimensional vectors answer in about 6 ms against 43 ms on 4 CPU threads
+  (`vecbench`).
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship

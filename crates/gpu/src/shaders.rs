@@ -285,6 +285,42 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 ";
 
+/// Vector scores: per row (`p.n` rows of `p.arg` values, stored column by column so that
+/// neighbouring invocations read neighbouring values), the dot product with the query
+/// (`p.slot` 0, cosine) or the squared distance to it (`p.slot` 1, euclidean), summed in
+/// `f32` in index order.
+const VECTORS: &str = r"
+@group(0) @binding(1) var<storage, read> rows: array<f32>;
+@group(0) @binding(2) var<storage, read> query: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = idx(wg, nwg, lid);
+    if (i >= p.n) {
+        return;
+    }
+    let d = p.arg;
+    var s = 0.0;
+    if (p.slot == 0u) {
+        for (var k = 0u; k < d; k = k + 1u) {
+            s = s + rows[k * p.n + i] * query[k];
+        }
+    } else {
+        for (var k = 0u; k < d; k = k + 1u) {
+            let x = rows[k * p.n + i] - query[k];
+            s = s + x * x;
+        }
+    }
+    out[i] = s;
+}
+";
+
+pub(crate) fn vectors() -> String {
+    format!("{COMMON}{VECTORS}")
+}
+
 pub(crate) fn propagate() -> String {
     format!("{COMMON}{PROPAGATE}")
 }
