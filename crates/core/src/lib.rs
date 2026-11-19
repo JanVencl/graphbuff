@@ -36,7 +36,8 @@ mod value;
 pub use csr::{Csr, CsrAdjacency};
 pub use error::{Error, Result};
 pub use kernels::{
-    Aggregates, Bits, CmpOp, Column, CpuKernels, ExpandBatch, Hop, Kernels, Mask, Num, label_mask,
+    Aggregates, Bits, CmpOp, Column, CpuKernels, ExpandBatch, Hop, Kernels, Mask, Num, VectorRows, VectorScores,
+    label_mask,
 };
 pub use hybrid::{HybridGraph, HybridOptions, SyncPolicy};
 pub use maintenance::{BackupInfo, CheckReport};

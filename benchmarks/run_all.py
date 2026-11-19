@@ -3,7 +3,7 @@
     python benchmarks/run_all.py                 all benchmarks, default sizes
     python benchmarks/run_all.py --quick         small graphs (a smoke run, a few minutes)
     python benchmarks/run_all.py --only adjbench txbench
-    python benchmarks/run_all.py --no-gpu        skip gpubench (needs a GPU and --features gpu)
+    python benchmarks/run_all.py --no-gpu        skip gpubench and vecbench (need --features gpu)
     python benchmarks/run_all.py --list          list the benchmarks
 
 The benchmarks are the release-built examples in crates/engine/examples. Each one's output
@@ -31,6 +31,8 @@ BENCHMARKS = {
                 [], ["20000"]),
     "gpubench": ("GPU kernels vs CPU kernels", ["gpu"],
                  [], ["--people", "50000", "--reps", "3"]),
+    "vecbench": ("vector index queries vs ORDER BY similarity, CPU and GPU", ["gpu"],
+                 [], ["--docs", "20000", "--dims", "128", "--reps", "3"]),
 }
 
 

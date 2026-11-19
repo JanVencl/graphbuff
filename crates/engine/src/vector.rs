@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 
 use graphbuff_core::{
-    Error, GraphStore, IndexDef, IndexEntity, IndexKind, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result, Snapshot, Value,
-    VectorSimilarity as Similarity,
+    Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result, Snapshot,
+    Value, VectorRows, VectorSimilarity as Similarity,
 };
 
 use crate::procedures::{ProcedureContext, ProcedureRows};
@@ -227,66 +227,44 @@ fn for_each_entity(
 pub(crate) struct Matrix {
     def: IndexDef,
     ids: Vec<u64>,
-    data: Vec<f32>,
-    /// The largest row norm (euclidean), bounding the f32 rounding error of a score.
-    max_norm: f64,
+    rows: VectorRows,
 }
 
 impl Matrix {
     fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Matrix> {
         let (dimensions, similarity) = vector_params(def);
-        let mut m = Matrix {
-            def: def.clone(),
-            ids: Vec::new(),
-            data: Vec::new(),
-            max_norm: 0.0,
-        };
+        let (mut ids, mut data) = (Vec::new(), Vec::new());
         for_each_entity(store, def, interrupt, |id, value| {
             let Some(v) = indexed_vector(&value, dimensions, similarity) else { return };
-            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let scale = if similarity == Similarity::Cosine { 1.0 / norm } else { 1.0 };
-            m.ids.push(id);
-            m.data.extend(v.iter().map(|x| (x * scale) as f32));
-            if similarity == Similarity::Euclidean {
-                m.max_norm = m.max_norm.max(norm);
-            }
+            let scale = match similarity {
+                Similarity::Cosine => 1.0 / v.iter().map(|x| x * x).sum::<f64>().sqrt(),
+                Similarity::Euclidean => 1.0,
+            };
+            ids.push(id);
+            data.extend(v.iter().map(|x| (x * scale) as f32));
         })?;
-        Ok(m)
+        Ok(Matrix { def: def.clone(), ids, rows: VectorRows::new(dimensions as usize, data) })
     }
 
-    /// Approximate scores (f32 rows, f64 sums) of every row against `q`, and how far
-    /// one may be from the exact score of the stored vector.
-    fn approximate(&self, q: &[f64]) -> (Vec<f64>, f64) {
-        let (dimensions, similarity) = vector_params(&self.def);
-        let d = dimensions as usize;
+    /// Approximate scores of every row against `q`, from `kernels` (the GPU, when the
+    /// database has one), and a bound on how far one may be from the exact score of the
+    /// stored vector.
+    fn approximate(&self, q: &[f64], kernels: &dyn Kernels) -> (Vec<f64>, f64) {
+        let (_, similarity) = vector_params(&self.def);
+        let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         match similarity {
             Similarity::Cosine => {
-                let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
                 let unit: Vec<f64> = q.iter().map(|x| x / qn).collect();
-                let scores = self
-                    .data
-                    .chunks_exact(d)
-                    .map(|row| {
-                        let dot: f64 = row.iter().zip(&unit).map(|(r, u)| f64::from(*r) * u).sum();
-                        (1.0 + dot.clamp(-1.0, 1.0)) / 2.0
-                    })
-                    .collect();
-                // Rows rounded to f32 move a dot product of unit vectors by < 2^-23.
-                (scores, 1e-6)
+                let s = kernels.vector_scores(&self.rows, &unit, similarity);
+                // The score is (1 + dot) / 2: it moves by half as much as the dot product.
+                let bound = s.error_bound(similarity, 1.0, 1.0);
+                (s.values.iter().map(|dot| (1.0 + dot.clamp(-1.0, 1.0)) / 2.0).collect(), bound)
             }
             Similarity::Euclidean => {
-                let scores = self
-                    .data
-                    .chunks_exact(d)
-                    .map(|row| {
-                        let d2: f64 = row.iter().zip(q).map(|(r, x)| (f64::from(*r) - x).powi(2)).sum();
-                        1.0 / (1.0 + d2)
-                    })
-                    .collect();
-                // |Δd²| <= 2^-23 |a - b| |b| for rows rounded to f32, and the score moves
-                // by at most |Δd²|; 8 times that, plus a little.
-                let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-                (scores, 2f64.powi(-20) * (qn + self.max_norm) * self.max_norm + 1e-12)
+                let s = kernels.vector_scores(&self.rows, q, similarity);
+                // 1 / (1 + d²) moves by at most as much as d².
+                let bound = s.error_bound(similarity, self.rows.max_norm(), qn);
+                (s.values.iter().map(|d2| 1.0 / (1.0 + d2.max(0.0))).collect(), bound)
             }
         }
     }
@@ -382,7 +360,7 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
         // A committed state: the cached matrix, then exact scores near the cut.
         Some((cache, snapshot)) => {
             let m = cache.matrix(snapshot, &def, &interrupt)?;
-            let (approx, tolerance) = m.approximate(&q);
+            let (approx, tolerance) = m.approximate(&q, &*ctx.kernels());
             if approx.is_empty() {
                 return Ok(Vec::new());
             }

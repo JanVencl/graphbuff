@@ -24,6 +24,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use crate::store::VectorSimilarity;
 use crate::{Csr, Direction, Error, GraphStore, RelId, Result, Value};
 
 // ---------------------------------------------------------------------------------------
@@ -564,6 +565,96 @@ fn overflow(what: &str) -> Error {
 // The kernel interface
 // ---------------------------------------------------------------------------------------
 
+/// The vectors of a vector index as rows of `f32`, for [`Kernels::vector_scores`]: unit
+/// length for cosine, as stored for euclidean. Each value has its own [`id`](Self::id), so
+/// that a backend can keep a copy (on a device) while it is in use.
+#[derive(Debug)]
+pub struct VectorRows {
+    id: u64,
+    dims: usize,
+    data: Vec<f32>,
+    max_norm: f64,
+}
+
+impl VectorRows {
+    /// Rows of `dims` values each (`data.len()` a multiple of `dims`, `dims` > 0).
+    pub fn new(dims: usize, data: Vec<f32>) -> VectorRows {
+        assert!(dims > 0 && data.len().is_multiple_of(dims), "rows of {dims} values");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let max_norm = data
+            .chunks_exact(dims)
+            .map(|r| r.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt())
+            .fold(0.0, f64::max);
+        VectorRows { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), dims, data, max_norm }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn dims(&self) -> usize {
+        self.dims
+    }
+
+    /// The number of rows.
+    pub fn len(&self) -> usize {
+        self.data.len() / self.dims
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// The largest row norm.
+    pub fn max_norm(&self) -> f64 {
+        self.max_norm
+    }
+}
+
+/// What [`Kernels::vector_scores`] computes per row: for cosine the dot product with the
+/// (unit) query, for euclidean the squared distance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorScores {
+    pub values: Vec<f64>,
+    /// How many terms each value summed in `f32` (0: the sums are `f64`), which bounds its
+    /// rounding error: see [`VectorScores::error_bound`].
+    pub f32_terms: u32,
+}
+
+impl VectorScores {
+    /// A bound on how far each value may be from the same computation in exact arithmetic
+    /// on the original (unrounded) vectors, for rows of norm at most `max_norm` and a
+    /// query of norm `query_norm` (1 for cosine). With unit roundoff u = 2^-24 and
+    /// `t` terms summed in f32: rounding rows and the query to f32 moves a dot product by
+    /// at most 2u·|r||q|, and summing adds t·u·Σ|rᵢqᵢ| (to first order); a squared
+    /// distance moves by at most (t + 5)·u·(|r| + |q|)². The bound returned is four times
+    /// that, for the higher-order terms and some margin.
+    pub fn error_bound(&self, similarity: VectorSimilarity, max_norm: f64, query_norm: f64) -> f64 {
+        let u = 2f64.powi(-24);
+        let t = f64::from(self.f32_terms);
+        match similarity {
+            VectorSimilarity::Cosine => 4.0 * (t + 2.0) * u,
+            VectorSimilarity::Euclidean => 4.0 * (t + 5.0) * u * (max_norm + query_norm).powi(2),
+        }
+    }
+}
+
+/// [`Kernels::vector_scores`] on the CPU over the rows in `range`, with `f64` sums.
+fn vector_scores_cpu(rows: &VectorRows, query: &[f64], similarity: VectorSimilarity, range: Range<usize>) -> Vec<f64> {
+    let d = rows.dims;
+    rows.data[range.start * d..range.end * d]
+        .chunks_exact(d)
+        .map(|row| match similarity {
+            VectorSimilarity::Cosine => row.iter().zip(query).map(|(r, q)| f64::from(*r) * q).sum(),
+            VectorSimilarity::Euclidean => row.iter().zip(query).map(|(r, q)| (f64::from(*r) - q).powi(2)).sum(),
+        })
+        .collect()
+}
+
 /// One hop of a [`Kernels::walk`]: relationships of `types` in `dir`, then only the nodes
 /// set in `mask` keep their counts (`None`: all do).
 #[derive(Clone, Copy, Debug)]
@@ -660,6 +751,14 @@ pub trait Kernels: Send + Sync {
     /// simple graph: direction ignored, parallel relationships counted once, self-loops
     /// ignored.
     fn triangles(&self, csr: &Csr, types: &[u32]) -> Vec<u64>;
+
+    /// Per row of `rows`: the dot product with `query` (cosine; `query` of unit length) or
+    /// the squared distance to it (euclidean). Approximate within
+    /// [`VectorScores::error_bound`]; callers needing exact scores re-score the rows near
+    /// their cut. The default runs on the calling thread with `f64` sums.
+    fn vector_scores(&self, rows: &VectorRows, query: &[f64], similarity: VectorSimilarity) -> VectorScores {
+        VectorScores { values: vector_scores_cpu(rows, query, similarity, 0..rows.len()), f32_terms: 0 }
+    }
 }
 
 /// The CPU implementation of [`Kernels`]: independent work (rows of an expand or select,
@@ -725,6 +824,29 @@ fn layouts(dir: Direction) -> (bool, bool) {
 impl Kernels for CpuKernels {
     fn name(&self) -> &str {
         "cpu"
+    }
+
+    fn vector_scores(&self, rows: &VectorRows, query: &[f64], similarity: VectorSimilarity) -> VectorScores {
+        // Split by rows, weighted by their length.
+        let n = rows.len();
+        let per = (PARALLEL_MIN / rows.dims.max(1)).max(1);
+        let parts: Vec<Range<usize>> = (0..n.div_ceil(per)).map(|p| p * per..((p + 1) * per).min(n)).collect();
+        let chunks = parts.len().div_ceil(self.threads).max(1);
+        let values = if parts.len() <= 1 {
+            vector_scores_cpu(rows, query, similarity, 0..n)
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = parts
+                    .chunks(chunks)
+                    .map(|group| {
+                        let range = group[0].start..group[group.len() - 1].end;
+                        s.spawn(move || vector_scores_cpu(rows, query, similarity, range))
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().expect("kernel thread panicked")).collect()
+            })
+        };
+        VectorScores { values, f32_terms: 0 }
     }
 
     fn expand(&self, csr: &Csr, sources: &[u32], dir: Direction, types: &[u32]) -> ExpandBatch {
