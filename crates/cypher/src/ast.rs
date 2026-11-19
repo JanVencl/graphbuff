@@ -94,8 +94,8 @@ pub enum Clause {
     },
     /// `SHOW PROCEDURES`
     ShowProcedures,
-    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, …)`,
-    /// `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`.
+    /// `CREATE [RANGE | VECTOR] INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, …)
+    /// [OPTIONS {…}]`, `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`.
     CreateIndex {
         name: Option<String>,
         entity: IndexEntity,
@@ -103,6 +103,10 @@ pub enum Clause {
         label: String,
         properties: Vec<String>,
         if_not_exists: bool,
+        /// `CREATE VECTOR INDEX`.
+        vector: bool,
+        /// The `OPTIONS` map (or parameter).
+        options: Option<Expr>,
     },
     /// `DROP INDEX name [IF EXISTS]` or `DROP INDEX ON :Label(a, …)`.
     DropIndex {

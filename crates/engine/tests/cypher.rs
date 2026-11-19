@@ -685,8 +685,8 @@ fn index_commands() {
     assert_eq!(
         rows(&run(&db, "SHOW INDEXES")),
         vec![
-            "\"index_Person_age\", \"NODE\", \"Person\", [\"age\"]",
-            "\"person_name\", \"NODE\", \"Person\", [\"name\"]"
+            "\"index_Person_age\", \"NODE\", \"Person\", [\"age\"], \"RANGE\", {}",
+            "\"person_name\", \"NODE\", \"Person\", [\"name\"], \"RANGE\", {}"
         ]
     );
     run(&db, "DROP INDEX ON :Person(age)");
@@ -1625,7 +1625,7 @@ fn procedure_yield_where_and_pipelines() {
     assert_eq!(r.columns, ["properties", "name"]);
     assert_eq!(rows(&r), ["[\"name\"], \"person_name\""]);
     let r = run(&db, "CALL db.indexes() YIELD *");
-    assert_eq!(r.columns, ["name", "entityType", "labelOrType", "properties"]);
+    assert_eq!(r.columns, ["name", "entityType", "labelOrType", "properties", "type", "options"]);
     // A VOID procedure keeps the rows; standalone it returns none.
     assert_eq!(scalar(&db, "UNWIND [1, 2, 3] AS x CALL db.awaitIndexes(10) RETURN sum(x)").as_int(), Some(6));
     let r = run(&db, "CALL db.awaitIndexes()");

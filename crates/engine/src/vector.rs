@@ -5,56 +5,87 @@
 //! cosine `(1 + cos) / 2`, euclidean `1 / (1 + d²)`, so a higher score is always more
 //! similar.
 
-use graphbuff_core::{Error, Result, Value};
+use std::collections::BTreeMap;
 
-/// How a vector index (or a `vector.similarity.*` function) compares vectors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Similarity {
-    Cosine,
-    Euclidean,
+use graphbuff_core::{Error, IndexDef, IndexKind, MAX_VECTOR_DIMENSIONS, Result, Value, VectorSimilarity as Similarity};
+
+/// The kind of index `CREATE [VECTOR] INDEX … OPTIONS {…}` asks for. A vector index needs
+/// `indexConfig: {`vector.dimensions`: n}` and may name `vector.similarity_function`
+/// (`'cosine'`, the default, or `'euclidean'`); `indexProvider` is accepted and ignored.
+pub fn index_kind(vector: bool, options: &BTreeMap<String, Value>) -> Result<IndexKind> {
+    let mut config = BTreeMap::new();
+    for (k, v) in options {
+        match (k.as_str(), v) {
+            ("indexProvider", Value::String(_) | Value::Null) => {}
+            ("indexConfig", Value::Map(m)) => config = m.clone(),
+            ("indexConfig", Value::Null) => {}
+            ("indexProvider" | "indexConfig", o) => {
+                return Err(Error::Type(format!("index option `{k}` does not accept {}", o.type_name())));
+            }
+            _ => return Err(Error::Semantic(format!("unknown index option `{k}`"))),
+        }
+    }
+    if !vector {
+        if let Some(k) = config.keys().next() {
+            return Err(Error::Semantic(format!("unknown index setting `{k}` for a range index")));
+        }
+        return Ok(IndexKind::Range);
+    }
+    let (mut dimensions, mut similarity) = (None, Similarity::Cosine);
+    for (k, v) in &config {
+        match (k.as_str(), v) {
+            ("vector.dimensions", Value::Int(n)) if (1..=i64::from(MAX_VECTOR_DIMENSIONS)).contains(n) => {
+                dimensions = Some(*n as u32);
+            }
+            ("vector.dimensions", o) => {
+                return Err(Error::Semantic(format!(
+                    "`vector.dimensions` needs an integer from 1 to {MAX_VECTOR_DIMENSIONS}, not {}",
+                    o
+                )));
+            }
+            ("vector.similarity_function", Value::String(f)) => {
+                similarity = Similarity::parse(f).ok_or_else(|| {
+                    Error::Semantic(format!(
+                        "`vector.similarity_function` is 'cosine' or 'euclidean', not '{f}'"
+                    ))
+                })?;
+            }
+            ("vector.similarity_function", o) => {
+                return Err(Error::Type(format!("`vector.similarity_function` does not accept {}", o.type_name())));
+            }
+            (k, _) if k.starts_with("vector.") => {
+                return Err(Error::Unsupported(format!("vector index setting `{k}` is not supported")));
+            }
+            _ => return Err(Error::Semantic(format!("unknown index setting `{k}` for a vector index"))),
+        }
+    }
+    let dimensions = dimensions.ok_or_else(|| {
+        Error::Semantic("a vector index needs OPTIONS {indexConfig: {`vector.dimensions`: n}}".into())
+    })?;
+    Ok(IndexKind::Vector { dimensions, similarity })
 }
 
-impl Similarity {
-    /// `'cosine'` or `'euclidean'` (any case), as in index options.
-    pub fn parse(name: &str) -> Option<Similarity> {
-        match name.to_ascii_lowercase().as_str() {
-            "cosine" => Some(Similarity::Cosine),
-            "euclidean" => Some(Similarity::Euclidean),
-            _ => None,
-        }
-    }
-
-    /// The name `SHOW INDEXES` shows, in Neo4j's form.
-    pub fn name(self) -> &'static str {
-        match self {
-            Similarity::Cosine => "COSINE",
-            Similarity::Euclidean => "EUCLIDEAN",
-        }
-    }
-
-    /// The normalized score of `a` and `b` (same length); `None` for cosine with a
-    /// zero vector.
-    pub fn score(self, a: &[f64], b: &[f64]) -> Option<f64> {
-        match self {
-            Similarity::Cosine => {
-                let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
-                for (x, y) in a.iter().zip(b) {
-                    dot += x * y;
-                    na += x * x;
-                    nb += y * y;
-                }
-                if na == 0.0 || nb == 0.0 {
-                    return None;
-                }
-                let cos = (dot / (na * nb).sqrt()).clamp(-1.0, 1.0);
-                Some((1.0 + cos) / 2.0)
-            }
-            Similarity::Euclidean => {
-                let d2: f64 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
-                Some(1.0 / (1.0 + d2))
-            }
-        }
-    }
+/// A `SHOW INDEXES` / `db.indexes()` row: name, entity type, label or type, properties,
+/// index type and options.
+pub fn index_row(d: IndexDef) -> Vec<Value> {
+    let options = match d.kind {
+        IndexKind::Range => BTreeMap::new(),
+        IndexKind::Vector { dimensions, similarity } => BTreeMap::from([(
+            "indexConfig".to_string(),
+            Value::Map(BTreeMap::from([
+                ("vector.dimensions".to_string(), Value::Int(i64::from(dimensions))),
+                ("vector.similarity_function".to_string(), Value::String(similarity.name().into())),
+            ])),
+        )]),
+    };
+    vec![
+        Value::String(d.name),
+        Value::String(d.entity.text().into()),
+        Value::String(d.label),
+        Value::List(d.properties.into_iter().map(Value::String).collect()),
+        Value::String(d.kind.text().into()),
+        Value::Map(options),
+    ]
 }
 
 /// The numbers of a vector argument of `function`: `Ok(None)` for null, an error for

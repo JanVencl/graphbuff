@@ -642,6 +642,8 @@ pub struct MemoryGraph {
     /// Live relationships per type token.
     type_counts: HashMap<Token, usize>,
     indexes: Vec<PropIndex>,
+    /// Vector index definitions (their vectors are kept by the engine).
+    vector_indexes: Vec<IndexDef>,
     constraints: Vec<ConstraintDef>,
     /// The state at `begin`, while a transaction is open; rollback returns to it.
     saved: Option<Box<MemoryGraph>>,
@@ -663,6 +665,7 @@ impl Clone for MemoryGraph {
             label_index: self.label_index.clone(),
             type_counts: self.type_counts.clone(),
             indexes: self.indexes.clone(),
+            vector_indexes: self.vector_indexes.clone(),
             constraints: self.constraints.clone(),
             saved: None,
         }
@@ -1216,14 +1219,21 @@ impl GraphStore for MemoryGraph {
     }
 
     fn create_index(&mut self, def: IndexDef) -> Result<()> {
-        let existing: Vec<IndexDef> = self.indexes.iter().map(|ix| ix.def.clone()).collect();
-        def.check_new(&existing)?;
+        def.check_new(&self.indexes())?;
+        if def.is_vector() {
+            self.vector_indexes.push(def);
+            return Ok(());
+        }
         let ix = self.build_index(def);
         self.indexes.push(ix);
         Ok(())
     }
 
     fn drop_index(&mut self, name: &str) -> Result<bool> {
+        if let Some(pos) = self.vector_indexes.iter().position(|d| d.name == name) {
+            self.vector_indexes.remove(pos);
+            return Ok(true);
+        }
         let Some(pos) = self.indexes.iter().position(|ix| ix.def.name == name) else {
             return Ok(false);
         };
@@ -1233,6 +1243,7 @@ impl GraphStore for MemoryGraph {
 
     fn indexes(&self) -> Vec<IndexDef> {
         let mut out: Vec<IndexDef> = self.indexes.iter().map(|ix| ix.def.clone()).collect();
+        out.extend(self.vector_indexes.iter().cloned());
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -1558,6 +1569,7 @@ mod tests {
             entity: IndexEntity::Node,
             label: "P".into(),
             properties: xy.to_vec(),
+            kind: Default::default(),
         })
         .unwrap();
         let w = ["w".to_string()];

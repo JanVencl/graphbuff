@@ -498,23 +498,13 @@ fn register_builtins(p: &mut Procedures) {
         },
     );
     add(
-        ProcedureSignature::new("db.indexes", NONE, ["name", "entityType", "labelOrType", "properties"])
-            .description("The property indexes (as SHOW INDEXES)."),
-        |ctx, _| {
-            Ok(ctx
-                .store()
-                .indexes()
-                .into_iter()
-                .map(|d| {
-                    vec![
-                        Value::String(d.name),
-                        Value::String(d.entity.text().into()),
-                        Value::String(d.label),
-                        strings(d.properties),
-                    ]
-                })
-                .collect())
-        },
+        ProcedureSignature::new(
+            "db.indexes",
+            NONE,
+            ["name", "entityType", "labelOrType", "properties", "type", "options"],
+        )
+        .description("The property and vector indexes (as SHOW INDEXES)."),
+        |ctx, _| Ok(ctx.store().indexes().into_iter().map(crate::vector::index_row).collect()),
     );
     add(
         ProcedureSignature::new("db.constraints", NONE, ["name", "type", "label", "properties"])

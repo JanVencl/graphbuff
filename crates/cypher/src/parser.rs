@@ -618,7 +618,12 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             if self.eat_kw("INDEX") {
-                return self.parse_create_index();
+                return self.parse_create_index(false);
+            }
+            if self.is_kw("VECTOR") && self.kw_at(1, "INDEX") {
+                self.advance();
+                self.advance();
+                return self.parse_create_index(true);
             }
             if self.eat_kw("CONSTRAINT") {
                 return self.parse_create_constraint();
@@ -913,9 +918,9 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// After `CREATE INDEX`.
-    fn parse_create_index(&mut self) -> Result<Clause> {
-        if self.eat_kw("ON") {
+    /// After `CREATE INDEX` or (`vector`) `CREATE VECTOR INDEX`.
+    fn parse_create_index(&mut self, vector: bool) -> Result<Clause> {
+        if !vector && self.eat_kw("ON") {
             let (label, properties) = self.parse_legacy_index_target()?;
             return Ok(Clause::CreateIndex {
                 name: None,
@@ -923,6 +928,8 @@ impl<'a> Parser<'a> {
                 label,
                 properties,
                 if_not_exists: false,
+                vector: false,
+                options: None,
             });
         }
         let name = if self.at_ident() && !self.is_kw("IF") && !self.is_kw("FOR") {
@@ -966,7 +973,11 @@ impl<'a> Parser<'a> {
             (IndexEntity::Node, var, label)
         };
         self.expect_kw("ON")?;
-        self.expect(Tok::LParen, "'('")?;
+        // A vector index is on one property, with or without parentheses.
+        let parens = !vector || matches!(self.peek(), Tok::LParen);
+        if parens {
+            self.expect(Tok::LParen, "'('")?;
+        }
         let mut properties = Vec::new();
         loop {
             let offset = self.offset();
@@ -979,17 +990,32 @@ impl<'a> Parser<'a> {
             }
             self.expect(Tok::Dot, "'.'")?;
             properties.push(self.ident()?);
-            if !self.eat(&Tok::Comma) {
+            if !parens || !self.eat(&Tok::Comma) {
                 break;
             }
         }
-        self.expect(Tok::RParen, "')'")?;
+        if parens {
+            self.expect(Tok::RParen, "')'")?;
+        }
+        let options = if self.eat_kw("OPTIONS") {
+            if !matches!(self.peek(), Tok::LBrace | Tok::Param(_)) {
+                return self.err(format!(
+                    "expected a map or a parameter after OPTIONS, found {}",
+                    self.describe()
+                ));
+            }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         Ok(Clause::CreateIndex {
             name,
             entity,
             label,
             properties,
             if_not_exists,
+            vector,
+            options,
         })
     }
 
@@ -2219,7 +2245,9 @@ mod tests {
                 entity: IndexEntity::Node,
                 label: "Person".into(),
                 properties: vec!["name".into()],
-                if_not_exists: true
+                if_not_exists: true,
+                vector: false,
+                options: None,
             }
         );
         let c = single("CREATE INDEX ON :Person(age)");
@@ -2233,7 +2261,9 @@ mod tests {
                 entity: IndexEntity::Node,
                 label: "Person".into(),
                 properties: vec!["first".into(), "last".into()],
-                if_not_exists: false
+                if_not_exists: false,
+                vector: false,
+                options: None,
             }
         );
         for q in [
@@ -2248,7 +2278,9 @@ mod tests {
                     entity: IndexEntity::Relationship,
                     label: "KNOWS".into(),
                     properties: vec!["since".into()],
-                    if_not_exists: false
+                    if_not_exists: false,
+                    vector: false,
+                    options: None,
                 },
                 "{q}"
             );
@@ -2268,6 +2300,26 @@ mod tests {
         ));
         let c = single("CREATE RANGE INDEX FOR (n:L) ON (n.k)");
         assert!(matches!(&c[0], Clause::CreateIndex { name: None, .. }));
+        for q in [
+            "CREATE VECTOR INDEX emb IF NOT EXISTS FOR (d:Doc) ON d.embedding OPTIONS {indexConfig: {`vector.dimensions`: 3}}",
+            "CREATE VECTOR INDEX emb FOR (d:Doc) ON (d.embedding) OPTIONS $opts",
+        ] {
+            assert!(
+                matches!(&single(q)[0], Clause::CreateIndex { vector: true, options: Some(_), properties, .. } if properties == &["embedding"]),
+                "{q}"
+            );
+        }
+        assert!(matches!(
+            &single("CREATE VECTOR INDEX FOR ()-[r:SIMILAR]-() ON r.v")[0],
+            Clause::CreateIndex { vector: true, entity: IndexEntity::Relationship, options: None, .. }
+        ));
+        for bad in [
+            "CREATE VECTOR INDEX ON :Doc(embedding)",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.a, d.b",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.a OPTIONS 3",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         assert_eq!(
             single("DROP INDEX person_name IF EXISTS")[0],
             Clause::DropIndex {

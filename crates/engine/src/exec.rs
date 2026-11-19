@@ -317,19 +317,36 @@ impl Executor<'_> {
                 label,
                 properties,
                 if_not_exists,
+                vector,
+                options,
             } => {
+                let options = match options {
+                    Some(e) => {
+                        let scope = Scope::default();
+                        match self.eval(e, &Env::new(&scope, &[]))? {
+                            Value::Map(m) => m,
+                            Value::Null => BTreeMap::new(),
+                            o => return Err(Error::Type(format!("OPTIONS must be a map, not {}", o.type_name()))),
+                        }
+                    }
+                    None => BTreeMap::new(),
+                };
+                let kind = crate::vector::index_kind(*vector, &options)?;
+                let prefix = if *vector { "vector" } else { "index" };
                 let def = IndexDef {
                     name: name
                         .clone()
-                        .unwrap_or_else(|| format!("index_{label}_{}", properties.join("_"))),
+                        .unwrap_or_else(|| format!("{prefix}_{label}_{}", properties.join("_"))),
                     entity: *entity,
                     label: label.clone(),
                     properties: properties.clone(),
+                    kind,
                 };
                 let existing = self.store().indexes();
-                let exists = existing
-                    .iter()
-                    .any(|d| d.name == def.name || d.covers(def.entity, &def.label, &def.properties));
+                let exists = existing.iter().any(|d| {
+                    d.name == def.name
+                        || (d.is_vector() == def.is_vector() && d.same_schema(def.entity, &def.label, &def.properties))
+                });
                 if exists && *if_not_exists {
                     return Ok(empty);
                 }
@@ -369,22 +386,10 @@ impl Executor<'_> {
                 Ok(empty)
             }
             Clause::ShowIndexes => Ok(RawResult {
-                columns: ["name", "entityType", "labelOrType", "properties"]
+                columns: ["name", "entityType", "labelOrType", "properties", "type", "options"]
                     .map(String::from)
                     .to_vec(),
-                rows: self
-                    .store()
-                    .indexes()
-                    .into_iter()
-                    .map(|d| {
-                        vec![
-                            Value::String(d.name),
-                            Value::String(d.entity.text().into()),
-                            Value::String(d.label),
-                            Value::List(d.properties.into_iter().map(Value::String).collect()),
-                        ]
-                    })
-                    .collect(),
+                rows: self.store().indexes().into_iter().map(crate::vector::index_row).collect(),
             }),
             Clause::CreateConstraint {
                 name,

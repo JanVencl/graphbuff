@@ -1891,7 +1891,7 @@ fn index_seeks(
     let mut composite = Vec::new();
     if found.len() > 1 {
         for ix in store.indexes() {
-            if ix.entity != entity || ix.properties.len() < 2 || !labels.contains(&ix.label) {
+            if ix.entity != entity || ix.is_vector() || ix.properties.len() < 2 || !labels.contains(&ix.label) {
                 continue;
             }
             let exprs: Option<Vec<Expr>> = ix
