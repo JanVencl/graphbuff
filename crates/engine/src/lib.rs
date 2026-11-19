@@ -46,6 +46,7 @@ mod stream;
 mod transaction;
 mod interrupt;
 mod unicode;
+mod vector;
 pub mod json;
 
 use std::collections::BTreeMap;

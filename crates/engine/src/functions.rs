@@ -89,6 +89,9 @@ impl Executor<'_> {
         if let Some(v) = spatial_function(name, &args)? {
             return Ok(v);
         }
+        if let Some(v) = crate::vector::vector_function(name, &args)? {
+            return Ok(v);
+        }
         if let Some(v) = extra_function(name, &args)? {
             return Ok(v);
         }
