@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 
+mod common;
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("graphbuff-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -61,12 +63,15 @@ fn spawn(cmd: &mut Command) -> Child {
 #[test]
 fn stop_request_checkpoints_and_exits_zero() {
     let data = temp_dir("shutdown");
+    // Logs in the data folder (no logs.dir).
+    let config = common::config_file(&common::toml(&[
+        ("server.bind", common::toml_str("127.0.0.1:0")),
+        ("storage.data", common::toml_path(&data)),
+        ("security.token", common::toml_str("test-token")),
+    ]));
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--token", "test-token", "--data"]).arg(&data);
-    cmd.env("GRAPHBUFF_CONFIG", "-");
-    for key in ["GRAPHBUFF_TOKEN", "GRAPHBUFF_DATA", "GRAPHBUFF_LOG_DIR", "GRAPHBUFF_LOG_LEVEL"] {
-        cmd.env_remove(key);
-    }
+    cmd.arg("--config").arg(&config);
+    cmd.env_remove("GRAPHBUFF_TOKEN").env_remove("GRAPHBUFF_CONFIG");
     let mut child = spawn(&mut cmd);
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut listening = String::new();
@@ -110,8 +115,8 @@ fn stop_request_checkpoints_and_exits_zero() {
 
     // The data is there on the next start.
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--token", "test-token", "--data"]).arg(&data);
-    cmd.env_remove("GRAPHBUFF_TOKEN").env("GRAPHBUFF_CONFIG", "-");
+    cmd.arg("--config").arg(&config);
+    cmd.env_remove("GRAPHBUFF_TOKEN").env_remove("GRAPHBUFF_CONFIG");
     let mut child = spawn(&mut cmd);
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();

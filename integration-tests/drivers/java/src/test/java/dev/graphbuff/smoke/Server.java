@@ -67,12 +67,23 @@ final class Server {
     private static Server start() throws Exception {
         int http = freePort();
         int bolt = freePort();
-        Process p = new ProcessBuilder(binary().toString(),
-                "--bind", "127.0.0.1:" + http,
-                "--bolt", "127.0.0.1:" + bolt,
-                "--token", TOKEN,
-                "--tx-timeout", "5",
-                "--in-memory")
+        Path config = Files.createTempDirectory("graphbuff-config-").resolve("graphbuff.toml");
+        Files.writeString(config, String.join("\n",
+                "[server]",
+                "bind = \"127.0.0.1:" + http + "\"",
+                "bolt = \"127.0.0.1:" + bolt + "\"",
+                "[storage]",
+                "mode = \"memory\"",
+                "[security]",
+                "token = \"" + TOKEN + "\"",
+                "[queries]",
+                "transaction_timeout_seconds = 5",
+                "[logs]",
+                "dir = \"-\"",
+                ""));
+        ProcessBuilder builder = new ProcessBuilder(binary().toString(), "--config", config.toString());
+        builder.environment().keySet().removeIf(k -> k.startsWith("GRAPHBUFF_"));
+        Process p = builder
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start();

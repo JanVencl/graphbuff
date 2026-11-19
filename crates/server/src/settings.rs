@@ -1,243 +1,530 @@
-//! The settings of `graphbuff-server`, from (lowest to highest precedence) the config
-//! file, the environment and the command line.
+//! The settings of `graphbuff-server`, from its config file, `graphbuff.toml`.
 //!
-//! The config file holds one `key = value` per line, where the keys are the long options
-//! without `--` (`bind = 0.0.0.0:7475`, `in-memory = true`); `#` starts a comment.
-//! Relative paths in it are relative to the file's directory.
+//! The file is TOML: sections (`[server]`, `[storage]`, …) of `key = value` lines, with
+//! strings in quotes, numbers and `true` / `false`; `#` starts a comment. Unknown sections
+//! and keys are errors, so a misspelt setting is not silently ignored. Relative paths are
+//! relative to the file's folder. [`TEMPLATE`] lists every setting.
+//!
+//! Where the file is: `--config FILE`, else env `GRAPHBUFF_CONFIG`, else `config/graphbuff.toml`
+//! next to the program, else the per-user (or system) one ([`user_config_file`]). With none
+//! of them, the server creates one from the template next to the program (or, if that
+//! folder cannot be written, in the per-user place).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Every setting: its name (the long option without `--`), and whether it is a flag
-/// (`--gpu` on the command line, `gpu = true` in the file) rather than taking a value.
-const KEYS: &[(&str, bool)] = &[
-    ("bind", false),
-    ("bolt", false),
-    ("data", false),
-    ("in-memory", true),
-    ("demo", false),
-    ("persistent", true),
-    ("no-fsync", true),
-    ("token", false),
-    ("tls-cert", false),
-    ("tls-key", false),
-    ("tls-allow-plain", true),
-    ("max-connections", false),
-    ("keep-alive", false),
-    ("tx-timeout", false),
-    ("query-timeout", false),
-    ("shutdown-timeout", false),
-    ("import-dir", false),
-    ("backup-dir", false),
-    ("gpu", true),
-    ("log-dir", false),
-    ("log-level", false),
-    ("slow-query", false),
-    ("test-procedures", true),
-];
+use graphbuff_server::Level;
 
-/// Settings that name a file or directory: relative ones in the config file are resolved
-/// against the file's directory.
-const PATHS: &[&str] = &["data", "tls-cert", "tls-key", "import-dir", "backup-dir", "log-dir"];
+/// The config file's name.
+pub const FILE_NAME: &str = "graphbuff.toml";
 
-/// Environment variables and the settings they stand for.
-const ENV: &[(&str, &str)] = &[
-    ("GRAPHBUFF_TOKEN", "token"),
-    ("GRAPHBUFF_DATA", "data"),
-    ("GRAPHBUFF_LOG_DIR", "log-dir"),
-    ("GRAPHBUFF_LOG_LEVEL", "log-level"),
-];
+/// The settings, with the defaults for those the file leaves out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    // [server]
+    pub bind: Option<String>,
+    pub bolt: Option<String>,
+    pub max_connections: Option<usize>,
+    pub keep_alive: Option<Duration>,
+    pub shutdown_timeout: Option<Duration>,
+    // [storage]
+    pub storage: Storage,
+    /// The data directory; `None`: the per-user default ([`default_data_dir`]).
+    pub data: Option<PathBuf>,
+    pub fsync: bool,
+    pub import_dir: Option<PathBuf>,
+    pub backup_dir: Option<PathBuf>,
+    pub demo: Option<String>,
+    // [security]
+    pub token: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub tls_allow_plain: bool,
+    // [queries]
+    pub transaction_timeout: Option<Duration>,
+    pub query_timeout: Option<Duration>,
+    pub gpu: bool,
+    pub test_procedures: bool,
+    // [logs]
+    pub log_dir: LogDir,
+    pub log_level: Level,
+    pub slow_query: Option<Duration>,
+}
 
-/// Written to the default config location the first time the server starts without one.
-pub const TEMPLATE: &str = "\
-# graphbuff-server configuration.
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            bind: None,
+            bolt: None,
+            max_connections: None,
+            keep_alive: None,
+            shutdown_timeout: None,
+            storage: Storage::Hybrid,
+            data: None,
+            fsync: true,
+            import_dir: None,
+            backup_dir: None,
+            demo: None,
+            token: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_allow_plain: false,
+            transaction_timeout: None,
+            query_timeout: None,
+            gpu: false,
+            test_procedures: false,
+            log_dir: LogDir::Default,
+            log_level: Level::Info,
+            slow_query: None,
+        }
+    }
+}
+
+/// `storage.mode`: how new databases keep their data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Storage {
+    /// In memory, made durable by a write-ahead log and snapshots in the data directory.
+    Hybrid,
+    /// Disk-resident paged storage in the data directory.
+    Persistent,
+    /// In memory only: lost when the server stops.
+    Memory,
+}
+
+/// `logs.dir`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogDir {
+    /// The `logs` folder of the data directory; standard error in memory mode.
+    Default,
+    /// `"-"`: standard error.
+    StandardError,
+    Dir(PathBuf),
+}
+
+/// Written as the config file when the server starts without one, and shipped next to the
+/// program. `{data}` is replaced by the `data` line: active next to the program, a comment
+/// in the per-user place (where the per-user data directory is the default).
+pub const TEMPLATE: &str = r#"# graphbuff-server configuration (TOML).
 #
-# One `key = value` per line; the keys are the command-line options without `--`.
-# Command-line options and environment variables (GRAPHBUFF_DATA, GRAPHBUFF_LOG_DIR,
-# GRAPHBUFF_LOG_LEVEL, GRAPHBUFF_TOKEN) override this file. Relative
-# paths are relative to this file's directory. `graphbuff-server --help` describes
-# every setting.
+# Change a setting by editing its line (remove the leading `#` to set one that is
+# commented out), then restart the server. Relative paths are relative to the folder of
+# this file. Env GRAPHBUFF_TOKEN overrides `security.token`; `graphbuff-server --config
+# FILE` (or env GRAPHBUFF_CONFIG) reads another file.
 
-# Network
-# bind = 127.0.0.1:7475
-# bolt = 127.0.0.1:7687
-# max-connections = 256
-# keep-alive = 30
+[server]
+# HTTP address. 127.0.0.1 accepts this machine only; 0.0.0.0 every machine (then also
+# set up TLS below).
+bind = "127.0.0.1:7475"
+# Also serve the Bolt protocol (Neo4j drivers) on this address.
+# bolt = "127.0.0.1:7687"
+max_connections = 256
+# Idle keep-alive timeout of a connection.
+keep_alive_seconds = 30
+# On stop (SIGTERM, Ctrl-C): how long running queries may take before they are cancelled.
+shutdown_timeout_seconds = 5
 
-# Storage (default data directory: see --help)
-# data = /path/to/data
-# in-memory = false
-# persistent = false
-# no-fsync = false
-# import-dir = import
-# backup-dir = backups
+[storage]
+# hybrid: in memory, made durable by a log and snapshots in the data folder (default)
+# persistent: disk-resident paged storage in the data folder, for graphs larger than memory
+# memory: in memory only, lost when the server stops
+mode = "hybrid"
+# The data folder: databases, user accounts and (by default) logs.
+{data}
+# Sync every commit to disk. false is faster, but the last commits may be lost when the
+# machine (not only the server) crashes.
+fsync = true
+# Folder LOAD CSV may read files from (off when not set).
+# import_dir = "../import"
+# Folder admins may back databases up to and restore them from (off when not set).
+# backup_dir = "../backups"
+# Load a demo graph into the default database when it is empty: movies.
+# demo = "movies"
 
-# Logs (default: the `logs` folder in the data directory)
-# log-dir = logs
-# log-level = info
-# slow-query = 1000
+[security]
+# Users log in with their accounts (see `graphbuff-server --help`). A token is also
+# accepted as `Authorization: Bearer TOKEN` or as the password of any user name, and its
+# holder may do anything.
+# token = "change-me"
+# HTTPS and Bolt over TLS: a PEM certificate chain and private key.
+# tls_cert = "cert.pem"
+# tls_key = "key.pem"
+# With TLS, also accept clients without TLS on the same ports.
+tls_allow_plain = false
 
-# Security
-# token = change-me
-# tls-cert = cert.pem
-# tls-key = key.pem
-# tls-allow-plain = false
+[queries]
+# Roll back a transaction after this long without a request.
+transaction_timeout_seconds = 60
+# Stop (and roll back) a query that runs longer (no limit when not set; a request may ask
+# for less with "timeoutMs").
+# query_timeout_ms = 30000
+# Run graph kernels (multi-hop counts, algo.* procedures, vector scores) on the GPU (needs
+# a build with the `gpu` feature).
+gpu = false
 
-# Queries and shutdown
-# tx-timeout = 60
-# query-timeout = 30000
-# shutdown-timeout = 5
-# gpu = false
-";
+[logs]
+# Folder of graphbuff.log and query.log; "-" for standard error. Default: the `logs`
+# folder in the data folder (standard error with mode = "memory").
+# dir = "../logs"
+# error, warn, info or debug (also every connection).
+level = "info"
+# Log queries that take at least this long to query.log.
+# slow_query_ms = 1000
+"#;
 
-/// Where a setting came from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Origin {
-    File,
-    Env,
-    Command,
+/// The `data` line of [`TEMPLATE`] for a config file next to the program.
+const DATA_NEXT_TO_PROGRAM: &str = r#"data = "../data""#;
+
+/// The `data` line of [`TEMPLATE`] for the per-user config file.
+const DATA_PER_USER: &str = "# Default: see `graphbuff-server --help`.\n# data = \"/path/to/data\"";
+
+/// The template for a config file next to the program (`next_to_program`) or in the
+/// per-user place.
+pub fn template(next_to_program: bool) -> String {
+    TEMPLATE.replace("{data}", if next_to_program { DATA_NEXT_TO_PROGRAM } else { DATA_PER_USER })
 }
 
-#[derive(Default)]
-pub struct Settings {
-    values: HashMap<&'static str, (String, Origin)>,
+/// A value in the file.
+#[derive(Clone, Debug, PartialEq)]
+enum Toml {
+    Str(String),
+    Int(i64),
+    Bool(bool),
 }
 
-impl Settings {
-    /// Reads the command line (without the program name); returns the config file it
-    /// names (`--config`) and the remaining settings to apply, in order.
-    pub fn command_line(args: impl Iterator<Item = String>) -> Result<CommandLine, String> {
-        let mut out = CommandLine::default();
-        let mut args = args.peekable();
-        while let Some(arg) = args.next() {
-            if arg == "-h" || arg == "--help" {
-                out.help = true;
-                continue;
-            }
-            let Some(name) = arg.strip_prefix("--") else {
-                return Err(format!("unknown option `{arg}`"));
-            };
-            if name == "config" {
-                out.config = Some(args.next().ok_or("--config needs a value")?);
-                continue;
-            }
-            let &(key, flag) = KEYS
-                .iter()
-                .find(|(k, _)| *k == name)
-                .ok_or_else(|| format!("unknown option `{arg}`"))?;
-            let value = if flag {
-                "true".to_string()
-            } else {
-                args.next().ok_or_else(|| format!("--{key} needs a value"))?
-            };
-            out.settings.push((key, value));
+impl Toml {
+    fn kind(&self) -> &'static str {
+        match self {
+            Toml::Str(_) => "a string",
+            Toml::Int(_) => "a number",
+            Toml::Bool(_) => "true or false",
         }
-        Ok(out)
     }
+}
 
-    /// Applies the config file at `path`.
-    pub fn apply_file(&mut self, path: &Path, text: &str) -> Result<(), String> {
+/// Every setting, by section, and what it holds.
+const SETTINGS: &[(&str, &[(&str, Kind)])] = &[
+    (
+        "server",
+        &[
+            ("bind", Kind::Str),
+            ("bolt", Kind::Str),
+            ("max_connections", Kind::Positive),
+            ("keep_alive_seconds", Kind::Count),
+            ("shutdown_timeout_seconds", Kind::Count),
+        ],
+    ),
+    (
+        "storage",
+        &[
+            ("mode", Kind::Str),
+            ("data", Kind::Path),
+            ("fsync", Kind::Bool),
+            ("import_dir", Kind::Path),
+            ("backup_dir", Kind::Path),
+            ("demo", Kind::Str),
+        ],
+    ),
+    (
+        "security",
+        &[("token", Kind::Str), ("tls_cert", Kind::Path), ("tls_key", Kind::Path), ("tls_allow_plain", Kind::Bool)],
+    ),
+    (
+        "queries",
+        &[
+            ("transaction_timeout_seconds", Kind::Positive),
+            ("query_timeout_ms", Kind::Positive),
+            ("gpu", Kind::Bool),
+            ("test_procedures", Kind::Bool),
+        ],
+    ),
+    ("logs", &[("dir", Kind::Str), ("level", Kind::Str), ("slow_query_ms", Kind::Count)]),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Str,
+    /// A string naming a file or folder, relative to the config file's folder.
+    Path,
+    Bool,
+    /// A number ≥ 0.
+    Count,
+    /// A number > 0.
+    Positive,
+}
+
+impl Config {
+    /// The settings of the config file `path`, whose text is `text`.
+    pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
+        let values = read_toml(path, text)?;
         let dir = path.parent().unwrap_or(Path::new(""));
-        let mut seen: Vec<&str> = Vec::new();
-        for (n, line) in text.lines().enumerate() {
-            let at = || format!("{}:{}", path.display(), n + 1);
-            let line = line.split_once('#').map_or(line, |(l, _)| l).trim();
-            if line.is_empty() {
-                continue;
-            }
-            let (name, value) = line.split_once('=').ok_or_else(|| format!("{}: expected `key = value`", at()))?;
-            let (name, value) = (name.trim(), value.trim());
-            let &(key, flag) = KEYS
-                .iter()
-                .find(|(k, _)| *k == name)
-                .ok_or_else(|| format!("{}: unknown setting `{name}`", at()))?;
-            if seen.contains(&key) {
-                return Err(format!("{}: `{key}` is set twice", at()));
-            }
-            seen.push(key);
-            let value = if flag {
-                match value {
-                    "true" | "yes" | "on" => "true".to_string(),
-                    "false" | "no" | "off" => "false".to_string(),
-                    _ => return Err(format!("{}: `{key}` needs true or false", at())),
-                }
-            } else if value.is_empty() {
-                return Err(format!("{}: `{key}` needs a value", at()));
-            } else if PATHS.contains(&key) && value != "-" && Path::new(value).is_relative() {
-                dir.join(value).display().to_string()
-            } else {
-                value.to_string()
-            };
-            self.set(key, value, Origin::File)?;
-        }
-        Ok(())
-    }
-
-    /// Applies the environment variables that stand for settings.
-    pub fn apply_env(&mut self) -> Result<(), String> {
-        for &(var, key) in ENV {
-            if let Some(v) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
-                self.set(key, v, Origin::Env)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies the settings of the command line.
-    pub fn apply_command_line(&mut self, settings: Vec<(&'static str, String)>) -> Result<(), String> {
-        for (key, value) in settings {
-            self.set(key, value, Origin::Command)?;
-        }
-        Ok(())
-    }
-
-    fn set(&mut self, key: &'static str, value: String, origin: Origin) -> Result<(), String> {
-        // `data` and `in-memory` replace each other, except from the same place.
-        let other = match key {
-            "data" => Some("in-memory"),
-            "in-memory" if value == "true" => Some("data"),
-            _ => None,
+        let mut c = Config::default();
+        let str_of = |v: &Toml| match v {
+            Toml::Str(s) => s.clone(),
+            _ => unreachable!("checked by read_toml"),
         };
-        if let Some(other) = other {
-            match self.values.get(other) {
-                Some((v, o)) if *o == origin && (other == "data" || v == "true") => {
-                    return Err("--in-memory and --data exclude each other".into());
+        let path_of = |v: &Toml| {
+            let p = PathBuf::from(str_of(v));
+            if p.is_relative() { dir.join(p) } else { p }
+        };
+        let int_of = |v: &Toml| match v {
+            Toml::Int(i) => *i as u64,
+            _ => unreachable!("checked by read_toml"),
+        };
+        let bool_of = |v: &Toml| matches!(v, Toml::Bool(true));
+        for ((section, key), (value, line)) in &values {
+            let at = || format!("{}:{line}", path.display());
+            match (section.as_str(), key.as_str()) {
+                ("server", "bind") => c.bind = Some(str_of(value)),
+                ("server", "bolt") => c.bolt = Some(str_of(value)),
+                ("server", "max_connections") => c.max_connections = Some(int_of(value) as usize),
+                ("server", "keep_alive_seconds") => c.keep_alive = Some(Duration::from_secs(int_of(value))),
+                ("server", "shutdown_timeout_seconds") => c.shutdown_timeout = Some(Duration::from_secs(int_of(value))),
+                ("storage", "mode") => {
+                    c.storage = match str_of(value).as_str() {
+                        "hybrid" => Storage::Hybrid,
+                        "persistent" => Storage::Persistent,
+                        "memory" => Storage::Memory,
+                        other => {
+                            return Err(format!(
+                                "{}: storage.mode is \"hybrid\", \"persistent\" or \"memory\", not \"{other}\"",
+                                at()
+                            ));
+                        }
+                    }
                 }
-                _ => {
-                    self.values.remove(other);
+                ("storage", "data") => c.data = Some(path_of(value)),
+                ("storage", "fsync") => c.fsync = bool_of(value),
+                ("storage", "import_dir") => c.import_dir = Some(path_of(value)),
+                ("storage", "backup_dir") => c.backup_dir = Some(path_of(value)),
+                ("storage", "demo") => c.demo = Some(str_of(value)),
+                ("security", "token") => c.token = Some(str_of(value)).filter(|t| !t.is_empty()),
+                ("security", "tls_cert") => c.tls_cert = Some(path_of(value)),
+                ("security", "tls_key") => c.tls_key = Some(path_of(value)),
+                ("security", "tls_allow_plain") => c.tls_allow_plain = bool_of(value),
+                ("queries", "transaction_timeout_seconds") => {
+                    c.transaction_timeout = Some(Duration::from_secs(int_of(value)));
                 }
+                ("queries", "query_timeout_ms") => c.query_timeout = Some(Duration::from_millis(int_of(value))),
+                ("queries", "gpu") => c.gpu = bool_of(value),
+                ("queries", "test_procedures") => c.test_procedures = bool_of(value),
+                ("logs", "dir") => {
+                    c.log_dir = match str_of(value).as_str() {
+                        "-" => LogDir::StandardError,
+                        _ => LogDir::Dir(path_of(value)),
+                    }
+                }
+                ("logs", "level") => {
+                    let l = str_of(value);
+                    c.log_level = Level::parse(&l).ok_or_else(|| {
+                        format!("{}: logs.level is \"error\", \"warn\", \"info\" or \"debug\", not \"{l}\"", at())
+                    })?;
+                }
+                ("logs", "slow_query_ms") => c.slow_query = Some(Duration::from_millis(int_of(value))),
+                _ => unreachable!("checked by read_toml"),
             }
         }
-        self.values.insert(key, (value, origin));
-        Ok(())
+        if c.storage == Storage::Memory && c.data.is_some() {
+            return Err(format!(
+                "{}: storage.data is set, but storage.mode = \"memory\" keeps no data on disk",
+                path.display()
+            ));
+        }
+        match (&c.tls_cert, &c.tls_key) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(format!("{}: TLS needs both security.tls_cert and security.tls_key", path.display()));
+            }
+            (None, None) if c.tls_allow_plain => {
+                return Err(format!(
+                    "{}: security.tls_allow_plain needs security.tls_cert and security.tls_key",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+        Ok(c)
     }
 
-    /// The value of a setting.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(|(v, _)| v.as_str())
+    /// Applies the environment: GRAPHBUFF_TOKEN sets the token (a secret, kept out of the
+    /// file in containers).
+    pub fn apply_env(&mut self) {
+        if let Some(t) = std::env::var("GRAPHBUFF_TOKEN").ok().filter(|t| !t.is_empty()) {
+            self.token = Some(t);
+        }
     }
 
-    /// Whether a flag is on.
-    pub fn flag(&self, key: &str) -> bool {
-        self.get(key) == Some("true")
+    /// The data directory, or `None` in memory mode.
+    pub fn data_dir(&self) -> Result<Option<PathBuf>, String> {
+        if self.storage == Storage::Memory {
+            return Ok(None);
+        }
+        match &self.data {
+            Some(d) => Ok(Some(d.clone())),
+            None => default_data_dir().map(Some).ok_or_else(|| {
+                "no default data folder (HOME or LOCALAPPDATA is not set): set storage.data in the config file".into()
+            }),
+        }
     }
 }
 
-#[derive(Default)]
-pub struct CommandLine {
-    pub help: bool,
-    pub config: Option<String>,
-    pub settings: Vec<(&'static str, String)>,
+/// The settings of a config file: `(section, key) → (value, line)`.
+type Values = HashMap<(String, String), (Toml, usize)>;
+
+/// Reads the TOML subset the config file uses, checking every section, key and value kind.
+fn read_toml(path: &Path, text: &str) -> Result<Values, String> {
+    let mut out = HashMap::new();
+    let mut section: Option<&'static [(&'static str, Kind)]> = None;
+    let mut section_name = String::new();
+    let mut seen_sections: Vec<String> = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line_no = n + 1;
+        let at = || format!("{}:{line_no}", path.display());
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let (name, after) = rest.split_once(']').ok_or_else(|| format!("{}: expected `[section]`", at()))?;
+            let after = after.trim();
+            if !(after.is_empty() || after.starts_with('#')) {
+                return Err(format!("{}: unexpected text after `[{name}]`", at()));
+            }
+            let name = name.trim();
+            let (_, keys) = SETTINGS.iter().find(|(s, _)| *s == name).ok_or_else(|| {
+                let known: Vec<String> = SETTINGS.iter().map(|(s, _)| format!("[{s}]")).collect();
+                format!("{}: unknown section `[{name}]` (sections: {})", at(), known.join(", "))
+            })?;
+            if seen_sections.iter().any(|s| s == name) {
+                return Err(format!("{}: section `[{name}]` appears twice", at()));
+            }
+            seen_sections.push(name.to_string());
+            section = Some(keys);
+            section_name = name.to_string();
+            continue;
+        }
+        let (key, rest) = line.split_once('=').ok_or_else(|| format!("{}: expected `key = value`", at()))?;
+        let key = key.trim();
+        let Some(keys) = section else {
+            return Err(format!("{}: `{key}` is outside a section; settings go under [server], [storage], …", at()));
+        };
+        let &(_, kind) = keys.iter().find(|(k, _)| *k == key).ok_or_else(|| {
+            let known: Vec<&str> = keys.iter().map(|(k, _)| *k).collect();
+            format!("{}: unknown setting `{key}` in [{section_name}] (settings: {})", at(), known.join(", "))
+        })?;
+        let value = parse_value(rest.trim()).map_err(|e| format!("{}: {key}: {e}", at()))?;
+        let fits = match (kind, &value) {
+            (Kind::Str | Kind::Path, Toml::Str(_)) | (Kind::Bool, Toml::Bool(_)) => true,
+            (Kind::Count, Toml::Int(i)) => *i >= 0,
+            (Kind::Positive, Toml::Int(i)) => *i > 0,
+            _ => false,
+        };
+        if !fits {
+            let wanted = match kind {
+                Kind::Str => "a string in quotes",
+                Kind::Path => "a path in quotes",
+                Kind::Bool => "true or false",
+                Kind::Count => "a number (0 or more)",
+                Kind::Positive => "a number greater than 0",
+            };
+            return Err(format!("{}: {section_name}.{key} needs {wanted}, not {}", at(), match &value {
+                Toml::Int(i) => i.to_string(),
+                v => v.kind().to_string(),
+            }));
+        }
+        let entry = (section_name.clone(), key.to_string());
+        if out.contains_key(&entry) {
+            return Err(format!("{}: {section_name}.{key} is set twice", at()));
+        }
+        out.insert(entry, (value, line_no));
+    }
+    Ok(out)
 }
 
-/// Where the config file is read from without --config or GRAPHBUFF_CONFIG:
-///   Linux    $XDG_CONFIG_HOME/graphbuff/graphbuff.conf (~/.config/graphbuff/graphbuff.conf),
-///            /etc/graphbuff/graphbuff.conf when run as root
-///   macOS    ~/Library/Application Support/graphbuff/graphbuff.conf
-///   Windows  %LOCALAPPDATA%\graphbuff\graphbuff.conf
-pub fn default_config_file() -> Option<PathBuf> {
+/// A value and an optional comment after it.
+fn parse_value(text: &str) -> Result<Toml, String> {
+    let rest_is_comment = |rest: &str| {
+        let rest = rest.trim();
+        if rest.is_empty() || rest.starts_with('#') {
+            Ok(())
+        } else {
+            Err(format!("unexpected `{rest}` after the value"))
+        }
+    };
+    if let Some(body) = text.strip_prefix('"') {
+        let mut s = String::new();
+        let mut chars = body.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => {
+                    rest_is_comment(&body[i + 1..])?;
+                    return Ok(Toml::Str(s));
+                }
+                '\\' => {
+                    let (_, e) = chars.next().ok_or("unfinished escape")?;
+                    s.push(match e {
+                        '"' => '"',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        'u' => {
+                            let hex: String = (0..4).filter_map(|_| chars.next().map(|(_, c)| c)).collect();
+                            u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| format!("bad escape `\\u{hex}`"))?
+                        }
+                        other => {
+                            return Err(format!(
+                                "unknown escape `\\{other}` (on Windows, write paths with `/` or in 'single quotes')"
+                            ));
+                        }
+                    });
+                }
+                c => s.push(c),
+            }
+        }
+        return Err("the string has no closing `\"`".into());
+    }
+    if let Some(body) = text.strip_prefix('\'') {
+        let (s, rest) = body.split_once('\'').ok_or("the string has no closing `'`")?;
+        rest_is_comment(rest)?;
+        return Ok(Toml::Str(s.to_string()));
+    }
+    let (word, rest) = text.split_once('#').map_or((text, ""), |(w, r)| (w, r));
+    let _ = rest;
+    let word = word.trim();
+    match word {
+        "true" => return Ok(Toml::Bool(true)),
+        "false" => return Ok(Toml::Bool(false)),
+        "" => return Err("needs a value".into()),
+        _ => {}
+    }
+    word.replace('_', "")
+        .parse::<i64>()
+        .map(Toml::Int)
+        .map_err(|_| format!("`{word}` is not a value; strings go in quotes (\"…\"), and true / false and numbers without"))
+}
+
+/// The config file next to the program: `config/graphbuff.toml` in the program's folder.
+pub fn program_config_file() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("config").join(FILE_NAME))
+}
+
+/// The per-user (or system) config file:
+///   Linux    $XDG_CONFIG_HOME/graphbuff/graphbuff.toml (~/.config/graphbuff/graphbuff.toml),
+///            /etc/graphbuff/graphbuff.toml when run as root
+///   macOS    ~/Library/Application Support/graphbuff/graphbuff.toml
+///   Windows  %LOCALAPPDATA%\graphbuff\graphbuff.toml
+pub fn user_config_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(FILE_NAME))
+}
+
+/// The folder of [`user_config_file`].
+pub fn config_dir() -> Option<PathBuf> {
     let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let dir = if cfg!(windows) {
+    if cfg!(windows) {
         env("LOCALAPPDATA").map(|d| d.join("graphbuff"))
     } else if cfg!(target_os = "macos") {
         env("HOME").map(|h| h.join("Library/Application Support/graphbuff"))
@@ -247,11 +534,10 @@ pub fn default_config_file() -> Option<PathBuf> {
         env("XDG_CONFIG_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".config")))
             .map(|d| d.join("graphbuff"))
-    };
-    dir.map(|d| d.join("graphbuff.conf"))
+    }
 }
 
-/// Where databases go without --data, GRAPHBUFF_DATA or `data` in the config file.
+/// Where databases go without `storage.data`.
 pub fn default_data_dir() -> Option<PathBuf> {
     let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
@@ -283,36 +569,74 @@ fn running_as_root() -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn precedence_and_paths() {
-        let mut s = Settings::default();
-        let file = Path::new("conf").join("graphbuff.conf");
-        s.apply_file(&file, "bind = 0.0.0.0:1 # comment\ndata = d\ngpu = yes\nlog-dir = -\n").unwrap();
-        assert_eq!(s.get("data"), Some(Path::new("conf").join("d").display().to_string().as_str()));
-        assert!(s.flag("gpu"));
-        assert_eq!(s.get("log-dir"), Some("-"));
-        let cl = Settings::command_line(["--bind", "127.0.0.1:2", "--in-memory"].map(String::from).into_iter()).unwrap();
-        s.apply_command_line(cl.settings).unwrap();
-        assert_eq!(s.get("bind"), Some("127.0.0.1:2"));
-        assert!(s.flag("in-memory"));
-        assert_eq!(s.get("data"), None);
+    fn parse(text: &str) -> Result<Config, String> {
+        Config::parse(&Path::new("conf").join("graphbuff.toml"), text)
     }
 
     #[test]
-    fn errors() {
-        let mut s = Settings::default();
-        let f = Path::new("x.conf");
-        assert!(s.apply_file(f, "nope = 1").unwrap_err().contains("unknown setting `nope`"));
-        assert!(s.apply_file(f, "gpu = maybe").unwrap_err().contains("true or false"));
-        assert!(s.apply_file(f, "bind").unwrap_err().contains("key = value"));
-        assert!(Settings::command_line(["--nope"].map(String::from).into_iter()).is_err());
-        let mut s = Settings::default();
-        let cl = Settings::command_line(["--in-memory", "--data", "x"].map(String::from).into_iter()).unwrap();
-        assert!(s.apply_command_line(cl.settings).unwrap_err().contains("exclude each other"));
+    fn sections_values_and_paths() {
+        let c = parse(
+            "# comment\n[server]\nbind = \"0.0.0.0:1\" # trailing\nmax_connections = 1_000\n\n\
+             [storage]\nmode = 'persistent'\ndata = \"d\"\nfsync = false\nbackup_dir = \"/abs/b\"\n\
+             [logs]\ndir = \"-\"\nlevel = \"debug\"\n[queries]\ngpu = true\nquery_timeout_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(c.bind.as_deref(), Some("0.0.0.0:1"));
+        assert_eq!(c.max_connections, Some(1000));
+        assert_eq!(c.storage, Storage::Persistent);
+        assert_eq!(c.data, Some(Path::new("conf").join("d")));
+        assert!(!c.fsync && c.gpu);
+        assert_eq!(c.backup_dir, Some(PathBuf::from("/abs/b")));
+        assert_eq!(c.log_dir, LogDir::StandardError);
+        assert_eq!(c.log_level, Level::Debug);
+        assert_eq!(c.query_timeout, Some(Duration::from_millis(250)));
+        assert_eq!(parse("").unwrap(), Config::default());
+        assert_eq!(parse("[security]\ntoken = \"a\\\"b\\u00e9\"").unwrap().token.as_deref(), Some("a\"bé"));
     }
 
     #[test]
-    fn template_parses() {
-        Settings::default().apply_file(Path::new("t.conf"), TEMPLATE).unwrap();
+    fn errors_name_the_line() {
+        let e = |text: &str| parse(text).unwrap_err();
+        assert!(e("[server]\nbnd = \"x\"").contains("graphbuff.toml:2: unknown setting `bnd` in [server]"), "{}", e("[server]\nbnd = \"x\""));
+        assert!(e("[srv]").contains("unknown section `[srv]`"));
+        assert!(e("bind = \"x\"").contains("outside a section"));
+        assert!(e("[server]\nbind = 127.0.0.1").contains("not a value"));
+        assert!(e("[server]\nmax_connections = 0").contains("greater than 0"));
+        assert!(e("[server]\nmax_connections = \"8\"").contains("needs a number greater than 0, not a string"));
+        assert!(e("[storage]\nfsync = yes").contains("not a value"));
+        assert!(e("[storage]\nmode = \"disk\"").contains("not \"disk\""));
+        assert!(e("[storage]\nmode = \"memory\"\ndata = \"d\"").contains("keeps no data on disk"));
+        assert!(e("[server]\nbind = \"a\"\nbind = \"b\"").contains("set twice"));
+        assert!(e("[server]\n[server]").contains("appears twice"));
+        assert!(e("[storage]\ndata = \"C:\\data\"").contains("single quotes"));
+        assert!(e("[security]\ntls_cert = \"c.pem\"").contains("needs both"));
+        assert!(e("[logs]\nlevel = \"loud\"").contains("logs.level"));
+        assert!(e("[server]\nbind = \"x").contains("no closing"));
+        assert!(e("[server]\nbind = \"x\" y").contains("after the value"));
+    }
+
+    #[test]
+    fn templates_parse() {
+        let next = Config::parse(Path::new("cfg/graphbuff.toml"), &template(true)).unwrap();
+        assert_eq!(next.data, Some(Path::new("cfg").join("../data")));
+        assert_eq!(next.bind.as_deref(), Some("127.0.0.1:7475"));
+        let user = Config::parse(Path::new("u/graphbuff.toml"), &template(false)).unwrap();
+        assert_eq!(user.data, None);
+    }
+
+    /// The files the release archives and the Docker image ship.
+    #[test]
+    fn shipped_files() {
+        let shipped = include_str!("../../../packaging/config/graphbuff.toml");
+        assert_eq!(shipped.replace("\r", ""), template(true), "packaging/config/graphbuff.toml is the template");
+        let docker = Config::parse(
+            Path::new("/etc/graphbuff/graphbuff.toml"),
+            include_str!("../../../packaging/docker/graphbuff.toml"),
+        )
+        .unwrap();
+        assert_eq!(docker.bind.as_deref(), Some("0.0.0.0:7475"));
+        assert_eq!(docker.bolt.as_deref(), Some("0.0.0.0:7687"));
+        assert_eq!(docker.data, Some(PathBuf::from("/data")));
+        assert_eq!(docker.log_dir, LogDir::StandardError);
     }
 }

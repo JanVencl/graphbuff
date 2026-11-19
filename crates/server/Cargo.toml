@@ -22,7 +22,7 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # RustCrypto provider instead (no C compiler; a pre-release). With both, ring is used.
 tls = ["dep:rustls", "rustls/ring"]
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
-# `--gpu`: run graph kernels on the GPU (wgpu).
+# `gpu = true` in [queries] of the config file: run graph kernels on the GPU (wgpu).
 gpu = ["graphbuff/gpu"]
 
 [dependencies.rustls]

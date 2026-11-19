@@ -3,7 +3,12 @@
 #
 #   docker build -t graphbuff .
 #   docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
-#     -e GRAPHBUFF_ADMIN_PASSWORD=change-me graphbuff --demo movies
+#     -e GRAPHBUFF_ADMIN_PASSWORD=change-me graphbuff
+#
+# Settings are in /etc/graphbuff/graphbuff.toml (packaging/docker/graphbuff.toml in the
+# repository). To change them, mount your own copy over it:
+#
+#   docker run ... -v ./graphbuff.toml:/etc/graphbuff/graphbuff.toml:ro graphbuff
 #
 # Clients log in with user accounts, kept in the system database in /data. On the first
 # start (no administrator yet) the server creates the administrator GRAPHBUFF_ADMIN_USER
@@ -54,17 +59,14 @@ LABEL org.opencontainers.image.title="graphbuff" \
       org.opencontainers.image.source="https://github.com/JanVencl/graphbuff" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
 COPY --from=build /out/bin/ /usr/local/bin/
+COPY packaging/docker/graphbuff.toml /etc/graphbuff/graphbuff.toml
 COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot
 WORKDIR /data
 VOLUME /data
-# Databases, user accounts (the system database) and the config file (graphbuff.conf, created on the first
-# start) in the /data volume; logs to standard error (`docker logs`). Options after the
-# image name override the config file and these variables.
-ENV GRAPHBUFF_DATA=/data \
-    GRAPHBUFF_CONFIG=/data/graphbuff.conf \
-    GRAPHBUFF_LOG_DIR=-
-# HTTP/JSON and Bolt. The server listens on every interface of the container; which
-# machines can reach it is decided by `docker run -p`.
+# Databases and user accounts (the system database) in the /data volume; logs to standard
+# error (`docker logs`). HTTP/JSON and Bolt listen on every interface of the container;
+# which machines can reach them is decided by `docker run -p`.
+ENV GRAPHBUFF_CONFIG=/etc/graphbuff/graphbuff.toml
 EXPOSE 7475 7687
-ENTRYPOINT ["graphbuff-server", "--bind", "0.0.0.0:7475", "--bolt", "0.0.0.0:7687"]
+ENTRYPOINT ["graphbuff-server"]

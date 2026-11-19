@@ -4,10 +4,12 @@ The binary is the one named by GRAPHBUFF_SERVER, else target/release or target/d
 (whichever was built last).
 """
 
+import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import requests
@@ -38,6 +40,39 @@ def free_port():
 TOKEN = "integration-test-token"
 
 
+def toml_value(v):
+    """A Python value as TOML: strings as literal strings ('…', so Windows paths need no
+    escapes) unless they hold a quote."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    v = str(v)
+    return f"'{v}'" if "'" not in v and "\n" not in v else json.dumps(v)
+
+
+def write_config(settings, directory=None):
+    """Writes `settings` ({"section.key": value}) as a graphbuff.toml in `directory` (a new
+    temporary folder by default); returns the file's path."""
+    sections = {}
+    for name, value in settings.items():
+        section, key = name.split(".", 1)
+        sections.setdefault(section, []).append(f"{key} = {toml_value(value)}")
+    text = "\n".join(f"[{s}]\n" + "\n".join(lines) + "\n" for s, lines in sections.items())
+    directory = directory or tempfile.mkdtemp(prefix="graphbuff-config-")
+    path = os.path.join(directory, "graphbuff.toml")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def clean_env(**extra):
+    """The environment without the caller's GRAPHBUFF_* variables, plus `extra`."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHBUFF_")}
+    env.update(extra)
+    return env
+
+
 class QueryError(Exception):
     """An error answer: `code` is the error kind (SyntaxError, TypeError, ...)."""
 
@@ -52,15 +87,16 @@ class ServerDied(Exception):
 
 
 class Server:
-    """One server process on a free port. `args` are extra command-line options; without
-    `--data`, databases live in memory. Clients log in with the token: the one in `args`
-    (`--token`), else `TOKEN`; `http` sends it with every request."""
+    """One server process on a free port. `settings` ({"section.key": value}) go into its
+    config file; without `storage.data`, databases live in memory. Clients log in with the
+    token: `security.token` from `settings`, else `TOKEN`; `http` sends it with every
+    request."""
 
-    def __init__(self, args=()):
-        self.args = list(args)
+    def __init__(self, settings=None):
+        self.settings = dict(settings or {})
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        self.token = self.args[self.args.index("--token") + 1] if "--token" in self.args else TOKEN
+        self.token = self.settings.get("security.token", TOKEN)
         self.http = self._session()
         self.proc = None
 
@@ -70,14 +106,13 @@ class Server:
         return http
 
     def start(self):
-        cmd = [server_binary(), "--bind", f"127.0.0.1:{self.port}", "--log-level", "error"]
-        if "--data" not in self.args:
-            cmd.append("--in-memory")
-        if "--token" not in self.args:
-            cmd += ["--token", self.token]
-        cmd += self.args
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                     env={**os.environ, "GRAPHBUFF_CONFIG": "-"})
+        settings = {"server.bind": f"127.0.0.1:{self.port}", "logs.level": "error", "logs.dir": "-",
+                    "security.token": self.token}
+        if "storage.data" not in self.settings:
+            settings["storage.mode"] = "memory"
+        settings.update(self.settings)
+        cmd = [server_binary(), "--config", write_config(settings)]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=clean_env())
         deadline = time.time() + 20
         while True:
             try:

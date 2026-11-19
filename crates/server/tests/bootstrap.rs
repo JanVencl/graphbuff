@@ -8,14 +8,13 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 
 /// Every variable the server reads, so the caller's environment does not leak in.
 const VARS: &[&str] = &[
     "GRAPHBUFF_TOKEN",
-    "GRAPHBUFF_DATA",
-    "GRAPHBUFF_LOG_DIR",
-    "GRAPHBUFF_LOG_LEVEL",
     "GRAPHBUFF_ADMIN_USER",
     "GRAPHBUFF_ADMIN_PASSWORD",
     "GRAPHBUFF_ADMIN_PASSWORD_FILE",
@@ -28,32 +27,29 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// The server with `args` (in memory unless they name --data), in a clean environment.
-fn command(args: &[&str], env: &[(&str, &str)]) -> Command {
+/// The server on the data folder `data` (in memory without one), in a clean environment.
+fn command(data: Option<&str>, env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(BIN);
-    cmd.args(["--bind", "127.0.0.1:0", "--log-dir", "-"]);
-    if !args.contains(&"--data") {
-        cmd.arg("--in-memory");
-    }
-    cmd.args(args);
+    cmd.arg("--config").arg(common::data_config(data));
     clean(&mut cmd, env);
     cmd
 }
 
-/// `graphbuff-server users ARGS…` in a clean environment; returns standard output, or
-/// standard error on failure.
-fn users(args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
-    offline("users", args, env, None)
+/// `graphbuff-server users ARGS…` on the data folder `data`, in a clean environment;
+/// returns standard output, or standard error on failure.
+fn users(data: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    offline("users", data, args, env, None)
 }
 
 /// `graphbuff-server admin ARGS…`, like [`users`]; `stdin` is standard input's text.
-fn admin(args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
-    offline("admin", args, env, stdin)
+fn admin(data: &str, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
+    offline("admin", data, args, env, stdin)
 }
 
-fn offline(command: &str, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
+fn offline(command: &str, data: &str, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(BIN);
-    cmd.arg(command).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg(command).arg("--config").arg(common::data_config(Some(data)));
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     clean(&mut cmd, env);
     let mut child = cmd.spawn().unwrap();
@@ -69,7 +65,7 @@ fn offline(command: &str, args: &[&str], env: &[(&str, &str)], stdin: Option<&st
 }
 
 fn clean(cmd: &mut Command, env: &[(&str, &str)]) {
-    cmd.env("GRAPHBUFF_CONFIG", "-");
+    cmd.env_remove("GRAPHBUFF_CONFIG");
     for key in VARS {
         cmd.env_remove(key);
     }
@@ -81,14 +77,14 @@ fn clean(cmd: &mut Command, env: &[(&str, &str)]) {
 
 /// Starts the server, checks each `(user, password, expected status)` login over HTTP,
 /// and stops it.
-fn logins(args: &[&str], env: &[(&str, &str)], checks: &[(&str, &str, u16)]) {
-    logins_while(args, env, checks, || {});
+fn logins(data: Option<&str>, env: &[(&str, &str)], checks: &[(&str, &str, u16)]) {
+    logins_while(data, env, checks, || {});
 }
 
 /// Like [`logins`], also running `during` while the server runs.
-fn logins_while(args: &[&str], env: &[(&str, &str)], checks: &[(&str, &str, u16)], during: impl FnOnce()) {
+fn logins_while(data: Option<&str>, env: &[(&str, &str)], checks: &[(&str, &str, u16)], during: impl FnOnce()) {
     // No terminal on standard input, so the server never waits for an answer.
-    let mut child = command(args, env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = command(data, env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut listening = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut listening).unwrap();
     let result = std::panic::catch_unwind(|| {
@@ -145,8 +141,8 @@ fn base64(data: &[u8]) -> String {
 }
 
 /// Runs the server expecting it to refuse to start; returns its standard error.
-fn refused(args: &[&str], env: &[(&str, &str)]) -> String {
-    let out = command(args, env).stdin(Stdio::null()).output().unwrap();
+fn refused(data: Option<&str>, env: &[(&str, &str)]) -> String {
+    let out = command(data, env).stdin(Stdio::null()).output().unwrap();
     assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -156,14 +152,12 @@ fn the_first_start_creates_the_administrator_and_later_starts_keep_it() {
     let dir = temp_dir("first");
     let data = dir.join("data");
     let data = data.to_str().unwrap();
-    logins(
-        &["--data", data],
+    logins(Some(data),
         &[("GRAPHBUFF_ADMIN_PASSWORD", "first-pw")],
         &[("admin", "first-pw", 200), ("admin", "wrong", 401), ("", "", 401)],
     );
     // There is an account now: a different password in the environment is ignored.
-    logins(
-        &["--data", data],
+    logins(Some(data),
         &[("GRAPHBUFF_ADMIN_PASSWORD", "second-pw")],
         &[("admin", "first-pw", 200), ("admin", "second-pw", 401)],
     );
@@ -176,8 +170,7 @@ fn password_file_and_user_name() {
     let dir = temp_dir("file");
     let secret = dir.join("secret");
     std::fs::write(&secret, "from-a-file\r\n").unwrap();
-    logins(
-        &[],
+    logins(None,
         &[("GRAPHBUFF_ADMIN_USER", "root"), ("GRAPHBUFF_ADMIN_PASSWORD_FILE", secret.to_str().unwrap())],
         &[("root", "from-a-file", 200), ("admin", "from-a-file", 401)],
     );
@@ -187,7 +180,7 @@ fn password_file_and_user_name() {
 #[test]
 fn accounts_are_on_by_default() {
     // Without an administrator, the token holder gets in (and can create one).
-    logins(&[], &[("GRAPHBUFF_TOKEN", "tok")], &[("x", "tok", 200), ("", "", 401), ("admin", "x", 401)]);
+    logins(None, &[("GRAPHBUFF_TOKEN", "tok")], &[("x", "tok", 200), ("", "", 401), ("admin", "x", 401)]);
 }
 
 #[test]
@@ -196,20 +189,19 @@ fn without_an_administrator_the_server_does_not_start() {
     let data = dir.join("data");
     let data = data.to_str().unwrap();
     // In memory: accounts would be lost at every stop, so only the environment helps.
-    let err = refused(&[], &[]);
+    let err = refused(None, &[]);
     assert!(err.contains("in-memory accounts are lost"), "{err}");
     // No terminal to ask on (standard input is not one here).
-    let err = refused(&["--data", data], &[]);
+    let err = refused(Some(data), &[]);
     assert!(err.contains("no terminal to ask"), "{err}");
     // Users without the admin role do not count.
-    users(&["--data", data, "add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
-    let err = refused(&["--data", data], &[]);
+    users(data, &["add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
+    let err = refused(Some(data), &[]);
     assert!(err.contains("no terminal to ask"), "{err}");
-    let err = refused(&["--data", data], &[("GRAPHBUFF_ADMIN_USER", "kim"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
+    let err = refused(Some(data), &[("GRAPHBUFF_ADMIN_USER", "kim"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
     assert!(err.contains("users grant kim admin"), "{err}");
     // Another name from the environment becomes the administrator.
-    logins(
-        &["--data", data],
+    logins(Some(data),
         &[("GRAPHBUFF_ADMIN_PASSWORD", "admin-password")],
         &[("admin", "admin-password", 200), ("kim", "kim-password", 200)],
     );
@@ -218,11 +210,12 @@ fn without_an_administrator_the_server_does_not_start() {
 
 #[test]
 fn accounts_cannot_be_turned_off() {
-    let out = command(&["--users", "off"], &[]).stdin(Stdio::null()).output().unwrap();
+    let mut cmd = command(None, &[]);
+    let out = cmd.args(["--users", "off"]).stdin(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option `--users`"));
     // The old variable is ignored: accounts stay on.
-    let err = refused(&[], &[("GRAPHBUFF_USERS", "off")]);
+    let err = refused(None, &[("GRAPHBUFF_USERS", "off")]);
     assert!(err.contains("there is no administrator"), "{err}");
 }
 
@@ -232,19 +225,17 @@ fn the_offline_command_works_on_the_data_directory() {
     let data = dir.join("data");
     let data = data.to_str().unwrap();
     let pw = [("GRAPHBUFF_PASSWORD", "offline-pw")];
-    assert_eq!(users(&["--data", data, "add", "root", "admin"], &pw).unwrap().trim(), "added user root");
-    users(&["--data", data, "add", "kim", "reader"], &pw).unwrap();
-    users(&["--data", data, "grant", "kim", "editor"], &[]).unwrap();
-    users(&["--data", data, "remove", "kim"], &[]).unwrap();
-    assert_eq!(users(&["--data", data, "list"], &[]).unwrap().trim(), "root\tadmin");
-    // GRAPHBUFF_DATA works too.
-    assert_eq!(users(&["list"], &[("GRAPHBUFF_DATA", data)]).unwrap().trim(), "root\tadmin");
-    logins_while(&["--data", data], &[], &[("root", "offline-pw", 200), ("root", "x", 401)], || {
+    assert_eq!(users(data, &["add", "root", "admin"], &pw).unwrap().trim(), "added user root");
+    users(data, &["add", "kim", "reader"], &pw).unwrap();
+    users(data, &["grant", "kim", "editor"], &[]).unwrap();
+    users(data, &["remove", "kim"], &[]).unwrap();
+    assert_eq!(users(data, &["list"], &[]).unwrap().trim(), "root\tadmin");
+    logins_while(Some(data), &[], &[("root", "offline-pw", 200), ("root", "x", 401)], || {
         // Not while a server uses the data directory.
-        let err = users(&["--data", data, "list"], &[]).unwrap_err();
+        let err = users(data, &["list"], &[]).unwrap_err();
         assert!(err.contains("is a server using it"), "{err}");
     });
-    let err = users(&["--data", data, "remove", "ghost"], &[]).unwrap_err();
+    let err = users(data, &["remove", "ghost"], &[]).unwrap_err();
     assert!(err.contains("does not exist"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -255,33 +246,33 @@ fn admin_init_creates_the_first_administrator_once() {
     let data = dir.join("data");
     let data = data.to_str().unwrap();
     // Without a terminal the password is the first line of standard input.
-    assert_eq!(admin(&["--data", data, "init"], &[], Some("stdin-password\n")).unwrap().trim(), "created the administrator admin");
-    let err = admin(&["--data", data, "init", "other"], &[], Some("other-password\n")).unwrap_err();
+    assert_eq!(admin(data, &["init"], &[], Some("stdin-password\n")).unwrap().trim(), "created the administrator admin");
+    let err = admin(data, &["init", "other"], &[], Some("other-password\n")).unwrap_err();
     assert!(err.contains("there is an administrator already (admin)"), "{err}");
-    assert_eq!(users(&["--data", data, "list"], &[]).unwrap().trim(), "admin\tadmin");
-    logins(&["--data", data], &[], &[("admin", "stdin-password", 200)]);
+    assert_eq!(users(data, &["list"], &[]).unwrap().trim(), "admin\tadmin");
+    logins(Some(data), &[], &[("admin", "stdin-password", 200)]);
 
     // A name on the command line; the password from the environment.
     let data2 = dir.join("data2");
     let data2 = data2.to_str().unwrap();
     let env = [("GRAPHBUFF_ADMIN_USER", "ignored"), ("GRAPHBUFF_ADMIN_PASSWORD", "env-password")];
-    assert_eq!(admin(&["--data", data2, "init", "root"], &env, None).unwrap().trim(), "created the administrator root");
+    assert_eq!(admin(data2, &["init", "root"], &env, None).unwrap().trim(), "created the administrator root");
     // GRAPHBUFF_ADMIN_USER names it when the command line does not.
     let data3 = dir.join("data3");
     let data3 = data3.to_str().unwrap();
     let env = [("GRAPHBUFF_ADMIN_USER", "boss"), ("GRAPHBUFF_ADMIN_PASSWORD", "env-password")];
-    assert_eq!(admin(&["--data", data3, "init"], &env, None).unwrap().trim(), "created the administrator boss");
+    assert_eq!(admin(data3, &["init"], &env, None).unwrap().trim(), "created the administrator boss");
 
     // An existing user without the admin role is not taken over.
     let data4 = dir.join("data4");
     let data4 = data4.to_str().unwrap();
-    users(&["--data", data4, "add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
-    let err = admin(&["--data", data4, "init", "kim"], &[], Some("new-password\n")).unwrap_err();
+    users(data4, &["add", "kim", "editor"], &[("GRAPHBUFF_PASSWORD", "kim-password")]).unwrap();
+    let err = admin(data4, &["init", "kim"], &[], Some("new-password\n")).unwrap_err();
     assert!(err.contains("users grant kim admin"), "{err}");
     // The password policy holds.
-    let err = admin(&["--data", data4, "init"], &[], Some("short\n")).unwrap_err();
+    let err = admin(data4, &["init"], &[], Some("short\n")).unwrap_err();
     assert!(err.contains("at least 8 characters"), "{err}");
-    let err = admin(&["--data", data4, "init", "a", "b"], &[], None).unwrap_err();
+    let err = admin(data4, &["init", "a", "b"], &[], None).unwrap_err();
     assert!(err.contains("at most one NAME"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -291,22 +282,22 @@ fn admin_reset_password_recovers_access() {
     let dir = temp_dir("admin-reset");
     let data = dir.join("data");
     let data = data.to_str().unwrap();
-    admin(&["--data", data, "init"], &[("GRAPHBUFF_ADMIN_PASSWORD", "forgotten-pw")], None).unwrap();
-    let out = admin(&["--data", data, "reset-password", "admin"], &[], Some("brand-new-pw\n")).unwrap();
+    admin(data, &["init"], &[("GRAPHBUFF_ADMIN_PASSWORD", "forgotten-pw")], None).unwrap();
+    let out = admin(data, &["reset-password", "admin"], &[], Some("brand-new-pw\n")).unwrap();
     assert_eq!(out.trim(), "reset the password of admin");
-    admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "from-env-pw")], None).unwrap();
-    logins_while(&["--data", data], &[], &[("admin", "from-env-pw", 200), ("admin", "forgotten-pw", 401)], || {
+    admin(data, &["reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "from-env-pw")], None).unwrap();
+    logins_while(Some(data), &[], &[("admin", "from-env-pw", 200), ("admin", "forgotten-pw", 401)], || {
         // Refused while a server holds the data directory.
-        let err = admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "x-password")], None).unwrap_err();
+        let err = admin(data, &["reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "x-password")], None).unwrap_err();
         assert!(err.contains("is a server using it"), "{err}");
     });
-    let err = admin(&["--data", data, "reset-password", "ghost"], &[], Some("whatever-pw\n")).unwrap_err();
+    let err = admin(data, &["reset-password", "ghost"], &[], Some("whatever-pw\n")).unwrap_err();
     assert!(err.contains("`ghost` does not exist; administrators: admin"), "{err}");
-    let err = admin(&["--data", data, "reset-password"], &[], None).unwrap_err();
+    let err = admin(data, &["reset-password"], &[], None).unwrap_err();
     assert!(err.contains("needs one user NAME"), "{err}");
-    let err = admin(&["--data", data, "reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "short")], None).unwrap_err();
+    let err = admin(data, &["reset-password", "admin"], &[("GRAPHBUFF_PASSWORD", "short")], None).unwrap_err();
     assert!(err.contains("at least 8 characters"), "{err}");
-    let err = admin(&["--data", data, "nope"], &[], None).unwrap_err();
+    let err = admin(data, &["nope"], &[], None).unwrap_err();
     assert!(err.contains("unknown admin command"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -315,17 +306,17 @@ fn admin_reset_password_recovers_access() {
 fn bad_bootstrap_settings_are_refused() {
     let dir = temp_dir("bad");
     let missing = dir.join("missing");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "root")]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_USER", "root")]);
     assert!(err.contains("GRAPHBUFF_ADMIN_USER needs GRAPHBUFF_ADMIN_PASSWORD"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD", "pw"), ("GRAPHBUFF_ADMIN_PASSWORD_FILE", "x")]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_PASSWORD", "pw"), ("GRAPHBUFF_ADMIN_PASSWORD_FILE", "x")]);
     assert!(err.contains("not both"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD_FILE", missing.to_str().unwrap())]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_PASSWORD_FILE", missing.to_str().unwrap())]);
     assert!(err.contains("cannot read GRAPHBUFF_ADMIN_PASSWORD_FILE"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "bad name!"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_USER", "bad name!"), ("GRAPHBUFF_ADMIN_PASSWORD", "long-enough")]);
     assert!(err.contains("cannot create the administrator"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_PASSWORD", "short")]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_PASSWORD", "short")]);
     assert!(err.contains("at least 8 characters"), "{err}");
-    let err = refused(&[], &[("GRAPHBUFF_ADMIN_USER", "longname"), ("GRAPHBUFF_ADMIN_PASSWORD", "longname")]);
+    let err = refused(None, &[("GRAPHBUFF_ADMIN_USER", "longname"), ("GRAPHBUFF_ADMIN_PASSWORD", "longname")]);
     assert!(err.contains("differ from the user name"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,7 +1,7 @@
 # Driver compatibility suite
 
 Smoke tests that run the official Neo4j drivers against `graphbuff-server` over Bolt. Each suite starts its own server (HTTP and Bolt on free ports,
-`--token` auth) and stops it at the end.
+token auth, from a config file it writes) and stops it at the end.
 
 Build the server first. The suites use the binary named by `GRAPHBUFF_SERVER`, else
 whichever of `target/release` and `target/debug` was built last:
@@ -44,7 +44,7 @@ recovering from them; other databases, and database commands on the `system` dat
 Java also runs the async API.
 
 Python's `test_accounts.py` starts servers of its own: one with user accounts in a data
-directory (made with `graphbuff-server users --data DIR add`), checking logins, roles
+directory (made with `graphbuff-server users --config FILE add`), checking logins, roles
 (`Forbidden`) and user management on the `system` database; and one with TLS, checking
 `bolt+s` with a custom CA, `bolt+ssc`, `neo4j+ssc` and refused plain or untrusted
 connections. The TLS tests are skipped unless the server was built with TLS:

@@ -48,5 +48,5 @@ passes. After a change that makes more scenarios pass, record them with
   expected error.
 - Test procedures (`there exists a procedure …`, in `clauses/call`) are added through
   `POST /db/{name}/test-procedure`, which the server offers only when started with
-  `--test-procedures`. Each answers from its table: the rows whose input columns equal
-  the arguments. Argument types are not checked.
+  `test_procedures = true` in `[queries]` of its config file. Each answers from its table: the rows whose input columns equal
+  the arguments; with types in the signature, arguments of another type fail.

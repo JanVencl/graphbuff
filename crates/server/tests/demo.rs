@@ -1,4 +1,4 @@
-//! `graphbuff-server --demo`: the real binary, started with the embedded movies graph.
+//! `demo` in the config file: the real binary, started with the embedded movies graph.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -7,12 +7,17 @@ use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_graphbuff-server");
 
+mod common;
+use common::{server_config, toml_str};
+
 #[test]
 fn demo_movies_is_loaded_at_startup() {
+    let config = server_config(&[("security.token", toml_str("test-token")), ("storage.demo", toml_str("movies"))]);
     let mut child = Command::new(BIN)
-        .args(["--bind", "127.0.0.1:0", "--in-memory", "--token", "test-token", "--demo", "movies"])
+        .arg("--config")
+        .arg(config)
         .env_remove("GRAPHBUFF_TOKEN")
-        .env("GRAPHBUFF_CONFIG", "-")
+        .env_remove("GRAPHBUFF_CONFIG")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -53,7 +58,8 @@ fn demo_movies_is_loaded_at_startup() {
 
 #[test]
 fn unknown_demo_is_refused() {
-    let out = Command::new(BIN).args(["--demo", "nope"]).env("GRAPHBUFF_CONFIG", "-").output().unwrap();
+    let config = server_config(&[("storage.demo", toml_str("nope"))]);
+    let out = Command::new(BIN).arg("--config").arg(config).env_remove("GRAPHBUFF_CONFIG").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("unknown demo `nope`; available: movies"), "{err}");

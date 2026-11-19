@@ -1,5 +1,5 @@
 // A tiny movie graph. Run with: cargo run --release -p graphbuff-cli -- -i examples/movies.cypher
-// It is also built into the binaries: graphbuff --demo movies, graphbuff-server --demo movies
+// It is also built into graphbuff-server: demo = "movies" in [storage] of its config file.
 CREATE (keanu:Person {name: 'Keanu Reeves', born: 1964}),
        (carrie:Person {name: 'Carrie-Anne Moss', born: 1967}),
        (lana:Person {name: 'Lana Wachowski', born: 1965}),

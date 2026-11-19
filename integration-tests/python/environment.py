@@ -1,6 +1,6 @@
 """behave hooks for both suites.
 
-- tck/features: one server (with --test-procedures) for the whole run; each scenario gets a
+- tck/features: one server (with queries.test_procedures) for the whole run; each scenario gets a
   fresh database (see tck_steps). Every scenario's outcome goes to tck/results/results.tsv
   for run_tck.py.
 - everything else (cucumber/features): every scenario starts on a fresh in-memory server
@@ -47,10 +47,10 @@ def _is_tck(feature):
 
 # ---- server per scenario (cucumber) ------------------------------------------------------
 
-def restart_server(context, args=()):
-    """Stops the running server, if any, and starts one with `args`."""
+def restart_server(context, settings=None):
+    """Stops the running server, if any, and starts one with `settings` (see Server)."""
     stop_server(context)
-    context.server = Server(args).start()
+    context.server = Server(settings).start()
     context.base_url = context.server.url
 
 
@@ -82,7 +82,7 @@ def before_scenario(context, scenario):
     if "ignore" in scenario.effective_tags:
         scenario.skip("marked @ignore by the TCK")
     if _tck_server is None:
-        _tck_server = Server(["--test-procedures"]).start()
+        _tck_server = Server({"queries.test_procedures": True}).start()
     elif not _tck_server.alive():  # an earlier query crashed it
         _tck_server.restart()
     context.server = _tck_server

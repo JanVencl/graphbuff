@@ -1,0 +1,68 @@
+# graphbuff-server configuration (TOML) of the Docker image.
+#
+# Mount your own over /etc/graphbuff/graphbuff.toml to change it; keep data = "/data"
+# (the volume), or set mode = "memory".
+#
+# Change a setting by editing its line (remove the leading `#` to set one that is
+# commented out), then restart the server. Relative paths are relative to the folder of
+# this file. Env GRAPHBUFF_TOKEN overrides `security.token`; `graphbuff-server --config
+# FILE` (or env GRAPHBUFF_CONFIG) reads another file.
+
+[server]
+# HTTP address. 127.0.0.1 accepts this machine only; 0.0.0.0 every machine (then also
+# set up TLS below).
+bind = "0.0.0.0:7475"
+# Also serve the Bolt protocol (Neo4j drivers) on this address.
+bolt = "0.0.0.0:7687"
+max_connections = 256
+# Idle keep-alive timeout of a connection.
+keep_alive_seconds = 30
+# On stop (SIGTERM, Ctrl-C): how long running queries may take before they are cancelled.
+shutdown_timeout_seconds = 5
+
+[storage]
+# hybrid: in memory, made durable by a log and snapshots in the data folder (default)
+# persistent: disk-resident paged storage in the data folder, for graphs larger than memory
+# memory: in memory only, lost when the server stops
+mode = "hybrid"
+# The data folder: databases, user accounts and (by default) logs.
+data = "/data"
+# Sync every commit to disk. false is faster, but the last commits may be lost when the
+# machine (not only the server) crashes.
+fsync = true
+# Folder LOAD CSV may read files from (off when not set).
+# import_dir = "../import"
+# Folder admins may back databases up to and restore them from (off when not set).
+# backup_dir = "../backups"
+# Load a demo graph into the default database when it is empty: movies.
+# demo = "movies"
+
+[security]
+# Users log in with their accounts (see `graphbuff-server --help`). A token is also
+# accepted as `Authorization: Bearer TOKEN` or as the password of any user name, and its
+# holder may do anything.
+# token = "change-me"
+# HTTPS and Bolt over TLS: a PEM certificate chain and private key.
+# tls_cert = "cert.pem"
+# tls_key = "key.pem"
+# With TLS, also accept clients without TLS on the same ports.
+tls_allow_plain = false
+
+[queries]
+# Roll back a transaction after this long without a request.
+transaction_timeout_seconds = 60
+# Stop (and roll back) a query that runs longer (no limit when not set; a request may ask
+# for less with "timeoutMs").
+# query_timeout_ms = 30000
+# Run graph kernels (multi-hop counts, algo.* procedures, vector scores) on the GPU (needs
+# a build with the `gpu` feature).
+gpu = false
+
+[logs]
+# Folder of graphbuff.log and query.log; "-" for standard error. Default: the `logs`
+# folder in the data folder (standard error with mode = "memory").
+dir = "-"
+# error, warn, info or debug (also every connection).
+level = "info"
+# Log queries that take at least this long to query.log.
+# slow_query_ms = 1000

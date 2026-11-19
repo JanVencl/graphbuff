@@ -73,11 +73,16 @@ def body_values(context):
 
 # ---- server setup -----------------------------------------------------------------------
 
+def _persistent(data_dir):
+    """Settings for persistent storage in `data_dir`."""
+    return {"storage.data": os.path.abspath(data_dir), "storage.mode": "persistent"}
+
+
 @given('the server is started with import directory "{import_dir}"')
 def server_with_import_dir(context, import_dir):
     context.import_dir = os.path.join(ROOT, import_dir)
     os.makedirs(context.import_dir, exist_ok=True)
-    restart_server(context, ["--import-dir", context.import_dir])
+    restart_server(context, {"storage.import_dir": context.import_dir})
 
 
 @given('a file "{filename}" in the import directory with content')
@@ -93,13 +98,13 @@ def persistent_server(context, data_dir):
         shutil.rmtree(data_dir)
     os.makedirs(data_dir)
     context.data_dir = data_dir
-    restart_server(context, ["--data", data_dir, "--persistent"])
+    restart_server(context, _persistent(data_dir))
 
 
 @when('I restart the server')
 def restart(context):
     data_dir = getattr(context, "data_dir", None)
-    restart_server(context, ["--data", data_dir, "--persistent"] if data_dir else [])
+    restart_server(context, _persistent(data_dir) if data_dir else None)
 
 
 @given('a fresh database')
@@ -109,7 +114,7 @@ def fresh_database(context):
     if data_dir:
         shutil.rmtree(data_dir, ignore_errors=True)
         os.makedirs(data_dir)
-        restart_server(context, ["--data", data_dir, "--persistent"])
+        restart_server(context, _persistent(data_dir))
     else:
         restart_server(context)
 

@@ -10,70 +10,39 @@ use std::time::{Duration, Instant};
 
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
-use settings::{CommandLine, Settings};
-use graphbuff_server::{Level, Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
+use settings::{Config, LogDir, Storage};
+use graphbuff_server::{Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
 
 const USAGE: &str = "\
-usage: graphbuff-server [options]
-       graphbuff-server users [--data DIR] [--config FILE]
+usage: graphbuff-server [--config FILE]
+       graphbuff-server users [--config FILE]
                         (list | add NAME [ROLE...] | password NAME
                          | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
-       graphbuff-server admin [--data DIR] [--config FILE]
-                        (init [NAME] | reset-password NAME)
+       graphbuff-server admin [--config FILE] (init [NAME] | reset-password NAME)
 
-Options:
-  --config FILE        read settings from FILE (also: env GRAPHBUFF_CONFIG; `-` for none);
-                       default, created with every setting commented out if missing:
-                         Linux    $XDG_CONFIG_HOME/graphbuff/graphbuff.conf
-                                  (~/.config/graphbuff/graphbuff.conf),
-                                  /etc/graphbuff/graphbuff.conf when run as root
-                         macOS    ~/Library/Application Support/graphbuff/graphbuff.conf
-                         Windows  %LOCALAPPDATA%\\graphbuff\\graphbuff.conf
-                       One `key = value` per line, keys are the options below without
-                       `--` (`bind = 0.0.0.0:7475`, `in-memory = true`). The command line
-                       overrides the environment, which overrides the file.
-  --bind ADDR          address to listen on (default 127.0.0.1:7475; use 0.0.0.0:7475
-                       to accept other machines, preferably with TLS)
-  --bolt ADDR          also serve the Bolt protocol (Neo4j drivers) on ADDR, such as
-                       127.0.0.1:7687; the token, if set, is the password (any user name)
-  --data DIR           keep databases durably in DIR (also: env GRAPHBUFF_DATA); default:
-                         Linux    $XDG_DATA_HOME/graphbuff (~/.local/share/graphbuff),
-                                  /var/lib/graphbuff when run as root
-                         macOS    ~/Library/Application Support/graphbuff
-                         Windows  %LOCALAPPDATA%\\graphbuff
-  --in-memory          keep databases in memory only; they are lost when the server stops
-  --demo NAME          start with a demo graph loaded into the default database (unless
-                       it already holds data); NAME: movies
-  --persistent         with --data: new databases use disk-resident paged storage
-  --no-fsync           with --data: don't fsync every commit
-  --token TOKEN        also accept this token (also: env GRAPHBUFF_TOKEN): HTTP
-                       `Authorization: Bearer TOKEN`, or as the password of any user name
-                       (HTTP Basic, Bolt basic); the token holder may do anything
-  --tls-cert FILE      serve HTTPS and Bolt over TLS with this PEM certificate chain
-  --tls-key FILE       ... and this PEM private key (needs the `tls` build feature)
-  --tls-allow-plain    with TLS: also accept clients without TLS on the same ports
-  --max-connections N  connections served at once (default 256)
-  --keep-alive SECS    idle keep-alive timeout (default 30)
-  --tx-timeout SECS    roll back a transaction after SECS without a request (default 60)
-  --query-timeout MS   stop (and roll back) a query that runs longer than MS milliseconds
-                       (default: no limit; a request may ask for less with \"timeoutMs\")
-  --shutdown-timeout SECS
-                       on SIGTERM or Ctrl-C, how long running queries may take to finish
-                       before they are cancelled (default 5); then durable databases are
-                       checkpointed and the server exits
-  --import-dir DIR     let LOAD CSV read files in DIR (off by default)
-  --backup-dir DIR     let admins back up databases into DIR and restore from it
-                       (off by default)
-  --gpu                run graph kernels (multi-hop counts, algo.* procedures) on the
-                       GPU (needs the `gpu` build feature)
-  --log-dir DIR        write graphbuff.log and query.log in DIR (also: env
-                       GRAPHBUFF_LOG_DIR); `-` for standard error; default: DATA/logs,
-                       or standard error with --in-memory
-  --log-level LEVEL    error, warn, info (default) or debug (also every connection);
-                       also: env GRAPHBUFF_LOG_LEVEL
-  --slow-query MS      log queries that take at least MS milliseconds to query.log
-  --test-procedures    for compatibility tests only: admins may add procedures that
-                       answer from a fixed table (POST /db/{name}/test-procedure)
+Settings:
+  Every setting is in the config file, graphbuff.toml (TOML). The server reads:
+    1. FILE, with --config FILE (also: env GRAPHBUFF_CONFIG; `-` for the built-in defaults)
+    2. config/graphbuff.toml in the program's folder (the release archives ship it)
+    3. the per-user (system) one:
+         Linux    $XDG_CONFIG_HOME/graphbuff/graphbuff.toml
+                  (~/.config/graphbuff/graphbuff.toml),
+                  /etc/graphbuff/graphbuff.toml when run as root
+         macOS    ~/Library/Application Support/graphbuff/graphbuff.toml
+         Windows  %LOCALAPPDATA%\\graphbuff\\graphbuff.toml
+  Without any of them it creates config/graphbuff.toml next to the program (or, if that
+  folder cannot be written, the per-user one) with every setting and its default. The
+  file describes each setting; sections: [server] (addresses, connections), [storage]
+  (mode, data folder, fsync, import and backup folders), [security] (token, TLS),
+  [queries] (timeouts, GPU), [logs]. Relative paths are relative to the file's folder.
+  Env GRAPHBUFF_TOKEN overrides security.token.
+
+  Without storage.data, databases are kept in:
+    Linux    $XDG_DATA_HOME/graphbuff (~/.local/share/graphbuff),
+             /var/lib/graphbuff when run as root
+    macOS    ~/Library/Application Support/graphbuff
+    Windows  %LOCALAPPDATA%\\graphbuff
+
   -h, --help           show this help
 
 Endpoints:
@@ -96,13 +65,13 @@ Endpoints:
 User accounts:
   Clients log in with a user name and password (HTTP Basic, Bolt basic), or with the
   token. The accounts are kept in the system database of the data directory (in memory
-  with --in-memory).
+  with storage.mode = \"memory\").
 
   Roles: reader (read queries), editor (also writes, indexes, constraints), admin (also
   databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
   PASSWORD 's3cret-pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users ...` on the data
-  directory (the same --data, GRAPHBUFF_DATA or config file as the server), only while
+  directory (the same config file as the server, or --config FILE), only while
   no server uses it. New passwords come from env GRAPHBUFF_PASSWORD, else are asked for
   without echo on a terminal, else read from the first line of standard input.
 
@@ -110,7 +79,8 @@ User accounts:
   creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the password in
   env GRAPHBUFF_ADMIN_PASSWORD, or in the file named by GRAPHBUFF_ADMIN_PASSWORD_FILE (a
   Docker or Compose secret; one trailing newline is ignored). Without them it asks on
-  the terminal; without a terminal, or with --in-memory, it does not start. With --token
+  the terminal; without a terminal, or with storage.mode = \"memory\", it does not start.
+  With a token (security.token)
   it starts anyway (the token holder can create users). Once there is an administrator,
   these variables are ignored, and no change may leave none.
 
@@ -127,58 +97,132 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-/// The settings from the config file (`--config`, else GRAPHBUFF_CONFIG, else the
-/// default one), the environment and the command line, and the config file read. With
-/// `create`, a missing config file is created with every setting commented out.
-fn load_settings(command_line: &CommandLine, create: bool) -> (Settings, Option<PathBuf>) {
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
-    let mut settings = Settings::default();
-    let config_file = match command_line.config.clone().or_else(|| env("GRAPHBUFF_CONFIG")) {
-        Some(f) if f == "-" => None,
-        Some(f) => Some(PathBuf::from(f)),
-        None => settings::default_config_file(),
-    };
-    let config_file: Option<PathBuf> = config_file.and_then(|f| match std::fs::read_to_string(&f) {
-        Ok(text) => {
-            settings.apply_file(&f, &text).unwrap_or_else(|e| fail(&e));
-            Some(f)
+/// The settings of the old command-line options, for the error that names their place in
+/// the config file.
+const OLD_OPTIONS: &[(&str, &str)] = &[
+    ("bind", "bind in [server]"),
+    ("bolt", "bolt in [server]"),
+    ("max-connections", "max_connections in [server]"),
+    ("keep-alive", "keep_alive_seconds in [server]"),
+    ("shutdown-timeout", "shutdown_timeout_seconds in [server]"),
+    ("data", "data in [storage]"),
+    ("in-memory", "mode = \"memory\" in [storage]"),
+    ("persistent", "mode = \"persistent\" in [storage]"),
+    ("no-fsync", "fsync = false in [storage]"),
+    ("import-dir", "import_dir in [storage]"),
+    ("backup-dir", "backup_dir in [storage]"),
+    ("demo", "demo in [storage]"),
+    ("token", "token in [security] (or env GRAPHBUFF_TOKEN)"),
+    ("tls-cert", "tls_cert in [security]"),
+    ("tls-key", "tls_key in [security]"),
+    ("tls-allow-plain", "tls_allow_plain in [security]"),
+    ("tx-timeout", "transaction_timeout_seconds in [queries]"),
+    ("query-timeout", "query_timeout_ms in [queries]"),
+    ("gpu", "gpu in [queries]"),
+    ("test-procedures", "test_procedures in [queries]"),
+    ("log-dir", "dir in [logs]"),
+    ("log-level", "level in [logs]"),
+    ("slow-query", "slow_query_ms in [logs]"),
+];
+
+/// Reads `--config FILE` (and `-h` / `--help`) from the front of `args`: the file, if
+/// given, and whether help was asked for. Any other option is an error, which for an old
+/// command-line option names the setting that took its place.
+fn config_option(args: &mut std::iter::Peekable<impl Iterator<Item = String>>) -> Result<(Option<String>, bool), String> {
+    let (mut config, mut help) = (None, false);
+    while let Some(arg) = args.next_if(|a| a.starts_with('-')) {
+        match arg.as_str() {
+            "-h" | "--help" => help = true,
+            "--config" => config = Some(args.next().ok_or("--config needs a FILE")?),
+            other => {
+                let name = other.trim_start_matches('-');
+                return Err(match OLD_OPTIONS.iter().find(|(o, _)| *o == name) {
+                    Some((_, setting)) => format!(
+                        "`{other}` is gone: graphbuff-server takes its settings from the config file \
+                         (graphbuff.toml); set {setting}"
+                    ),
+                    None => format!("unknown option `{other}`"),
+                });
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => None,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let written = f.parent().map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&f, settings::TEMPLATE));
-            match written {
-                Ok(()) => Some(f),
-                Err(e) => {
-                    eprintln!("warning: cannot create the config file {}: {e}", f.display());
-                    None
+    }
+    Ok((config, help))
+}
+
+/// The settings of the config file: `--config` (`explicit`), else env GRAPHBUFF_CONFIG,
+/// else the one next to the program, else the per-user one; and the file read. With
+/// `create`, a missing file is created from the template, next to the program if that
+/// folder can be written, else in the per-user place.
+fn load_config(explicit: Option<String>, create: bool) -> (Config, Option<PathBuf>) {
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let read = |f: &PathBuf| -> Config {
+        let text = std::fs::read_to_string(f).unwrap_or_else(|e| fail(&format!("cannot read the config file {}: {e}", f.display())));
+        Config::parse(f, &text).unwrap_or_else(|e| fail(&e))
+    };
+    let (mut config, file) = match explicit.or_else(|| env("GRAPHBUFF_CONFIG")) {
+        Some(f) if f == "-" => (Config::default(), None),
+        Some(f) => {
+            let f = PathBuf::from(f);
+            (read(&f), Some(f))
+        }
+        None => {
+            let candidates = [settings::program_config_file(), settings::user_config_file()];
+            match candidates.iter().flatten().find(|f| f.is_file()) {
+                Some(f) => (read(f), Some(f.clone())),
+                None => {
+                    if let Some(old) = settings::config_dir().map(|d| d.join("graphbuff.conf")).filter(|f| f.is_file()) {
+                        fail(&format!(
+                            "{} is no longer read: graphbuff-server now reads graphbuff.toml (TOML, with \
+                             sections). Create it with `graphbuff-server` (after moving the old file away) and \
+                             copy your settings over",
+                            old.display()
+                        ));
+                    }
+                    let created = if create { create_config(&candidates) } else { None };
+                    match created {
+                        Some(f) => (read(&f), Some(f)),
+                        None => (Config::default(), None),
+                    }
                 }
             }
         }
-        Err(e) => fail(&format!("cannot read the config file {}: {e}", f.display())),
-    });
-    settings.apply_env().unwrap_or_else(|e| fail(&e));
-    settings.apply_command_line(command_line.settings.clone()).unwrap_or_else(|e| fail(&e));
-    (settings, config_file)
+    };
+    config.apply_env();
+    (config, file)
 }
 
-/// The data directory, or `None` with `in-memory`.
-fn data_dir(settings: &Settings) -> Option<PathBuf> {
-    if settings.flag("in-memory") {
-        return None;
+/// Writes the template to the first of `candidates` (next to the program, per-user) that
+/// can be written; the file written.
+fn create_config(candidates: &[Option<PathBuf>; 2]) -> Option<PathBuf> {
+    for (i, f) in candidates.iter().enumerate() {
+        let Some(f) = f else { continue };
+        let written = f
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(f, settings::template(i == 0)));
+        match written {
+            Ok(()) => {
+                eprintln!("created the config file {}", f.display());
+                return Some(f.clone());
+            }
+            Err(e) if i == 0 => {
+                let _ = e; // next to the program may be read-only; try the per-user place
+            }
+            Err(e) => eprintln!("warning: cannot create the config file {}: {e}", f.display()),
+        }
     }
-    Some(match settings.get("data") {
-        Some(d) => d.into(),
-        None => settings::default_data_dir().unwrap_or_else(|| {
-            fail("no default data directory (HOME or LOCALAPPDATA is not set); use --data DIR or --in-memory")
-        }),
-    })
+    None
+}
+
+/// The data directory, or `None` in memory mode.
+fn data_dir(config: &Config) -> Option<PathBuf> {
+    config.data_dir().unwrap_or_else(|e| fail(&e))
 }
 
 /// The storage of new databases in the data directory.
-fn default_storage(settings: &Settings) -> StorageKind {
-    let mut storage = if settings.flag("persistent") { StorageKind::persistent() } else { StorageKind::hybrid() };
-    if settings.flag("no-fsync")
+fn default_storage(config: &Config) -> StorageKind {
+    let mut storage = if config.storage == Storage::Persistent { StorageKind::persistent() } else { StorageKind::hybrid() };
+    if !config.fsync
         && let StorageKind::Hybrid { sync, .. } | StorageKind::Persistent { sync, .. } = &mut storage
     {
         *sync = SyncPolicy::OsBuffered;
@@ -187,7 +231,7 @@ fn default_storage(settings: &Settings) -> StorageKind {
 }
 
 /// The accounts in the system database of the data directory, for the offline command
-/// `what` with `[--data DIR] [--config FILE]` options, while no server uses it; also the
+/// `what` with a `[--config FILE]` option, while no server uses it; also the
 /// command word and the arguments after it. The manager holds the data directory's lock.
 fn offline_users(
     what: &str,
@@ -195,24 +239,20 @@ fn offline_users(
     args: impl Iterator<Item = String>,
 ) -> Result<(DatabaseManager, Users, String, Vec<String>), String> {
     let mut args = args.peekable();
-    let mut options = Vec::new();
-    while let Some(opt) = args.next_if(|a| a == "--data" || a == "--config") {
-        options.push(opt.clone());
-        options.push(args.next().ok_or(format!("{opt} needs a value"))?);
-    }
-    let command_line = Settings::command_line(options.into_iter())?;
-    let (settings, _) = load_settings(&command_line, false);
+    let (file, _) = config_option(&mut args)?;
+    let (config, _) = load_config(file, false);
     let command = args.next().ok_or(format!("{what} needs a command: {commands}"))?;
-    let data = data_dir(&settings)
-        .ok_or(format!("{what} works on a data directory, but the settings say in-memory; use --data DIR"))?;
-    let mgr = DatabaseManager::open_with(&data, default_storage(&settings))
+    let data = data_dir(&config).ok_or(format!(
+        "{what} works on a data folder, but the config file says storage.mode = \"memory\""
+    ))?;
+    let mgr = DatabaseManager::open_with(&data, default_storage(&config))
         .map_err(|e| format!("cannot open the data directory {} (is a server using it?): {e}", data.display()))?;
     let system = mgr.system_database().ok_or("this build has no system database")?;
     let users = Users::system(system).map_err(|e| e.to_string())?;
     Ok((mgr, users, command, args.collect()))
 }
 
-/// `graphbuff-server users [--data DIR] [--config FILE] …`: manages the accounts in the
+/// `graphbuff-server users [--config FILE] …`: manages the accounts in the
 /// system database of the data directory, while no server uses it.
 fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     let (_mgr, users, command, rest) =
@@ -277,7 +317,7 @@ fn admins(users: &Users) -> Vec<String> {
     users.list().into_iter().filter(|(_, roles)| roles.contains(&Role::Admin)).map(|(n, _)| n).collect()
 }
 
-/// `graphbuff-server admin [--data DIR] [--config FILE] (init [NAME] | reset-password NAME)`:
+/// `graphbuff-server admin [--config FILE] (init [NAME] | reset-password NAME)`:
 /// creates the first administrator, or sets a new password for a user, offline.
 fn admin_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     let (_mgr, users, command, rest) = offline_users("admin", "init or reset-password", args)?;
@@ -415,54 +455,47 @@ fn main() {
         }
         return;
     }
-    let command_line = Settings::command_line(std::env::args().skip(1)).unwrap_or_else(|e| fail(&e));
-    if command_line.help {
+    let mut args = std::env::args().skip(1).peekable();
+    let (file, help) = config_option(&mut args).unwrap_or_else(|e| fail(&e));
+    if help {
         println!("{USAGE}");
         return;
     }
-    let (settings, config_file) = load_settings(&command_line, true);
+    if let Some(extra) = args.next() {
+        fail(&format!("unexpected `{extra}`"));
+    }
+    let (settings, config_file) = load_config(file, true);
 
-    let get = |key: &str| settings.get(key).map(str::to_string);
-    let number = |key: &str, what: &str, positive: bool| -> Option<u64> {
-        settings.get(key).map(|v| {
-            v.parse::<u64>()
-                .ok()
-                .filter(|&n| !positive || n > 0)
-                .unwrap_or_else(|| fail(&format!("--{key} needs a {}number of {what}", if positive { "positive " } else { "" })))
-        })
-    };
     let mut config = ServerConfig {
-        token: get("token"),
-        bolt: get("bolt"),
-        backup_dir: get("backup-dir").map(Into::into),
-        test_procedures: settings.flag("test-procedures"),
+        token: settings.token.clone(),
+        bolt: settings.bolt.clone(),
+        backup_dir: settings.backup_dir.clone(),
+        test_procedures: settings.test_procedures,
         ..ServerConfig::default()
     };
-    if let Some(bind) = get("bind") {
-        config.bind = bind;
+    if let Some(bind) = &settings.bind {
+        config.bind = bind.clone();
     }
-    if let Some(n) = settings.get("max-connections") {
-        config.max_connections = n.parse().unwrap_or_else(|_| fail("--max-connections needs a number"));
+    if let Some(n) = settings.max_connections {
+        config.max_connections = n;
     }
-    if let Some(s) = number("keep-alive", "seconds", false) {
-        config.keep_alive = Duration::from_secs(s);
+    if let Some(d) = settings.keep_alive {
+        config.keep_alive = d;
     }
-    if let Some(s) = number("tx-timeout", "seconds", true) {
-        config.transaction_timeout = Duration::from_secs(s);
+    if let Some(d) = settings.transaction_timeout {
+        config.transaction_timeout = d;
     }
-    if let Some(ms) = number("query-timeout", "milliseconds", true) {
-        config.query_timeout = Some(Duration::from_millis(ms));
+    config.query_timeout = settings.query_timeout;
+    if let Some(d) = settings.shutdown_timeout {
+        config.shutdown_grace = d;
     }
-    if let Some(s) = number("shutdown-timeout", "seconds", false) {
-        config.shutdown_grace = Duration::from_secs(s);
-    }
-    let slow_query = number("slow-query", "milliseconds", false).map(Duration::from_millis);
-    let persistent = settings.flag("persistent");
-    let sync = if settings.flag("no-fsync") { SyncPolicy::OsBuffered } else { SyncPolicy::EveryCommit };
-    let import_dir = get("import-dir");
-    let gpu = settings.flag("gpu");
-    let demo = get("demo");
-    let (tls_cert, tls_key, tls_plain) = (get("tls-cert"), get("tls-key"), settings.flag("tls-allow-plain"));
+    let slow_query = settings.slow_query;
+    let persistent = settings.storage == Storage::Persistent;
+    let sync = if settings.fsync { SyncPolicy::EveryCommit } else { SyncPolicy::OsBuffered };
+    let import_dir = settings.import_dir.clone();
+    let gpu = settings.gpu;
+    let demo = settings.demo.clone();
+    let (tls_cert, tls_key, tls_plain) = (settings.tls_cert.clone(), settings.tls_key.clone(), settings.tls_allow_plain);
 
     if let Some(name) = &demo
         && let Err(e) = graphbuff::demo_script(name)
@@ -471,14 +504,11 @@ fn main() {
     }
 
     let data = data_dir(&settings);
-    let level = match settings.get("log-level") {
-        Some(l) => Level::parse(&l).unwrap_or_else(|| fail("--log-level needs error, warn, info or debug")),
-        None => Level::Info,
-    };
-    let log_dir = match get("log-dir") {
-        Some(d) if d == "-" => None,
-        Some(d) => Some(PathBuf::from(d)),
-        None => data.as_ref().map(|d| d.join("logs")),
+    let level = settings.log_level;
+    let log_dir = match &settings.log_dir {
+        LogDir::StandardError => None,
+        LogDir::Dir(d) => Some(d.clone()),
+        LogDir::Default => data.as_ref().map(|d| d.join("logs")),
     };
     let log = match Log::open(LogConfig {
         dir: log_dir.clone(),
@@ -512,9 +542,7 @@ fn main() {
             allow_plaintext: tls_plain,
             ..TlsConfig::new(cert, key)
         }),
-        (None, None) if tls_plain => fail("--tls-allow-plain needs --tls-cert and --tls-key"),
-        (None, None) => None,
-        _ => fail("TLS needs both --tls-cert and --tls-key"),
+        _ => None, // the config file checks that both or neither are set
     };
     let admin = first_admin().unwrap_or_else(|e| fatal(&e));
 
@@ -554,7 +582,7 @@ fn main() {
         } else if data.is_none() {
             fatal(
                 "there is no administrator, and in-memory accounts are lost at every stop: set \
-                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), or start with --token",
+                 GRAPHBUFF_ADMIN_PASSWORD (or GRAPHBUFF_ADMIN_PASSWORD_FILE), or set security.token",
             );
         } else if prompt::interactive() {
             if let Err(e) = ask_for_admin(&users, None) {
@@ -564,13 +592,13 @@ fn main() {
             fatal(
                 "there is no administrator yet and no terminal to ask for one: set GRAPHBUFF_ADMIN_PASSWORD (or \
                  GRAPHBUFF_ADMIN_PASSWORD_FILE), create one with `graphbuff-server admin init` while the \
-                 server is stopped, start the server in a terminal to be asked, or start with --token",
+                 server is stopped, start the server in a terminal to be asked, or set security.token",
             );
         }
         config.users = Some(Arc::new(users));
     }
 
-    mgr.set_import_dir(import_dir.map(Into::into));
+    mgr.set_import_dir(import_dir);
     let demo = demo.map(|name| match graphbuff::load_demo(&mgr, &name) {
         Ok(d) => (name, d),
         Err(e) => fatal(&format!("cannot load the demo `{name}`: {e}")),
@@ -578,7 +606,7 @@ fn main() {
     if gpu {
         match graphbuff::gpu_kernels() {
             Ok(k) => mgr.set_kernels(k),
-            Err(e) => fail(&format!("--gpu: {e}")),
+            Err(e) => fatal(&format!("queries.gpu: {e}")),
         }
     }
     let server = match Server::start(Arc::clone(&mgr), config.clone()) {
@@ -592,7 +620,7 @@ fn main() {
     let addr = server.local_addr();
     let tls = config.tls.is_some();
     if !tls && (!addr.ip().is_loopback() || server.bolt_addr().is_some_and(|b| !b.ip().is_loopback())) {
-        warn("without TLS (--tls-cert, --tls-key), passwords and tokens cross the network in clear text");
+        warn("without TLS (security.tls_cert, tls_key), passwords and tokens cross the network in clear text");
     }
     let (http, bolt) = if tls { ("https", "bolt+s") } else { ("http", "bolt") };
     let listening = format!(
