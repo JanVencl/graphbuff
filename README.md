@@ -1017,8 +1017,9 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   ```
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
-  `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES`,
-  `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
+  `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
+  type, label or type, properties, `RANGE` or `VECTOR`, options), vector indexes (see
+  *Vectors* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
   and `(n.a, n.b) IS UNIQUE | NODE KEY`; the older `ON … ASSERT …` form works too),
   `DROP CONSTRAINT name [IF EXISTS]`, `SHOW CONSTRAINTS`
 * **Databases** (through a `Session`): `CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {…}]`,
@@ -1095,11 +1096,25 @@ feature are in [`integration-tests/tck`](integration-tests/tck/README.md).
   sorts them after paths and before temporal values. They can be stored as properties (and in
   lists) and indexed for equality; HTTP returns them as
   `{"$type": "point", "crs": …, "srid": …, "x": …, "y": …}`
+* **Vectors:** a vector is a list of numbers. `vector.similarity.cosine(a, b)` and
+  `vector.similarity.euclidean(a, b)` score in [0, 1] as Neo4j does (`(1 + cos) / 2`,
+  `1 / (1 + d²)`). ``CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:L) ON n.p OPTIONS
+  {indexConfig: {`vector.dimensions`: 1536, `vector.similarity_function`: 'cosine'}}`` (or
+  `'euclidean'`; also `FOR ()-[r:T]-() ON r.p`) indexes the entities whose property is a list
+  of exactly that many numbers (non-zero for cosine); anything else is skipped, never refused.
+  `CALL db.index.vector.queryNodes('name', k, $vector) YIELD node, score` (and
+  `db.index.vector.queryRelationships(…) YIELD relationship, score`) returns the k most similar,
+  best first. The index is exact: the same entities and scores as `ORDER BY
+  vector.similarity.cosine(n.p, $vector) DESC LIMIT k`. Read queries share an f32 copy of the
+  vectors of the last commit (about 4 bytes per dimension per entity, built on the first query
+  after a commit); inside a transaction the query scans what the transaction sees.
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship
 constraints,
-spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
+spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), approximate
+vector search (HNSW, quantization), the `VECTOR` value type, `db.create.setNodeVectorProperty`
+(use `SET n.p = $vector`), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).
 
 ## License

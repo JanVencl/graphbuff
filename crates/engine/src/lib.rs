@@ -125,6 +125,8 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     description: String,
     /// The CSR export ([`Database::csr`]), columns and label sets of a committed state.
     kernel_cache: Arc<accel::KernelCache>,
+    /// The vector index matrices of a committed state.
+    vector_cache: Arc<vector::VectorCache>,
     /// The kernel backend read queries use, and when they use it.
     kernels: RwLock<(Arc<dyn Kernels>, KernelMode)>,
 }
@@ -180,6 +182,7 @@ impl<S: GraphStore> Database<S> {
             procedures: RwLock::new(Procedures::builtin()),
             tx_thread: Mutex::new(None),
             kernel_cache: Arc::default(),
+            vector_cache: Arc::default(),
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
         }
     }
@@ -449,6 +452,7 @@ impl<S: GraphStore> Database<S> {
                 let (kernels, mode) = self.kernels.read().unwrap_or_else(|e| e.into_inner()).clone();
                 ex.accel = Some(accel::Accel {
                     cache: self.kernel_cache.clone(),
+                    vectors: self.vector_cache.clone(),
                     snapshot: snapshot.clone(),
                     kernels,
                     mode,
