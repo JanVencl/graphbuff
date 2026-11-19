@@ -129,7 +129,7 @@ impl<'db, S: GraphStore> Transaction<'db, S> {
         self.open_store()?;
         let mut store = self.store.take().expect("checked open");
         let committed = store.commit();
-        let old = committed.is_ok().then(|| self.db.publish(&store)).flatten();
+        let old = committed.is_ok().then(|| self.db.publish(&mut store)).flatten();
         drop(store);
         self.db.end_transaction();
         // The old snapshot may own the versions this transaction replaced.

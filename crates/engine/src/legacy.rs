@@ -894,7 +894,7 @@ mod tests {
         match outcome {
             Ok(r) => {
                 GraphStore::commit(&mut *guard)?;
-                let _ = db.publish(&guard);
+                let _ = db.publish(&mut guard);
                 Ok(r)
             }
             Err(e) => {

@@ -936,6 +936,10 @@ impl GraphStore for HybridGraph {
         self.mem.rollback();
     }
 
+    fn take_changes(&mut self) -> crate::Changes {
+        self.mem.take_changes()
+    }
+
     fn checkpoint(&mut self) -> Result<()> {
         if self.pending.is_some() {
             return Err(Error::Runtime(

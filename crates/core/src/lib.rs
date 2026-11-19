@@ -45,7 +45,7 @@ pub use memory::MemoryGraph;
 pub use persistent::{BulkLoader, DEFAULT_MAX_TRANSACTION_BYTES, PersistentGraph, PersistentOptions};
 pub use storage::{StorageMode, open_store};
 pub use store::{
-    Adjacency, BoxedStore, ConstraintDef, ConstraintKind, Direction, Expansion, GraphStore,
+    Adjacency, BoxedStore, Changes, ConstraintDef, ConstraintKind, Direction, Expansion, GraphStore,
     IndexDef, IndexEntity, IndexKind, IndexStats, MAX_INDEX_PROPERTIES, MAX_VECTOR_DIMENSIONS, Scan, Snapshot,
     ValueRange, VectorSimilarity,
 };

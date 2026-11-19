@@ -195,6 +195,7 @@ impl MemoryGraph {
             vector_indexes: Vec::new(),
             constraints: Vec::new(),
             saved: None,
+            changes: Default::default(),
         };
 
         let n = d.len(8 + 4 + 4)?;

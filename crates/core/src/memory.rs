@@ -26,7 +26,7 @@ use std::cmp::Ordering;
 use std::ops::Bound;
 
 use crate::store::{
-    Adjacency, ConstraintDef, Direction, Expansion, GraphStore, IndexDef, IndexEntity, IndexStats, Scan,
+    Adjacency, ChangeLog, Changes, ConstraintDef, Direction, Expansion, GraphStore, IndexDef, IndexEntity, IndexStats, Scan,
     Snapshot, ValueRange,
 };
 use cow::{CowVec, PMap, PSet, PVec};
@@ -647,6 +647,8 @@ pub struct MemoryGraph {
     constraints: Vec<ConstraintDef>,
     /// The state at `begin`, while a transaction is open; rollback returns to it.
     saved: Option<Box<MemoryGraph>>,
+    /// The entities written since [`GraphStore::take_changes`] (not part of a clone).
+    changes: ChangeLog,
 }
 
 impl Clone for MemoryGraph {
@@ -668,6 +670,7 @@ impl Clone for MemoryGraph {
             vector_indexes: self.vector_indexes.clone(),
             constraints: self.constraints.clone(),
             saved: None,
+            changes: ChangeLog::default(),
         }
     }
 }
@@ -887,6 +890,7 @@ impl GraphStore for MemoryGraph {
         }));
         self.node_count += 1;
         self.index_touch(id, None, None, true);
+        self.changes.node(id);
         Ok(id)
     }
 
@@ -916,6 +920,7 @@ impl GraphStore for MemoryGraph {
         self.rels.push(Some(rec));
         self.rel_count += 1;
         self.rel_index_touch(id, None, true);
+        self.changes.rel(id);
         Ok(id)
     }
 
@@ -955,6 +960,7 @@ impl GraphStore for MemoryGraph {
             }
         }
         self.node_count -= 1;
+        self.changes.node(id);
         Ok(true)
     }
 
@@ -965,6 +971,7 @@ impl GraphStore for MemoryGraph {
         };
         self.unlink_rel(id, &rec);
         self.rel_count -= 1;
+        self.changes.rel(id);
         Ok(true)
     }
 
@@ -982,6 +989,7 @@ impl GraphStore for MemoryGraph {
             node.props.insert(k, value);
         }
         self.index_touch(id, None, Some(k), true);
+        self.changes.node(id);
         Ok(())
     }
 
@@ -999,6 +1007,7 @@ impl GraphStore for MemoryGraph {
             rel.props.insert(k, value);
         }
         self.rel_index_touch(id, Some(k), true);
+        self.changes.rel(id);
         Ok(())
     }
 
@@ -1014,6 +1023,7 @@ impl GraphStore for MemoryGraph {
         node.labels.make_mut().push(t);
         self.label_index.entry(t).or_default().insert(id);
         self.index_touch(id, Some(t), None, true);
+        self.changes.node(id);
         Ok(true)
     }
 
@@ -1033,6 +1043,7 @@ impl GraphStore for MemoryGraph {
         if let Some(set) = self.label_index.get_mut(&t) {
             set.remove(&id);
         }
+        self.changes.node(id);
         Ok(true)
     }
 
@@ -1312,18 +1323,27 @@ impl GraphStore for MemoryGraph {
 
     fn begin(&mut self) -> Result<()> {
         self.saved = Some(Box::new(self.clone()));
+        self.changes.begin();
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
         self.saved = None;
+        self.changes.commit();
         Ok(())
     }
 
     fn rollback(&mut self) {
         if let Some(saved) = self.saved.take() {
+            let mut changes = std::mem::take(&mut self.changes);
+            changes.rollback();
             *self = *saved;
+            self.changes = changes;
         }
+    }
+
+    fn take_changes(&mut self) -> Changes {
+        self.changes.take()
     }
 }
 
