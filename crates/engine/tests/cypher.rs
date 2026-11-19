@@ -1656,6 +1656,30 @@ fn procedure_errors() {
 }
 
 #[test]
+fn typed_procedure_parameters() {
+    use graphbuff::{ProcedureSignature, ProcedureType};
+    let db = db_with(SOCIAL);
+    let sig = ProcedureSignature::new("test.typed", ["n", "x"], ["out"])
+        .input_types([ProcedureType::Integer, ProcedureType::Float]);
+    assert_eq!(sig.text(), "test.typed(n :: INTEGER, x :: FLOAT) :: (out)");
+    db.register_procedure(sig, |_, args| Ok(vec![vec![args[0].clone()]])).unwrap();
+    // Integers pass as FLOAT, and null as anything.
+    assert_eq!(rows(&run(&db, "CALL test.typed(1, 2) YIELD out RETURN out")), ["1"]);
+    assert_eq!(rows(&run(&db, "CALL test.typed(null, 2.5)")), ["null"]);
+    // A literal of another type fails before the query runs (nothing is written)…
+    for q in ["CALL test.typed(true, 1.0)", "CREATE (:Typed) WITH 1 AS one CALL test.typed(1, 'x') YIELD out RETURN out"] {
+        let e = db.execute(q).unwrap_err();
+        assert!(matches!(e, Error::Semantic(_)) && e.to_string().contains("expects"), "{q}: {e}");
+    }
+    assert_eq!(rows(&run(&db, "MATCH (n:Typed) RETURN count(n)")), ["0"]);
+    // … and a value of another type when the call runs.
+    let e = db.execute("MATCH (p:Person) CALL test.typed(p.name, 1) YIELD out RETURN out").unwrap_err();
+    assert!(matches!(e, Error::Type(_)) && e.to_string().contains("expects INTEGER for `n`"), "{e}");
+    assert_eq!(ProcedureType::parse("list of any?"), Some(ProcedureType::List));
+    assert_eq!(ProcedureType::parse("DURATION"), None);
+}
+
+#[test]
 fn registered_procedures() {
     use graphbuff::{ProcedureSignature, Value};
     let db = db_with(SOCIAL);

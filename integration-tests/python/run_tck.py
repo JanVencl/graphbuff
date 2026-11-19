@@ -102,7 +102,7 @@ def main():
     passing = sorted(scenario_id(f, n) for f, n, s, _ in results if s == "passed")
     if args.save_baseline:
         with open(BASELINE, "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"# openCypher TCK {TCK_VERSION} scenarios that pass; run.py fails if one stops passing.\n"
+            f.write(f"# openCypher TCK {TCK_VERSION} scenarios that pass; python/run_tck.py fails if one stops passing.\n"
                     "# Regenerate with: python python/run_tck.py --save-baseline\n")
             f.write("".join(p + "\n" for p in passing))
         print(f"wrote {BASELINE}")

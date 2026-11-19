@@ -205,6 +205,8 @@ Call2 [1] In-query call to procedure with explicit arguments
 Call2 [2] Standalone call to procedure with explicit arguments
 Call2 [3] Standalone call to procedure with implicit arguments
 Call2 [4] In-query call to procedure that takes arguments fails when trying to pass them implicitly
+Call2 [5] Standalone call to procedure should fail if input type is wrong
+Call2 [6] In-query call to procedure should fail if input type is wrong
 Call3 [1] Standalone call to procedure with argument of type NUMBER accepts value of type INTEGER
 Call3 [2] In-query call to procedure with argument of type NUMBER accepts value of type INTEGER
 Call3 [3] Standalone call to procedure with argument of type NUMBER accepts value of type FLOAT

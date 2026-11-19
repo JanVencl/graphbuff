@@ -554,7 +554,7 @@ fn test_procedure(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
     if let Err(e) = check(me.access, Access::Admin, "adding a test procedure") {
         return query_error(&e);
     }
-    let mut fields = match body_fields(req, &["name", "inputs", "outputs", "rows"]) {
+    let mut fields = match body_fields(req, &["name", "inputs", "types", "outputs", "rows"]) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -586,7 +586,15 @@ fn test_procedure(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
         (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => *x as f64 == *y,
         _ => a == b,
     };
-    let signature = graphbuff::ProcedureSignature::new(&proc, inputs, outputs);
+    // Optional parameter types (`INTEGER?` …), one per input.
+    let types = match fields.remove("types") {
+        None | Some(Json::Null) => Vec::new(),
+        t => match names(t).map(|t| t.iter().map(|x| graphbuff::ProcedureType::parse(x)).collect::<Option<Vec<_>>>()) {
+            Some(Some(t)) if t.len() == inputs.len() => t,
+            _ => return error(400, "BadRequest", "`types` needs one known type name per input"),
+        },
+    };
+    let signature = graphbuff::ProcedureSignature::new(&proc, inputs, outputs).input_types(types);
     let body = move |_: &graphbuff::ProcedureContext<'_>, args: &[Value]| {
         Ok(table
             .iter()
