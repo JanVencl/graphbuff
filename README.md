@@ -1,6 +1,20 @@
 ![GraphBuff logo](graphbuff_github_social.png "GraphBuff")
 ## Graph database engine written in Rust and queried with **Cypher**.
 
+* high performance, low memory footprint database
+* you can operate on graphs with millions of nodes and billions of relationships
+* supports **Cypher** queries
+* supports **Bolt** (Neo4j drivers)
+* supports **HTTP/JSON** (REST API)
+* supports **TLS** (HTTPS)
+* supports **user accounts**
+* supports **GPU** (wgpu)
+* supports **backup** and **restore**
+* supports **consistency check**
+* supports **bulk CSV import**
+* supports **online backup** and **restore**
+* supports **online consistency check**
+
 - **Storage:** in memory, hybrid (in-memory graph with a write-ahead log and snapshots) or
   disk-resident paged storage for graphs larger than RAM
 - **Cypher:** query planner, streaming execution, indexes, constraints, transactions

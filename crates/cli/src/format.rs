@@ -8,6 +8,8 @@ use std::time::Duration;
 use graphbuff::json::Json;
 
 use crate::client::{Outcome, compact};
+use crate::highlight;
+use crate::style::{self, Color, paint};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Format {
@@ -42,8 +44,9 @@ impl Format {
     }
 }
 
-/// Writes `r` in `format`; `elapsed` goes into the table's summary.
-pub fn write(out: &mut impl Write, format: Format, r: &Outcome, elapsed: Duration) -> io::Result<()> {
+/// Writes `r` in `format`; `elapsed` goes into the table's summary. `color`: a table
+/// with colors (the other formats are for programs and never have any).
+pub fn write(out: &mut impl Write, format: Format, r: &Outcome, elapsed: Duration, color: bool) -> io::Result<()> {
     match format {
         Format::Json => writeln!(out, "{}", r.raw.trim()),
         Format::Plain => {
@@ -68,29 +71,33 @@ pub fn write(out: &mut impl Write, format: Format, r: &Outcome, elapsed: Duratio
         }
         Format::Table => {
             if let Some(plan) = &r.plan {
-                write_plan(out, plan)?;
+                write_plan(out, plan, color)?;
             }
             if !r.columns.is_empty() {
-                let cells: Vec<Vec<String>> =
-                    r.rows.iter().map(|row| row.iter().map(|v| one_line(&cypher(v))).collect()).collect();
-                write_table(out, &r.columns, &cells)?;
+                let cells: Vec<Vec<String>> = r
+                    .rows
+                    .iter()
+                    .map(|row| row.iter().map(|v| highlight::paint(color, &one_line(&cypher(v)))).collect())
+                    .collect();
+                write_table(out, &r.columns, &cells, color)?;
             }
-            writeln!(out, "{}", summary(r, elapsed))
+            writeln!(out, "{}", summary(r, elapsed, color))
         }
     }
 }
 
 /// `3 rows, 2 ms` and what the statement changed.
-pub fn summary(r: &Outcome, elapsed: Duration) -> String {
+pub fn summary(r: &Outcome, elapsed: Duration, color: bool) -> String {
     let mut s = match r.rows.len() {
         1 => "1 row".to_string(),
         n => format!("{n} rows"),
     };
     let ms = elapsed.as_secs_f64() * 1e3;
     let _ = write!(s, ", {}", if ms < 10.0 { format!("{ms:.1} ms") } else { format!("{ms:.0} ms") });
+    let mut s = paint(color, Color::Dim, &s);
     let changes = changes(&r.stats);
     if !changes.is_empty() {
-        let _ = write!(s, "\n{changes}");
+        let _ = write!(s, "\n{}", paint(color, Color::Good, &changes));
     }
     s
 }
@@ -121,7 +128,8 @@ pub fn changes(stats: &BTreeMap<String, Json>) -> String {
         .join(", ")
 }
 
-fn write_table(out: &mut impl Write, columns: &[String], cells: &[Vec<String>]) -> io::Result<()> {
+/// A boxed table of `cells` (painted already when `color`).
+fn write_table(out: &mut impl Write, columns: &[String], cells: &[Vec<String>], color: bool) -> io::Result<()> {
     let mut widths: Vec<usize> = columns.iter().map(|c| width(c)).collect();
     for row in cells {
         for (i, c) in row.iter().enumerate() {
@@ -136,18 +144,20 @@ fn write_table(out: &mut impl Write, columns: &[String], cells: &[Vec<String>]) 
             s.push_str(&"-".repeat(w + 2));
             s.push('+');
         }
-        s
+        paint(color, Color::Border, &s)
     };
+    let bar = paint(color, Color::Border, "|");
     let line = |out: &mut dyn Write, values: &[String]| -> io::Result<()> {
-        let mut s = String::from("|");
+        let mut s = bar.clone();
         for (i, w) in widths.iter().enumerate() {
             let v = values.get(i).map_or("", String::as_str);
-            let _ = write!(s, " {v}{} |", " ".repeat(w - width(v)));
+            let _ = write!(s, " {v}{} {bar}", " ".repeat(w - width(v)));
         }
         writeln!(out, "{s}")
     };
     writeln!(out, "{rule}")?;
-    line(out, columns)?;
+    let header: Vec<String> = columns.iter().map(|c| paint(color, Color::Header, &one_line(c))).collect();
+    line(out, &header)?;
     writeln!(out, "{rule}")?;
     for row in cells {
         line(out, row)?;
@@ -158,7 +168,7 @@ fn write_table(out: &mut impl Write, columns: &[String], cells: &[Vec<String>]) 
     Ok(())
 }
 
-fn write_plan(out: &mut impl Write, plan: &Json) -> io::Result<()> {
+fn write_plan(out: &mut impl Write, plan: &Json, color: bool) -> io::Result<()> {
     let Json::Object(p) = plan else { return Ok(()) };
     let profiled = matches!(p.get("profiled"), Some(Json::Bool(true)));
     let Some(Json::Array(lines)) = p.get("lines") else { return Ok(()) };
@@ -186,19 +196,20 @@ fn write_plan(out: &mut impl Write, plan: &Json) -> io::Result<()> {
                 Some(v) => text(v),
                 None => String::new(),
             };
-            let mut row = vec![one_line(&format!("{}{op}", "  ".repeat(depth))), num("estimatedRows")];
+            let op = format!("{}{}", "  ".repeat(depth), paint(color, Color::Function, &one_line(op)));
+            let mut row = vec![op, num("estimatedRows")];
             if profiled {
                 row.extend([num("rows"), num("timeMs")]);
             }
             row
         })
         .collect();
-    write_table(out, &columns, &rows)
+    write_table(out, &columns, &rows, color)
 }
 
-/// The display width of `s`, counting characters.
+/// The display width of `s`: its characters, without color codes.
 fn width(s: &str) -> usize {
-    s.chars().count()
+    style::width(s)
 }
 
 fn one_line(s: &str) -> String {
@@ -414,11 +425,26 @@ mod tests {
             ..Outcome::default()
         };
         let mut out = Vec::new();
-        write(&mut out, Format::Table, &r, Duration::from_millis(12)).unwrap();
+        write(&mut out, Format::Table, &r, Duration::from_millis(12), false).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "+---+-------+\n| n | name  |\n+---+-------+\n| 1 | \"Ann\" |\n+---+-------+\n1 row, 12 ms\n"
         );
+    }
+
+    #[test]
+    fn colored_table_keeps_its_shape() {
+        let r = Outcome {
+            columns: vec!["n".into()],
+            rows: vec![vec![Json::String("Ann".into())]],
+            ..Outcome::default()
+        };
+        let mut out = Vec::new();
+        write(&mut out, Format::Table, &r, Duration::from_millis(12), true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[32m\"Ann\"\x1b[0m"), "{text:?}");
+        let widths: Vec<usize> = text.lines().take(5).map(style::width).collect();
+        assert_eq!(widths, [9, 9, 9, 9, 9]);
     }
 
     #[test]

@@ -9,7 +9,9 @@ use graphbuff::json::Json;
 
 use crate::client::{Client, Error, Tx};
 use crate::format::{self, Format};
+use crate::highlight;
 use crate::split;
+use crate::style::{self, Color, paint};
 
 /// How deep `:source` may nest.
 const MAX_SOURCE_DEPTH: usize = 16;
@@ -70,19 +72,30 @@ impl Shell {
         !self.buffer.is_empty() && !split::is_blank(&self.buffer)
     }
 
-    pub fn prompt(&self) -> String {
+    /// The text of the statement begun so far.
+    pub fn pending_text(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Drops the statement begun so far (Ctrl-C at the prompt).
+    pub fn cancel(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// The prompt: `database> `, `database(tx)> ` in a transaction, and `> ` under it
+    /// for the next lines of a statement.
+    pub fn prompt(&self, color: bool) -> String {
         let db = match (&self.tx, &self.database) {
             (Some(tx), _) => tx.database.clone(),
             (None, Some(db)) => db.clone(),
             (None, None) => "graphbuff".into(),
         };
         let tx = if self.tx.is_some() { "(tx)" } else { "" };
-        let main = format!("{db}{tx}> ");
+        let width = db.chars().count() + tx.len();
         if self.pending() {
-            format!("{}> ", " ".repeat(main.chars().count().saturating_sub(2)))
-        } else {
-            main
+            return format!("{}{} ", " ".repeat(width), paint(color, Color::Dim, ">"));
         }
+        format!("{}{}{} ", paint(color, Color::Good, &db), paint(color, Color::Warn, tx), paint(color, Color::Dim, ">"))
     }
 
     /// Takes one line of input.
@@ -143,7 +156,7 @@ impl Shell {
             Ok(r) => {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
-                if let Err(e) = format::write(&mut out, self.format, &r, elapsed).and_then(|()| out.flush()) {
+                if let Err(e) = format::write(&mut out, self.format, &r, elapsed, style::out()).and_then(|()| out.flush()) {
                     output_failed(e);
                 }
                 if self.tx.is_none()
@@ -162,9 +175,13 @@ impl Shell {
 
     fn failed(&mut self, e: &Error, statement: Option<&str>) {
         self.failures += 1;
-        eprintln!("{e}");
+        let on = style::err();
+        match e {
+            Error::Server { code, message, .. } => eprintln!("{}: {message}", paint(on, Color::Error, code)),
+            other => eprintln!("{}", paint(on, Color::Error, &other.to_string())),
+        }
         if let (Error::Server { offset: Some(offset), .. }, Some(text)) = (e, statement) {
-            eprint!("{}", pointer(text, *offset));
+            eprint!("{}", pointer(text, *offset, on));
         }
         if let Error::Server { rolled_back, code, .. } = e
             && self.tx.is_some()
@@ -203,7 +220,7 @@ impl Shell {
             Ok(()) => Flow::Go,
             Err(m) => {
                 if !m.is_empty() {
-                    eprintln!("{m}");
+                    eprintln!("{}", paint(style::err(), Color::Error, &m));
                     self.failures += 1;
                 }
                 if self.stop_on_error { Flow::Quit } else { Flow::Go }
@@ -226,7 +243,7 @@ impl Shell {
             Ok(r) => {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
-                if let Err(e) = format::write(&mut out, self.format, &r, started.elapsed()) {
+                if let Err(e) = format::write(&mut out, self.format, &r, started.elapsed(), style::out()) {
                     output_failed(e);
                 }
                 Ok(())
@@ -296,7 +313,7 @@ impl Shell {
         match self.client.query(self.database.as_deref(), None, &query, &self.params, self.timeout_ms) {
             Ok(mut r) => {
                 let value = r.rows.pop().and_then(|mut row| row.pop()).unwrap_or(Json::Null);
-                println!("${name} = {}", format::cypher(&value));
+                println!("{}", show_param(&name, &value));
                 self.params.insert(name, value);
                 Ok(())
             }
@@ -311,7 +328,7 @@ impl Shell {
         match arg {
             "" => {
                 for (k, v) in &self.params {
-                    println!("${k} = {}", format::cypher(v));
+                    println!("{}", show_param(k, v));
                 }
                 Ok(())
             }
@@ -378,7 +395,13 @@ impl Shell {
 
 /// Writes a note for the user on standard error, which keeps standard output for results.
 fn note(message: &str) {
-    eprintln!("{message}");
+    eprintln!("{}", paint(style::err(), Color::Dim, message));
+}
+
+/// `$name = value`.
+fn show_param(name: &str, value: &Json) -> String {
+    let on = style::out();
+    format!("{} = {}", paint(on, Color::Param, &format!("${name}")), highlight::paint(on, &format::cypher(value)))
 }
 
 /// Standard output is gone (a closed pipe, such as `| head`): stop quietly.
@@ -391,13 +414,18 @@ fn output_failed(e: io::Error) -> ! {
 }
 
 /// The line of `text` with byte `offset`, and a `^` under it.
-fn pointer(text: &str, offset: usize) -> String {
+fn pointer(text: &str, offset: usize, color: bool) -> String {
     let offset = offset.min(text.len());
     let offset = (0..=offset).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
     let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
     let end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
     let column = text[start..offset].chars().count();
-    format!("  {}\n  {}^\n", &text[start..end], " ".repeat(column))
+    format!(
+        "  {}\n  {}{}\n",
+        highlight::paint(color, &text[start..end]),
+        " ".repeat(column),
+        paint(color, Color::Error, "^")
+    )
 }
 
 /// The database a statement that is only `USE name` switches to.
@@ -452,7 +480,7 @@ mod tests {
 
     #[test]
     fn error_pointer() {
-        assert_eq!(pointer("MATCH (n)\nRETRN n", 10), "  RETRN n\n  ^\n");
-        assert_eq!(pointer("RETURN ä x", 10), format!("  RETURN ä x\n  {}^\n", " ".repeat(9)));
+        assert_eq!(pointer("MATCH (n)\nRETRN n", 10, false), "  RETRN n\n  ^\n");
+        assert_eq!(pointer("RETURN ä x", 10, false), format!("  RETURN ä x\n  {}^\n", " ".repeat(9)));
     }
 }

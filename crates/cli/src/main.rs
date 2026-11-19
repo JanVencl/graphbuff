@@ -4,10 +4,13 @@
 //! interactive prompt when standard input is a terminal.
 
 mod client;
+mod editor;
 mod format;
+mod highlight;
 mod prompt;
 mod shell;
 mod split;
+mod style;
 mod tls;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -16,8 +19,10 @@ use std::path::PathBuf;
 use graphbuff::json::{self, Json};
 
 use client::{Auth, Client, Url};
+use editor::{Editor, Input};
 use format::Format;
 use shell::{Flow, Shell};
+use style::{Color, paint};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7475";
 
@@ -29,6 +34,11 @@ Usage: graphbuff-cli [OPTIONS] [STATEMENTS]...
 With STATEMENTS (joined with spaces) or --file, runs them and exits. Otherwise reads
 standard input: an interactive prompt on a terminal, else a script. Statements end with
 `;`; lines starting with `:` are commands (`:help` lists them).
+
+At the prompt, Cypher is highlighted as it is typed. Keys: Left/Right, Ctrl-Left/Right
+(words), Home/End (Ctrl-A/E), Up/Down (history, kept in ~/.graphbuff_history or the file
+in env GRAPHBUFF_HISTORY, empty for none), Ctrl-U/K/W (delete to start / to end / word),
+Ctrl-L (clear), Ctrl-C (drop the statement), Ctrl-D (leave, on an empty line).
 
 Options:
   -a, --address URL       the server [env GRAPHBUFF_URL] (default http://127.0.0.1:7475)
@@ -43,6 +53,8 @@ Options:
       --timeout MS        stop each statement after MS milliseconds
       --continue          go on after a statement fails (scripts stop at the first error)
       --cacert FILE       trust the CA certificates in FILE (PEM) for https:// URLs
+      --color WHEN        colors: auto (on a terminal unless NO_COLOR is set), always, never
+      --no-color          the same as --color never
   -h, --help              this help
   -V, --version           the version
 
@@ -67,6 +79,7 @@ struct Args {
     timeout_ms: Option<u64>,
     keep_going: bool,
     cacert: Option<PathBuf>,
+    color: Option<style::When>,
     statements: Vec<String>,
     help: bool,
     version: bool,
@@ -106,9 +119,11 @@ impl Args {
                 "--timeout" => a.timeout_ms = Some(shell::parse_ms(&value(&flag)?)?),
                 "--continue" => a.keep_going = true,
                 "--cacert" => a.cacert = Some(PathBuf::from(value(&flag)?)),
+                "--color" | "--colour" => a.color = Some(style::When::parse(&value(&flag)?)?),
+                "--no-color" | "--no-colour" => a.color = Some(style::When::Never),
                 _ => return Err(format!("unknown option `{arg}`")),
             }
-            if inline.is_some() && matches!(flag.as_str(), "--help" | "--version" | "--continue") {
+            if inline.is_some() && matches!(flag.as_str(), "--help" | "--version" | "--continue" | "--no-color" | "--no-colour") {
                 return Err(format!("{flag} takes no value"));
             }
         }
@@ -161,6 +176,7 @@ fn run() -> i32 {
 }
 
 fn start(args: Args) -> Result<i32, String> {
+    style::init(args.color.unwrap_or(style::When::Auto));
     let url_text = args.url.or_else(|| env("GRAPHBUFF_URL")).unwrap_or_else(|| DEFAULT_URL.into());
     let url = Url::parse(&url_text)?;
     let stdin_script = args.files.iter().any(|f| f == "-");
@@ -266,7 +282,7 @@ fn connect_interactively(client: &mut Client) -> Result<(), String> {
             Ok(_) => break,
             Err(e) if e.is_unauthorized() && tries < 3 => {
                 if !matches!(client.auth(), Auth::None) {
-                    eprintln!("{e}");
+                    eprintln!("{}", paint(style::err(), Color::Error, &e.to_string()));
                 }
                 tries += 1;
                 let name = prompt::line("user: ").map_err(|e| e.to_string())?;
@@ -281,32 +297,52 @@ fn connect_interactively(client: &mut Client) -> Result<(), String> {
         Auth::Token(_) => " with the token".into(),
         Auth::User { name, .. } => format!(" as {name}"),
     };
-    eprintln!("Connected to {}{who}. Type :help for help, :quit to leave.", client.url());
+    let on = style::err();
+    eprintln!(
+        "Connected to {}{who}. {}",
+        paint(on, Color::Good, &client.url().to_string()),
+        paint(on, Color::Dim, "Type :help for help, :quit to leave.")
+    );
     Ok(())
 }
 
 fn repl(shell: &mut Shell) {
-    let stdin = io::stdin();
+    let color = style::out();
+    let mut editor = Editor::new(color);
     loop {
-        print!("{}", shell.prompt());
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                println!();
-                break;
+        let prompt = shell.prompt(color);
+        let line = if io::stdout().is_terminal() {
+            editor.read_line(&prompt, shell.pending_text())
+        } else {
+            plain_line(&prompt)
+        };
+        match line {
+            Ok(Input::Line(line)) => {
+                if shell.line(&line) == Flow::Quit {
+                    break;
+                }
             }
-            Ok(_) => {}
+            Ok(Input::Interrupted) => shell.cancel(),
+            Ok(Input::Eof) => break,
             Err(e) => {
                 eprintln!("reading standard input: {e}");
                 break;
             }
         }
-        if shell.line(line.trim_end_matches(['\r', '\n'])) == Flow::Quit {
-            break;
-        }
     }
     shell.finish();
+}
+
+/// A line read the plain way (standard output is not a terminal).
+fn plain_line(prompt: &str) -> io::Result<Input> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        println!();
+        return Ok(Input::Eof);
+    }
+    Ok(Input::Line(line.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 #[cfg(test)]
