@@ -608,7 +608,10 @@ it uses:
 | Windows | `%LOCALAPPDATA%\graphbuff` |
 | Docker image | `/data` (a volume) |
 
-The start-up line names the directory in use. New databases there use hybrid storage
+The start-up line names the directory in use. `DATA/system/` holds the user accounts (the
+system database; see [Users and TLS](#users-and-tls)). One process at a time uses a data
+directory: a second server, or an offline `users` / `admin` command, is refused while it
+is locked. New databases there use hybrid storage
 (`--persistent`: disk-resident, for graphs larger than RAM). `--in-memory` keeps everything
 in memory and writes nothing. Back up databases with the server's backup endpoint (see
 [Backup, restore and consistency checks](#backup-restore-and-consistency-checks)).
@@ -730,6 +733,11 @@ graphbuff-server --bolt 127.0.0.1:7687
 
 # lost the password? set a new one, offline (from GRAPHBUFF_PASSWORD or asked for)
 graphbuff-server admin reset-password root
+
+# other accounts, offline, the same way (passwords as for reset-password)
+graphbuff-server users list
+graphbuff-server users add kim editor
+graphbuff-server users grant kim admin     # also: password, revoke, remove
 ```
 
 Or let the server create the first administrator when it starts and no user has the
