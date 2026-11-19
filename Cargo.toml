@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/server", "crates/wasm"]
+members = ["crates/cli", "crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/server", "crates/wasm"]
 # The GPU backend pulls in wgpu (and, on Windows with the GNU toolchain, needs extra tools to
 # link; see the README), so a plain `cargo build` / `cargo test` leaves it out. Build it with
 # `-p graphbuff-gpu` or the `gpu` feature of `graphbuff` or `graphbuff-server`.
 # The browser build (`crates/wasm`) is for the wasm32-unknown-unknown target; see its README.
-default-members = ["crates/core", "crates/cypher", "crates/engine", "crates/server"]
+default-members = ["crates/cli", "crates/core", "crates/cypher", "crates/engine", "crates/server"]
 
 [workspace.package]
 version = "0.4.0"

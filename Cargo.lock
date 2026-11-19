@@ -571,6 +571,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphbuff-cli"
+version = "0.4.0"
+dependencies = [
+ "graphbuff",
+ "graphbuff-server",
+ "rustls",
+ "rustls-rustcrypto",
+]
+
+[[package]]
 name = "graphbuff-core"
 version = "0.4.0"
 
