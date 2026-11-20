@@ -21,11 +21,21 @@ the same notes.
   memory); a query over it fails with `MemoryLimit` and is rolled back.
 - Failed logins lock a client out for a while (`security.max_failed_logins`,
   `security.login_lockout_seconds`).
+- Approximate vector indexes (HNSW): `vector.hnsw.enabled`, `vector.hnsw.m` and
+  `vector.hnsw.ef_construction` in `indexConfig`. Candidates are rescored exactly; indexes
+  without these settings stay exact.
+- `Database::execute_streaming` and `Session::execute_streaming` with a `RowSink`, for
+  rows handed over as a read-only query produces them.
 
 ### Changed
 
 - Release binaries and the Docker image are built with TLS support.
 - Minimum Rust version 1.100.
+- Results stream: an auto-commit read-only query sends its rows to Bolt `PULL`s as they
+  are produced, and over HTTP a result past 64 KiB goes out as a chunked `200`; a
+  failure after that ends the JSON with `"error"` instead of `"stats"`.
+- Aggregation keeps only its groups, not its input rows, so it needs far less memory.
+- `SHOW INDEXES` lists `vector.hnsw.enabled` for every vector index.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
 
