@@ -139,6 +139,7 @@ pub struct DatabaseManager {
     catalog: RwLock<Catalog>,
     /// Where `LOAD CSV` reads files, for every database.
     import_dir: RwLock<Option<PathBuf>>,
+    csv_urls: RwLock<Option<crate::CsvUrls>>,
     /// The procedures `CALL` can run, in every database.
     procedures: RwLock<Arc<crate::Procedures>>,
     /// The kernel backend of every database, when not the default.
@@ -382,6 +383,7 @@ impl DatabaseManager {
                 dbs,
             }),
             import_dir: RwLock::new(None),
+            csv_urls: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
             system: system_in_memory(),
@@ -464,6 +466,7 @@ impl DatabaseManager {
             default_storage,
             catalog: RwLock::new(catalog),
             import_dir: RwLock::new(None),
+            csv_urls: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
             system,
@@ -492,6 +495,21 @@ impl DatabaseManager {
     /// The directory `LOAD CSV` reads from, if it is enabled.
     pub fn import_dir(&self) -> Option<PathBuf> {
         self.import_dir.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Lets `LOAD CSV` read web URLs in every database (see [`crate::CsvUrls`]); `None`
+    /// (the default): only files.
+    pub fn set_csv_urls(&self, urls: Option<crate::CsvUrls>) {
+        let cat = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        *self.csv_urls.write().unwrap_or_else(|e| e.into_inner()) = urls.clone();
+        for entry in cat.dbs.values() {
+            entry.db.set_csv_urls(urls.clone());
+        }
+    }
+
+    /// The web URLs `LOAD CSV` may read, if any.
+    pub fn csv_urls(&self) -> Option<crate::CsvUrls> {
+        self.csv_urls.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Adds a procedure that `CALL` can run in every database (see
@@ -828,6 +846,7 @@ impl DatabaseManager {
         fs::rename(tmp, &dir).map_err(io(&dir, "moving the new database to"))?;
         let db = open_db(Some(root), name, &storage, false)?;
         db.set_import_dir(self.import_dir());
+        db.set_csv_urls(self.csv_urls());
         db.set_procedures(self.procedures());
         self.apply_kernels(&db);
         cat.dbs.insert(name.to_string(), Entry { storage, db });
@@ -862,6 +881,7 @@ impl DatabaseManager {
         }
         let db = open_db(self.root(), &name, &storage, true)?;
         db.set_import_dir(self.import_dir());
+        db.set_csv_urls(self.csv_urls());
         db.set_procedures(self.procedures());
         self.apply_kernels(&db);
         cat.dbs.insert(name.clone(), Entry { storage, db });
@@ -918,6 +938,7 @@ impl DatabaseManager {
             // Still listed on disk: bring it back so memory matches the catalog file.
             if let Ok(db) = open_db(self.root(), name, &entry.storage, false) {
                 db.set_import_dir(self.import_dir());
+        db.set_csv_urls(self.csv_urls());
                 db.set_procedures(self.procedures());
         self.apply_kernels(&db);
                 cat.dbs.insert(

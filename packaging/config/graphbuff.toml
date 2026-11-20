@@ -32,6 +32,9 @@ data = "../data"
 fsync = true
 # Folder LOAD CSV may read files from (off when not set).
 # import_dir = "../import"
+# Web URLs LOAD CSV may read (http:// or https://), a comma-separated list of prefixes
+# that each end in a path, at least "/" (off when not set).
+# load_csv_urls = "https://data.example.com/exports/"
 # Folder admins may back databases up to and restore them from (off when not set).
 # backup_dir = "../backups"
 # Load a demo graph into the default database when it is empty: movies.

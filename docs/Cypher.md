@@ -10,9 +10,12 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `UNWIND`, `WITH`, `RETURN`, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, `UNION [ALL]`,
   `FOREACH (x IN list | updates)`,
   `LOAD CSV [WITH HEADERS] FROM 'file:///data.csv' AS row [FIELDTERMINATOR ';']` (files inside
-  the import directory only: `Database::set_import_dir` / `DatabaseManager::set_import_dir`,
-  `storage.import_dir` for the server, the current directory by default in the CLI; each record is a
-  list of strings, or a map by header; an unquoted empty field is `null`, `""` an empty string),
+  the import directory: `Database::set_import_dir` / `DatabaseManager::set_import_dir`,
+  `storage.import_dir` for the server, the current directory by default in the CLI; `http://`
+  and `https://` URLs that start with an allowed prefix: `storage.load_csv_urls` for the
+  server, `set_csv_urls` with your own opener when embedded; gzip files such as `data.csv.gz`
+  are decompressed as they are read; each record is a list of strings, or a map by header; an
+  unquoted empty field is `null`, `""` an empty string),
   `CALL { … }` subqueries (run once per row; import outer variables with `CALL (a, b) { … }`,
   `CALL (*) { … }` or a leading `WITH a, b`; they may change the graph, and a subquery without
   `RETURN` keeps each row once)
@@ -219,7 +222,7 @@ recognise. Where there is another way to write it, it is given.
 | Regular expressions with lookaround, atomic groups, backreferences, possessive quantifiers or nested classes (`RuntimeError`) | rewrite without them |
 | Procedures that change the graph, `db.create.setNodeVectorProperty` (no such procedure) | `SET n.p = $vector` |
 | `apoc.*` beyond the functions listed above (`Unsupported`) | the built-in functions |
-| `LOAD CSV` from URLs other than local files (`Unsupported`) | download the file into the import directory |
+| `LOAD CSV` from URLs not allowed by `storage.load_csv_urls`, or other than `file:`, `http:` and `https:` | download the file into the import directory |
 | Two result columns with the same name (`RETURN 1 AS a, 2 AS a`, `SemanticError`) | distinct names |
 
 **`CALL { … } IN TRANSACTIONS`** (`Unsupported`): inside a `UNION`, under `PROFILE`, and

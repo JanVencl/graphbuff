@@ -96,6 +96,7 @@ mode = "hybrid"                       # hybrid (default), persistent or memory
 data = "/srv/graphbuff"               # databases, user accounts and (by default) logs
 fsync = true                          # false: faster commits, the last ones may be lost in a crash
 import_dir = "/srv/import"            # LOAD CSV reads files here (off when not set)
+# load_csv_urls = "https://data.example.com/exports/"  # and web URLs starting with these
 backup_dir = "/srv/backups"           # online backups and restores (off when not set)
 # demo = "movies"                     # load the movies demo graph into an empty default database
 

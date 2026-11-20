@@ -36,6 +36,8 @@ pub struct Config {
     pub data: Option<PathBuf>,
     pub fsync: bool,
     pub import_dir: Option<PathBuf>,
+    /// `storage.load_csv_urls`, checked: URL prefixes LOAD CSV may read.
+    pub load_csv_urls: Vec<String>,
     pub backup_dir: Option<PathBuf>,
     pub demo: Option<String>,
     // [security]
@@ -71,6 +73,7 @@ impl Default for Config {
             data: None,
             fsync: true,
             import_dir: None,
+            load_csv_urls: Vec::new(),
             backup_dir: None,
             demo: None,
             token: None,
@@ -149,6 +152,9 @@ mode = "hybrid"
 fsync = true
 # Folder LOAD CSV may read files from (off when not set).
 # import_dir = "../import"
+# Web URLs LOAD CSV may read (http:// or https://), a comma-separated list of prefixes
+# that each end in a path, at least "/" (off when not set).
+# load_csv_urls = "https://data.example.com/exports/"
 # Folder admins may back databases up to and restore them from (off when not set).
 # backup_dir = "../backups"
 # Load a demo graph into the default database when it is empty: movies.
@@ -243,6 +249,7 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("data", Kind::Path, "The data folder: databases, user accounts and (by default) logs."),
             ("fsync", Kind::Bool, "Sync every commit to disk."),
             ("import_dir", Kind::Path, "Folder LOAD CSV may read files from (off when not set)."),
+            ("load_csv_urls", Kind::Str, "Web URL prefixes LOAD CSV may read (off when not set)."),
             ("backup_dir", Kind::Path, "Folder of backups and restores (off when not set)."),
             ("demo", Kind::Str, "Demo graph loaded into an empty default database."),
         ],
@@ -337,6 +344,10 @@ impl Config {
                 ("storage", "data") => c.data = Some(path_of(value)),
                 ("storage", "fsync") => c.fsync = bool_of(value),
                 ("storage", "import_dir") => c.import_dir = Some(path_of(value)),
+                ("storage", "load_csv_urls") => {
+                    c.load_csv_urls = graphbuff_server::fetch::parse_prefixes(&str_of(value))
+                        .map_err(|e| format!("{}: storage.load_csv_urls: {e}", at()))?;
+                }
                 ("storage", "backup_dir") => c.backup_dir = Some(path_of(value)),
                 ("storage", "demo") => c.demo = Some(str_of(value)),
                 ("security", "token") => c.token = Some(str_of(value)).filter(|t| !t.is_empty()),
@@ -413,6 +424,7 @@ impl Config {
             ("storage", "data") => path(&self.data),
             ("storage", "fsync") => Some(self.fsync.to_string()),
             ("storage", "import_dir") => path(&self.import_dir),
+            ("storage", "load_csv_urls") => (!self.load_csv_urls.is_empty()).then(|| self.load_csv_urls.join(", ")),
             ("storage", "backup_dir") => path(&self.backup_dir),
             ("storage", "demo") => self.demo.clone(),
             ("security", "token") => self.token.as_ref().map(|_| "********".into()),
@@ -745,6 +757,9 @@ max_memory_mb = 512").unwrap();
         assert!(e("[server]\nbind = \"x").contains("no closing"));
         assert!(e("[server]\nbind = \"x\" y").contains("after the value"));
         assert!(e("[server]\ncors_origins = \"example.com\"").contains("server.cors_origins"));
+        assert!(e("[storage]\nload_csv_urls = \"https://a.example\"").contains("storage.load_csv_urls"));
+        let urls = parse("[storage]\nload_csv_urls = \"https://a.example/x/, http://b.example/\"").unwrap();
+        assert_eq!(urls.load_csv_urls, ["https://a.example/x/", "http://b.example/"]);
     }
 
     #[test]

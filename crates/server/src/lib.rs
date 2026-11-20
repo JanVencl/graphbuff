@@ -62,6 +62,7 @@
 mod api;
 mod bolt;
 mod crypto;
+pub mod fetch;
 mod http;
 pub mod log;
 mod net;
