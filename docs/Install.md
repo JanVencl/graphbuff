@@ -123,11 +123,12 @@ graphbuff-VERSION-PLATFORM/
 | Platform | Archive |
 |----------|---------|
 | Linux x86-64 (static, any distribution) | `graphbuff-linux-x86_64.tar.gz` |
+| Linux ARM64 (static, any distribution) | `graphbuff-linux-aarch64.tar.gz` |
 | macOS Apple silicon | `graphbuff-macos-arm64.tar.gz` |
 | macOS Intel | `graphbuff-macos-x86_64.tar.gz` |
 | Windows x86-64 | `graphbuff-windows-x86_64.zip` |
 
-and `SHA256SUMS` with the checksums of all four. The file names carry no version, so
+and `SHA256SUMS` with the checksums of all of them. The file names carry no version, so
 `https://github.com/JanVencl/graphbuff/releases/latest/download/graphbuff-linux-x86_64.tar.gz`
 always points at the newest release (a specific one: `.../releases/download/v0.1.0/...`).
 
