@@ -506,6 +506,7 @@ fn main() {
     let persistent = settings.storage == Storage::Persistent;
     let sync = if settings.fsync { SyncPolicy::EveryCommit } else { SyncPolicy::OsBuffered };
     let import_dir = settings.import_dir.clone();
+    let load_csv_urls = settings.load_csv_urls.clone();
     let gpu = settings.gpu;
     let demo = settings.demo.clone();
     let (tls_cert, tls_key, tls_plain) = (settings.tls_cert.clone(), settings.tls_key.clone(), settings.tls_allow_plain);
@@ -612,6 +613,9 @@ fn main() {
     }
 
     mgr.set_import_dir(import_dir);
+    if !load_csv_urls.is_empty() {
+        mgr.set_csv_urls(Some(graphbuff_server::fetch::csv_urls(load_csv_urls)));
+    }
     let demo = demo.map(|name| match graphbuff::load_demo(&mgr, &name) {
         Ok(d) => (name, d),
         Err(e) => fatal(&format!("cannot load the demo `{name}`: {e}")),

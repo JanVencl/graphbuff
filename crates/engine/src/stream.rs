@@ -425,8 +425,8 @@ impl<'a> Expander<'a> for CsvStep<'a> {
                 )));
             }
         };
-        let path = crate::csv::resolve(ex.import_dir.as_deref(), &url)?;
-        let mut reader = crate::csv::CsvReader::open(path, self.terminator)?;
+        let source = crate::csv::resolve(ex.import_dir.as_deref(), ex.csv_urls.as_ref(), &url)?;
+        let mut reader = crate::csv::open(source, ex.csv_urls.as_ref(), self.terminator)?;
         if self.headers {
             match reader.next_record()? {
                 Some(h) => self.header = h.into_iter().map(|(s, _)| s).collect(),

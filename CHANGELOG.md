@@ -30,6 +30,9 @@ the same notes.
   transactions, backups and restores (who, from where, outcome), and failed logins.
 - `SHOW FUNCTIONS` and `dbms.functions()`; `SHOW SETTINGS` on the server (administrators);
   `OPTIONAL CALL` for procedures and subqueries.
+- `LOAD CSV` reads gzip files, and `http://` / `https://` URLs under the prefixes in
+  `storage.load_csv_urls` (redirects only within them); `Database::set_csv_urls` for
+  embedders. Bulk import reads `.csv.gz` too.
 - `Database::execute_streaming` and `Session::execute_streaming` with a `RowSink`, for
   rows handed over as a read-only query produces them.
 

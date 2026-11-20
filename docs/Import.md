@@ -22,6 +22,8 @@ follows.csv         :START_ID(Person),:END_ID(Person),since:date
   nodes, indexes built after loading from sorted keys, cache size, fsync.
 * **Target:** an existing database is replaced only if it is empty, or with overwrite. A
   failed import leaves it as it was.
+* **Compressed files:** a file that is gzip (`people.csv.gz`) is decompressed as it is
+  read, here and in `LOAD CSV`.
 * **Bare stores:** `PersistentGraph::bulk_loader`
   plus `import_csv` for a bare store. `BulkLoader` can also be filled directly
   (`create_node`, `create_relationship`, `create_index`, `finish`).

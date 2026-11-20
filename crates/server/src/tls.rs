@@ -15,7 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::net::{Accepted, Stream, TlsConfig};
 
 /// The crypto provider the build chose: ring with the `tls` feature, else RustCrypto.
-fn provider() -> rustls::crypto::CryptoProvider {
+pub(crate) fn provider() -> rustls::crypto::CryptoProvider {
     #[cfg(feature = "tls")]
     return rustls::crypto::ring::default_provider();
     #[cfg(not(feature = "tls"))]

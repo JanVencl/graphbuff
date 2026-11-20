@@ -140,6 +140,8 @@ pub(crate) struct Executor<'s> {
     pub regexes: RefCell<HashMap<String, Rc<crate::regex::Regex>>>,
     /// Where `LOAD CSV` reads files; `None` disables it.
     pub import_dir: Option<std::path::PathBuf>,
+    /// The web URLs `LOAD CSV` may read; `None`: none.
+    pub csv_urls: Option<crate::csv::CsvUrls>,
     /// The statement's clock, `(days, nanos)` in UTC, read on first use: `date()`,
     /// `datetime()`, … return the same time throughout a query.
     pub now: std::cell::Cell<Option<(i64, i64)>>,
@@ -182,6 +184,7 @@ impl<'s> Executor<'s> {
             subplans: RefCell::default(),
             regexes: RefCell::default(),
             import_dir: None,
+            csv_urls: None,
             now: std::cell::Cell::new(None),
             procedures: crate::procedures::Procedures::builtin(),
             interrupt: None,

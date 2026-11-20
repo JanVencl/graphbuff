@@ -359,7 +359,7 @@ impl Group<'_> {
             if let Some(r) = &mut self.reader
                 && let Some(rec) = r.next_record()?
             {
-                return Ok(Some((rec, format!("{} line {}", r.path().display(), r.record_line()))));
+                return Ok(Some((rec, format!("{} line {}", r.name(), r.record_line()))));
             }
             match self.files.next() {
                 Some(f) => self.reader = Some(CsvReader::open(f.clone(), self.delimiter)?),

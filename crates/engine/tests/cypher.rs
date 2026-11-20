@@ -2069,3 +2069,30 @@ fn optional_call() {
     ));
     assert!(db.execute("UNWIND [1] AS i OPTIONAL CALL (i) { CREATE () } IN TRANSACTIONS RETURN i").is_err());
 }
+
+#[test]
+fn load_csv_gzip_and_urls() {
+    use std::sync::Arc;
+    let dir = import_dir("load-gz");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/people.csv.gz"), dir.join("people.csv.gz")).unwrap();
+    let db = Database::in_memory();
+    db.set_import_dir(Some(dir));
+    let r = run(&db, "LOAD CSV WITH HEADERS FROM 'people.csv.gz' AS row RETURN count(*), max(toInteger(row.age))");
+    assert_eq!(rows(&r), ["5000, 4999"]);
+    // Web URLs: refused until allowed, then read through the opener.
+    let url = "LOAD CSV WITH HEADERS FROM 'https://data.example.com/p.csv' AS row RETURN row.name";
+    assert!(matches!(db.execute(url), Err(Error::Unsupported(_))));
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&opened);
+    db.set_csv_urls(Some(graphbuff::CsvUrls {
+        prefixes: vec!["https://data.example.com/".into()],
+        open: Arc::new(move |u: &str| {
+            seen.lock().unwrap().push(u.to_string());
+            Ok(Box::new(std::io::Cursor::new(b"name\nAnn\n".to_vec())) as Box<dyn std::io::Read + Send>)
+        }),
+    }));
+    assert_eq!(rows(&run(&db, url)), ["\"Ann\""]);
+    assert!(opened.lock().unwrap().iter().all(|u| u == "https://data.example.com/p.csv"));
+    let other = db.execute("LOAD CSV FROM 'https://elsewhere.example.com/p.csv' AS row RETURN row").unwrap_err();
+    assert!(other.to_string().contains("allowed URL prefixes"), "{other}");
+}

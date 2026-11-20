@@ -27,6 +27,7 @@ mod accel;
 mod aggregate;
 mod batched;
 mod catalog;
+mod gzip;
 mod context;
 mod csv;
 mod dbms;
@@ -59,6 +60,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError};
 use std::thread::ThreadId;
 
+pub use csv::{CsvUrls, UrlOpener};
 pub use import::{IdType, ImportFiles, ImportOptions, ImportSummary, import_csv, parse_index};
 pub use demo::{DEMOS, DemoSummary, demo_script, load_demo};
 pub use dbms::{DEFAULT_DATABASE, SYSTEM_DATABASE, DatabaseInfo, DatabaseManager, Session, StorageKind};
@@ -123,6 +125,7 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     committed: RwLock<Option<Snapshot>>,
     /// Where `LOAD CSV` reads files; `None` disables it.
     import_dir: RwLock<Option<PathBuf>>,
+    csv_urls: RwLock<Option<CsvUrls>>,
     /// The procedures `CALL` can run.
     procedures: RwLock<Arc<Procedures>>,
     /// The thread with an open [`Transaction`], which holds the store.
@@ -196,6 +199,7 @@ impl<S: GraphStore> Database<S> {
             description: store.describe(),
             store: RwLock::new(store),
             import_dir: RwLock::new(None),
+            csv_urls: RwLock::new(None),
             procedures: RwLock::new(Procedures::builtin()),
             tx_thread: Mutex::new(None),
             kernel_cache: Arc::default(),
@@ -232,6 +236,7 @@ impl<S: GraphStore> Database<S> {
     fn executor<'s>(&self, store: StoreRef<'s>, params: &'s BTreeMap<String, Value>) -> Executor<'s> {
         let mut ex = Executor::new(store, params);
         ex.import_dir = self.import_dir();
+        ex.csv_urls = self.csv_urls();
         ex.procedures = self.procedures();
         ex
     }
@@ -246,6 +251,16 @@ impl<S: GraphStore> Database<S> {
     /// The directory `LOAD CSV` reads from, if it is enabled.
     pub fn import_dir(&self) -> Option<PathBuf> {
         self.import_dir.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Lets `LOAD CSV` read web URLs (see [`CsvUrls`]); `None` (the default): only files.
+    pub fn set_csv_urls(&self, urls: Option<CsvUrls>) {
+        *self.csv_urls.write().unwrap_or_else(|e| e.into_inner()) = urls;
+    }
+
+    /// The web URLs `LOAD CSV` may read, if any.
+    pub fn csv_urls(&self) -> Option<CsvUrls> {
+        self.csv_urls.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Runs a Cypher statement without parameters.
