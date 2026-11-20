@@ -44,6 +44,11 @@ fsync = true
 # tls_key = "key.pem"
 # With TLS, also accept clients without TLS on the same ports.
 tls_allow_plain = false
+# After this many failed logins of one client address and user name (three times as many
+# over all names), refuse its logins for login_lockout_seconds, doubling with each further
+# failure up to an hour. 0 turns this off.
+max_failed_logins = 10
+login_lockout_seconds = 60
 
 [queries]
 # Roll back a transaction after this long without a request.

@@ -83,6 +83,7 @@ const POINT_3D: u8 = 0x59;
 // Error codes, in Neo4j's `Neo.<classification>.<category>.<title>` form.
 const INVALID: &str = "Neo.ClientError.Request.Invalid";
 const UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
+const RATE_LIMIT: &str = "Neo.ClientError.Security.AuthenticationRateLimit";
 const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 const TYPE_ERROR: &str = "Neo.ClientError.Statement.TypeError";
 const NOT_SUPPORTED: &str = "Neo.ClientError.Statement.FeatureNotSupported";
@@ -561,16 +562,17 @@ impl Conn<'_> {
     /// Who `auth` (`scheme`, `principal`, `credentials`) logs in as: `basic` with a
     /// user's name and password, or with the server token as the password (any name);
     /// `bearer` with the token.
-    fn login(&self, auth: &BTreeMap<String, PackValue>) -> Option<Principal> {
+    /// Fails with the failure to send: wrong credentials, or locked out after too many.
+    fn login(&self, auth: &BTreeMap<String, PackValue>) -> Result<Principal, Failure> {
         let ctx = &self.shared.ctx;
-        if !ctx.auth_required() {
-            return Some(Principal::Open);
-        }
         let text = |key: &str| match auth.get(key) {
             Some(PackValue::String(s)) => s.as_str(),
             _ => "",
         };
-        let who = match text("scheme") {
+        let scheme = text("scheme");
+        let user = if scheme == "basic" { text("principal") } else { "" };
+        let counts = matches!(scheme, "basic" | "bearer");
+        let attempt = || match scheme {
             "basic" => ctx.login(text("principal"), text("credentials")),
             "bearer" => match &ctx.token {
                 Some(t) if api::same_secret(text("credentials"), t) => Some(Principal::Token),
@@ -578,10 +580,10 @@ impl Conn<'_> {
             },
             _ => None,
         };
-        if who.is_none() {
-            ctx.login_failed("bolt", &self.peer, text("principal"));
-        }
-        who
+        ctx.throttled_login("bolt", &self.peer, user, counts, attempt).map_err(|e| match e {
+            api::LoginError::Wrong => Failure::new(UNAUTHORIZED, "wrong or missing credentials"),
+            api::LoginError::Locked(wait) => Failure::new(RATE_LIMIT, api::LoginError::locked_message(wait)),
+        })
     }
 
     /// What the logged-in client may do now.
@@ -600,11 +602,13 @@ impl Conn<'_> {
         };
         // From 5.1 the credentials come with LOGON.
         if !self.at_least(5, 1) {
-            let Some(who) = self.login(&extra) else {
-                self.fail(Failure::new(UNAUTHORIZED, "wrong or missing credentials"))?;
-                return Ok(Flow::Close);
-            };
-            self.who = Some(who);
+            match self.login(&extra) {
+                Ok(who) => self.who = Some(who),
+                Err(failure) => {
+                    self.fail(failure)?;
+                    return Ok(Flow::Close);
+                }
+            }
         }
         self.hello = true;
         let id = CONNECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -636,11 +640,13 @@ impl Conn<'_> {
             self.fail(Failure::invalid("LOGON takes a map"))?;
             return Ok(Flow::Close);
         };
-        let Some(who) = self.login(&auth) else {
-            self.fail(Failure::new(UNAUTHORIZED, "wrong or missing credentials"))?;
-            return Ok(Flow::Close);
-        };
-        self.who = Some(who);
+        match self.login(&auth) {
+            Ok(who) => self.who = Some(who),
+            Err(failure) => {
+                self.fail(failure)?;
+                return Ok(Flow::Close);
+            }
+        }
         self.success(BTreeMap::new())?;
         Ok(Flow::Continue)
     }

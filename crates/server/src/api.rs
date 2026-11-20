@@ -12,6 +12,7 @@ use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statemen
 use crate::crypto;
 use crate::http::{Request, Response};
 use crate::log::Log;
+use crate::throttle::{self, Throttle};
 use crate::json::{self, Json, encode_result, to_value, write_str};
 use crate::tx::{Transactions, TxError};
 use crate::users::{self, Access, Principal, Users};
@@ -31,6 +32,23 @@ pub(crate) struct Ctx {
     pub abort: CancelHandle,
     /// `POST /db/{name}/test-procedure` is on (see [`crate::ServerConfig::test_procedures`]).
     pub test_procedures: bool,
+    /// Failed logins, per client address and user name.
+    pub throttle: Throttle,
+}
+
+/// Why a login was refused.
+pub(crate) enum LoginError {
+    /// Wrong or missing credentials.
+    Wrong,
+    /// Too many failed logins: none is tried for this long.
+    Locked(Duration),
+}
+
+impl LoginError {
+    /// The message for a client that is locked out for `d`.
+    pub(crate) fn locked_message(d: Duration) -> String {
+        format!("too many failed logins; try again in {} s", throttle::seconds(d))
+    }
 }
 
 impl Ctx {
@@ -62,6 +80,42 @@ impl Ctx {
             let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
             log.warn(format_args!("failed login ({protocol}) from {peer}{user}"));
         }
+    }
+
+    /// Runs `attempt`, a login from `peer` as `user` (empty for a token), unless failed
+    /// logins have locked that client out. A failure is logged and counted when
+    /// `counts` (the client sent credentials); a success clears the count.
+    pub(crate) fn throttled_login(
+        &self,
+        protocol: &str,
+        peer: &str,
+        user: &str,
+        counts: bool,
+        attempt: impl FnOnce() -> Option<Principal>,
+    ) -> Result<Principal, LoginError> {
+        if !self.auth_required() {
+            return Ok(Principal::Open);
+        }
+        let addr = throttle::peer_addr(peer);
+        if let Some(wait) = self.throttle.locked(addr, user, Instant::now()) {
+            return Err(LoginError::Locked(wait));
+        }
+        if let Some(who) = attempt() {
+            self.throttle.succeeded(addr, user);
+            return Ok(who);
+        }
+        self.login_failed(protocol, peer, user);
+        if counts
+            && let Some(lockout) = self.throttle.failed(addr, user, Instant::now())
+            && let Some(log) = &self.log
+        {
+            let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
+            log.warn(format_args!(
+                "too many failed logins ({protocol}) from {peer}{user}: locked out for {} s",
+                throttle::seconds(lockout)
+            ));
+        }
+        Err(LoginError::Wrong)
     }
 
     /// The limits for a query that asked for `requested` milliseconds (if anything).
@@ -169,10 +223,15 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
     let who = if segments.as_slice() == ["health"] {
         Principal::Open
     } else {
-        match authenticate(ctx, req) {
-            Some(who) => who,
-            None => {
-                ctx.login_failed("http", peer, &basic_user(req).unwrap_or_default());
+        let user = basic_user(req).unwrap_or_default();
+        let sent = req.header("authorization").is_some();
+        match ctx.throttled_login("http", peer, &user, sent, || authenticate(ctx, req)) {
+            Ok(who) => who,
+            Err(LoginError::Locked(wait)) => {
+                return error(429, "TooManyRequests", &LoginError::locked_message(wait))
+                    .with_header("Retry-After", throttle::seconds(wait).to_string());
+            }
+            Err(LoginError::Wrong) => {
                 let challenge = if ctx.users.is_some() {
                     r#"Basic realm="graphbuff", charset="UTF-8""#
                 } else {

@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use graphbuff::{BoxedStore, Database, Error, QueryResult, QueryStats, Result, ResultValue, Value};
 use graphbuff::cypher::ast::{DbName, ExistingDatabase, Secret, UserCommand};
@@ -237,6 +237,44 @@ pub struct Users {
     params: HashParams,
     min_password_length: usize,
     state: RwLock<State>,
+    /// Limits the password hashes computed at once (each takes the hash's memory).
+    hashing: Gate,
+}
+
+/// A counting semaphore: at most `max` holders at once, the others wait.
+struct Gate {
+    held: Mutex<usize>,
+    freed: Condvar,
+    max: usize,
+}
+
+impl Default for Gate {
+    /// One holder per CPU (at least two).
+    fn default() -> Gate {
+        let max = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
+        Gate { held: Mutex::new(0), freed: Condvar::new(), max }
+    }
+}
+
+impl Gate {
+    /// Runs `f` once fewer than `max` others are running.
+    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct Release<'a>(&'a Gate);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                self.0.freed.notify_one();
+            }
+        }
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held >= self.max {
+            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held += 1;
+        drop(held);
+        let _release = Release(self);
+        f()
+    }
 }
 
 impl fmt::Debug for Users {
@@ -292,6 +330,7 @@ impl Users {
             params: HashParams::DEFAULT,
             min_password_length: MIN_PASSWORD_LENGTH,
             state: RwLock::default(),
+            hashing: Gate::default(),
         }
     }
 
@@ -349,6 +388,7 @@ impl Users {
                 accounts,
                 verified: HashMap::new(),
             }),
+            hashing: Gate::default(),
         })
     }
 
@@ -422,13 +462,14 @@ impl Users {
             }
             account.password.clone()
         };
-        // The slow hashes run without the lock.
-        if !stored.matches(password) {
+        // The slow hashes run without the lock, a few at a time: each takes the hash's
+        // memory (64 MiB by default), and logins must not exhaust it.
+        if !self.hashing.run(|| stored.matches(password)) {
             return false;
         }
         let mut current = stored.clone();
         if stored.params != self.params {
-            let new = PasswordHash::new(password, self.params);
+            let new = self.hashing.run(|| PasswordHash::new(password, self.params));
             let upgraded = self.change(|accounts| match accounts.get_mut(name) {
                 // Only if the password did not change meanwhile.
                 Some(a) if a.password == stored => {

@@ -11,7 +11,7 @@ use graphbuff::DatabaseManager;
 use graphbuff::cypher::ast::ExistingDatabase;
 use graphbuff_server::json::{self, Json};
 use graphbuff_server::packstream::{self, PackValue};
-use graphbuff_server::{HashParams, Role, Server, ServerConfig, Users};
+use graphbuff_server::{HashParams, LoginLimits, Role, Server, ServerConfig, Users};
 
 fn users() -> Arc<Users> {
     let u = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
@@ -415,4 +415,71 @@ fn bolt_logins_and_roles() {
     let mut t = Bolt::connect(addr);
     assert_eq!(t.logon("whoever", "tok").0, SUCCESS);
     assert_eq!(t.run("MATCH (m:Made) RETURN count(m)", None).unwrap()[0][0], PackValue::Int(1));
+}
+
+const RATE_LIMIT: &str = "Neo.ClientError.Security.AuthenticationRateLimit";
+
+/// The failure code of a Bolt reply.
+fn failure_code(fields: &[PackValue]) -> String {
+    let PackValue::Map(m) = &fields[0] else { panic!("{fields:?}") };
+    let PackValue::String(code) = &m["code"] else { panic!("{fields:?}") };
+    code.clone()
+}
+
+#[test]
+fn failed_logins_lock_the_client_out() {
+    let server = Server::start(
+        Arc::new(DatabaseManager::in_memory()),
+        ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            bolt: Some("127.0.0.1:0".into()),
+            token: Some("tok".into()),
+            users: Some(users()),
+            login_limits: LoginLimits { max_failures: 3, lockout: Duration::from_secs(60) },
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let (addr, bolt) = (server.local_addr(), server.bolt_addr().unwrap());
+    let root = basic("root", "rootpw");
+
+    // No credentials at all is not a guess.
+    for _ in 0..5 {
+        assert_eq!(http(addr, "GET", "/db", None, None).status, 401);
+    }
+    // A success clears the count.
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("root", "wrong")), None).status, 401);
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("root", "wrong")), None).status, 401);
+    assert_eq!(http(addr, "GET", "/db", Some(&root), None).status, 200);
+    // Failures over HTTP and Bolt count together: the third locks `root` out.
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("root", "wrong")), None).status, 401);
+    let mut b = Bolt::connect(bolt);
+    assert_eq!(failure_code(&b.logon("root", "wrong").1), "Neo.ClientError.Security.Unauthorized");
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("root", "wrong")), None).status, 401);
+
+    // Now even the right password is refused, without being checked.
+    let r = http(addr, "GET", "/db", Some(&root), None);
+    assert_eq!((r.status, r.code()), (429, "TooManyRequests".to_string()), "{}", r.body);
+    let retry = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("retry-after")).unwrap();
+    let secs: u64 = retry.1.parse().unwrap();
+    assert!((59..=60).contains(&secs), "{secs}");
+    let mut b = Bolt::connect(bolt);
+    let (tag, fields) = b.logon("root", "rootpw");
+    assert_eq!((tag, failure_code(&fields)), (FAILURE, RATE_LIMIT.to_string()));
+
+    // Other user names from this address still log in, until their failures add up.
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("rita", "ritapw")), None).status, 200);
+    assert_eq!(http(addr, "GET", "/db", Some("Bearer tok"), None).status, 200);
+    // (Five failures so far from this address: the address's own count is not cleared
+    // by a success.)
+    for name in ["ed", "rita", "nobody"] {
+        assert_eq!(http(addr, "GET", "/db", Some(&basic(name, "wrong")), None).status, 401, "{name}");
+    }
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("rita", "ritapw")), None).status, 200);
+    // The ninth failure from this address over all names locks it out, token included.
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("ghost", "wrong")), None).status, 401);
+    assert_eq!(http(addr, "GET", "/db", Some("Bearer tok"), None).status, 429);
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("rita", "ritapw")), None).status, 429);
+    // The health check needs no login.
+    assert_eq!(http(addr, "GET", "/health", None, None).status, 200);
 }

@@ -71,6 +71,7 @@ Errors have the form:
 | 408 | `Timeout` |
 | 409 | `ConstraintError`, `Cancelled` |
 | 413 | body over 16 MiB, or `TransactionTooLarge` (transaction past its database's size cap; rolled back) |
+| 429 | `TooManyRequests`: too many failed logins from this client; `Retry-After` says when to try again |
 | 500 | `StorageError` |
 
 ## Security
@@ -81,6 +82,8 @@ Errors have the form:
 - HTTPS and Bolt over TLS are enabled with `security.tls_cert` and `security.tls_key`.
 - `LOAD CSV` is off unless `storage.import_dir` is set, and then reads only files inside
   that folder.
+- Failed logins lock the client out for a while: `security.max_failed_logins` (default 10)
+  and `security.login_lockout_seconds` (default 60); see [Users and TLS](Users.md).
 - Passwords are hashed with Argon2. Query parameters are never logged.
 
 ## Implementation
@@ -115,7 +118,7 @@ Logs go to `DATA/logs` (`logs.dir`; `"-"` for standard error, the default with
 
 | File | Contents |
 |------|----------|
-| `graphbuff.log` | start-up and settings (with the config file read), failed logins (client address and user name), refused connections, storage errors; every connection at `level = "debug"` |
+| `graphbuff.log` | start-up and settings (with the config file read), failed logins (client address and user name) and lockouts, refused connections, storage errors; every connection at `level = "debug"` |
 | `query.log` | with `logs.slow_query_ms`: each query that took at least that long, with duration, protocol, database and user |
 
 Levels: `error`, `warn`, `info` (default), `debug`. Each file rotates to `.1`, `.2`, … at

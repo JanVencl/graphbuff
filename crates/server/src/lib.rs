@@ -68,6 +68,7 @@ mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
 mod tls;
+mod throttle;
 mod tx;
 pub mod users;
 
@@ -75,6 +76,7 @@ pub mod users;
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use net::TlsConfig;
+pub use throttle::{LoginLimits, MAX_LOCKOUT};
 pub use users::{HashParams, MIN_PASSWORD_LENGTH, Role, Users};
 
 use std::io::{self, BufReader};
@@ -143,6 +145,9 @@ pub struct ServerConfig {
     /// `POST /db/{name}/test-procedure`, which lets an admin add a procedure that answers
     /// from a fixed table. Default: off.
     pub test_procedures: bool,
+    /// How failed logins lock a client out (see [`LoginLimits`]). Default: 10 failures of
+    /// one client address and user name, then a minute, doubling up to an hour.
+    pub login_limits: LoginLimits,
 }
 
 impl Default for ServerConfig {
@@ -162,6 +167,7 @@ impl Default for ServerConfig {
             log: None,
             shutdown_grace: Duration::from_secs(5),
             test_procedures: false,
+            login_limits: LoginLimits::default(),
         }
     }
 }
@@ -230,6 +236,7 @@ impl Server {
                 log: config.log,
                 abort: abort.clone(),
                 test_procedures: config.test_procedures,
+                throttle: crate::throttle::Throttle::new(config.login_limits),
             },
             tls,
             limits: Limits {
