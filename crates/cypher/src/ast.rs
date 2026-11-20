@@ -746,6 +746,34 @@ pub enum Statement {
     /// `CREATE USER`, `GRANT ROLE`, `SHOW USERS`, …: user accounts, which belong to
     /// `graphbuff-server` rather than to the database manager.
     User(UserCommand),
+    /// `SHOW TRANSACTIONS`, `TERMINATE TRANSACTIONS`: the transactions open on
+    /// `graphbuff-server`.
+    Transaction(Box<TransactionCommand>),
+}
+
+/// `SHOW TRANSACTION[S] [ids] [tail]` or `TERMINATE TRANSACTION[S] ids [tail]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactionCommand {
+    pub terminate: bool,
+    /// Transaction ids: string expressions, or parameters holding a string or a list of
+    /// strings. Empty: every transaction (`SHOW` only).
+    pub ids: Vec<Expr>,
+    pub tail: ShowTail,
+}
+
+impl TransactionCommand {
+    pub fn name(&self) -> &'static str {
+        if self.terminate { "TERMINATE TRANSACTIONS" } else { "SHOW TRANSACTIONS" }
+    }
+}
+
+/// What may follow a `SHOW` command: `YIELD …` (with `ORDER BY`, `SKIP`, `LIMIT` and
+/// `WHERE`), then `RETURN …`; or only `WHERE …`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShowTail {
+    pub yields: Option<Projection>,
+    pub where_: Option<Expr>,
+    pub returns: Option<Projection>,
 }
 
 /// A database name, written literally or passed as a parameter.

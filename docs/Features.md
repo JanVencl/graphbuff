@@ -32,6 +32,49 @@ An explicit transaction (`POST /db/{name}/tx`) works like this:
   rolled back. Requests to a transaction that has ended answer `404 TransactionNotFound`.
 - Shutting the server down rolls back open transactions.
 
+### Listing and stopping transactions
+
+`SHOW TRANSACTIONS` lists the transactions open on the server, over HTTP or Bolt: every
+query running on its own, and every explicit transaction from its begin to its end, with
+the statement it is running.
+
+```cypher
+SHOW TRANSACTIONS
+SHOW TRANSACTIONS 'graphbuff-transaction-12', $ids
+SHOW TRANSACTIONS WHERE username = 'ann'
+SHOW TRANSACTIONS YIELD transactionId, currentQuery, elapsedTime
+  WHERE elapsedTime.milliseconds > 10000 RETURN transactionId, currentQuery
+TERMINATE TRANSACTIONS 'graphbuff-transaction-12'
+```
+
+| Column | |
+|--------|---|
+| `database` | the database it runs on |
+| `transactionId` | `DATABASE-transaction-N` |
+| `currentQueryId`, `currentQuery` | the statement it runs (`query-N` and its text), or `""` |
+| `connectionId` | `bolt-N` for a Bolt connection, `http` for HTTP |
+| `clientAddress`, `username` | who runs it (`token` for the server token) |
+| `startTime`, `elapsedTime` | when it began (a string), and for how long (a duration) |
+| `status` | `Running` while it runs a statement, `Idle` between statements |
+| `protocol`, `currentQueryStartTime`, `currentQueryElapsedTime` | with `YIELD` only |
+
+Without `YIELD`, the first ten columns are returned; `YIELD` (with `ORDER BY`, `SKIP`,
+`LIMIT`, `WHERE`) and `RETURN` shape the result like a query. The ids are strings, or
+parameters holding a string or a list of strings.
+
+`TERMINATE TRANSACTIONS id, …` stops them: a query running on its own is cancelled and
+answers `409 Cancelled` (Bolt: `Neo.ClientError.Transaction.Terminated`); an explicit
+transaction is rolled back at once, releasing its database for other writers, and its
+next request answers `404 TransactionNotFound` (Bolt: its next message fails with
+`Neo.ClientError.Transaction.Terminated`). It returns `transactionId`, `username` and
+`message` (`Transaction terminated.` or `Transaction not found.`) per id. Terminations are
+logged.
+
+Administrators see and terminate every transaction; other users only their own. Neither
+command runs inside an explicit transaction. Not listed: the `SHOW` or `TERMINATE` command
+itself, and `system`-database transactions over Bolt. Unlike Neo4j, an idle explicit
+transaction shows `Idle`.
+
 ## Timeouts
 
 - `queries.query_timeout_ms` stops a query that runs longer (default: no limit). A request

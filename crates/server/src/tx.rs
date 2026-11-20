@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use graphbuff::cypher::ast::Query;
 use graphbuff::{BoxedStore, CancelHandle, Database, Error, QueryOptions, QueryResult, Result, Value};
 
+use crate::running::{Guard, Info, Running, Stop};
 use crate::users::Principal;
 
 /// What a transaction's thread knows about itself.
@@ -34,6 +35,8 @@ struct Started<'a> {
 enum Command {
     Run {
         query: Box<Query>,
+        /// Its text, for `SHOW TRANSACTIONS`.
+        text: String,
         params: BTreeMap<String, Value>,
         timeout: Option<Duration>,
         reply: Sender<Result<QueryResult>>,
@@ -83,10 +86,12 @@ pub(crate) struct Transactions {
     closing: CancelHandle,
     /// The most memory a statement may hold, in bytes.
     max_memory: Option<u64>,
+    /// Where open transactions are listed.
+    running: Arc<Running>,
 }
 
 impl Transactions {
-    pub(crate) fn new(timeout: Duration, max_memory: Option<u64>) -> Arc<Transactions> {
+    pub(crate) fn new(timeout: Duration, max_memory: Option<u64>, running: Arc<Running>) -> Arc<Transactions> {
         Arc::new(Transactions {
             state: Mutex::default(),
             ended: Condvar::new(),
@@ -95,6 +100,7 @@ impl Transactions {
             random: RandomState::new(),
             closing: CancelHandle::new(),
             max_memory,
+            running,
         })
     }
 
@@ -132,6 +138,7 @@ impl Transactions {
         name: &str,
         db: Arc<Database<BoxedStore>>,
         wait: Option<Duration>,
+        client: &str,
     ) -> Result<String, TxError> {
         {
             let mut st = self.state();
@@ -149,6 +156,14 @@ impl Transactions {
         let thread_id = id.clone();
         let thread_cancel = cancel.clone();
         let thread_committed = Arc::clone(&committed);
+        let info = Info {
+            database: name.to_string(),
+            who: owner.clone(),
+            protocol: "http",
+            connection: "http".into(),
+            client: client.to_string(),
+        };
+        let listed = self.running.begin(info, Stop::Http(id.clone()), None);
         let begin_options = QueryOptions {
             timeout: wait,
             cancel: Some(self.closing.clone()),
@@ -163,7 +178,8 @@ impl Transactions {
                     cancel: thread_cancel,
                     committed: thread_committed,
                 };
-                me.serve(tx, &db, &begin_options, inbox, began);
+                me.serve(tx, &db, &begin_options, inbox, began, &listed);
+                drop(listed);
                 let mut st = me.state();
                 st.open.remove(&thread_id);
                 st.threads -= 1;
@@ -207,6 +223,7 @@ impl Transactions {
         begin_options: &QueryOptions,
         inbox: Receiver<Command>,
         began: Sender<Result<()>>,
+        listed: &Guard,
     ) {
         let id = started.id;
         let tx = match db.begin_with_options(begin_options) {
@@ -232,16 +249,19 @@ impl Transactions {
             match command {
                 Command::Run {
                     query,
+                    text,
                     params,
                     timeout,
                     reply,
                 } => {
+                    listed.query(Some(&text));
                     let options = QueryOptions {
                         timeout,
                         cancel: Some(started.cancel.clone()),
                         max_memory: self.max_memory,
                     };
                     let result = open.execute_query_with_options(&query, &params, &options);
+                    listed.query(None);
                     let failed = result.is_err();
                     let _ = reply.send(result);
                     if failed {
@@ -301,13 +321,15 @@ impl Transactions {
         who: &Principal,
         db: &str,
         id: &str,
-        query: Query,
+        (query, text): (Query, &str),
         params: BTreeMap<String, Value>,
         timeout: Option<Duration>,
     ) -> Result<QueryResult, TxError> {
         let query = Box::new(query);
+        let text = text.to_string();
         self.ask(who, db, id, |reply| Command::Run {
             query,
+            text,
             params,
             timeout,
             reply,
@@ -344,6 +366,18 @@ impl Transactions {
             Err(_) if committed.load(Ordering::Relaxed) => Err(TxError::NotFound),
             Err(_) => Ok(()),
         }
+    }
+
+    /// Rolls back transaction `id` whoever began it, cancelling the statement it runs
+    /// (`TERMINATE TRANSACTIONS`). Returns whether it was open.
+    pub(crate) fn terminate(&self, id: &str) -> bool {
+        let Some(e) = self.state().open.remove(id) else {
+            return false;
+        };
+        e.cancel.cancel();
+        // Dropping `commands` ends the thread, which rolls the transaction back.
+        drop(e.commands);
+        true
     }
 
     /// Rolls back every open transaction and refuses new ones. Waits for the

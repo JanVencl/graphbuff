@@ -36,6 +36,8 @@ pub(crate) struct Ctx {
     pub test_procedures: bool,
     /// Failed logins, per client address and user name.
     pub throttle: Throttle,
+    /// The open transactions, for `SHOW TRANSACTIONS`.
+    pub running: Arc<crate::running::Running>,
 }
 
 /// Why a login was refused.
@@ -127,7 +129,8 @@ impl Ctx {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             },
-            cancel: Some(self.abort.clone()),
+            // A handle of its own, so that `TERMINATE TRANSACTIONS` stops only this query.
+            cancel: Some(self.abort.child()),
             max_memory: self.query_max_memory,
         }
     }
@@ -187,7 +190,7 @@ pub(crate) fn authorize(access: Access, stmt: &Statement) -> Result<(), Error> {
         Statement::Query { query, .. } => authorize_query(query),
         Statement::Use(_) | Statement::Database(DatabaseCommand::Show(_)) => (Access::Read, "reading"),
         Statement::Database(cmd) => (Access::Admin, cmd.name()),
-        Statement::User(_) => return Ok(()),
+        Statement::User(_) | Statement::Transaction(_) => return Ok(()),
     };
     check(access, needed, what)
 }
@@ -249,7 +252,7 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
     let Some(access) = ctx.access(&who) else {
         return error(401, "Unauthorized", "the user no longer exists");
     };
-    let me = Client { who: &who, access };
+    let me = Client { who: &who, access, peer };
     let ctx = &(ctx, me);
     let method = req.method.as_str();
     match segments.as_slice() {
@@ -344,6 +347,8 @@ fn basic_user(req: &Request) -> Option<String> {
 struct Client<'a> {
     who: &'a Principal,
     access: Access,
+    /// The client's address.
+    peer: &'a str,
 }
 
 /// The server context with the client of the request.
@@ -458,6 +463,12 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
             Err(e) => query_error(&e),
         };
     }
+    if let Statement::Transaction(cmd) = &statement {
+        return match ctx.transaction_command(me.who, me.access, cmd, &params) {
+            Ok(r) => Response::json(200, encode_result(&r)),
+            Err(e) => query_error(&e),
+        };
+    }
     if let Err(e) = authorize(me.access, &statement) {
         return query_error(&e);
     }
@@ -472,7 +483,18 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
         }
     }
     let started = Instant::now();
-    let result = session.execute_with_options(&query, &params, &ctx.query_options(timeout));
+    let options = ctx.query_options(timeout);
+    let info = crate::running::Info {
+        database: session.current_database().to_string(),
+        who: me.who.clone(),
+        protocol: "http",
+        connection: "http".into(),
+        client: me.peer.to_string(),
+    };
+    let stop = crate::running::Stop::Cancel(options.cancel.clone().expect("query_options sets one"));
+    let listed = ctx.running.begin(info, stop, Some(&query));
+    let result = session.execute_with_options(&query, &params, &options);
+    drop(listed);
     ctx.finished("http", session.current_database(), me.who, &query, started.elapsed(), result.as_ref().err());
     match result {
         Ok(r) => Response::json(200, encode_result(&r)),
@@ -755,7 +777,7 @@ fn begin(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
         Ok(d) => d,
         Err(_) => return error(404, "DatabaseNotFound", &format!("database `{name}` does not exist")),
     };
-    match ctx.txs.begin(me.who, &name, database, ctx.query_timeout) {
+    match ctx.txs.begin(me.who, &name, database, ctx.query_timeout, me.peer) {
         Ok(id) => {
             let path = tx_path(&name, &id);
             let mut body = String::from(r#"{"transaction":{"id":"#);
@@ -802,7 +824,7 @@ fn in_transaction(&(ctx, me): &Req, db: Option<&str>, id: &str, req: &Request) -
         return query_error(&e);
     }
     let started = Instant::now();
-    let result = ctx.txs.run(me.who, &name, id, parsed, params, ctx.query_options(timeout).timeout);
+    let result = ctx.txs.run(me.who, &name, id, (parsed, &query), params, ctx.query_options(timeout).timeout);
     let failure = match &result {
         Err(TxError::Failed(e)) => Some(e),
         _ => None,

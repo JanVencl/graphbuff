@@ -31,6 +31,7 @@ pub fn parse(src: &str) -> Result<Query> {
             "{} needs graphbuff-server with user accounts",
             cmd.name()
         ))),
+        Statement::Transaction(cmd) => Err(Error::Unsupported(format!("{} needs graphbuff-server", cmd.name()))),
     }
 }
 
@@ -204,6 +205,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_plain_statement(&mut self) -> Result<Statement> {
+        if (self.is_kw("SHOW") || self.is_kw("TERMINATE"))
+            && (self.kw_at(1, "TRANSACTIONS") || self.kw_at(1, "TRANSACTION"))
+        {
+            let terminate = self.is_kw("TERMINATE");
+            self.pos += 2;
+            return self.parse_transaction_command(terminate);
+        }
         if let Some(cmd) = self.parse_user_command()? {
             return Ok(Statement::User(cmd));
         }
@@ -374,6 +382,39 @@ impl<'a> Parser<'a> {
             name,
             if_exists,
         }))
+    }
+
+    /// After `SHOW TRANSACTIONS` / `TERMINATE TRANSACTIONS`: `[id, … | $ids]` (required to
+    /// terminate), then `YIELD … [RETURN …]` or `WHERE …`.
+    fn parse_transaction_command(&mut self, terminate: bool) -> Result<Statement> {
+        let mut ids = Vec::new();
+        let at_tail = |p: &Self| {
+            p.is_kw("YIELD") || p.is_kw("WHERE") || p.is_kw("RETURN") || matches!(p.peek(), Tok::Eof | Tok::Semicolon)
+        };
+        if !at_tail(self) {
+            loop {
+                ids.push(self.parse_expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        if terminate && ids.is_empty() {
+            return self.err("TERMINATE TRANSACTIONS needs the ids of the transactions to terminate");
+        }
+        let mut tail = ShowTail::default();
+        if self.eat_kw("YIELD") {
+            tail.yields = Some(self.parse_projection(true)?);
+            if self.eat_kw("RETURN") {
+                tail.returns = Some(self.parse_projection(false)?);
+            }
+        } else if self.eat_kw("WHERE") {
+            tail.where_ = Some(self.parse_expr()?);
+        } else if self.is_kw("RETURN") {
+            return self.err("RETURN after SHOW or TERMINATE TRANSACTIONS needs a YIELD before it");
+        }
+        self.end_of_statement()?;
+        Ok(Statement::Transaction(Box::new(TransactionCommand { terminate, ids, tail })))
     }
 
     // ---- user commands ----
@@ -2648,5 +2689,29 @@ mod tests {
     fn errors_have_offsets() {
         let err = parse("MATCH (n RETURN n").unwrap_err();
         assert!(matches!(err, Error::Syntax { offset: 9, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn transaction_commands() {
+        let tx = |src: &str| match parse_statement(src).unwrap() {
+            Statement::Transaction(c) => c,
+            other => panic!("{src}: {other:?}"),
+        };
+        let c = tx("SHOW TRANSACTIONS");
+        assert!(!c.terminate && c.ids.is_empty() && c.tail == ShowTail::default());
+        let c = tx("show transaction 'a', $b");
+        assert_eq!(c.ids, vec![Expr::Literal(Value::String("a".into())), Expr::Param("b".into())]);
+        let c = tx("SHOW TRANSACTIONS WHERE username = 'ann'");
+        assert!(c.tail.where_.is_some() && c.tail.yields.is_none());
+        let c = tx("SHOW TRANSACTIONS YIELD transactionId AS id, status ORDER BY id LIMIT 2 WHERE status = 'Idle' RETURN id");
+        let y = c.tail.yields.unwrap();
+        assert_eq!((y.items.len(), y.order_by.len(), y.limit.is_some(), y.where_.is_some()), (2, 1, true, true));
+        assert!(c.tail.returns.is_some());
+        assert!(tx("SHOW TRANSACTIONS YIELD *").tail.yields.unwrap().star);
+        let c = tx("TERMINATE TRANSACTIONS 'neo4j-transaction-1' YIELD message");
+        assert!(c.terminate && c.ids.len() == 1);
+        assert!(matches!(parse_statement("TERMINATE TRANSACTIONS"), Err(Error::Syntax { .. })));
+        assert!(matches!(parse_statement("SHOW TRANSACTIONS RETURN 1"), Err(Error::Syntax { .. })));
+        assert!(matches!(parse("SHOW TRANSACTIONS"), Err(Error::Unsupported(_))));
     }
 }
