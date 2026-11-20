@@ -20,6 +20,7 @@
 * **persistent storage**
 * **durable transactions**
 * **bulk CSV import**
+* **vector search** ([details](./docs/Vectors.md))
 * [More features](./docs/Features.md)
 
 ## Quick start
