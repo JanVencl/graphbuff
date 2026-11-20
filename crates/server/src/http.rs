@@ -273,6 +273,7 @@ pub fn read_request(
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -314,12 +315,25 @@ pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::
     w.flush()
 }
 
-/// Starts a `200` response whose body follows in chunks ([`write_chunk`], [`end_chunks`]).
-pub fn write_chunked_head(w: &mut Stream, content_type: &str, keep_alive: bool) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n\r\n",
+/// Starts a `200` response whose body follows in chunks ([`write_chunk`], [`end_chunks`]),
+/// with `headers` added.
+pub fn write_chunked_head(
+    w: &mut Stream,
+    content_type: &str,
+    keep_alive: bool,
+    headers: &[(&'static str, String)],
+) -> io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n",
         if keep_alive { "keep-alive" } else { "close" }
     );
+    for (name, value) in headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     w.write_all(head.as_bytes())
 }
 
@@ -345,6 +359,8 @@ pub fn end_chunks(w: &mut Stream) -> io::Result<()> {
 pub struct Out<'w> {
     pub w: &'w mut Stream,
     pub keep_alive: bool,
+    /// Headers every response to the request carries (CORS).
+    pub headers: Vec<(&'static str, String)>,
     /// The handler wrote the response; a failed write closes the connection.
     pub written: Option<io::Result<()>>,
 }
@@ -359,5 +375,112 @@ pub fn drain(r: &mut BufReader<Stream>) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+    }
+}
+
+/// Cross-origin requests from browser apps (`server.cors_origins`): which page origins may
+/// call the API.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cors {
+    /// Allowed origins (`scheme://host[:port]`, lower-cased); `"*"` allows every origin.
+    origins: Vec<String>,
+}
+
+/// Methods and request headers a preflight allows.
+const CORS_METHODS: &str = "GET, POST, DELETE";
+const CORS_HEADERS: &str = "Authorization, Content-Type, Accept";
+
+impl Cors {
+    /// From a comma-separated list of origins, such as
+    /// `"https://app.example.com, http://localhost:5173"`, or `"*"`. An empty list turns
+    /// CORS off.
+    pub fn parse(list: &str) -> Result<Cors, String> {
+        let mut origins = Vec::new();
+        for o in list.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+            if o != "*" {
+                let rest = o
+                    .strip_prefix("https://")
+                    .or_else(|| o.strip_prefix("http://"))
+                    .ok_or_else(|| format!("`{o}` is not an origin like https://app.example.com (or *)"))?;
+                if rest.is_empty() || rest.contains('/') {
+                    return Err(format!("`{o}` is not an origin like https://app.example.com (scheme and host, no path)"));
+                }
+            }
+            origins.push(o.to_ascii_lowercase());
+        }
+        Ok(Cors { origins })
+    }
+
+    /// Whether any origin is allowed.
+    pub fn is_on(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
+    /// The allowed `Origin` of `req`, if it has one.
+    fn allowed<'r>(&self, req: &'r Request) -> Option<&'r str> {
+        let origin = req.header("origin")?;
+        let lower = origin.to_ascii_lowercase();
+        self.origins.iter().any(|o| o == "*" || *o == lower).then_some(origin)
+    }
+
+    /// The headers a response to `req` carries: none unless it comes from an allowed origin.
+    pub fn headers(&self, req: &Request) -> Vec<(&'static str, String)> {
+        let Some(origin) = self.allowed(req) else {
+            return Vec::new();
+        };
+        vec![
+            ("Access-Control-Allow-Origin", origin.to_string()),
+            ("Access-Control-Expose-Headers", "Retry-After, WWW-Authenticate".into()),
+            ("Vary", "Origin".into()),
+        ]
+    }
+
+    /// The answer to a preflight (`OPTIONS` with `Access-Control-Request-Method`) from an
+    /// allowed origin. Preflights carry no credentials, so this comes before logging in.
+    pub fn preflight(&self, req: &Request) -> Option<Response> {
+        if req.method != "OPTIONS" || req.header("access-control-request-method").is_none() {
+            return None;
+        }
+        self.allowed(req)?;
+        let mut r = Response::text(204, String::new(), "text/plain");
+        r.headers = self.headers(req);
+        r.headers.push(("Access-Control-Allow-Methods", CORS_METHODS.into()));
+        r.headers.push(("Access-Control-Allow-Headers", CORS_HEADERS.into()));
+        r.headers.push(("Access-Control-Max-Age", "600".into()));
+        Some(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(method: &str, headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: method.into(),
+            path: "/db".into(),
+            headers: headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+            body: Vec::new(),
+            keep_alive: true,
+        }
+    }
+
+    #[test]
+    fn cors_origins() {
+        assert!(!Cors::parse("").unwrap().is_on());
+        assert!(Cors::parse("app.example.com").is_err());
+        assert!(Cors::parse("https://app.example.com/x").is_err());
+        let c = Cors::parse("https://App.example.com, http://localhost:5173").unwrap();
+        let from = |o: &str| c.headers(&req("GET", &[("origin", o)]));
+        assert_eq!(from("https://app.example.com")[0].1, "https://app.example.com");
+        assert_eq!(from("http://localhost:5173").len(), 3);
+        assert!(from("https://evil.example").is_empty());
+        assert!(c.headers(&req("GET", &[])).is_empty());
+        let pre = |o: &str| c.preflight(&req("OPTIONS", &[("origin", o), ("access-control-request-method", "POST")]));
+        assert_eq!(pre("http://localhost:5173").unwrap().status, 204);
+        assert!(pre("https://evil.example").is_none());
+        assert!(c.preflight(&req("OPTIONS", &[("origin", "http://localhost:5173")])).is_none());
+        let any = Cors::parse("*").unwrap();
+        assert_eq!(any.headers(&req("GET", &[("origin", "https://x.dev")]))[0].1, "https://x.dev");
     }
 }

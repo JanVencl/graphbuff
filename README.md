@@ -89,6 +89,7 @@ bolt = "0.0.0.0:7687"                 # also Bolt, for Neo4j drivers (off when n
 max_connections = 256
 keep_alive_seconds = 30
 shutdown_timeout_seconds = 5
+# cors_origins = "https://app.example.com"  # browser apps on these origins may call the HTTP API
 
 [storage]
 mode = "hybrid"                       # hybrid (default), persistent or memory

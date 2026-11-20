@@ -37,6 +37,14 @@ check for `error` in a `200` body too.
 A query request is its own transaction. Database commands (`CREATE DATABASE`,
 `SHOW DATABASES`, `USE x MATCH ...`) work through either query endpoint.
 
+**From a browser app** on another origin, list that origin in `server.cors_origins`
+(comma-separated, or `"*"`): `cors_origins = "https://app.example.com, http://localhost:5173"`.
+Responses to requests from those origins carry `Access-Control-Allow-Origin` (also errors,
+so the page can read them), and `OPTIONS` preflights are answered without credentials
+(methods `GET, POST, DELETE`; headers `Authorization, Content-Type, Accept`). Other
+origins get no CORS headers, so the browser keeps their pages from reading responses. Send
+credentials as an `Authorization` header from the page; the server sets no cookies.
+
 Transactions, timeouts, how values and errors look, security and the implementation are
 described in [Features](Features.md).
 

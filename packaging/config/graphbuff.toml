@@ -16,6 +16,9 @@ max_connections = 256
 keep_alive_seconds = 30
 # On stop (SIGTERM, Ctrl-C): how long running queries may take before they are cancelled.
 shutdown_timeout_seconds = 5
+# Web pages from these origins may call the HTTP API from the browser (CORS): a
+# comma-separated list such as "https://app.example.com, http://localhost:5173", or "*".
+# cors_origins = "https://app.example.com"
 
 [storage]
 # hybrid: in memory, made durable by a log and snapshots in the data folder (default)

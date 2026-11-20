@@ -594,7 +594,7 @@ impl Rows<'_, '_> {
     fn send(&mut self) -> io::Result<()> {
         if !self.chunked {
             self.chunked = true;
-            http::write_chunked_head(self.out.w, "application/json; charset=utf-8", self.out.keep_alive)?;
+            http::write_chunked_head(self.out.w, "application/json; charset=utf-8", self.out.keep_alive, &self.out.headers)?;
         }
         let r = http::write_chunk(self.out.w, self.json.as_bytes());
         self.json.clear();
