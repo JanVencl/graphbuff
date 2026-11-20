@@ -7,6 +7,7 @@ the same notes.
 
 ### Added
 
+- A release archive for ARM64 Linux, `graphbuff-linux-aarch64.tar.gz` (static, musl).
 - `graphbuff-cli`, a command-line client for `graphbuff-server` (line editor, Cypher
   highlighting, colors), shipped in the release archives and the Docker image.
 - `CALL { … } IN TRANSACTIONS` for batched updates (`OF n ROWS`, `ON ERROR`,
