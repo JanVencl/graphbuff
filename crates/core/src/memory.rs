@@ -642,8 +642,8 @@ pub struct MemoryGraph {
     /// Live relationships per type token.
     type_counts: HashMap<Token, usize>,
     indexes: Vec<PropIndex>,
-    /// Vector index definitions (their vectors are kept by the engine).
-    vector_indexes: Vec<IndexDef>,
+    /// Vector and full-text index definitions (the engine keeps their contents).
+    engine_indexes: Vec<IndexDef>,
     constraints: Vec<ConstraintDef>,
     /// The state at `begin`, while a transaction is open; rollback returns to it.
     saved: Option<Box<MemoryGraph>>,
@@ -667,7 +667,7 @@ impl Clone for MemoryGraph {
             label_index: self.label_index.clone(),
             type_counts: self.type_counts.clone(),
             indexes: self.indexes.clone(),
-            vector_indexes: self.vector_indexes.clone(),
+            engine_indexes: self.engine_indexes.clone(),
             constraints: self.constraints.clone(),
             saved: None,
             changes: ChangeLog::default(),
@@ -1231,8 +1231,8 @@ impl GraphStore for MemoryGraph {
 
     fn create_index(&mut self, def: IndexDef) -> Result<()> {
         def.check_new(&self.indexes())?;
-        if def.is_vector() {
-            self.vector_indexes.push(def);
+        if def.is_vector() || def.is_fulltext() {
+            self.engine_indexes.push(def);
             return Ok(());
         }
         let ix = self.build_index(def);
@@ -1241,8 +1241,8 @@ impl GraphStore for MemoryGraph {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<bool> {
-        if let Some(pos) = self.vector_indexes.iter().position(|d| d.name == name) {
-            self.vector_indexes.remove(pos);
+        if let Some(pos) = self.engine_indexes.iter().position(|d| d.name == name) {
+            self.engine_indexes.remove(pos);
             return Ok(true);
         }
         let Some(pos) = self.indexes.iter().position(|ix| ix.def.name == name) else {
@@ -1254,7 +1254,7 @@ impl GraphStore for MemoryGraph {
 
     fn indexes(&self) -> Vec<IndexDef> {
         let mut out: Vec<IndexDef> = self.indexes.iter().map(|ix| ix.def.clone()).collect();
-        out.extend(self.vector_indexes.iter().cloned());
+        out.extend(self.engine_indexes.iter().cloned());
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -1589,6 +1589,7 @@ mod tests {
             entity: IndexEntity::Node,
             label: "P".into(),
             properties: xy.to_vec(),
+            extra_labels: Vec::new(),
             kind: Default::default(),
         })
         .unwrap();

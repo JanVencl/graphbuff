@@ -280,6 +280,12 @@ impl<'a> ProcedureContext<'a> {
         self.accel.map(|a| (&*a.vectors, &a.snapshot))
     }
 
+    /// The full-text index cache and the committed state the call reads, if it reads one
+    /// (not inside a transaction).
+    pub(crate) fn texts(&self) -> Option<(&'a crate::fulltext::TextCache, &'a graphbuff_core::Snapshot)> {
+        self.accel.map(|a| (&*a.texts, &a.snapshot))
+    }
+
     /// Fails if the query ran out of time or was cancelled; long procedures call it
     /// between steps.
     pub fn check_interrupt(&self) -> Result<()> {
@@ -614,7 +620,7 @@ fn register_builtins(p: &mut Procedures) {
             NONE,
             ["name", "entityType", "labelOrType", "properties", "type", "options"],
         )
-        .description("The property and vector indexes (as SHOW INDEXES)."),
+        .description("The property, vector and full-text indexes (as SHOW INDEXES)."),
         |ctx, _| Ok(ctx.store().indexes().into_iter().map(crate::vector::index_row).collect()),
     );
     add(
@@ -630,6 +636,30 @@ fn register_builtins(p: &mut Procedures) {
         )
         .description("The relationships of a vector index most similar to a vector, best first, with their scores."),
         |ctx, args| crate::vector::query_index(ctx, graphbuff_core::IndexEntity::Relationship, args),
+    );
+    add(
+        ProcedureSignature::new("db.index.fulltext.queryNodes", ["indexName", "queryString"], ["node", "score"])
+            .optional("options", Value::Map(BTreeMap::new()))
+            .description("The nodes of a full-text index matching a query (Lucene syntax), best first, with their scores."),
+        |ctx, args| crate::fulltext::query_index(ctx, graphbuff_core::IndexEntity::Node, args),
+    );
+    add(
+        ProcedureSignature::new("db.index.fulltext.queryRelationships", ["indexName", "queryString"], ["relationship", "score"])
+            .optional("options", Value::Map(BTreeMap::new()))
+            .description(
+                "The relationships of a full-text index matching a query (Lucene syntax), best first, with their scores.",
+            ),
+        |ctx, args| crate::fulltext::query_index(ctx, graphbuff_core::IndexEntity::Relationship, args),
+    );
+    add(
+        ProcedureSignature::new("db.index.fulltext.listAvailableAnalyzers", NONE, ["analyzer", "description", "stopwords"])
+            .description("The analyzers a full-text index can use."),
+        |_, _| Ok(crate::fulltext::list_analyzers()),
+    );
+    add(
+        ProcedureSignature::new("db.index.fulltext.awaitEventuallyConsistentIndexRefresh", NONE, NONE)
+            .description("Returns at once: full-text indexes are up to date when a transaction commits."),
+        |_, _| Ok(Vec::new()),
     );
     add(
         ProcedureSignature::new("db.constraints", NONE, ["name", "type", "label", "properties"])

@@ -124,6 +124,7 @@ pub fn parse_index(spec: &str) -> Result<IndexDef> {
         entity,
         label: label.to_string(),
         properties,
+        extra_labels: Vec::new(),
         kind: Default::default(),
     })
 }

@@ -154,8 +154,8 @@ impl BulkLoader {
                 .flat_map(|(l, nodes)| nodes.iter().map(move |&n| label_key(l as Token, n).to_vec()));
             t.m.label_tree = btree::build(t.p, &mut t.m.index_pages, keys)?;
             for def in indexes {
-                if def.is_vector() {
-                    t.m.vector_indexes.push(def);
+                if def.is_vector() || def.is_fulltext() {
+                    t.m.engine_indexes.push(def);
                     continue;
                 }
                 build_index(t, def, &labels)?;
@@ -308,6 +308,7 @@ mod tests {
                 entity: IndexEntity::Node,
                 label: "Admin".into(),
                 properties: vec!["group".into(), "id".into()],
+                extra_labels: Vec::new(),
                 kind: Default::default(),
             },
             IndexDef::relationship("by_w", "KNOWS", "w"),

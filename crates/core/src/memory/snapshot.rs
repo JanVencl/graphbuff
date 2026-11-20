@@ -16,8 +16,8 @@ use crate::{ConstraintDef, GraphStore, IndexDef, NodeId, RelId, Result};
 /// Snapshot layout version written by [`MemoryGraph::encode_snapshot`]: 2 added the
 /// constraint definitions at the end, 3 full index definitions (relationship and
 /// composite indexes), 4 temporal property values (laid out as 3), 5 points (likewise),
-/// 6 vector index definitions at the end.
-pub(crate) const SNAPSHOT_VERSION: u8 = 6;
+/// 6 vector index definitions at the end, 7 full-text index definitions after them.
+pub(crate) const SNAPSHOT_VERSION: u8 = 7;
 
 impl Interner {
     pub(crate) fn from_names(names: Vec<String>, d: &Decoder) -> Result<Self> {
@@ -108,7 +108,8 @@ impl MemoryGraph {
         }
 
         ConstraintDef::encode_list(&self.constraints, e);
-        IndexDef::encode_vector_list(&self.vector_indexes, e);
+        IndexDef::encode_vector_list(&self.engine_indexes, e);
+        IndexDef::encode_fulltext_list(&self.engine_indexes, e);
     }
 
     /// Rebuilds a graph from data written by [`encode_snapshot`](Self::encode_snapshot),
@@ -192,7 +193,7 @@ impl MemoryGraph {
             label_index,
             type_counts,
             indexes: Vec::new(),
-            vector_indexes: Vec::new(),
+            engine_indexes: Vec::new(),
             constraints: Vec::new(),
             saved: None,
             changes: Default::default(),
@@ -218,9 +219,13 @@ impl MemoryGraph {
             g.constraints = ConstraintDef::decode_list(d)?;
         }
         if version >= 6 {
-            for def in IndexDef::decode_vector_list(d)? {
+            let mut defs = IndexDef::decode_vector_list(d)?;
+            if version >= 7 {
+                defs.extend(IndexDef::decode_fulltext_list(d)?);
+            }
+            for def in defs {
                 def.check_new(&g.indexes()).map_err(|e| d.corrupt(format!("bad index definition: {e}")))?;
-                g.vector_indexes.push(def);
+                g.engine_indexes.push(def);
             }
         }
         Ok(g)
@@ -256,6 +261,7 @@ mod tests {
             entity: crate::IndexEntity::Node,
             label: "Person".into(),
             properties: vec!["name".into(), "kind".into()],
+            extra_labels: Vec::new(),
             kind: Default::default(),
         })
         .unwrap();

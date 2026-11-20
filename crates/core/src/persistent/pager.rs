@@ -38,7 +38,9 @@ pub(crate) const PAGE_SIZE: usize = 8192;
 /// The most pages one log record can hold: its length is a `u32`, and each page takes
 /// its image plus a 9-byte key. 1 MiB is left for the record's metadata header.
 pub(crate) const MAX_LOGGED_PAGES: usize = ((u32::MAX as usize) - (1 << 20)) / (PAGE_SIZE + 9);
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"GBPWALv9";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"GBPWAL10";
+/// Log written by format version 9 (metadata without full-text indexes).
+pub(crate) const WAL_MAGIC_V9: &[u8; 8] = b"GBPWALv9";
 /// Log written by format version 8 (metadata without vector indexes).
 pub(crate) const WAL_MAGIC_V8: &[u8; 8] = b"GBPWALv8";
 /// Log written by format version 7 (no point property values).

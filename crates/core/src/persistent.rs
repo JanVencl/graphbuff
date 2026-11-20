@@ -10,8 +10,8 @@
 //! <dir>/blobs.db   128-byte blocks holding labels and properties, chained per entity
 //! <dir>/index.db   B+tree pages: the label index and the property indexes
 //! <dir>/groups.db  fixed 64-byte relationship group records of dense nodes, at id * 64
-//! <dir>/meta       "GBMETAv9", metadata (see below), CRC-32
-//! <dir>/graph.wal  "GBPWALv9", then records: len u32 | crc u32 | metadata, page images
+//! <dir>/meta       "GBMETA10", metadata (see below), CRC-32
+//! <dir>/graph.wal  "GBPWAL10", then records: len u32 | crc u32 | metadata, page images
 //! ```
 //!
 //! The metadata is small and kept in memory: id counters, entity counts, the token tables
@@ -52,6 +52,7 @@
 //! point values (another value tag), laid out the same way. Version 9 added vector index
 //! definitions at the end of the metadata (their vectors are kept in memory by the
 //! engine); older metadata reads as having none, and an older log is replaced on open.
+//! Version 10 added full-text index definitions after them, likewise.
 //!
 //! ## Index keys
 //! A single-property index entry is the value's sort key, its exact encoding (or a lossy
@@ -90,7 +91,7 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use btree::{MAX_KEY, PageAlloc};
 use pager::{
     DataFile, MAX_LOGGED_PAGES, PAGE_SIZE, PageKey, Pager, WAL_MAGIC, WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3,
-    WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8,
+    WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8, WAL_MAGIC_V9,
 };
 
 use crate::codec::{Decoder, Encoder, crc32};
@@ -109,7 +110,8 @@ const GROUPS: u8 = 4;
 const FILE_NAMES: [&str; 5] = ["nodes.db", "rels.db", "blobs.db", "index.db", "groups.db"];
 const META_FILE: &str = "meta";
 const META_TMP: &str = "meta.tmp";
-const META_MAGIC: &[u8; 8] = b"GBMETAv9";
+const META_MAGIC: &[u8; 8] = b"GBMETA10";
+const META_MAGIC_V9: &[u8; 8] = b"GBMETAv9";
 const META_MAGIC_V8: &[u8; 8] = b"GBMETAv8";
 const META_MAGIC_V7: &[u8; 8] = b"GBMETAv7";
 const META_MAGIC_V6: &[u8; 8] = b"GBMETAv6";
@@ -123,7 +125,7 @@ const META_MAGIC_V1: &[u8; 8] = b"GBMETAv1";
 /// (storage format 4). Older indexes are rebuilt when the store is opened.
 const INDEX_FORMAT: u8 = 3;
 /// The storage format this code writes.
-const FORMAT: u8 = 9;
+const FORMAT: u8 = 10;
 const WAL_FILE: &str = "graph.wal";
 const LOCK_FILE: &str = "LOCK";
 
@@ -250,8 +252,9 @@ struct Meta {
     index_format: u8,
     /// Constraint definitions (format version 5).
     constraints: Vec<ConstraintDef>,
-    /// Vector index definitions (format version 9).
-    vector_indexes: Vec<IndexDef>,
+    /// Vector (format version 9) and full-text (10) index definitions: the engine keeps
+    /// their contents.
+    engine_indexes: Vec<IndexDef>,
 }
 
 impl Meta {
@@ -318,11 +321,14 @@ impl Meta {
             ConstraintDef::encode_list(&self.constraints, e);
         }
         if version >= 9 {
-            IndexDef::encode_vector_list(&self.vector_indexes, e);
+            IndexDef::encode_vector_list(&self.engine_indexes, e);
+        }
+        if version >= 10 {
+            IndexDef::encode_fulltext_list(&self.engine_indexes, e);
         }
     }
 
-    /// Decodes metadata written by storage format `version` (1 to 9).
+    /// Decodes metadata written by storage format `version` (1 to 10).
     fn decode(d: &mut Decoder, version: u8) -> Result<Meta> {
         let mut m = Meta {
             seq: d.u64()?,
@@ -395,7 +401,10 @@ impl Meta {
             m.constraints = ConstraintDef::decode_list(d)?;
         }
         if version >= 9 {
-            m.vector_indexes = IndexDef::decode_vector_list(d)?;
+            m.engine_indexes = IndexDef::decode_vector_list(d)?;
+        }
+        if version >= 10 {
+            m.engine_indexes.extend(IndexDef::decode_fulltext_list(d)?);
         }
         Ok(m)
     }
@@ -1971,10 +1980,10 @@ impl Tx<'_> {
 
     fn create_index(&mut self, def: IndexDef) -> Result<()> {
         let mut existing: Vec<IndexDef> = self.m.indexes.iter().map(|ix| ix.def.clone()).collect();
-        existing.extend(self.m.vector_indexes.iter().cloned());
+        existing.extend(self.m.engine_indexes.iter().cloned());
         def.check_new(&existing)?;
-        if def.is_vector() {
-            self.m.vector_indexes.push(def);
+        if def.is_vector() || def.is_fulltext() {
+            self.m.engine_indexes.push(def);
             return Ok(());
         }
         let entity = def.entity;
@@ -2060,8 +2069,8 @@ impl Tx<'_> {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<bool> {
-        if let Some(pos) = self.m.vector_indexes.iter().position(|d| d.name == name) {
-            self.m.vector_indexes.remove(pos);
+        if let Some(pos) = self.m.engine_indexes.iter().position(|d| d.name == name) {
+            self.m.engine_indexes.remove(pos);
             return Ok(true);
         }
         let Some(pos) = self.m.indexes.iter().position(|ix| ix.def.name == name) else {
@@ -2140,7 +2149,8 @@ fn load_meta(path: &Path) -> Result<Meta> {
     };
     let what = path.display().to_string();
     let version = match bytes.get(..8) {
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => 9,
+        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => 10,
+        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V9 => 9,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V8 => 8,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V7 => 7,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V6 => 6,
@@ -2276,6 +2286,7 @@ impl PersistentGraph {
         let wal_version = match bytes.get(..8) {
             None => FORMAT, // empty (or shorter than a header): a fresh log
             Some(m) if m == WAL_MAGIC => FORMAT,
+            Some(m) if m == WAL_MAGIC_V9 => 9,
             Some(m) if m == WAL_MAGIC_V8 => 8,
             Some(m) if m == WAL_MAGIC_V7 => 7,
             Some(m) if m == WAL_MAGIC_V6 => 6,
@@ -2660,7 +2671,7 @@ macro_rules! persistent_reads {
 
     fn indexes(&self) -> Vec<IndexDef> {
         let mut out: Vec<IndexDef> = self.meta.indexes.iter().map(|ix| ix.def.clone()).collect();
-        out.extend(self.meta.vector_indexes.iter().cloned());
+        out.extend(self.meta.engine_indexes.iter().cloned());
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -3417,6 +3428,7 @@ mod tests {
                 entity: IndexEntity::Node,
                 label: "P".into(),
                 properties: xy.to_vec(),
+                extra_labels: Vec::new(),
                 kind: Default::default(),
             })
             .unwrap();
