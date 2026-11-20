@@ -1007,7 +1007,8 @@ mod tests {
     fn key(name: &str) -> ConstraintDef {
         ConstraintDef {
             name: name.into(),
-            kind: ConstraintKind::NodeKey,
+            entity: crate::IndexEntity::Node,
+            kind: ConstraintKind::Key,
             label: "P".into(),
             properties: vec!["a".into(), "b".into()],
         }

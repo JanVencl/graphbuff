@@ -662,23 +662,9 @@ fn register_builtins(p: &mut Procedures) {
         |_, _| Ok(Vec::new()),
     );
     add(
-        ProcedureSignature::new("db.constraints", NONE, ["name", "type", "label", "properties"])
+        ProcedureSignature::new("db.constraints", NONE, crate::exec::CONSTRAINT_COLUMNS)
             .description("The constraints (as SHOW CONSTRAINTS)."),
-        |ctx, _| {
-            Ok(ctx
-                .store()
-                .constraints()
-                .into_iter()
-                .map(|c| {
-                    vec![
-                        Value::String(c.name),
-                        Value::String(c.kind.text().into()),
-                        Value::String(c.label),
-                        strings(c.properties),
-                    ]
-                })
-                .collect())
-        },
+        |ctx, _| Ok(ctx.store().constraints().into_iter().map(crate::exec::constraint_row).collect()),
     );
     add(
         ProcedureSignature::new("db.awaitIndexes", NONE, NONE)

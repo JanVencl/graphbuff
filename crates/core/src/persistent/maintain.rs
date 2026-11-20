@@ -135,7 +135,12 @@ impl<'a> Checker<'a> {
             constraint_tokens: m
                 .constraints
                 .iter()
-                .map(|c| (m.labels.get(&c.label), c.properties.iter().map(|p| m.keys.get(p)).collect()))
+                .map(|c| {
+                    // Only node uniqueness and existence are checked here.
+                    let checked = c.entity == IndexEntity::Node && !matches!(c.kind, ConstraintKind::Typed(_));
+                    let label = if checked { m.labels.get(&c.label) } else { None };
+                    (label, c.properties.iter().map(|p| m.keys.get(p)).collect())
+                })
                 .collect(),
         }
     }
@@ -634,7 +639,7 @@ impl<'a> Checker<'a> {
             let values: Vec<Option<&Value>> = keys.iter().map(|k| k.and_then(|k| props.get(&k))).collect();
             let complete = values.iter().all(Option::is_some);
             match c.kind {
-                ConstraintKind::NotNull | ConstraintKind::NodeKey if !complete => {
+                ConstraintKind::NotNull | ConstraintKind::Key if !complete => {
                     self.rep.error(format!(
                         "node {id} breaks constraint `{}`: it lacks a required property",
                         c.name
@@ -743,6 +748,7 @@ mod tests {
         g.create_index(IndexDef::relationship("rw", "R", "w")).unwrap();
         g.create_constraint(ConstraintDef {
             name: "pk".into(),
+            entity: crate::IndexEntity::Node,
             kind: ConstraintKind::Unique,
             label: "P".into(),
             properties: vec!["i".into()],

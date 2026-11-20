@@ -3347,6 +3347,7 @@ mod tests {
     fn unique(name: &str, label: &str, prop: &str) -> ConstraintDef {
         ConstraintDef {
             name: name.into(),
+            entity: IndexEntity::Node,
             kind: crate::ConstraintKind::Unique,
             label: label.into(),
             properties: vec![prop.into()],

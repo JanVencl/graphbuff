@@ -1335,9 +1335,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// After `CREATE CONSTRAINT`: `[name] [IF NOT EXISTS] FOR (n:Label) REQUIRE <props>
-    /// IS UNIQUE | IS NOT NULL | IS NODE KEY`, where `<props>` is `n.p` or `(n.p, n.q, …)`.
-    /// The older `ON … ASSERT …` spelling is accepted too.
+    /// After `CREATE CONSTRAINT`: `[name] [IF NOT EXISTS] FOR <target> REQUIRE <props> IS
+    /// <kind>`, where `<target>` is `(n:Label)` or `()-[r:TYPE]-()`, `<props>` is `n.p` or
+    /// `(n.p, n.q, …)` and `<kind>` is `UNIQUE`, `NOT NULL`, `NODE KEY`,
+    /// `RELATIONSHIP KEY` or `:: <type>` (`TYPED <type>`). The older `ON … ASSERT …`
+    /// spelling is accepted for nodes.
     fn parse_create_constraint(&mut self) -> Result<Clause> {
         let name = if self.at_ident() && !self.is_kw("IF") && !self.is_kw("FOR") && !self.is_kw("ON") {
             Some(self.ident()?)
@@ -1355,15 +1357,28 @@ impl<'a> Parser<'a> {
             self.expect_kw("ON")?;
         }
         self.expect(Tok::LParen, "'('")?;
-        let var = self.ident()?;
-        if *self.peek() != Tok::Colon {
-            return self.err(
-                "expected ':' and a label (constraints on relationships are not supported yet)",
-            );
-        }
-        self.advance();
-        let label = self.ident()?;
-        self.expect(Tok::RParen, "')'")?;
+        let (entity, var, label) = if self.eat(&Tok::RParen) {
+            // `()-[r:TYPE]-()`, in any direction.
+            let offset = self.offset();
+            let rel = self.parse_rel_pattern()?;
+            self.expect(Tok::LParen, "'('")?;
+            self.expect(Tok::RParen, "')'")?;
+            match (rel.var, rel.types.len(), &rel.props, &rel.length) {
+                (Some(var), 1, None, None) => (IndexEntity::Relationship, var, rel.types[0].clone()),
+                _ => {
+                    return Err(Error::syntax(
+                        "a relationship constraint needs a variable and one type, as in ()-[r:TYPE]-()",
+                        offset,
+                    ));
+                }
+            }
+        } else {
+            let var = self.ident()?;
+            self.expect(Tok::Colon, "':' and a label")?;
+            let label = self.ident()?;
+            self.expect(Tok::RParen, "')'")?;
+            (IndexEntity::Node, var, label)
+        };
         if !self.eat_kw("REQUIRE") {
             self.expect_kw("ASSERT")?;
         }
@@ -1387,28 +1402,160 @@ impl<'a> Parser<'a> {
         if list {
             self.expect(Tok::RParen, "')'")?;
         }
-        self.expect_kw("IS")?;
-        let kind = if self.eat_kw("UNIQUE") {
+        let colons = |p: &mut Self| {
+            let found = *p.peek() == Tok::Colon && *p.peek_at(1) == Tok::Colon;
+            if found {
+                p.advance();
+                p.advance();
+            }
+            found
+        };
+        // `n.p :: T`, `n.p IS :: T` or `n.p IS TYPED T`
+        let typed = colons(self) || {
+            self.expect_kw("IS")?;
+            self.eat_kw("TYPED") || colons(self)
+        };
+        let offset = self.offset();
+        let kind = if typed {
+            ConstraintKind::Typed(self.parse_property_type()?)
+        } else if self.is_kw("NODE") || self.is_kw("RELATIONSHIP") || self.is_kw("REL") {
+            // `NODE` / `RELATIONSHIP` (`REL`) before UNIQUE or KEY: must match the target.
+            let word = if self.eat_kw("NODE") {
+                IndexEntity::Node
+            } else {
+                self.advance();
+                IndexEntity::Relationship
+            };
+            if word != entity {
+                return Err(Error::syntax(
+                    format!(
+                        "a {} constraint on a {}",
+                        word.text().to_lowercase(),
+                        entity.text().to_lowercase()
+                    ),
+                    offset,
+                ));
+            }
+            if self.eat_kw("UNIQUE") {
+                ConstraintKind::Unique
+            } else {
+                self.expect_kw("KEY")?;
+                ConstraintKind::Key
+            }
+        } else if self.eat_kw("UNIQUE") {
             ConstraintKind::Unique
         } else if self.eat_kw("NOT") {
             self.expect_kw("NULL")?;
             ConstraintKind::NotNull
-        } else if self.eat_kw("NODE") {
-            self.expect_kw("KEY")?;
-            ConstraintKind::NodeKey
         } else {
             return self.err(format!(
-                "expected UNIQUE, NOT NULL or NODE KEY, found {}",
+                "expected UNIQUE, NOT NULL, {} or :: <type>, found {}",
+                ConstraintKind::Key.text(entity),
                 self.describe()
             ));
         };
         Ok(Clause::CreateConstraint {
             name,
+            entity,
             kind,
             label,
             properties,
             if_not_exists,
         })
+    }
+
+    /// A property type in a constraint: `INTEGER`, `LIST<STRING NOT NULL>`, a union
+    /// `INTEGER | FLOAT` or `ANY<INTEGER | FLOAT>`.
+    fn parse_property_type(&mut self) -> Result<PropertyType> {
+        let any = self.is_kw("ANY") && *self.peek_at(1) == Tok::Lt;
+        if any {
+            self.advance();
+            self.advance();
+        }
+        let mut t = self.parse_type_part()?;
+        while self.eat(&Tok::Pipe) {
+            t = t.union(self.parse_type_part()?);
+        }
+        if any {
+            self.expect(Tok::Gt, "'>'")?;
+        }
+        if self.is_kw("NOT") {
+            return self.err("a property type constraint takes no NOT NULL; add a separate IS NOT NULL constraint");
+        }
+        Ok(t)
+    }
+
+    /// One member of a property type union: a scalar type or `LIST<scalar NOT NULL>`.
+    fn parse_type_part(&mut self) -> Result<PropertyType> {
+        if (self.is_kw("LIST") || self.is_kw("ARRAY")) && *self.peek_at(1) == Tok::Lt {
+            self.advance();
+            self.advance();
+            let name = self.parse_scalar_type()?;
+            if !self.eat_kw("NOT") {
+                return self.err("a list type in a constraint needs NOT NULL elements, as in LIST<INTEGER NOT NULL>");
+            }
+            self.expect_kw("NULL")?;
+            self.expect(Tok::Gt, "'>'")?;
+            return Ok(PropertyType::scalar(name, true).expect("a known scalar"));
+        }
+        let name = self.parse_scalar_type()?;
+        Ok(PropertyType::scalar(name, false).expect("a known scalar"))
+    }
+
+    /// A scalar property type, by its name in [`PropertyType::SCALARS`].
+    fn parse_scalar_type(&mut self) -> Result<&'static str> {
+        let zone = |p: &mut Self| -> Result<bool> {
+            // `WITH TIME ZONE` / `WITHOUT TIME ZONE`
+            let with = if p.eat_kw("WITH") {
+                true
+            } else {
+                p.expect_kw("WITHOUT")?;
+                false
+            };
+            p.expect_kw("TIME")?;
+            p.expect_kw("ZONE")?;
+            Ok(with)
+        };
+        let simple = [
+            ("BOOL", "BOOLEAN"),
+            ("BOOLEAN", "BOOLEAN"),
+            ("STRING", "STRING"),
+            ("VARCHAR", "STRING"),
+            ("INT", "INTEGER"),
+            ("INTEGER", "INTEGER"),
+            ("INT64", "INTEGER"),
+            ("INTEGER64", "INTEGER"),
+            ("FLOAT", "FLOAT"),
+            ("FLOAT64", "FLOAT"),
+            ("DATE", "DATE"),
+            ("DURATION", "DURATION"),
+            ("POINT", "POINT"),
+        ];
+        for (kw, name) in simple {
+            if self.eat_kw(kw) {
+                return Ok(name);
+            }
+        }
+        if self.eat_kw("SIGNED") {
+            self.expect_kw("INTEGER")?;
+            return Ok("INTEGER");
+        }
+        for (kw, local, zoned) in [("LOCAL", "LOCAL TIME", "LOCAL DATETIME"), ("ZONED", "ZONED TIME", "ZONED DATETIME")] {
+            if self.eat_kw(kw) {
+                if self.eat_kw("TIME") {
+                    return Ok(local);
+                }
+                self.expect_kw("DATETIME")?;
+                return Ok(zoned);
+            }
+        }
+        if self.eat_kw("TIME") {
+            return Ok(if zone(self)? { "ZONED TIME" } else { "LOCAL TIME" });
+        }
+        if self.eat_kw("TIMESTAMP") {
+            return Ok(if zone(self)? { "ZONED DATETIME" } else { "LOCAL DATETIME" });
+        }
+        self.err(format!("expected a property type, found {}", self.describe()))
     }
 
     /// After `DROP INDEX`.
@@ -2674,6 +2821,7 @@ mod tests {
             single("CREATE CONSTRAINT person_name IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE")[0],
             Clause::CreateConstraint {
                 name: Some("person_name".into()),
+                entity: IndexEntity::Node,
                 kind: ConstraintKind::Unique,
                 label: "Person".into(),
                 properties: vec!["name".into()],
@@ -2682,12 +2830,36 @@ mod tests {
         );
         assert!(matches!(
             &single("CREATE CONSTRAINT FOR (p:P) REQUIRE (p.a, p.b) IS NODE KEY")[0],
-            Clause::CreateConstraint { name: None, kind: ConstraintKind::NodeKey, properties, .. } if properties.len() == 2
+            Clause::CreateConstraint { name: None, kind: ConstraintKind::Key, properties, .. } if properties.len() == 2
         ));
         assert!(matches!(
             single("CREATE CONSTRAINT ON (p:P) ASSERT p.a IS NOT NULL")[0],
             Clause::CreateConstraint { kind: ConstraintKind::NotNull, .. }
         ));
+        let constraint = |q: &str| match single(q).remove(0) {
+            Clause::CreateConstraint { entity, kind, label, properties, .. } => (entity, kind, label, properties),
+            other => panic!("{other:?}"),
+        };
+        let rel = IndexEntity::Relationship;
+        assert_eq!(
+            constraint("CREATE CONSTRAINT FOR ()-[r:KNOWS]->() REQUIRE r.since IS UNIQUE"),
+            (rel, ConstraintKind::Unique, "KNOWS".into(), vec!["since".into()])
+        );
+        assert_eq!(constraint("CREATE CONSTRAINT FOR ()<-[r:R]-() REQUIRE (r.a, r.b) IS RELATIONSHIP KEY").1, ConstraintKind::Key);
+        assert_eq!(constraint("CREATE CONSTRAINT FOR ()-[r:R]-() REQUIRE r.a IS REL UNIQUE").1, ConstraintKind::Unique);
+        assert_eq!(constraint("CREATE CONSTRAINT FOR (n:N) REQUIRE n.a IS NODE UNIQUE").1, ConstraintKind::Unique);
+        assert_eq!(constraint("CREATE CONSTRAINT FOR ()-[r:R]-() REQUIRE r.a IS NOT NULL").1, ConstraintKind::NotNull);
+        let typed = |q: &str| match constraint(q).1 {
+            ConstraintKind::Typed(t) => t.to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(typed("CREATE CONSTRAINT FOR (n:N) REQUIRE n.a IS :: INTEGER"), "INTEGER");
+        assert_eq!(typed("CREATE CONSTRAINT FOR (n:N) REQUIRE n.a :: INT | FLOAT"), "INTEGER | FLOAT");
+        assert_eq!(typed("CREATE CONSTRAINT FOR (n:N) REQUIRE n.a IS TYPED ANY<STRING | LIST<STRING NOT NULL>>"), "STRING | LIST<STRING NOT NULL>");
+        assert_eq!(
+            typed("CREATE CONSTRAINT FOR ()-[r:R]-() REQUIRE r.a IS :: TIMESTAMP WITH TIME ZONE | LOCAL TIME | SIGNED INTEGER"),
+            "INTEGER | LOCAL TIME | ZONED DATETIME"
+        );
         assert_eq!(
             single("DROP CONSTRAINT c IF EXISTS")[0],
             Clause::DropConstraint { name: "c".into(), if_exists: true }
@@ -2695,8 +2867,14 @@ mod tests {
         for bad in [
             "CREATE CONSTRAINT FOR (p:P) REQUIRE q.a IS UNIQUE",
             "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a IS",
-            "CREATE CONSTRAINT FOR ()-[r:R]-() REQUIRE r.a IS UNIQUE",
             "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a, p.b IS UNIQUE",
+            "CREATE CONSTRAINT FOR ()-[r]-() REQUIRE r.a IS UNIQUE",
+            "CREATE CONSTRAINT FOR ()-[r:A|B]-() REQUIRE r.a IS UNIQUE",
+            "CREATE CONSTRAINT FOR ()-[r:R]-() REQUIRE r.a IS NODE KEY",
+            "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a IS RELATIONSHIP KEY",
+            "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a IS :: INTEGER NOT NULL",
+            "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a IS :: LIST<INTEGER>",
+            "CREATE CONSTRAINT FOR (p:P) REQUIRE p.a IS :: MAP",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

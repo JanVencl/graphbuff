@@ -1,5 +1,6 @@
-//! Constraints (`CREATE CONSTRAINT … IS UNIQUE | IS NOT NULL | IS NODE KEY`), end to end
-//! on every store: enforcement, rollback, schema commands and durability.
+//! Constraints (`CREATE CONSTRAINT … IS UNIQUE | IS NOT NULL | IS NODE KEY |
+//! IS RELATIONSHIP KEY | IS :: <type>`) on nodes and relationships, end to end on every
+//! store: enforcement, rollback, schema commands and durability.
 
 use std::fs;
 use std::path::PathBuf;
@@ -82,7 +83,7 @@ fn unique_constraints() {
         run(&db, "CREATE (:P {id: 1}), (:P {id: 2}), (:P), (:Q {id: 1})");
         let r = run(&db, "CREATE CONSTRAINT p_id FOR (p:P) REQUIRE p.id IS UNIQUE");
         assert_eq!((r.stats.constraints_added, r.stats.indexes_added), (1, 1), "{store}");
-        assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"p_id\", \"UNIQUE\", \"P\", [\"id\"]"]);
+        assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"p_id\", \"UNIQUE\", \"P\", [\"id\"], \"NODE\", null"]);
         assert_eq!(rows(&db, "SHOW INDEXES"), ["\"p_id\", \"NODE\", \"P\", [\"id\"], \"RANGE\", {}"], "{store}: backing index");
 
         violates(store, &db, "CREATE (:P {id: 1})", "both have id = 1");
@@ -114,7 +115,7 @@ fn not_null_constraints() {
     on_every_store(|store, db, reopen| {
         run(&db, "CREATE (:P {name: 'a'}), (:Q)");
         run(&db, "CREATE CONSTRAINT FOR (p:P) REQUIRE p.name IS NOT NULL");
-        assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"constraint_P_name\", \"NOT NULL\", \"P\", [\"name\"]"]);
+        assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"constraint_P_name\", \"NOT NULL\", \"P\", [\"name\"], \"NODE\", null"]);
         assert_eq!(rows(&db, "SHOW INDEXES"), Vec::<String>::new(), "{store}: no index needed");
         violates(store, &db, "CREATE (:P)", "must have the property `name`");
         violates(store, &db, "CREATE (:P {name: null})", "`name`");
@@ -213,5 +214,111 @@ fn explain_and_profile_with_constraints() {
         run(&db, "CREATE (:P {id: 1})");
         assert!(run(&db, "EXPLAIN CREATE (:P {id: 1})").plan.is_some());
         violates(store, &db, "PROFILE CREATE (:P {id: 1})", "id = 1");
+    });
+}
+
+/// `q` fails with a constraint error mentioning `needle`, and leaves the relationships
+/// as they were.
+fn violates_rels(store: &str, db: &Db, q: &str, needle: &str) {
+    let before = rows(db, "MATCH ()-[r]->() RETURN r, properties(r) ORDER BY id(r)");
+    violates(store, db, q, needle);
+    assert_eq!(rows(db, "MATCH ()-[r]->() RETURN r, properties(r) ORDER BY id(r)"), before, "{store}: `{q}`");
+}
+
+#[test]
+fn relationship_constraints() {
+    on_every_store(|store, db, reopen| {
+        run(&db, "CREATE (a:A), (b:B), (a)-[:R {id: 1, w: 1}]->(b), (a)-[:R {id: 2, w: 1}]->(b), (a)-[:S {id: 1}]->(b)");
+        let r = run(&db, "CREATE CONSTRAINT r_id FOR ()-[r:R]-() REQUIRE r.id IS UNIQUE");
+        assert_eq!((r.stats.constraints_added, r.stats.indexes_added), (1, 1), "{store}");
+        assert_eq!(rows(&db, "SHOW CONSTRAINTS"), ["\"r_id\", \"UNIQUE\", \"R\", [\"id\"], \"RELATIONSHIP\", null"]);
+        assert_eq!(
+            rows(&db, "SHOW INDEXES"),
+            ["\"r_id\", \"RELATIONSHIP\", \"R\", [\"id\"], \"RANGE\", {}"],
+            "{store}: backing index"
+        );
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (a)-[:R {id: 1}]->(b)", "relationships");
+        violates_rels(store, &db, "MATCH ()-[r:R {id: 2}]->() SET r.id = 1", "of type `R` both have id = 1");
+        // Other types and missing values are fine; so is a swap.
+        run(&db, "MATCH (a:A), (b:B) CREATE (a)-[:S {id: 2}]->(b), (a)-[:R {w: 1}]->(b)");
+        run(&db, "MATCH ()-[x:R {id: 1}]->(), ()-[y:R {id: 2}]->() SET x.id = 2, y.id = 1");
+
+        run(&db, "CREATE CONSTRAINT r_w FOR ()-[r:R]-() REQUIRE r.w IS NOT NULL");
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (a)-[:R {id: 9}]->(b)", "must have the property `w`");
+        violates_rels(store, &db, "MATCH ()-[r:R {id: 1}]->() REMOVE r.w", "relationship");
+        assert!(
+            matches!(db.execute("CREATE CONSTRAINT FOR ()-[r:S]-() REQUIRE r.w IS NOT NULL"), Err(Error::Constraint(m)) if m.contains("existing data")),
+            "{store}"
+        );
+
+        run(&db, "MATCH (a:A), (b:B) CREATE (a)-[:K {a: 1, b: 1}]->(b)");
+        run(&db, "CREATE CONSTRAINT k FOR ()-[k:K]-() REQUIRE (k.a, k.b) IS RELATIONSHIP KEY");
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (a)-[:K {a: 1}]->(b)", "`b`");
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (b)-[:K {a: 1, b: 1}]->(a)", "a = 1, b = 1");
+        run(&db, "MATCH (a:A), (b:B) CREATE (a)-[:K {a: 1, b: 2}]->(b)");
+
+        // A deleted relationship frees its value.
+        run(&db, "MATCH ()-[r:R {id: 1}]->() DELETE r WITH 1 AS x MATCH (a:A), (b:B) CREATE (a)-[:R {id: 1, w: 0}]->(b)");
+
+        let db = reopen(db);
+        assert_eq!(rows(&db, "SHOW CONSTRAINTS").len(), 3, "{store}");
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (a)-[:R {id: 2, w: 0}]->(b)", "id = 2");
+        violates_rels(store, &db, "MATCH (a:A), (b:B) CREATE (a)-[:K {a: 1, b: 2}]->(b)", "constraint `k`");
+        // Node constraints of the same name as the type do not apply to relationships.
+        run(&db, "CREATE (:R {id: 1}), (:R {id: 1})");
+        run(&db, "DROP CONSTRAINT r_id");
+        assert_eq!(scalar(&db, "CALL db.indexes() YIELD name RETURN collect(name)"), "[\"k\"]", "{store}: the backing index goes with it");
+        run(&db, "MATCH (a:A), (b:B) CREATE (a)-[:R {id: 2, w: 0}]->(b)");
+        if store == "persistent" {
+            db.check().unwrap_or_else(|e| panic!("{store}: {e}"));
+        }
+    });
+}
+
+#[test]
+fn property_type_constraints() {
+    on_every_store(|store, db, reopen| {
+        run(&db, "CREATE (:P {n: 1}), (:P), (:Q {n: 'x'})");
+        run(&db, "CREATE CONSTRAINT p_n FOR (p:P) REQUIRE p.n IS :: INTEGER | FLOAT");
+        run(&db, "CREATE CONSTRAINT p_tags FOR (p:P) REQUIRE p.tags IS TYPED LIST<STRING NOT NULL>");
+        run(&db, "CREATE CONSTRAINT r_at FOR ()-[r:R]-() REQUIRE r.at :: ZONED DATETIME");
+        assert_eq!(
+            rows(&db, "CALL db.constraints() YIELD name, type, propertyType RETURN name, type, propertyType ORDER BY name"),
+            [
+                "\"p_n\", \"PROPERTY TYPE\", \"INTEGER | FLOAT\"",
+                "\"p_tags\", \"PROPERTY TYPE\", \"LIST<STRING NOT NULL>\"",
+                "\"r_at\", \"PROPERTY TYPE\", \"ZONED DATETIME\"",
+            ],
+            "{store}"
+        );
+        violates(store, &db, "CREATE (:P {n: '1'})", "has `n` of type STRING, but constraint `p_n` requires INTEGER | FLOAT");
+        violates(store, &db, "MATCH (p:P) SET p.n = true", "BOOLEAN");
+        violates(store, &db, "MATCH (q:Q) SET q:P", "`p_n`");
+        violates(store, &db, "CREATE (:P {tags: [1]})", "LIST<STRING NOT NULL>");
+        violates(store, &db, "CREATE (:P {tags: ['a', 1]})", "`p_tags`");
+        violates_rels(store, &db, "CREATE ()-[:R {at: date()}]->()", "relationship");
+        violates_rels(store, &db, "CREATE ()-[:R {at: localdatetime()}]->()", "LOCAL DATETIME");
+        // Missing, matching and other labels' values are fine.
+        run(&db, "CREATE (:P), (:P {n: 2.5, tags: []}), (:P {tags: ['a', 'b']}), (:Q {n: true})");
+        run(&db, "CREATE ()-[:R {at: datetime()}]->(), ()-[:R]->(), ()-[:S {at: 1}]->()");
+
+        // One type per property: another type is a clash, the same one is a no-op with IF NOT EXISTS.
+        assert!(
+            matches!(db.execute("CREATE CONSTRAINT FOR (p:P) REQUIRE p.n IS :: STRING"), Err(Error::Constraint(m)) if m.contains("`p_n`")),
+            "{store}"
+        );
+        run(&db, "CREATE CONSTRAINT IF NOT EXISTS FOR (p:P) REQUIRE p.n IS :: INTEGER | FLOAT");
+        assert!(
+            matches!(db.execute("CREATE CONSTRAINT FOR (q:Q) REQUIRE q.n IS :: STRING"), Err(Error::Constraint(m)) if m.contains("existing data")),
+            "{store}"
+        );
+
+        let db = reopen(db);
+        assert_eq!(rows(&db, "SHOW CONSTRAINTS").len(), 3, "{store}");
+        violates(store, &db, "CREATE (:P {n: 'x'})", "`p_n`");
+        violates_rels(store, &db, "CREATE ()-[:R {at: 1}]->()", "`r_at`");
+        if store == "persistent" {
+            db.check().unwrap_or_else(|e| panic!("{store}: {e}"));
+        }
     });
 }
