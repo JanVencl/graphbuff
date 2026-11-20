@@ -26,6 +26,8 @@ the same notes.
   without these settings stay exact.
 - `server.cors_origins`: browser apps on the listed origins may call the HTTP API (CORS
   headers and preflights).
+- `security.log`: an audit trail of user, role and database changes, terminated
+  transactions, backups and restores (who, from where, outcome), and failed logins.
 - `Database::execute_streaming` and `Session::execute_streaming` with a `RowSink`, for
   rows handed over as a read-only query produces them.
 

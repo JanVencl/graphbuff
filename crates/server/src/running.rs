@@ -251,7 +251,7 @@ fn s(v: &str) -> Value {
 
 /// The transaction ids `ids` name: strings, or parameters holding a string or a list of
 /// them.
-fn ids(ids: &[Expr], params: &BTreeMap<String, Value>) -> Result<Vec<String>, Error> {
+pub(crate) fn ids(ids: &[Expr], params: &BTreeMap<String, Value>) -> Result<Vec<String>, Error> {
     let mut out = Vec::new();
     let mut add = |v: &Value| match v {
         Value::String(s) => {

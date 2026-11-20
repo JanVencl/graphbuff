@@ -1,5 +1,5 @@
 //! The real binary and its config file: the data folder and logs it names, what the logs
-//! record (start-up, failed logins, slow queries), where the file is looked for and
+//! record (start-up, failed logins, slow queries, administrative actions), where the file is looked for and
 //! created, and its errors.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -92,6 +92,14 @@ fn data_and_logs_go_to_the_data_folder() {
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
         let denied = query(&addr, Some("Bearer wrong"), r#"{"query": "RETURN 1"}"#);
         assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        for admin in [
+            "CREATE DATABASE audited",
+            "CREATE USER bob SET PASSWORD 'bobs-long-password'",
+            "GRANT ROLE editor ON DATABASE audited TO bob",
+            "DROP DATABASE nosuch",
+        ] {
+            query(&addr, Some("Bearer secret"), &format!(r#"{{"query": "{admin}"}}"#));
+        }
     });
     stop(child);
     result.unwrap();
@@ -105,6 +113,19 @@ fn data_and_logs_go_to_the_data_folder() {
     let queries = std::fs::read_to_string(data.join("logs/query.log")).unwrap();
     assert!(queries.contains(" http graphbuff token CREATE (:Person {name: 'Ann'})"), "{queries}");
     assert!(!queries.contains("RETURN 1"), "{queries}");
+    let security = std::fs::read_to_string(data.join("logs/security.log")).unwrap();
+    for line in [
+        " AUDIT http 127.0.0.1:",
+        " - LOGIN: failed",
+        " token CREATE DATABASE audited: ok",
+        " token CREATE USER bob: ok",
+        " token GRANT ROLE editor ON DATABASE audited TO bob: ok",
+        " token DROP DATABASE nosuch: failed: ",
+    ] {
+        assert!(security.contains(line), "{line:?} not in {security}");
+    }
+    assert!(!security.contains("bobs-long-password") && !queries.contains("bobs-long-password"), "{security}");
+    assert!(!security.contains("CREATE (:Person"), "{security}");
 
     // The data is still there after a restart; GRAPHBUFF_TOKEN overrides the file's token.
     let (child, addr) = spawn(clean(Command::new(BIN).arg("--config").arg(&config)).env("GRAPHBUFF_TOKEN", "from-env"));
