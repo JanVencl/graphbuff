@@ -81,10 +81,12 @@ pub(crate) struct Transactions {
     random: RandomState,
     /// Cancelled at shutdown: stops transactions waiting to begin.
     closing: CancelHandle,
+    /// The most memory a statement may hold, in bytes.
+    max_memory: Option<u64>,
 }
 
 impl Transactions {
-    pub(crate) fn new(timeout: Duration) -> Arc<Transactions> {
+    pub(crate) fn new(timeout: Duration, max_memory: Option<u64>) -> Arc<Transactions> {
         Arc::new(Transactions {
             state: Mutex::default(),
             ended: Condvar::new(),
@@ -92,6 +94,7 @@ impl Transactions {
             ids: AtomicU64::new(0),
             random: RandomState::new(),
             closing: CancelHandle::new(),
+            max_memory,
         })
     }
 
@@ -149,6 +152,7 @@ impl Transactions {
         let begin_options = QueryOptions {
             timeout: wait,
             cancel: Some(self.closing.clone()),
+            max_memory: None,
         };
         let spawned = thread::Builder::new()
             .name("graphbuff-tx".into())
@@ -235,6 +239,7 @@ impl Transactions {
                     let options = QueryOptions {
                         timeout,
                         cancel: Some(started.cancel.clone()),
+                        max_memory: self.max_memory,
                     };
                     let result = open.execute_query_with_options(&query, &params, &options);
                     let failed = result.is_err();

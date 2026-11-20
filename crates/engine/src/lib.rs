@@ -67,6 +67,7 @@ pub use graphbuff_core::kernels::{
     self, Aggregates, Bits, CmpOp, Column, CpuKernels, ExpandBatch, Hop, Kernels, Mask, Num, label_mask,
 };
 pub use graphbuff_core::maintenance::BACKUP_MARKER;
+pub use graphbuff_core::accounting;
 pub use graphbuff_cypher as cypher;
 pub use graphbuff_cypher::ast::{ExistingDatabase, QueryMode};
 pub use procedures::{
@@ -619,6 +620,10 @@ fn run_query(ex: &mut Executor, ast: &cypher::ast::Query) -> Result<QueryResult>
     let raw = ex.run_plan(&plan)?;
     ex.check_constraints()?;
     let mut result = finish(raw, ex)?;
+    // Materializing the rows takes memory of its own.
+    if let Some(i) = &ex.interrupt {
+        i.check_now()?;
+    }
     if let Some(profile) = &ex.profile {
         result.plan = Some(plan.describe(Some(&profile.borrow())));
     }

@@ -24,6 +24,9 @@ pub enum Error {
     Timeout(String),
     /// A query was cancelled while it ran; its changes were rolled back.
     Cancelled(String),
+    /// A query held more memory than its limit and was stopped; its changes were rolled
+    /// back.
+    MemoryLimit(String),
     /// The user running the statement may not run it (see `graphbuff-server`'s user
     /// accounts). Nothing was changed.
     Forbidden(String),
@@ -55,6 +58,7 @@ impl fmt::Display for Error {
             Error::TransactionTooLarge(m) => write!(f, "TransactionTooLarge: {m}"),
             Error::Timeout(m) => write!(f, "Timeout: {m}"),
             Error::Cancelled(m) => write!(f, "Cancelled: {m}"),
+            Error::MemoryLimit(m) => write!(f, "MemoryLimit: {m}"),
             Error::Forbidden(m) => write!(f, "Forbidden: {m}"),
         }
     }

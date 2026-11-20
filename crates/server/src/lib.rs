@@ -126,6 +126,12 @@ pub struct ServerConfig {
     /// may run before it is stopped and rolled back. A request may ask for less with
     /// `timeoutMs`. `None` (the default): no limit but the request's own.
     pub query_timeout: Option<Duration>,
+    /// The most memory a query (or a statement of a transaction) may hold, in bytes; one
+    /// that takes more stops with [`graphbuff::Error::MemoryLimit`] and is rolled back.
+    /// Enforced only when the program's global allocator is
+    /// [`graphbuff::accounting::CountingAllocator`], as in `graphbuff-server`.
+    /// `None` (the default): no limit.
+    pub query_max_memory: Option<u64>,
     /// Where to serve the Bolt protocol (Neo4j drivers), such as `127.0.0.1:7687`.
     /// `None` (the default): no Bolt.
     pub bolt: Option<String>,
@@ -161,6 +167,7 @@ impl Default for ServerConfig {
             keep_alive: Duration::from_secs(30),
             transaction_timeout: Duration::from_secs(60),
             query_timeout: None,
+            query_max_memory: None,
             bolt: None,
             tls: None,
             backup_dir: None,
@@ -223,7 +230,7 @@ impl Server {
         let bolt_addr = bolt.as_ref().map(TcpListener::local_addr).transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
-        let txs = Transactions::new(config.transaction_timeout);
+        let txs = Transactions::new(config.transaction_timeout, config.query_max_memory);
         let abort = CancelHandle::new();
         let shared = Arc::new(Shared {
             ctx: Ctx {
@@ -232,6 +239,7 @@ impl Server {
                 users: config.users,
                 txs: Arc::clone(&txs),
                 query_timeout: config.query_timeout,
+                query_max_memory: config.query_max_memory,
                 backup_dir: config.backup_dir,
                 log: config.log,
                 abort: abort.clone(),

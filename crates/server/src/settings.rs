@@ -46,6 +46,8 @@ pub struct Config {
     // [queries]
     pub transaction_timeout: Option<Duration>,
     pub query_timeout: Option<Duration>,
+    /// `queries.max_memory_mb`; `None`: the default ([`default_query_memory`]), `Some(0)`: off.
+    pub max_memory_mb: Option<u64>,
     pub gpu: bool,
     pub test_procedures: bool,
     // [logs]
@@ -76,6 +78,7 @@ impl Default for Config {
             login_lockout: Duration::from_secs(60),
             transaction_timeout: None,
             query_timeout: None,
+            max_memory_mb: None,
             gpu: false,
             test_procedures: false,
             log_dir: LogDir::Default,
@@ -167,6 +170,9 @@ transaction_timeout_seconds = 60
 # Stop (and roll back) a query that runs longer (no limit when not set; a request may ask
 # for less with "timeoutMs").
 # query_timeout_ms = 30000
+# Stop (and roll back) a query that holds more memory than this (MiB; 0: no limit). Default:
+# a quarter of this machine's memory (or of the container's limit), at least 256.
+# max_memory_mb = 4096
 # Run graph kernels (multi-hop counts, algo.* procedures, vector scores) on the GPU (needs
 # a build with the `gpu` feature).
 gpu = false
@@ -250,6 +256,7 @@ const SETTINGS: &[(&str, &[(&str, Kind)])] = &[
         &[
             ("transaction_timeout_seconds", Kind::Positive),
             ("query_timeout_ms", Kind::Positive),
+            ("max_memory_mb", Kind::Count),
             ("gpu", Kind::Bool),
             ("test_procedures", Kind::Bool),
         ],
@@ -324,6 +331,7 @@ impl Config {
                     c.transaction_timeout = Some(Duration::from_secs(int_of(value)));
                 }
                 ("queries", "query_timeout_ms") => c.query_timeout = Some(Duration::from_millis(int_of(value))),
+                ("queries", "max_memory_mb") => c.max_memory_mb = Some(int_of(value)),
                 ("queries", "gpu") => c.gpu = bool_of(value),
                 ("queries", "test_procedures") => c.test_procedures = bool_of(value),
                 ("logs", "dir") => {
@@ -583,6 +591,22 @@ fn running_as_root() -> bool {
         .unwrap_or(false)
 }
 
+/// The memory limit of a query when `queries.max_memory_mb` is not set, in bytes: a
+/// quarter of the machine's (or container's) memory, at least 256 MiB; 2 GiB when that is
+/// unknown.
+pub fn default_query_memory() -> u64 {
+    graphbuff::accounting::total_memory().map_or(2 << 30, |total| (total / 4).max(256 << 20))
+}
+
+/// The memory limit of a query from `queries.max_memory_mb`, in bytes; `None`: no limit.
+pub fn query_memory(c: &Config) -> Option<u64> {
+    match c.max_memory_mb {
+        None => Some(default_query_memory()),
+        Some(0) => None,
+        Some(mb) => Some(mb.saturating_mul(1 << 20)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +632,14 @@ mod tests {
         assert_eq!(c.log_dir, LogDir::StandardError);
         assert_eq!(c.log_level, Level::Debug);
         assert_eq!(c.query_timeout, Some(Duration::from_millis(250)));
+        assert_eq!(query_memory(&c), Some(default_query_memory()));
+        let off = parse("[queries]
+max_memory_mb = 0").unwrap();
+        assert_eq!(query_memory(&off), None);
+        let set = parse("[queries]
+max_memory_mb = 512").unwrap();
+        assert_eq!(query_memory(&set), Some(512 << 20));
+        assert!(default_query_memory() >= 256 << 20);
         assert_eq!(parse("").unwrap(), Config::default());
         assert_eq!(parse("[security]\ntoken = \"a\\\"b\\u00e9\"").unwrap().token.as_deref(), Some("a\"bé"));
     }

@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use graphbuff_core::{Bits, CmpOp, Column, Csr, Direction, Error, GraphStore, Kernels, Mask, Result, Snapshot, Value, label_mask};
+use graphbuff_core::accounting::exempt;
 use graphbuff_cypher::ast::{BinaryOp, Clause, Expr, NodePattern, RelDirection, SingleQuery, UnaryOp};
 
 use crate::context::{Executor, Frame, Scope};
@@ -114,11 +115,16 @@ impl KernelCache {
     /// The CSR export of `snapshot`: built on the first call after a commit, then shared.
     /// Callers that ask while it is built wait for it.
     pub fn csr(&self, snapshot: &Snapshot) -> Result<Arc<Csr>> {
-        self.lock().csr(snapshot)
+        // The cache outlives the query that fills it: not the query's memory.
+        exempt(|| self.lock().csr(snapshot))
     }
 
     /// Property `key` of every node of `snapshot` as a column.
     pub fn column(&self, snapshot: &Snapshot, key: &str) -> Result<Arc<Column>> {
+        exempt(|| self.build_column(snapshot, key))
+    }
+
+    fn build_column(&self, snapshot: &Snapshot, key: &str) -> Result<Arc<Column>> {
         let mut st = self.lock();
         let csr = st.csr(snapshot)?;
         if let Some(c) = st.columns.get(key) {
@@ -135,6 +141,10 @@ impl KernelCache {
 
     /// The nodes of `snapshot` with `label`.
     pub fn label(&self, snapshot: &Snapshot, label: &str) -> Result<Arc<Bits>> {
+        exempt(|| self.build_label(snapshot, label))
+    }
+
+    fn build_label(&self, snapshot: &Snapshot, label: &str) -> Result<Arc<Bits>> {
         let mut st = self.lock();
         let csr = st.csr(snapshot)?;
         if let Some(b) = st.labels.get(label) {

@@ -59,6 +59,9 @@ transaction_timeout_seconds = 60
 # Stop (and roll back) a query that runs longer (no limit when not set; a request may ask
 # for less with "timeoutMs").
 # query_timeout_ms = 30000
+# Stop (and roll back) a query that holds more memory than this (MiB; 0: no limit). Default:
+# a quarter of this machine's memory (or of the container's limit), at least 256.
+# max_memory_mb = 4096
 # Run graph kernels (multi-hop counts, algo.* procedures, vector scores) on the GPU (needs
 # a build with the `gpu` feature).
 gpu = false

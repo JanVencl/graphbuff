@@ -303,6 +303,7 @@ impl Failure {
             Error::TransactionTooLarge(_) => "Neo.ClientError.Transaction.TransactionTooLarge",
             Error::Timeout(_) => TIMED_OUT,
             Error::Cancelled(_) => "Neo.ClientError.Transaction.Terminated",
+            Error::MemoryLimit(_) => "Neo.TransientError.General.MemoryPoolOutOfMemoryError",
             Error::Forbidden(_) => FORBIDDEN,
         };
         Failure::new(code, e.to_string())
@@ -469,6 +470,7 @@ impl Conn<'_> {
             Some(f(&QueryOptions {
                 timeout,
                 cancel: Some(cancel),
+                max_memory: self.shared.ctx.query_max_memory,
             }))
         };
         *self.control.running() = None;

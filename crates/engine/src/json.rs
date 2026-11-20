@@ -345,6 +345,7 @@ pub fn error_code(e: &Error) -> &'static str {
         Error::TransactionTooLarge(_) => "TransactionTooLarge",
         Error::Timeout(_) => "Timeout",
         Error::Cancelled(_) => "Cancelled",
+        Error::MemoryLimit(_) => "MemoryLimit",
         Error::Forbidden(_) => "Forbidden",
     }
 }
@@ -378,6 +379,7 @@ pub fn encode_error(e: &Error) -> String {
         | Error::TransactionTooLarge(m)
         | Error::Timeout(m)
         | Error::Cancelled(m)
+        | Error::MemoryLimit(m)
         | Error::Forbidden(m) => encode_error_message(error_code(e), m),
     }
 }
