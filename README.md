@@ -1,6 +1,6 @@
 ![GraphBuff logo](graphbuff_github_social.png "GraphBuff")
 
-[![Release](https://img.shields.io/github/v/release/JanVencl/graphbuff)](https://github.com/JanVencl/graphbuff/releases)
+[![Release](https://img.shields.io/github/v/release/JanVencl/graphbuff?color=blue)](https://github.com/JanVencl/graphbuff/releases)
 [![Build](https://github.com/JanVencl/graphbuff/actions/workflows/release.yml/badge.svg)](https://github.com/JanVencl/graphbuff/actions/workflows/release.yml)
 [![License: AGPL-3.0](https://img.shields.io/github/license/JanVencl/graphbuff)](LICENSE)
 [![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-blue?logo=rust)](https://www.rust-lang.org)
