@@ -1412,10 +1412,8 @@ fn call_subquery_errors() {
     // Without an import, outer variables are not visible.
     assert!(db.execute("MATCH (p:Person) CALL { MATCH (p)-->(q) RETURN q } RETURN q").is_ok());
     assert!(db.execute("MATCH (p:Person) CALL { RETURN p.name AS n } RETURN n").is_err());
-    assert!(matches!(
-        db.execute("UNWIND [1] AS i CALL (i) { CREATE (:X) } IN TRANSACTIONS"),
-        Err(Error::Unsupported(_))
-    ));
+    // Batched transactions.
+    assert_eq!(db.execute("UNWIND [1] AS i CALL (i) { CREATE (:X) } IN TRANSACTIONS").unwrap().stats.nodes_created, 1);
     assert!(matches!(db.execute("CALL { RETURN 1 AS x RETURN x"), Err(Error::Syntax { .. })));
 }
 

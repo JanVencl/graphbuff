@@ -111,6 +111,10 @@ impl<'db, S: GraphStore> Transaction<'db, S> {
         params: &BTreeMap<String, Value>,
         interrupt: Option<Interrupt>,
     ) -> Result<QueryResult> {
+        // Refused before it runs: the transaction stays usable.
+        if ast.mode != cypher::ast::QueryMode::Explain && crate::batched::position(ast)?.is_some() {
+            return Err(crate::batched::in_explicit_transaction());
+        }
         let db = self.db;
         let store = self.open_store()?;
         match db.run_on_store(&mut **store, ast, params, interrupt) {

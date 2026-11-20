@@ -215,6 +215,12 @@ impl QueryPlan {
     /// Plans a subquery whose start row holds `imported` (outer variables). Returns the
     /// plan and the columns it returns (none for a unit subquery).
     pub fn build_subquery(q: &Query, ex: &Executor, imported: &[String]) -> Result<(QueryPlan, Vec<String>)> {
+        let nested = q.parts.iter().flat_map(|p| &p.clauses).any(|c| {
+            matches!(c, Clause::CallSubquery { in_transactions: Some(_), .. })
+        });
+        if nested {
+            return Err(Error::Semantic("CALL { … } IN TRANSACTIONS cannot be nested in a subquery".into()));
+        }
         let mut parts = Vec::new();
         let mut columns: Option<Vec<String>> = None;
         for p in &q.parts {
@@ -741,13 +747,21 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 var: var.clone(),
             },
             Clause::With(p) | Clause::Return(p) => plan_projection(input, p),
-            Clause::CallSubquery { scope, query } => {
+            Clause::CallSubquery { scope, query, in_transactions } => {
                 let imports = call_imports(scope, query, &bound)?;
-                let (plan, columns) = QueryPlan::build_subquery(query, ex, &imports)?;
+                let (plan, mut columns) = QueryPlan::build_subquery(query, ex, &imports)?;
                 if let Some(c) = columns.iter().find(|c| bound.contains(c)) {
                     return Err(Error::Semantic(format!(
                         "variable `{c}` already declared; a CALL subquery cannot return it"
                     )));
+                }
+                // `IN TRANSACTIONS` runs through `Database` (see `batched`), never this
+                // operator; planning it here checks the query and binds its variables.
+                if let Some(status) = in_transactions.as_ref().and_then(|t| t.report_status.as_ref()) {
+                    if bound.contains(status) || columns.contains(status) {
+                        return Err(Error::Semantic(format!("variable `{status}` already declared")));
+                    }
+                    columns.push(status.clone());
                 }
                 let returns = matches!(plan.parts.first(), Some(PartPlan::Pipeline { returns: true, .. }));
                 let updating = plan.is_updating();
