@@ -1,7 +1,9 @@
-//! The Bolt protocol (versions 4.4 and 5.0–5.4), spoken by the Neo4j drivers.
+//! The Bolt protocol (versions 4.4, 5.0–5.4 and 5.6–5.8), spoken by the Neo4j drivers.
 //!
 //! A connection starts with a handshake: the magic `60 60 B0 17` and four version
-//! proposals, answered with the chosen version. Then messages flow, each a PackStream
+//! proposals, answered with the chosen version; or (5.7+) a manifest request
+//! `00 00 01 FF`, answered with the versions served, from which the client picks one.
+//! Bolt 5.5 was never served by Neo4j and is skipped. Then messages flow, each a PackStream
 //! structure split into chunks (a big-endian `u16` size, the bytes, and a `00 00` end).
 //!
 //! Every connection has two threads. A reader decodes messages and queues them, so that
@@ -41,7 +43,13 @@ use crate::{POLL, Shared, api};
 
 const MAGIC: [u8; 4] = [0x60, 0x60, 0xB0, 0x17];
 /// The newest Bolt 5 minor version served.
-const MAX_V5_MINOR: u8 = 4;
+const MAX_V5_MINOR: u8 = 8;
+/// The Bolt 5 minor version no server negotiates (its design was withdrawn).
+const SKIPPED_V5_MINOR: u8 = 5;
+/// A handshake slot asking for the manifest (version 1) instead of a version.
+const MANIFEST_V1: [u8; 4] = [0, 0, 1, 0xFF];
+/// The versions a manifest lists, as `[_, range, minor, major]`: 5.8–5.6, 5.4–5.0, 4.4.
+const MANIFEST_VERSIONS: [[u8; 4]; 3] = [[0, 2, 8, 5], [0, 4, 4, 5], [0, 0, 4, 4]];
 
 // Requests.
 const HELLO: u8 = 0x01;
@@ -102,17 +110,76 @@ const LINGER: Duration = Duration::from_secs(1);
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static BOOKMARKS: AtomicU64 = AtomicU64::new(0);
 
-/// The Bolt version a client and the server agreed on.
-fn negotiate(proposals: &[u8]) -> Option<(u8, u8)> {
-    for &[_, range, minor, major] in proposals.as_chunks::<4>().0 {
+/// What the client's proposals ask for: a version, or the manifest.
+#[derive(Debug, PartialEq, Eq)]
+enum Handshake {
+    Version(u8, u8),
+    Manifest,
+}
+
+/// The newest version served of the 5.x range `lowest..=minor`.
+fn best_v5(lowest: u8, minor: u8) -> Option<u8> {
+    let mut best = minor.min(MAX_V5_MINOR);
+    if best == SKIPPED_V5_MINOR {
+        best -= 1;
+    }
+    (best >= lowest).then_some(best)
+}
+
+/// What a client and the server agree on, from the client's four proposals (in its order
+/// of preference).
+fn negotiate(proposals: &[u8]) -> Option<Handshake> {
+    for slot in proposals.as_chunks::<4>().0 {
+        if *slot == MANIFEST_V1 {
+            return Some(Handshake::Manifest);
+        }
+        let [_, range, minor, major] = *slot;
         let lowest = minor.saturating_sub(range);
         match major {
-            5 if lowest <= MAX_V5_MINOR => return Some((5, minor.min(MAX_V5_MINOR))),
-            4 if minor >= 4 && lowest <= 4 => return Some((4, 4)),
+            5 => {
+                if let Some(m) = best_v5(lowest, minor) {
+                    return Some(Handshake::Version(5, m));
+                }
+            }
+            4 if minor >= 4 && lowest <= 4 => return Some(Handshake::Version(4, 4)),
             _ => {}
         }
     }
     None
+}
+
+/// Whether `(major, minor)` is a version served.
+fn served(major: u8, minor: u8) -> bool {
+    matches!((major, minor), (4, 4)) || (major == 5 && minor <= MAX_V5_MINOR && minor != SKIPPED_V5_MINOR)
+}
+
+/// The server's manifest: `00 00 01 FF`, the number of version ranges (a varint), the
+/// ranges, and the capabilities (a varint; none).
+fn manifest() -> Vec<u8> {
+    let mut out = MANIFEST_V1.to_vec();
+    out.push(MANIFEST_VERSIONS.len() as u8);
+    for v in MANIFEST_VERSIONS {
+        out.extend(v);
+    }
+    out.push(0);
+    out
+}
+
+/// Reads a varint (7 bits per byte, least significant first, high bit set on all but
+/// the last byte).
+fn read_varint(stream: &mut Stream, keep_going: &dyn Fn() -> bool) -> io::Result<Option<u64>> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let mut b = [0u8];
+        if !read_full(stream, &mut b, keep_going)? {
+            return Ok(None);
+        }
+        value |= u64::from(b[0] & 0x7F) << shift;
+        if b[0] & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+    }
+    Err(io::Error::new(ErrorKind::InvalidData, "varint too long"))
 }
 
 /// Reads exactly `buf.len()` bytes. Read timeouts are retried while `keep_going` says
@@ -143,13 +210,35 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
     if !matches!(read_full(&mut stream, &mut hello, &in_time), Ok(true)) || hello[..4] != MAGIC {
         return;
     }
-    let Some(version) = negotiate(&hello[4..]) else {
-        let _ = stream.write_all(&[0, 0, 0, 0]);
-        return;
+    let (version, by_manifest) = match negotiate(&hello[4..]) {
+        None => {
+            let _ = stream.write_all(&[0, 0, 0, 0]);
+            return;
+        }
+        Some(Handshake::Version(major, minor)) => {
+            if stream.write_all(&[0, 0, minor, major]).is_err() {
+                return;
+            }
+            ((major, minor), false)
+        }
+        Some(Handshake::Manifest) => {
+            if stream.write_all(&manifest()).is_err() || stream.flush().is_err() {
+                return;
+            }
+            // The client answers with the version it picked and the capabilities it uses.
+            let mut chosen = [0u8; 4];
+            if !matches!(read_full(&mut stream, &mut chosen, &in_time), Ok(true))
+                || !matches!(read_varint(&mut stream, &in_time), Ok(Some(_)))
+            {
+                return;
+            }
+            let [_, _, minor, major] = chosen;
+            if !served(major, minor) {
+                return;
+            }
+            ((major, minor), true)
+        }
     };
-    if stream.write_all(&[0, 0, version.1, version.0]).is_err() {
-        return;
-    }
     let (Ok(reader), Ok(writer), Ok(local)) = (stream.try_clone(), stream.try_clone(), stream.local_addr()) else {
         return;
     };
@@ -172,6 +261,7 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
             local,
             peer,
             version,
+            by_manifest,
             utc: version.0 >= 5,
             hello: false,
             who: None,
@@ -282,6 +372,45 @@ struct Failure {
     message: String,
 }
 
+/// The GQL status and its description for a Neo4j error code (Bolt 5.7+), by the
+/// code's category: GQL's general class codes where Neo4j has no closer one.
+fn gql_status(code: &str) -> (&'static str, &'static str) {
+    let category = code.split('.').nth(2).unwrap_or("");
+    let title = code.split('.').nth(3).unwrap_or("");
+    match (category, title) {
+        ("Statement", "SyntaxError") => ("42001", "error: syntax error or access rule violation - invalid syntax"),
+        ("Statement", "SemanticError" | "FeatureNotSupported") | ("Security", _) | ("Database", "DatabaseNotFound") => {
+            ("42000", "error: syntax error or access rule violation")
+        }
+        ("Statement", _) | ("Schema", _) | ("Request", _) => ("22000", "error: data exception"),
+        ("Transaction", _) => ("40000", "error: transaction rollback"),
+        _ => ("50N42", "error: general processing exception - unexpected error"),
+    }
+}
+
+/// The GQL classification of a Neo4j error code: `CLIENT_ERROR`, `TRANSIENT_ERROR` or
+/// `DATABASE_ERROR`.
+fn classification(code: &str) -> &'static str {
+    match code.split('.').nth(1) {
+        Some("ClientError") => "CLIENT_ERROR",
+        Some("TransientError") => "TRANSIENT_ERROR",
+        _ => "DATABASE_ERROR",
+    }
+}
+
+/// A GQL diagnostic record with the default operation and schema, and `extra` entries.
+fn diagnostic_record(extra: &[(&str, &str)]) -> PackValue {
+    let mut m = BTreeMap::from([
+        ("OPERATION".to_string(), PackValue::str("")),
+        ("OPERATION_CODE".to_string(), PackValue::str("0")),
+        ("CURRENT_SCHEMA".to_string(), PackValue::str("/")),
+    ]);
+    for (k, v) in extra {
+        m.insert(k.to_string(), PackValue::str(*v));
+    }
+    PackValue::Map(m)
+}
+
 impl Failure {
     fn new(code: &'static str, message: impl Into<String>) -> Failure {
         Failure {
@@ -333,6 +462,9 @@ enum Event {
 /// A result computed by `RUN`, waiting for `PULL` or `DISCARD`.
 struct Pending {
     rows: std::vec::IntoIter<Vec<ResultValue>>,
+    /// Whether the result has columns, and rows (for the GQL status, 5.6+).
+    has_columns: bool,
+    has_rows: bool,
     stats: QueryStats,
     plan: Option<PlanDescription>,
     db: String,
@@ -342,6 +474,8 @@ struct Pending {
 impl Pending {
     fn new(r: QueryResult, db: String, started: Instant) -> (Pending, Vec<String>) {
         let pending = Pending {
+            has_columns: !r.columns.is_empty(),
+            has_rows: !r.rows.is_empty(),
             rows: r.rows.into_iter(),
             stats: r.stats,
             plan: r.plan,
@@ -361,6 +495,8 @@ struct Conn<'s> {
     /// The client's address, for the log.
     peer: String,
     version: (u8, u8),
+    /// The version was picked from the manifest (HELLO then reports it).
+    by_manifest: bool,
     /// Whether date-times travel as UTC instants (Bolt 5, or the 4.4 `utc` patch).
     utc: bool,
     hello: bool,
@@ -405,13 +541,24 @@ impl Conn<'_> {
         self.send(IGNORED, vec![])
     }
 
-    /// Reports a failure; later messages are ignored until `RESET`.
+    /// Reports a failure; later messages are ignored until `RESET`. From 5.7 it is a GQL
+    /// error: `neo4j_code` (for `code`), `gql_status`, `description` and
+    /// `diagnostic_record`.
     fn fail(&mut self, f: Failure) -> io::Result<()> {
         self.failed = true;
-        self.send(
-            FAILURE,
-            vec![PackValue::map([("code", PackValue::str(f.code)), ("message", PackValue::String(f.message))])],
-        )
+        let meta = if self.at_least(5, 7) {
+            let (status, description) = gql_status(f.code);
+            PackValue::map([
+                ("neo4j_code", PackValue::str(f.code)),
+                ("message", PackValue::String(f.message)),
+                ("gql_status", PackValue::str(status)),
+                ("description", PackValue::str(description)),
+                ("diagnostic_record", diagnostic_record(&[("_classification", classification(f.code))])),
+            ])
+        } else {
+            PackValue::map([("code", PackValue::str(f.code)), ("message", PackValue::String(f.message))])
+        };
+        self.send(FAILURE, vec![meta])
     }
 
     // ---- reading ----
@@ -643,6 +790,12 @@ impl Conn<'_> {
         );
         self.connection = format!("bolt-{id}");
         meta.insert("connection_id".into(), PackValue::String(self.connection.clone()));
+        if self.by_manifest {
+            meta.insert(
+                "protocol_version".into(),
+                PackValue::String(format!("{}.{}", self.version.0, self.version.1)),
+            );
+        }
         if self.version == (4, 4)
             && let Some(PackValue::List(patches)) = extra.get("patch_bolt")
             && patches.contains(&PackValue::str("utc"))
@@ -747,9 +900,9 @@ impl Conn<'_> {
         let prepared = Self::run_fields(fields).and_then(|(query, params, extra)| {
             let db = self.database_name(&extra)?;
             let timeout = self.time_limit(&extra)?;
-            Ok((query, params, db, timeout))
+            Ok((query, params, db, timeout, no_db(&extra)))
         });
-        let (query, params, db, timeout) = match prepared {
+        let (query, params, db, timeout, home) = match prepared {
             Ok(v) => v,
             Err(f) => {
                 self.fail(f)?;
@@ -799,8 +952,14 @@ impl Conn<'_> {
                 Ok(None)
             }
             Some(Ok(r)) => {
+                let resolved = (home && self.at_least(5, 8)).then(|| db.clone());
                 let (pending, columns) = Pending::new(r, db, started);
-                self.success(run_success(columns, started, None))?;
+                let mut meta = run_success(columns, started, None);
+                if let Some(db) = resolved {
+                    // The home database it ran on, for the driver's cache (5.8+).
+                    meta.insert("db".into(), PackValue::String(db));
+                }
+                self.success(meta)?;
                 Ok(Some(pending))
             }
         }
@@ -874,6 +1033,22 @@ impl Conn<'_> {
             let key = if plan.profiled { "profile" } else { "plan" };
             meta.insert(key.into(), plan_tree(plan));
         }
+        if self.at_least(5, 6) {
+            // The GQL status of the result (5.6+; there are no notifications).
+            let (status, description) = match (p.has_columns, p.has_rows) {
+                (false, _) => ("00001", "note: successful completion - omitted result"),
+                (true, false) => ("02000", "note: no data"),
+                (true, true) => ("00000", "note: successful completion"),
+            };
+            meta.insert(
+                "statuses".into(),
+                PackValue::List(vec![PackValue::map([
+                    ("gql_status", PackValue::str(status)),
+                    ("status_description", PackValue::str(description)),
+                    ("diagnostic_record", diagnostic_record(&[])),
+                ])]),
+            );
+        }
         self.success(meta)?;
         Ok(true)
     }
@@ -889,6 +1064,7 @@ impl Conn<'_> {
                 return Ok(Flow::Continue);
             }
         };
+        let home = no_db(&extra) && self.at_least(5, 8);
         let prepared = self.database_name(&extra).and_then(|name| {
             let (who, _) = self.access()?;
             let ctx = &self.shared.ctx;
@@ -929,7 +1105,12 @@ impl Conn<'_> {
                 Ok(Flow::Continue)
             }
             Some(Ok(tx)) => {
-                self.success(BTreeMap::new())?;
+                let mut meta = BTreeMap::new();
+                if home {
+                    // The home database it runs on, for the driver's cache (5.8+).
+                    meta.insert("db".into(), PackValue::String(name.clone()));
+                }
+                self.success(meta)?;
                 self.transaction(Some(tx), &name, deadline)
             }
         }
@@ -1204,6 +1385,15 @@ fn node_element_id(id: u64) -> String {
 /// The element id of a relationship, as `elementId()` returns it.
 fn rel_element_id(id: u64) -> String {
     format!("r:{id}")
+}
+
+/// Whether an `extra` map leaves the database to the server (no `db`, null or empty).
+fn no_db(extra: &BTreeMap<String, PackValue>) -> bool {
+    match extra.get("db") {
+        None | Some(PackValue::Null) => true,
+        Some(PackValue::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
 }
 
 fn new_bookmark() -> String {
@@ -1626,11 +1816,29 @@ mod tests {
     #[test]
     fn negotiates_the_newest_common_version() {
         let p = |v: &[[u8; 4]]| v.concat();
-        assert_eq!(negotiate(&p(&[[0, 8, 8, 5], [0, 2, 4, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((5, 4)));
-        assert_eq!(negotiate(&p(&[[0, 0, 1, 0xFF], [0, 0, 2, 5], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((5, 2)));
-        assert_eq!(negotiate(&p(&[[0, 0, 4, 4], [0, 0, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), Some((4, 4)));
-        assert_eq!(negotiate(&p(&[[0, 0, 8, 5], [0, 0, 3, 4], [0, 0, 0, 3], [0, 0, 0, 0]])), None);
+        let v = |major, minor| Some(Handshake::Version(major, minor));
+        assert_eq!(negotiate(&p(&[[0, 8, 8, 5], [0, 2, 4, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), v(5, 8));
+        assert_eq!(negotiate(&p(&[[0, 4, 9, 5], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])), v(5, 8));
+        assert_eq!(negotiate(&p(&[[0, 2, 4, 4], [0, 0, 2, 5], [0, 0, 0, 0], [0, 0, 0, 0]])), v(4, 4));
+        // 5.5 is never served: 5.5–5.4 gives 5.4, 5.5 alone nothing.
+        assert_eq!(negotiate(&p(&[[0, 1, 5, 5], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])), v(5, 4));
+        assert_eq!(negotiate(&p(&[[0, 0, 5, 5], [0, 0, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), None);
+        assert_eq!(negotiate(&p(&[[0, 0, 6, 5], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])), v(5, 6));
+        assert_eq!(negotiate(&p(&[[0, 0, 4, 4], [0, 0, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]])), v(4, 4));
+        assert_eq!(negotiate(&p(&[[0, 0, 3, 4], [0, 0, 0, 3], [0, 0, 0, 0], [0, 0, 0, 0]])), None);
         assert_eq!(negotiate(&p(&[[0, 0, 0, 0]; 4])), None);
+        // The manifest, in the client's order of preference.
+        assert_eq!(negotiate(&p(&[[0, 0, 1, 0xFF], [0, 0, 2, 5], [0, 0, 0, 0], [0, 0, 0, 0]])), Some(Handshake::Manifest));
+        assert_eq!(negotiate(&p(&[[0, 0, 2, 5], [0, 0, 1, 0xFF], [0, 0, 0, 0], [0, 0, 0, 0]])), v(5, 2));
+        assert_eq!(negotiate(&p(&[[0, 0, 2, 0xFF], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])), None);
+        assert_eq!(
+            manifest(),
+            [0, 0, 1, 0xFF, 3, 0, 2, 8, 5, 0, 4, 4, 5, 0, 0, 4, 4, 0]
+        );
+        assert!(served(5, 8) && served(5, 6) && served(5, 0) && served(4, 4));
+        assert!(!served(5, 5) && !served(5, 9) && !served(4, 3) && !served(6, 0));
+        assert_eq!(gql_status("Neo.ClientError.Statement.SyntaxError").0, "42001");
+        assert_eq!(classification("Neo.TransientError.General.MemoryPoolOutOfMemoryError"), "TRANSIENT_ERROR");
     }
 
     #[test]
