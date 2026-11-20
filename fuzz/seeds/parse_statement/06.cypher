@@ -1,0 +1,1 @@
+MATCH (n) WHERE n.name =~ '(?i)a.*b' OR n.name STARTS WITH 'x' RETURN n UNION ALL RETURN 1 AS n

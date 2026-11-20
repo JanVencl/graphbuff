@@ -24,6 +24,8 @@ tls = ["dep:rustls", "rustls/ring"]
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
 # `gpu = true` in [queries] of the config file: run graph kernels on the GPU (wgpu).
 gpu = ["graphbuff/gpu"]
+# Entry points for the fuzz targets in `fuzz/` (`graphbuff_server::fuzzing`); not for other use.
+fuzzing = []
 
 [dependencies.rustls]
 version = "0.23"

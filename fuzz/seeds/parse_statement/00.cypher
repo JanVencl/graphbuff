@@ -1,0 +1,1 @@
+MATCH (n:Person {name: $name})-[:KNOWS*1..3]->(m) WHERE m.age > 30 RETURN m.name, count(*) AS c ORDER BY c DESC LIMIT 10

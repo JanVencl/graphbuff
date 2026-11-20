@@ -1,0 +1,1 @@
+MERGE (n:L {id: $id}) ON CREATE SET n.created = datetime() ON MATCH SET n += $props

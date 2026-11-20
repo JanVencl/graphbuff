@@ -1,0 +1,1 @@
+EXPLAIN MATCH (a)-[r:A|B*0..]->(b:!C&(D|%)) WHERE all(x IN r WHERE x.w > 0) RETURN a {.*, k: b.k}

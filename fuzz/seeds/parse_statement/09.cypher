@@ -1,0 +1,1 @@
+CREATE VECTOR INDEX v FOR (n:Doc) ON n.embedding OPTIONS {indexConfig: {`vector.dimensions`: 3}}

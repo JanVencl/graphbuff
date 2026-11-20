@@ -32,6 +32,8 @@ Cypher changes should keep the openCypher TCK at 100 %: see
 [integration-tests/tck](integration-tests/tck/README.md) (`python python/run_tck.py`
 from `integration-tests`). Bolt changes can be checked against the official drivers with
 the smoke suites in [integration-tests/drivers](integration-tests/drivers/README.md).
+Changes to the parser, the Bolt and HTTP readers or the storage formats are fuzzed
+nightly; see [fuzz](fuzz/README.md) to run a target yourself or reproduce a crash.
 
 ## Pull requests
 

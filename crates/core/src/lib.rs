@@ -16,6 +16,9 @@
 //! additional [`GraphStore`] implementations, without touching the Cypher front end.
 
 pub mod accounting;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod clock;
 mod codec;
 pub mod csr;

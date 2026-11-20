@@ -1,0 +1,1 @@
+USE movies MATCH (m:Movie) RETURN m.title, EXISTS { (m)<-[:ACTED_IN]-() } AS cast, COUNT { (m)--() } AS deg

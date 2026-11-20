@@ -1,0 +1,1 @@
+CALL db.index.fulltext.queryNodes('idx', 'graph~ AND data*') YIELD node, score RETURN node, score

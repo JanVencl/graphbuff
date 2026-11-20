@@ -1,0 +1,1 @@
+MATCH p = shortestPath((a)-[*]-(b)) WHERE a.id = 1 AND b.id = 2 RETURN [x IN nodes(p) | x.id], length(p)

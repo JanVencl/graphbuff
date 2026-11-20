@@ -1080,3 +1080,27 @@ mod tests {
         assert_eq!(g.constraints(), vec![key("k")]);
     }
 }
+
+/// A snapshot body (the first byte picks the format version) (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_snapshot(bytes: &[u8]) {
+    let Some((&v, body)) = bytes.split_first() else { return };
+    let mut d = Decoder::new(body, "snapshot");
+    if d.u64().is_ok() {
+        let _ = MemoryGraph::decode_snapshot(&mut d, 1 + v % SNAPSHOT_VERSION);
+    }
+}
+
+/// A write-ahead log record, replayed onto an empty graph (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_wal_record(bytes: &[u8]) {
+    let mut d = Decoder::new(bytes, "record");
+    let (Ok(_), Ok(n)) = (d.u64(), d.len(1)) else { return };
+    let mut g = MemoryGraph::new();
+    for _ in 0..n {
+        let Ok(op) = Op::decode(&mut d) else { return };
+        if op.replay(&mut g).is_err() {
+            return;
+        }
+    }
+}
