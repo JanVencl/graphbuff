@@ -219,7 +219,7 @@ Logs go to `DATA/logs` (`logs.dir`; `"-"` for standard error, the default with
 |------|----------|
 | `graphbuff.log` | start-up and settings (with the config file read), failed logins (client address and user name) and lockouts, refused connections, storage errors; every connection at `level = "debug"` |
 | `query.log` | with `logs.slow_query_ms`: each query that took at least that long, with duration, protocol, database and user |
-| `security.log` | at every level: who (user or `token`), from which address and protocol, changed users, roles or databases (`CREATE`/`ALTER`/`RENAME`/`DROP USER`, `GRANT`/`REVOKE ROLE`, `CREATE`/`DROP DATABASE`), terminated transactions, backed up or restored, and whether it worked (refused attempts too); failed logins and lockouts. Never passwords |
+| `security.log` | at every level: who (user or `token`), from which address and protocol, changed users, roles or databases (`CREATE`/`ALTER`/`RENAME`/`DROP USER`, `GRANT`/`REVOKE ROLE`, `CREATE`/`ALTER`/`DROP DATABASE`, alias commands), terminated transactions, backed up or restored, and whether it worked (refused attempts too); failed logins and lockouts. Never passwords |
 
 Levels: `error`, `warn`, `info` (default), `debug`. Each file rotates to `.1`, `.2`, … at
 10 MiB, and five old files are kept. An embedded server gets the same log via

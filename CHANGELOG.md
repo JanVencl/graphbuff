@@ -7,6 +7,9 @@ the same notes.
 
 ### Added
 
+- `ALTER DATABASE … SET ACCESS READ ONLY | READ WRITE`, database aliases
+  (`CREATE` / `ALTER` / `DROP ALIAS`, `SHOW ALIASES`) and `DROP DATABASE … DUMP DATA`
+  (a backup in `dumps/` first). `SHOW DATABASES` gains `access` and `aliases` columns.
 - A release archive for ARM64 Linux, `graphbuff-linux-aarch64.tar.gz` (static, musl).
 - `graphbuff-cli`, a command-line client for `graphbuff-server` (line editor, Cypher
   highlighting, colors), shipped in the release archives and the Docker image.

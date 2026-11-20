@@ -221,6 +221,10 @@ impl<'a> Parser<'a> {
         if let Some(cmd) = self.parse_user_command()? {
             return Ok(Statement::User(cmd));
         }
+        if self.is_kw("CREATE") && (self.kw_at(1, "ALIAS") || (self.kw_at(1, "OR") && self.kw_at(3, "ALIAS"))) {
+            self.advance();
+            return self.parse_create_alias();
+        }
         if self.is_kw("CREATE") && (self.kw_at(1, "DATABASE") || self.kw_at(1, "OR")) {
             self.advance();
             return self.parse_create_database();
@@ -229,6 +233,55 @@ impl<'a> Parser<'a> {
             self.advance();
             self.advance();
             return self.parse_drop_database();
+        }
+        if self.is_kw("ALTER") && self.kw_at(1, "DATABASE") {
+            self.pos += 2;
+            return self.parse_alter_database();
+        }
+        if self.is_kw("ALTER") && self.kw_at(1, "ALIAS") {
+            self.pos += 2;
+            let alias = self.db_name()?;
+            let if_exists = self.eat_kw("IF") && {
+                self.expect_kw("EXISTS")?;
+                true
+            };
+            self.expect_kw("SET")?;
+            self.expect_kw("DATABASE")?;
+            if !self.eat_kw("TARGET") {
+                return Err(Error::Unsupported(format!(
+                    "ALTER ALIAS … SET DATABASE {} is not supported: only TARGET",
+                    self.describe()
+                )));
+            }
+            let target = self.db_name()?;
+            self.alias_extras()?;
+            self.end_of_statement()?;
+            return Ok(Statement::Database(DatabaseCommand::AlterAlias { alias, if_exists, target }));
+        }
+        if self.is_kw("DROP") && self.kw_at(1, "ALIAS") {
+            self.pos += 2;
+            let alias = self.db_name()?;
+            let if_exists = self.eat_kw("IF") && {
+                self.expect_kw("EXISTS")?;
+                true
+            };
+            self.expect_kw("FOR")?;
+            self.expect_kw("DATABASE")?;
+            self.end_of_statement()?;
+            return Ok(Statement::Database(DatabaseCommand::DropAlias { alias, if_exists }));
+        }
+        if self.is_kw("SHOW") && (self.kw_at(1, "ALIASES") || self.kw_at(1, "ALIAS")) {
+            self.pos += 2;
+            let name = if self.is_kw("FOR") { None } else { Some(self.db_name()?) };
+            self.expect_kw("FOR")?;
+            if !self.eat_kw("DATABASES") {
+                self.expect_kw("DATABASE")?;
+            }
+            if self.is_kw("YIELD") || self.is_kw("WHERE") {
+                return Err(Error::Unsupported("SHOW ALIASES … YIELD / WHERE is not supported".into()));
+            }
+            self.end_of_statement()?;
+            return Ok(Statement::Database(DatabaseCommand::ShowAliases(name)));
         }
         if self.is_kw("SHOW") {
             if self.kw_at(1, "DEFAULT") && self.kw_at(2, "DATABASE") {
@@ -374,12 +427,8 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        if self.is_kw("DUMP") {
-            return Err(Error::Unsupported(
-                "DROP DATABASE … DUMP DATA is not supported".into(),
-            ));
-        }
-        if self.eat_kw("DESTROY") {
+        let dump = self.eat_kw("DUMP");
+        if dump || self.eat_kw("DESTROY") {
             self.expect_kw("DATA")?;
         }
         self.skip_wait();
@@ -387,7 +436,79 @@ impl<'a> Parser<'a> {
         Ok(Statement::Database(DatabaseCommand::Drop {
             name,
             if_exists,
+            dump,
         }))
+    }
+
+    /// After `ALTER DATABASE`: `name [IF EXISTS] SET ACCESS READ ONLY | READ WRITE`.
+    fn parse_alter_database(&mut self) -> Result<Statement> {
+        let name = self.db_name()?;
+        let if_exists = self.eat_kw("IF") && {
+            self.expect_kw("EXISTS")?;
+            true
+        };
+        if !self.eat_kw("SET") || !self.eat_kw("ACCESS") {
+            return Err(Error::Unsupported(format!(
+                "ALTER DATABASE … {} is not supported: only SET ACCESS READ ONLY | READ WRITE",
+                self.describe()
+            )));
+        }
+        self.expect_kw("READ")?;
+        let read_only = if self.eat_kw("ONLY") {
+            true
+        } else if self.eat_kw("WRITE") {
+            false
+        } else {
+            return self.err(format!("expected ONLY or WRITE after READ, found {}", self.describe()));
+        };
+        self.skip_wait();
+        self.end_of_statement()?;
+        Ok(Statement::Database(DatabaseCommand::Alter { name, if_exists, read_only }))
+    }
+
+    /// After `CREATE`: `[OR REPLACE] ALIAS name [IF NOT EXISTS] FOR DATABASE target`.
+    fn parse_create_alias(&mut self) -> Result<Statement> {
+        let or_replace = self.eat_kw("OR") && {
+            self.expect_kw("REPLACE")?;
+            true
+        };
+        self.expect_kw("ALIAS")?;
+        let alias = self.db_name()?;
+        let offset = self.offset();
+        let if_not_exists = self.eat_kw("IF") && {
+            self.expect_kw("NOT")?;
+            self.expect_kw("EXISTS")?;
+            true
+        };
+        if or_replace && if_not_exists {
+            return Err(Error::syntax("CREATE OR REPLACE ALIAS cannot be combined with IF NOT EXISTS", offset));
+        }
+        self.expect_kw("FOR")?;
+        self.expect_kw("DATABASE")?;
+        let target = self.db_name()?;
+        self.alias_extras()?;
+        self.end_of_statement()?;
+        let existing = if or_replace {
+            ExistingDatabase::Replace
+        } else if if_not_exists {
+            ExistingDatabase::Keep
+        } else {
+            ExistingDatabase::Fail
+        };
+        Ok(Statement::Database(DatabaseCommand::CreateAlias { alias, target, existing }))
+    }
+
+    /// Fails on the parts of an alias command for remote databases (`AT 'url'`, `USER`,
+    /// `PROPERTIES`, …), which a single instance has no use for.
+    fn alias_extras(&mut self) -> Result<()> {
+        for kw in ["AT", "USER", "PASSWORD", "DRIVER", "PROPERTIES", "DEFAULT"] {
+            if self.is_kw(kw) {
+                return Err(Error::Unsupported(format!(
+                    "{kw} in an alias command is not supported: aliases name local databases only"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// After `SHOW TRANSACTIONS` / `TERMINATE TRANSACTIONS`: `[id, … | $ids]` (required to
@@ -2632,9 +2753,58 @@ mod tests {
             db("DROP DATABASE $n IF EXISTS DESTROY DATA"),
             DatabaseCommand::Drop {
                 name: DbName::Param("n".into()),
-                if_exists: true
+                if_exists: true,
+                dump: false,
             }
         );
+        assert_eq!(
+            db("DROP DATABASE x DUMP DATA NOWAIT"),
+            DatabaseCommand::Drop { name: name("x"), if_exists: false, dump: true }
+        );
+        assert_eq!(
+            db("ALTER DATABASE x IF EXISTS SET ACCESS READ ONLY WAIT"),
+            DatabaseCommand::Alter { name: name("x"), if_exists: true, read_only: true }
+        );
+        assert_eq!(
+            db("ALTER DATABASE x SET ACCESS READ WRITE"),
+            DatabaseCommand::Alter { name: name("x"), if_exists: false, read_only: false }
+        );
+        assert_eq!(
+            db("CREATE ALIAS films IF NOT EXISTS FOR DATABASE movies"),
+            DatabaseCommand::CreateAlias { alias: name("films"), target: name("movies"), existing: ExistingDatabase::Keep }
+        );
+        assert_eq!(
+            db("CREATE OR REPLACE ALIAS a.b FOR DATABASE $db"),
+            DatabaseCommand::CreateAlias {
+                alias: name("a.b"),
+                target: DbName::Param("db".into()),
+                existing: ExistingDatabase::Replace
+            }
+        );
+        assert_eq!(
+            db("ALTER ALIAS films IF EXISTS SET DATABASE TARGET other"),
+            DatabaseCommand::AlterAlias { alias: name("films"), if_exists: true, target: name("other") }
+        );
+        assert_eq!(
+            db("DROP ALIAS films IF EXISTS FOR DATABASE"),
+            DatabaseCommand::DropAlias { alias: name("films"), if_exists: true }
+        );
+        assert_eq!(db("SHOW ALIASES FOR DATABASES"), DatabaseCommand::ShowAliases(None));
+        assert_eq!(db("SHOW ALIAS films FOR DATABASE"), DatabaseCommand::ShowAliases(Some(name("films"))));
+        for (q, unsupported) in [
+            ("ALTER DATABASE x SET TOPOLOGY 1 PRIMARY", true),
+            ("ALTER DATABASE x REMOVE OPTION txLogEnrichment", true),
+            ("ALTER DATABASE x SET ACCESS READ", false),
+            ("CREATE ALIAS a FOR DATABASE b AT 'neo4j+s://x'", true),
+            ("CREATE OR REPLACE ALIAS a IF NOT EXISTS FOR DATABASE b", false),
+            ("DROP ALIAS a", false),
+        ] {
+            match parse_statement(q) {
+                Err(Error::Unsupported(_)) if unsupported => {}
+                Err(Error::Syntax { .. }) if !unsupported => {}
+                other => panic!("{q}: {other:?}"),
+            }
+        }
         assert_eq!(
             db("SHOW DATABASES"),
             DatabaseCommand::Show(ShowDatabases::All)
