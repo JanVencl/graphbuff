@@ -63,6 +63,25 @@ USER` and `ALTER CURRENT USER SET PASSWORD FROM 'old' TO 'new'`. Explicit HTTP
 transactions belong to the client that began them. Not supported: custom roles and
 privileges (`GRANT MATCH …`), `CHANGE REQUIRED`, suspended users, home databases.
 
+**Failed logins** lock a client out for a while, over HTTP and Bolt alike. They are counted
+per client address and user name, and per client address over all names. After
+`security.max_failed_logins` (default 10) failures of one address and name, or three times
+as many from one address over all names, its logins are refused for
+`security.login_lockout_seconds` (default 60), and each further failure after a lockout
+doubles that, up to an hour. While locked out, a login is refused without checking the
+password, even a right one: HTTP answers `429 TooManyRequests` with `Retry-After`, Bolt
+fails with `Neo.ClientError.Security.AuthenticationRateLimit`. A successful login clears
+the count of its address and name; counts are forgotten after an hour without failures.
+Requests without credentials are not counted. `max_failed_logins = 0` turns this off. At
+most one password hash per CPU is computed at once, so logins cannot exhaust the memory
+the hashes take.
+
+```toml
+[security]
+max_failed_logins = 10
+login_lockout_seconds = 60
+```
+
 **TLS** serves HTTPS and Bolt over TLS (TLS 1.3 and 1.2) on the same ports. The release
 binaries and the Docker image have it. Built from source, it is an optional feature, with
 two choices of crypto provider for rustls:

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
 use settings::{Config, LogDir, Storage};
-use graphbuff_server::{Log, LogConfig, Role, Server, ServerConfig, TlsConfig, Users};
+use graphbuff_server::{Log, LogConfig, LoginLimits, Role, Server, ServerConfig, TlsConfig, Users};
 
 const USAGE: &str = "\
 usage: graphbuff-server [--config FILE]
@@ -471,6 +471,10 @@ fn main() {
         bolt: settings.bolt.clone(),
         backup_dir: settings.backup_dir.clone(),
         test_procedures: settings.test_procedures,
+        login_limits: LoginLimits {
+            max_failures: settings.max_failed_logins,
+            lockout: settings.login_lockout,
+        },
         ..ServerConfig::default()
     };
     if let Some(bind) = &settings.bind {

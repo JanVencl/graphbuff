@@ -41,6 +41,8 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_allow_plain: bool,
+    pub max_failed_logins: u32,
+    pub login_lockout: Duration,
     // [queries]
     pub transaction_timeout: Option<Duration>,
     pub query_timeout: Option<Duration>,
@@ -70,6 +72,8 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             tls_allow_plain: false,
+            max_failed_logins: 10,
+            login_lockout: Duration::from_secs(60),
             transaction_timeout: None,
             query_timeout: None,
             gpu: false,
@@ -151,6 +155,11 @@ fsync = true
 # tls_key = "key.pem"
 # With TLS, also accept clients without TLS on the same ports.
 tls_allow_plain = false
+# After this many failed logins of one client address and user name (three times as many
+# over all names), refuse its logins for login_lockout_seconds, doubling with each further
+# failure up to an hour. 0 turns this off.
+max_failed_logins = 10
+login_lockout_seconds = 60
 
 [queries]
 # Roll back a transaction after this long without a request.
@@ -227,7 +236,14 @@ const SETTINGS: &[(&str, &[(&str, Kind)])] = &[
     ),
     (
         "security",
-        &[("token", Kind::Str), ("tls_cert", Kind::Path), ("tls_key", Kind::Path), ("tls_allow_plain", Kind::Bool)],
+        &[
+            ("token", Kind::Str),
+            ("tls_cert", Kind::Path),
+            ("tls_key", Kind::Path),
+            ("tls_allow_plain", Kind::Bool),
+            ("max_failed_logins", Kind::Count),
+            ("login_lockout_seconds", Kind::Positive),
+        ],
     ),
     (
         "queries",
@@ -302,6 +318,8 @@ impl Config {
                 ("security", "tls_cert") => c.tls_cert = Some(path_of(value)),
                 ("security", "tls_key") => c.tls_key = Some(path_of(value)),
                 ("security", "tls_allow_plain") => c.tls_allow_plain = bool_of(value),
+                ("security", "max_failed_logins") => c.max_failed_logins = int_of(value).min(u64::from(u32::MAX)) as u32,
+                ("security", "login_lockout_seconds") => c.login_lockout = Duration::from_secs(int_of(value)),
                 ("queries", "transaction_timeout_seconds") => {
                     c.transaction_timeout = Some(Duration::from_secs(int_of(value)));
                 }

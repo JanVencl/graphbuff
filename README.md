@@ -101,6 +101,8 @@ backup_dir = "/srv/backups"           # online backups and restores (off when no
 tls_cert = "/etc/graphbuff/cert.pem"  # HTTPS and Bolt over TLS
 tls_key = "/etc/graphbuff/key.pem"
 tls_allow_plain = false
+max_failed_logins = 10                # then the client is locked out (0: off)
+login_lockout_seconds = 60            # doubling with each further failure, up to an hour
 
 [queries]
 transaction_timeout_seconds = 60
