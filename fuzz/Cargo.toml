@@ -1,0 +1,49 @@
+[package]
+name = "graphbuff-fuzz"
+description = "Fuzz targets for graphbuff (cargo-fuzz; see README.md)"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the main workspace: it needs nightly Rust and libFuzzer.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+graphbuff-cypher = { path = "../crates/cypher" }
+graphbuff-core = { path = "../crates/core", features = ["fuzzing"] }
+graphbuff-server = { path = "../crates/server", features = ["fuzzing"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_statement"
+path = "fuzz_targets/parse_statement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bolt_message"
+path = "fuzz_targets/bolt_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage"
+path = "fuzz_targets/storage.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,1 @@
+CREATE (a:A {x: 1, l: [1, 2.5, 'x', null], m: {k: true}})-[:R {w: -3}]->(b:B) RETURN a, b

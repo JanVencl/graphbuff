@@ -1,0 +1,7 @@
+POST /db/graphbuff/query HTTP/1.1
+Host: x
+Authorization: Basic YTpi
+Content-Type: application/json
+Content-Length: 38
+
+{"query":"RETURN $x","params":{"x":1}}

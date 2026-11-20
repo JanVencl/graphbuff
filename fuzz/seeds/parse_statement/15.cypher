@@ -1,0 +1,1 @@
+LOAD CSV WITH HEADERS FROM 'file:///p.csv' AS row FIELDTERMINATOR ';' CREATE (:P {id: toInteger(row.id)})

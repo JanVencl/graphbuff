@@ -526,3 +526,13 @@ pub(crate) fn destroy(p: &mut Pager, a: &mut PageAlloc, root: u64) -> Result<()>
     }
     release(p, a, root)
 }
+
+/// A B-tree page: `bytes`, zero-padded to a page as the pager reads it (see
+/// [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode(bytes: &[u8]) {
+    let mut page = vec![0; PAGE_SIZE];
+    let n = bytes.len().min(PAGE_SIZE);
+    page[..n].copy_from_slice(&bytes[..n]);
+    let _ = Node::decode(1, &page);
+}

@@ -1,0 +1,1 @@
+SHOW TRANSACTIONS YIELD transactionId, elapsedTime WHERE elapsedTime > duration('PT1S') RETURN *

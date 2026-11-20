@@ -63,6 +63,22 @@ mod api;
 mod bolt;
 mod crypto;
 pub mod fetch;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    //! Entry points for the fuzz targets in `fuzz/` (feature `fuzzing`): any input must
+    //! be answered or refused, never panic.
+
+    /// Reads requests from `data` as from one connection, up to the first error.
+    pub fn http_request(data: &[u8]) {
+        crate::http::fuzz_read_requests(data);
+    }
+
+    /// Decodes `data` as a Bolt message and converts its fields to query values.
+    pub fn bolt_message(data: &[u8]) {
+        crate::bolt::fuzz_message(data);
+    }
+}
 mod http;
 pub mod log;
 mod net;

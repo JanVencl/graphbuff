@@ -3617,3 +3617,29 @@ mod tests {
         assert_eq!(g.node_count(), 10_100);
     }
 }
+
+/// Metadata (the first byte picks the format version) (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_meta(bytes: &[u8]) {
+    let Some((&v, body)) = bytes.split_first() else { return };
+    let _ = Meta::decode(&mut Decoder::new(body, "meta"), 1 + v % FORMAT);
+}
+
+/// A node, relationship or group record (zero-padded to its size, as the pager hands it
+/// over), or a B-tree page (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_page(bytes: &[u8]) {
+    let Some((&kind, rest)) = bytes.split_first() else { return };
+    let record = |size: usize| {
+        let mut b = vec![0; size];
+        let n = rest.len().min(size);
+        b[..n].copy_from_slice(&rest[..n]);
+        b
+    };
+    match kind % 4 {
+        0 => drop(NodeRec::decode(&record(NODE_REC))),
+        1 => drop(RelRec::decode(&record(REL_REC))),
+        2 => drop(GroupRec::decode(&record(GROUP_REC))),
+        _ => btree::fuzz_decode(rest),
+    }
+}

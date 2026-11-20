@@ -84,12 +84,12 @@ fn is_timeout(e: &io::Error) -> bool {
 }
 
 /// Reads from a stream with a short read timeout, retrying until `deadline`.
-struct Timed<'a> {
-    r: &'a mut BufReader<Stream>,
+struct Timed<'a, R> {
+    r: &'a mut R,
     deadline: Instant,
 }
 
-impl Timed<'_> {
+impl<R: BufRead> Timed<'_, R> {
     fn fill(&mut self) -> Result<&[u8], ReadError> {
         loop {
             match self.r.fill_buf() {
@@ -98,7 +98,9 @@ impl Timed<'_> {
                 Err(_) => return Err(ReadError::Io),
             }
         }
-        Ok(self.r.buffer())
+        // Filled: this returns the buffered bytes without reading (the borrow checker
+        // will not let the loop return them).
+        self.r.fill_buf().map_err(|_| ReadError::Io)
     }
 
     /// One line without its line ending.
@@ -147,8 +149,8 @@ impl Timed<'_> {
 /// Reads the next request. Returns `None` when the client closed the connection, it
 /// stayed idle too long, or `stop()` became true while it was idle.
 pub fn read_request(
-    reader: &mut BufReader<Stream>,
-    writer: &mut Stream,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
     limits: &Limits,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<Request>, ReadError> {
@@ -488,4 +490,16 @@ mod tests {
         let any = Cors::parse("*").unwrap();
         assert_eq!(any.headers(&req("GET", &[("origin", "https://x.dev")]))[0].1, "https://x.dev");
     }
+}
+
+/// Reads requests from `data` as from one connection (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_read_requests(data: &[u8]) {
+    let limits = Limits {
+        max_body: 64 * 1024,
+        idle: Duration::from_secs(1),
+        request: Duration::from_secs(1),
+    };
+    let mut reader = BufReader::with_capacity(512, data);
+    while let Ok(Some(_)) = read_request(&mut reader, &mut io::sink(), &limits, &|| true) {}
 }

@@ -5,3 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+# Entry points for the fuzz targets in `fuzz/` (`graphbuff_core::fuzzing`); not for other use.
+fuzzing = []

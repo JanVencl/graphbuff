@@ -1,0 +1,75 @@
+# Fuzzes the code that reads untrusted input (see fuzz/README.md): every night for
+# 10 minutes per target, for 1 minute on a pull request that changes the fuzz targets or
+# the code they test, and on demand for as long as asked. The corpus each target builds
+# up is kept in the Actions cache; a crash fails the run and is attached as an artifact.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+      - "crates/core/src/**"
+      - "crates/cypher/src/**"
+      - "crates/server/src/bolt.rs"
+      - "crates/server/src/http.rs"
+      - "crates/server/src/packstream.rs"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_statement, bolt_message, http_request, storage]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: Restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Build
+        run: cargo +nightly fuzz build --debug-assertions ${{ matrix.target }}
+      - name: Fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo +nightly fuzz run --debug-assertions ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=10 -max_len=65536
+      - name: Show the crashing input
+        if: failure()
+        run: |
+          for f in fuzz/artifacts/${{ matrix.target }}/*; do
+            [ -f "$f" ] || continue
+            echo "== $f"; base64 -w0 "$f"; echo
+          done
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -2160,3 +2160,16 @@ mod tests {
         assert!(structure_value(DATE_TIME_ZONE_ID, &[]).is_err());
     }
 }
+
+/// Decodes a message and converts its fields to query values (see [`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_message(data: &[u8]) {
+    let Ok(v) = packstream::decode(data) else { return };
+    let fields = match v {
+        PackValue::Struct { fields, .. } => fields,
+        other => vec![other],
+    };
+    for f in fields {
+        let _ = to_value(f);
+    }
+}

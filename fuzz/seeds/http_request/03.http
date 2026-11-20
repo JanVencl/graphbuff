@@ -1,0 +1,4 @@
+OPTIONS /query HTTP/1.1
+Origin: https://app.example
+Access-Control-Request-Method: POST
+

@@ -1,0 +1,1 @@
+RETURN reduce(s = 0, x IN [1, 2, 3] | s + x) AS sum, point({x: 1, y: 2}) AS p, date('2024-02-29') + duration('P1M')
