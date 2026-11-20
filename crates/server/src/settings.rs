@@ -389,12 +389,13 @@ impl Config {
         Ok(c)
     }
 
-    /// The value of `section.key` in use, as `SHOW SETTINGS` shows it; `None`: not set.
-    fn value_of(&self, section: &str, key: &str) -> Option<String> {
+    /// The value of `section.key` in use, as `SHOW SETTINGS` shows it (`None`: not set);
+    /// `Err` for a setting this function does not know (a test checks there is none).
+    fn value_of(&self, section: &str, key: &str) -> Result<Option<String>, ()> {
         let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
         let secs = |d: &Option<Duration>| d.map(|d| d.as_secs().to_string());
         let millis = |d: &Option<Duration>| d.map(|d| d.as_millis().to_string());
-        match (section, key) {
+        Ok(match (section, key) {
             ("server", "bind") => self.bind.clone(),
             ("server", "bolt") => self.bolt.clone(),
             ("server", "max_connections") => self.max_connections.map(|n| n.to_string()),
@@ -432,8 +433,8 @@ impl Config {
             },
             ("logs", "level") => Some(format!("{:?}", self.log_level).to_ascii_lowercase()),
             ("logs", "slow_query_ms") => millis(&self.slow_query),
-            _ => unreachable!("every setting has a value: {section}.{key}"),
-        }
+            _ => return Err(()),
+        })
     }
 
     /// Every setting with its value and default, for `SHOW SETTINGS`.
@@ -444,8 +445,8 @@ impl Config {
             .flat_map(|(section, keys)| keys.iter().map(move |(key, _, description)| (*section, *key, *description)))
             .map(|(section, key, description)| graphbuff_server::Setting {
                 name: format!("{section}.{key}"),
-                value: self.value_of(section, key),
-                default: defaults.value_of(section, key),
+                value: self.value_of(section, key).unwrap_or_default(),
+                default: defaults.value_of(section, key).unwrap_or_default(),
                 description: description.to_string(),
             })
             .collect()
@@ -759,6 +760,11 @@ max_memory_mb = 512").unwrap();
         assert_eq!(get("storage.mode").value.as_deref(), Some("hybrid"));
         assert_eq!(list.len(), SETTINGS.iter().map(|(_, k)| k.len()).sum::<usize>());
         assert!(!format!("{list:?}").contains("s3cret"));
+        for (section, keys) in SETTINGS {
+            for (key, ..) in keys.iter() {
+                assert!(c.value_of(section, key).is_ok(), "SHOW SETTINGS has no value for {section}.{key}");
+            }
+        }
     }
 
     #[test]
