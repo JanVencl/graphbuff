@@ -172,11 +172,58 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `whitespace`, `keyword`; `db.index.fulltext.listAvailableAnalyzers()`). The inverted index
   is kept in memory and updated with each commit. More in [Full-text search](FullText.md).
 
-**Not yet supported** (these return an `Unsupported` error rather than a wrong result):
-procedures that change the graph, `LOAD CSV` from URLs other than local files, relationship
-constraints,
-spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), quantization of
-vector indexes, the `VECTOR` value type, full-text ranges, regular
-expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`), text and point indexes, `db.create.setNodeVectorProperty`
-(use `SET n.p = $vector`), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
-(use `btrim` / `ltrim` / `rtrim` with a second argument).
+## Not supported
+
+What is missing fails rather than giving a wrong result. Features graphbuff knows about
+fail with an `Unsupported` error (HTTP `400`, `"code":"Unsupported"`); syntax it does not
+know yet, mostly from Neo4j 5 and GQL, fails as a `SyntaxError` at the first word it does not
+recognise. Where there is another way to write it, it is given.
+
+**Clauses and patterns** (syntax errors):
+
+| Missing | Instead |
+|---------|---------|
+| Quantified path patterns: `(a)-[:R]->{1,3}(b)`, `((a)-[:R]->(b)){1,2}`, `-[:R]->+` | variable-length relationships: `(a)-[:R*1..3]->(b)` |
+| `SHORTEST k`, `ALL SHORTEST`, `ANY` path selectors | `shortestPath(…)`, `allShortestPaths(…)` |
+| Match modes: `DIFFERENT RELATIONSHIPS`, `REPEATABLE ELEMENTS` | relationships are never repeated within a match, as in `DIFFERENT RELATIONSHIPS` |
+| GQL clauses: `FINISH`, `FILTER`, `LET`, `WHEN … THEN`, `NEXT`, standalone `ORDER BY` / `OFFSET` | `WITH … WHERE`, `WITH x AS y`, `CASE`, `SKIP` |
+| `OPTIONAL CALL` | `OPTIONAL MATCH`, or a `CALL { … }` subquery that returns a row anyway |
+| Dynamic labels and types: `n:$(expr)`, `[:$(expr)]` | none yet |
+| Type predicates: `x IS :: STRING` | `valueType(x) = 'STRING NOT NULL'` |
+| `USE graph.byName(…)` | `USE name` |
+
+**Schema:**
+
+| Missing | Error |
+|---------|-------|
+| `CREATE TEXT INDEX`, `CREATE POINT INDEX`, `CREATE LOOKUP INDEX` | `Unsupported` (range, full-text and vector indexes exist) |
+| Spatial index seeks for `point.distance` / `point.withinBBox` | none: they filter every candidate |
+| Relationship constraints (`FOR ()-[r:R]-() REQUIRE …`) | syntax error |
+| Property type constraints (`REQUIRE n.p IS :: INTEGER`, `IS TYPED`) | syntax error |
+| Quantization of vector indexes, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
+| Full-text ranges, regular expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`) | `Unsupported` |
+| Index or constraint settings graphbuff does not know | `Unsupported` |
+
+**Expressions and procedures:**
+
+| Missing | Instead |
+|---------|---------|
+| `trim(BOTH \| LEADING \| TRAILING 'x' FROM s)` (syntax error) | `btrim(s, 'x')`, `ltrim(s, 'x')`, `rtrim(s, 'x')` |
+| Regular expressions with lookaround, atomic groups, backreferences, possessive quantifiers or nested classes (`RuntimeError`) | rewrite without them |
+| Procedures that change the graph, `db.create.setNodeVectorProperty` (no such procedure) | `SET n.p = $vector` |
+| `apoc.*` beyond the functions listed above (`Unsupported`) | the built-in functions |
+| `LOAD CSV` from URLs other than local files (`Unsupported`) | download the file into the import directory |
+| Two result columns with the same name (`RETURN 1 AS a, 2 AS a`, `SemanticError`) | distinct names |
+
+**`CALL { … } IN TRANSACTIONS`** (`Unsupported`): inside a `UNION`, under `PROFILE`, and
+`ON ERROR RETRY`.
+
+**Administration:**
+
+| Missing | Error |
+|---------|-------|
+| `SHOW FUNCTIONS`, `SHOW SETTINGS`, `SHOW PRIVILEGES`, `SHOW ALIASES` | `Unsupported` |
+| `ALTER DATABASE`, database aliases (`CREATE ALIAS`), `DROP DATABASE … DUMP DATA`, `TOPOLOGY` | syntax error or `Unsupported` |
+| `CREATE ROLE`, `DENY`, privileges (`GRANT TRAVERSE …`): roles are the fixed `reader`, `editor` and `admin` | syntax error |
+| Account options: `SET HOME DATABASE`, `SET STATUS SUSPENDED`, `SET ENCRYPTED PASSWORD`, `SET AUTH`, `CHANGE REQUIRED`, `SHOW ROLES WITH USERS` | `Unsupported` |
+| User and role commands, `SHOW` / `TERMINATE TRANSACTIONS` in the embedded engine | `Unsupported`: they need `graphbuff-server` |
