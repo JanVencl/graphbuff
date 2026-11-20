@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use graphbuff::{CancelHandle, DatabaseManager, Error, QueryOptions, QueryResult, ResultValue, RowSink, Value};
 
-use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statement};
+use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statement, UserCommand};
 
 use crate::crypto;
 use crate::http::{self, Out, Request, Response};
@@ -87,8 +87,27 @@ impl Ctx {
     pub(crate) fn login_failed(&self, protocol: &str, peer: &str, user: &str) {
         self.metrics.failed_login(protocol);
         if let Some(log) = &self.log {
+            log.security(format_args!("{protocol} {peer} {} LOGIN: failed", audit_user(user)));
             let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
             log.warn(format_args!("failed login ({protocol}) from {peer}{user}"));
+        }
+    }
+
+    /// Writes `action` by `who` from `peer`, and whether it failed, to `security.log`.
+    pub(crate) fn audit(
+        &self,
+        protocol: &str,
+        peer: &str,
+        who: &Principal,
+        action: &str,
+        failure: Option<&dyn std::fmt::Display>,
+    ) {
+        let Some(log) = &self.log else { return };
+        let name = crate::running::username(who);
+        let user = audit_user(&name);
+        match failure {
+            None => log.security(format_args!("{protocol} {peer} {user} {action}: ok")),
+            Some(e) => log.security(format_args!("{protocol} {peer} {user} {action}: failed: {e}")),
         }
     }
 
@@ -118,6 +137,11 @@ impl Ctx {
         if counts && let Some(lockout) = self.throttle.failed(addr, user, Instant::now()) {
             self.metrics.lockout();
             if let Some(log) = &self.log {
+                log.security(format_args!(
+                    "{protocol} {peer} {} LOGIN: locked out for {} s",
+                    audit_user(user),
+                    throttle::seconds(lockout)
+                ));
                 let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
                 log.warn(format_args!(
                     "too many failed logins ({protocol}) from {peer}{user}: locked out for {} s",
@@ -243,6 +267,49 @@ impl Ctx {
         }
         users::run(users, who, access, cmd, params)
     }
+}
+
+/// A user name in `security.log`: `-` for none.
+fn audit_user(user: &str) -> &str {
+    if user.is_empty() { "-" } else { user }
+}
+
+/// What an administrative statement does, for `security.log` (never a password); `None`
+/// for other statements.
+pub(crate) fn audit_action(stmt: &Statement, params: &BTreeMap<String, Value>) -> Option<String> {
+    let name = |n: &DbName| match users::resolve(n, params, "name") {
+        Ok(s) => s,
+        Err(_) => match n {
+            DbName::Name(s) => s.clone(),
+            DbName::Param(p) => format!("${p}"),
+        },
+    };
+    let names = |ns: &[DbName]| ns.iter().map(name).collect::<Vec<_>>().join(", ");
+    let on = |db: &Option<DbName>| db.as_ref().map_or_else(String::new, |d| format!(" ON DATABASE {}", name(d)));
+    Some(match stmt {
+        Statement::Database(DatabaseCommand::Show(_)) => return None,
+        Statement::Database(cmd @ (DatabaseCommand::Create { name: n, .. } | DatabaseCommand::Drop { name: n, .. })) => {
+            format!("{} {}", cmd.name(), name(n))
+        }
+        Statement::User(cmd) if cmd.is_updating() => match cmd {
+            UserCommand::Create { name: n, .. } | UserCommand::Alter { name: n, .. } | UserCommand::Drop { name: n, .. } => {
+                format!("{} {}", cmd.name(), name(n))
+            }
+            UserCommand::Rename { from, to, .. } => format!("RENAME USER {} TO {}", name(from), name(to)),
+            UserCommand::Grant { roles, database, users } => {
+                format!("GRANT ROLE {}{} TO {}", names(roles), on(database), names(users))
+            }
+            UserCommand::Revoke { roles, database, users } => {
+                format!("REVOKE ROLE {}{} FROM {}", names(roles), on(database), names(users))
+            }
+            _ => cmd.name().to_string(),
+        },
+        Statement::Transaction(cmd) if cmd.terminate => match crate::running::ids(&cmd.ids, params) {
+            Ok(ids) => format!("TERMINATE TRANSACTIONS {}", ids.join(", ")),
+            Err(_) => cmd.name().to_string(),
+        },
+        _ => return None,
+    })
 }
 
 /// The access `query` needs, and what it does.
@@ -525,20 +592,27 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request, out: &mut Out<'_
             return query_error(&e);
         }
     };
-    if let Statement::User(cmd) = &statement {
-        return match ctx.user_command(me.who, me.access, cmd, &params) {
-            Ok(r) => Response::json(200, encode_result(&r)),
-            Err(e) => query_error(&e),
-        };
-    }
-    if let Statement::Transaction(cmd) = &statement {
-        return match ctx.transaction_command(me.who, me.access, cmd, &params) {
+    let action = audit_action(&statement, &params);
+    let audit = |failure: Option<&Error>| {
+        if let Some(a) = &action {
+            ctx.audit("http", me.peer, me.who, a, failure.map(|e| e as &dyn std::fmt::Display));
+        }
+    };
+    let command = match &statement {
+        Statement::User(cmd) => Some(ctx.user_command(me.who, me.access, cmd, &params)),
+        Statement::Transaction(cmd) => Some(ctx.transaction_command(me.who, me.access, cmd, &params)),
+        _ => None,
+    };
+    if let Some(result) = command {
+        audit(result.as_ref().err());
+        return match result {
             Ok(r) => Response::json(200, encode_result(&r)),
             Err(e) => query_error(&e),
         };
     }
     let current = db.map_or_else(|| ctx.mgr.default_database(), String::from);
     if let Err(e) = ctx.authorize(me.who, &statement, &current, &params) {
+        audit(Some(&e));
         return query_error(&e);
     }
     let mut session = ctx.mgr.session();
@@ -570,6 +644,7 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request, out: &mut Out<'_
         _ => None,
     };
     ctx.finished("http", session.current_database(), me.who, &query, started.elapsed(), failure);
+    audit(result.as_ref().err());
     rows.finish(result)
 }
 
@@ -714,14 +789,21 @@ fn database_error(name: &str, e: &Error) -> Response {
 
 /// `POST /db/{name}/backup`: an online backup into the backup directory.
 fn backup(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
+    let action = format!("BACKUP DATABASE {name}");
+    let audit = |failure: Option<&Error>| {
+        ctx.audit("http", me.peer, me.who, &action, failure.map(|e| e as &dyn std::fmt::Display));
+    };
     if let Err(e) = check(me.access, Access::Admin, "backing up") {
+        audit(Some(&e));
         return query_error(&e);
     }
     let path = match body_fields(req, &["backup"]).and_then(|f| backup_path(ctx, &f)) {
         Ok(p) => p,
         Err(r) => return r,
     };
-    match ctx.mgr.backup_database(name, &path) {
+    let result = ctx.mgr.backup_database(name, &path);
+    audit(result.as_ref().err());
+    match result {
         Ok(info) => {
             let mut body = String::from(r#"{"backup":{"database":"#);
             write_str(&mut body, &name.to_ascii_lowercase());
@@ -743,7 +825,12 @@ fn backup(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
 /// `POST /db/{name}/restore`: creates (or with `"overwrite": true` replaces) a database
 /// from a backup in the backup directory.
 fn restore(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
+    let action = format!("RESTORE DATABASE {name}");
+    let audit = |failure: Option<&Error>| {
+        ctx.audit("http", me.peer, me.who, &action, failure.map(|e| e as &dyn std::fmt::Display));
+    };
     if let Err(e) = check(me.access, Access::Admin, "restoring") {
+        audit(Some(&e));
         return query_error(&e);
     }
     let fields = match body_fields(req, &["backup", "overwrite"]) {
@@ -764,7 +851,9 @@ fn restore(&(ctx, me): &Req, name: &str, req: &Request) -> Response {
     if !path.is_dir() {
         return error(404, "NotFound", "no backup with that name");
     }
-    match ctx.mgr.restore_database(name, &path, overwrite) {
+    let result = ctx.mgr.restore_database(name, &path, overwrite);
+    audit(result.as_ref().err());
+    match result {
         Ok(info) => {
             let mut body = String::from(r#"{"database":{"name":"#);
             write_str(&mut body, &info.name);

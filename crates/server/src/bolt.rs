@@ -948,6 +948,8 @@ impl Conn<'_> {
         let control = self.control;
         // The home database it ran on, for the driver's cache (5.8+).
         let resolved = (home && self.at_least(5, 8)).then(|| db.clone());
+        let audit_peer = self.peer.clone();
+        let mut action = None;
         let mut streamer = Streamer {
             conn: self,
             started,
@@ -960,6 +962,7 @@ impl Conn<'_> {
         };
         let result = interruptible(control, &base, ctx.query_max_memory, timeout, |options| {
             let statement = graphbuff::cypher::parse_statement(&query)?;
+            action = api::audit_action(&statement, &params);
             if let Statement::User(cmd) = &statement {
                 return ctx.user_command(&who, access, cmd, &params)?.feed(&mut streamer);
             }
@@ -992,6 +995,9 @@ impl Conn<'_> {
         };
         if result.is_some() {
             ctx.finished("bolt", &db, &who, &query, started.elapsed(), failure);
+        }
+        if let (Some(a), Some(r)) = (&action, &result) {
+            ctx.audit("bolt", &audit_peer, &who, a, r.as_ref().err().map(|e| e as &dyn std::fmt::Display));
         }
         if !opened {
             // No row came: answer the RUN, as for a result computed by it.
@@ -1288,6 +1294,7 @@ impl Conn<'_> {
                         let source = text.clone();
                         let (who, access) = self.access()?;
                         let ctx = &self.shared.ctx;
+                        let mut action = None;
                         let statement = match tx {
                             Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
                                 let (needed, what) = api::authorize_query(&q);
@@ -1295,6 +1302,7 @@ impl Conn<'_> {
                                 Ok(TxStatement::Query(q))
                             }),
                             None => graphbuff::cypher::parse_statement(&text).and_then(|s| {
+                                action = api::audit_action(&s, &params);
                                 ctx.authorize(who, &s, name, &params)?;
                                 system_command(&s)?;
                                 Ok(match s {
@@ -1303,9 +1311,12 @@ impl Conn<'_> {
                                 })
                             }),
                         };
-                        Ok((statement.map_err(|e| Failure::from_error(&e))?, params, access, source))
+                        if let (Some(a), Err(e)) = (&action, &statement) {
+                            ctx.audit("bolt", &self.peer, who, a, Some(e as &dyn std::fmt::Display));
+                        }
+                        Ok((statement.map_err(|e| Failure::from_error(&e))?, params, access, source, action))
                     });
-                    let (query, params, access, source) = match prepared {
+                    let (query, params, access, source, action) = match prepared {
                         Ok(v) => v,
                         Err(f) => {
                             self.fail(f)?;
@@ -1335,6 +1346,10 @@ impl Conn<'_> {
                     if let Some(r) = &result {
                         let who = self.who.clone().unwrap_or(Principal::Open);
                         ctx.finished("bolt", name, &who, &source, started.elapsed(), r.as_ref().err());
+                        if let Some(a) = &action {
+                            let failure = r.as_ref().err().map(|e| e as &dyn std::fmt::Display);
+                            ctx.audit("bolt", &self.peer, &who, a, failure);
+                        }
                     }
                     match result {
                         None => self.ignored()?,

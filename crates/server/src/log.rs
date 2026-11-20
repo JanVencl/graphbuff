@@ -1,6 +1,7 @@
 //! The server's log: `graphbuff.log` (start-up, settings, connections, failed logins,
-//! errors) and `query.log` (queries slower than [`LogConfig::slow_query`]), one line per
-//! event, each starting with a UTC timestamp. Files rotate by size: `graphbuff.log`
+//! errors), `query.log` (queries slower than [`LogConfig::slow_query`]) and `security.log`
+//! (who changed users, roles and databases, terminated transactions, backed up or restored,
+//! and failed logins), one line per event, each starting with a UTC timestamp. Files rotate by size: `graphbuff.log`
 //! becomes `graphbuff.log.1`, and so on, keeping [`LogConfig::keep`] old files.
 //!
 //! Without a directory both go to standard error, which suits containers.
@@ -9,9 +10,10 @@
 //! 2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.3.0 listening on http://127.0.0.1:7475
 //! 2026-11-15T18:00:05.004Z WARN  failed login (bolt) from 10.0.0.7:51234
 //! 2026-11-15T18:00:09.871Z SLOW  1532 ms bolt neo4j alice MATCH (a)-[*..6]->(b) RETURN count(b)
+//! 2026-11-15T18:01:00.000Z AUDIT bolt 10.0.0.7:51234 admin GRANT ROLE editor TO alice: ok
 //! ```
 //!
-//! Query parameters are never logged.
+//! Query parameters and passwords are never logged.
 
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
@@ -86,6 +88,7 @@ pub struct Log {
     dir: Option<PathBuf>,
     events: Mutex<Sink>,
     queries: Mutex<Sink>,
+    security: Mutex<Sink>,
 }
 
 impl std::fmt::Debug for Log {
@@ -117,6 +120,7 @@ impl Log {
             slow_query: config.slow_query,
             events: Mutex::new(sink("graphbuff.log")?),
             queries: Mutex::new(sink("query.log")?),
+            security: Mutex::new(sink("security.log")?),
             dir: config.dir,
         })
     }
@@ -156,6 +160,13 @@ impl Log {
 
     pub fn debug(&self, message: impl Display) {
         self.log(Level::Debug, message);
+    }
+
+    /// Records an administrative action (or a failed login) in `security.log`, whatever
+    /// the level.
+    pub(crate) fn security(&self, message: impl Display) {
+        let line = format!("{} AUDIT {}\n", timestamp(SystemTime::now()), one_line(&message.to_string()));
+        self.security.lock().unwrap_or_else(|e| e.into_inner()).write(&line);
     }
 
     /// Records a query that took `elapsed`, if that is slow enough.
@@ -336,6 +347,7 @@ mod tests {
         log.debug("not written");
         log.query(Duration::from_millis(5), "http", "neo4j", "-", "fast");
         log.query(Duration::from_millis(50), "bolt", "neo4j", "alice", "MATCH (n)\nRETURN n");
+        log.security("http 127.0.0.1:1 admin DROP USER bob: ok");
         drop(log);
         let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap_or_default();
         assert!(dir.join("graphbuff.log.1").exists() && dir.join("graphbuff.log.2").exists());
@@ -345,6 +357,7 @@ mod tests {
         let q = read("query.log");
         assert!(q.contains("SLOW  50 ms bolt neo4j alice MATCH (n) RETURN n"), "{q}");
         assert!(!q.contains("fast"));
+        assert!(read("security.log").contains(" AUDIT http 127.0.0.1:1 admin DROP USER bob: ok"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
