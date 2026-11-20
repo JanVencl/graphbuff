@@ -6,14 +6,24 @@
 //!
 //! ```text
 //! CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {storage: 'hybrid', …}]
-//! DROP DATABASE name [IF EXISTS]
+//! DROP DATABASE name [IF EXISTS] [DUMP DATA | DESTROY DATA]
+//! ALTER DATABASE name [IF EXISTS] SET ACCESS READ ONLY | READ WRITE
 //! SHOW DATABASES | SHOW DATABASE name | SHOW DEFAULT DATABASE
+//! CREATE [OR REPLACE] ALIAS name [IF NOT EXISTS] FOR DATABASE target
+//! ALTER ALIAS name [IF EXISTS] SET DATABASE TARGET target
+//! DROP ALIAS name [IF EXISTS] FOR DATABASE
+//! SHOW ALIASES [name] FOR DATABASES
 //! USE name                      -- switch the session's current database
 //! USE name MATCH … RETURN …     -- run one query against another database
 //! ```
 //!
-//! A manager opened on a directory keeps a `catalog` file there (the list of databases
-//! and their storage settings) and stores each hybrid database under
+//! An alias is another name for a database: everywhere a database name goes (`USE`,
+//! the driver's database), the alias reaches its target. `DUMP DATA` writes a backup of
+//! the database to `dumps/<name>-<unix seconds>/` in the data directory before it is
+//! dropped.
+//!
+//! A manager opened on a directory keeps a `catalog` file there (the list of databases,
+//! their storage settings and access, and the aliases) and stores each hybrid database under
 //! `databases/<name>/`. Databases with `memory` storage stay in the catalog across
 //! restarts but come back empty.
 //!
@@ -54,6 +64,7 @@ const CATALOG_FILE: &str = "catalog";
 const CATALOG_TMP: &str = "catalog.tmp";
 const CATALOG_HEADER: &str = "graphbuff-catalog 1";
 const DATABASES_DIR: &str = "databases";
+const DUMPS_DIR: &str = "dumps";
 const LOCK_FILE: &str = "LOCK";
 
 /// How one database stores its graph. Unlike [`StorageMode`] it carries no path: the
@@ -118,6 +129,10 @@ pub struct DatabaseInfo {
     pub default: bool,
     pub nodes: usize,
     pub relationships: usize,
+    /// Set by `ALTER DATABASE … SET ACCESS READ ONLY`.
+    pub read_only: bool,
+    /// The aliases that name it, sorted.
+    pub aliases: Vec<String>,
 }
 
 type Db = Arc<Database<BoxedStore>>;
@@ -130,6 +145,34 @@ struct Entry {
 struct Catalog {
     default: String,
     dbs: BTreeMap<String, Entry>,
+    /// Alias → database.
+    aliases: BTreeMap<String, String>,
+}
+
+impl Catalog {
+    /// The database `name` (already normalized) names: itself, or an alias's target.
+    fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
+        self.aliases.get(name).map_or(name, String::as_str)
+    }
+
+    /// Fails if `name` is taken by a database or an alias.
+    fn check_free(&self, name: &str) -> Result<()> {
+        if self.dbs.contains_key(name) {
+            return Err(Error::Constraint(format!("a database named `{name}` already exists")));
+        }
+        if let Some(target) = self.aliases.get(name) {
+            return Err(Error::Constraint(format!("`{name}` is already an alias for database `{target}`")));
+        }
+        Ok(())
+    }
+}
+
+/// What a catalog file lists.
+struct CatalogFile {
+    default: String,
+    dbs: Vec<(String, StorageKind)>,
+    read_only: Vec<String>,
+    aliases: BTreeMap<String, String>,
 }
 
 /// A set of named databases, each with its own storage. See the [module docs](self).
@@ -287,7 +330,7 @@ fn open_db(root: Option<&Path>, name: &str, storage: &StorageKind, fresh: bool) 
     Ok(Arc::new(Database::open(mode)?))
 }
 
-fn parse_catalog(text: &str, path: &Path) -> Result<(String, Vec<(String, StorageKind)>)> {
+fn parse_catalog(text: &str, path: &Path) -> Result<CatalogFile> {
     let bad =
         |line: usize, msg: &str| Error::Storage(format!("{} line {line}: {msg}", path.display()));
     let mut lines = text.lines().enumerate().map(|(i, l)| (i + 1, l.trim()));
@@ -297,6 +340,9 @@ fn parse_catalog(text: &str, path: &Path) -> Result<(String, Vec<(String, Storag
     }
     let mut default = None;
     let mut dbs = Vec::new();
+    let mut read_only = Vec::new();
+    let mut aliases = BTreeMap::new();
+    let name_at = |n: usize, name: &str| normalize_name(name).map_err(|_| bad(n, "invalid name"));
     for (n, line) in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
@@ -353,6 +399,22 @@ fn parse_catalog(text: &str, path: &Path) -> Result<(String, Vec<(String, Storag
                 }
                 dbs.push((name, storage));
             }
+            ["access", name, "read-only"] => {
+                let name = name_at(n, name)?;
+                if !dbs.iter().any(|(d, _)| *d == name) {
+                    return Err(bad(n, "access of a database not listed before it"));
+                }
+                read_only.push(name);
+            }
+            ["alias", alias, target] => {
+                let (alias, target) = (name_at(n, alias)?, name_at(n, target)?);
+                if !dbs.iter().any(|(d, _)| *d == target) {
+                    return Err(bad(n, "alias for a database not listed before it"));
+                }
+                if dbs.iter().any(|(d, _)| *d == alias) || aliases.insert(alias, target).is_some() {
+                    return Err(bad(n, "duplicate name"));
+                }
+            }
             _ => return Err(bad(n, "unrecognized line")),
         }
     }
@@ -360,7 +422,7 @@ fn parse_catalog(text: &str, path: &Path) -> Result<(String, Vec<(String, Storag
     if !dbs.iter().any(|(d, _)| *d == default) {
         return Err(bad(0, "the default database is not in the catalog"));
     }
-    Ok((default, dbs))
+    Ok(CatalogFile { default, dbs, read_only, aliases })
 }
 
 impl DatabaseManager {
@@ -381,6 +443,7 @@ impl DatabaseManager {
             catalog: RwLock::new(Catalog {
                 default: DEFAULT_DATABASE.to_string(),
                 dbs,
+                aliases: BTreeMap::new(),
             }),
             import_dir: RwLock::new(None),
             csv_urls: RwLock::new(None),
@@ -425,8 +488,8 @@ impl DatabaseManager {
         let catalog_path = root.join(CATALOG_FILE);
         let catalog = match fs::read_to_string(&catalog_path) {
             Ok(text) => {
-                let (default, list) = parse_catalog(&text, &catalog_path)?;
-                if list.iter().any(|(name, _)| name == SYSTEM_DATABASE) {
+                let file = parse_catalog(&text, &catalog_path)?;
+                if file.dbs.iter().any(|(name, _)| name == SYSTEM_DATABASE) || file.aliases.contains_key(SYSTEM_DATABASE) {
                     return Err(Error::Storage(format!(
                         "{} lists a database named `{SYSTEM_DATABASE}`, a name now reserved for the system \
                          database; with the earlier graphbuff version, back it up, restore it under another \
@@ -435,12 +498,13 @@ impl DatabaseManager {
                     )));
                 }
                 let mut dbs = BTreeMap::new();
-                for (name, storage) in list {
+                for (name, storage) in file.dbs {
                     let db = open_db(Some(&root), &name, &storage, false)
                         .map_err(|e| Error::Storage(format!("opening database `{name}`: {e}")))?;
+                    db.set_read_only(file.read_only.contains(&name));
                     dbs.insert(name, Entry { storage, db });
                 }
-                Catalog { default, dbs }
+                Catalog { default: file.default, dbs, aliases: file.aliases }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let db = open_db(Some(&root), DEFAULT_DATABASE, &default_storage, false)?;
@@ -455,6 +519,7 @@ impl DatabaseManager {
                 Catalog {
                     default: DEFAULT_DATABASE.to_string(),
                     dbs,
+                    aliases: BTreeMap::new(),
                 }
             }
             Err(e) => return Err(io(&catalog_path, "reading")(e)),
@@ -568,18 +633,29 @@ impl DatabaseManager {
         self.system.clone()
     }
 
-    /// The database called `name` (case-insensitive). The system database is not
-    /// returned (see [`system_database`](Self::system_database)).
+    /// The database called `name` (case-insensitive), or named by alias `name`. The
+    /// system database is not returned (see [`system_database`](Self::system_database)).
     pub fn database(&self, name: &str) -> Result<Arc<Database<BoxedStore>>> {
         let key = name.to_ascii_lowercase();
         if key == SYSTEM_DATABASE {
             return Err(system_not_queryable());
         }
-        self.read()
-            .dbs
-            .get(&key)
+        let cat = self.read();
+        cat.dbs
+            .get(cat.resolve(&key))
             .map(|e| Arc::clone(&e.db))
             .ok_or_else(|| not_found(name))
+    }
+
+    /// The name of the database `name` names: itself (lowercased), or an alias's target.
+    pub fn resolve_name(&self, name: &str) -> String {
+        let key = name.to_ascii_lowercase();
+        self.read().resolve(&key).to_string()
+    }
+
+    /// Every alias and the database it names, by alias.
+    pub fn aliases(&self) -> Vec<(String, String)> {
+        self.read().aliases.iter().map(|(a, t)| (a.clone(), t.clone())).collect()
     }
 
     /// The bytes of the files database `name` keeps on disk; `None` for an in-memory
@@ -608,13 +684,7 @@ impl DatabaseManager {
         let cat = self.read();
         cat.dbs
             .iter()
-            .map(|(name, e)| DatabaseInfo {
-                name: name.clone(),
-                storage: e.storage.clone(),
-                default: *name == cat.default,
-                nodes: e.db.node_count(),
-                relationships: e.db.relationship_count(),
-            })
+            .map(|(name, e)| info(&cat, name, e))
             .collect()
     }
 
@@ -787,14 +857,7 @@ impl DatabaseManager {
         }
         self.install(root, &name, &tmp, storage, overwrite)?;
         let cat = self.read();
-        let entry = &cat.dbs[&name];
-        Ok(DatabaseInfo {
-            name: name.clone(),
-            storage: entry.storage.clone(),
-            default: cat.default == name,
-            nodes: entry.db.node_count(),
-            relationships: entry.db.relationship_count(),
-        })
+        Ok(info(&cat, &name, &cat.dbs[&name]))
     }
 
     /// Fails if database `name` exists and is not empty, unless `overwrite`.
@@ -829,7 +892,9 @@ impl DatabaseManager {
         };
         self.check_replaceable(&cat, name, overwrite).map_err(fail)?;
         let dir = root.join(DATABASES_DIR).join(name);
+        let mut read_only = false;
         if let Some(entry) = cat.dbs.remove(name) {
+            read_only = entry.db.is_read_only();
             match Arc::try_unwrap(entry.db) {
                 Ok(db) => drop(db), // closes its files and releases its lock
                 Err(db) => {
@@ -845,6 +910,7 @@ impl DatabaseManager {
         }
         fs::rename(tmp, &dir).map_err(io(&dir, "moving the new database to"))?;
         let db = open_db(Some(root), name, &storage, false)?;
+        db.set_read_only(read_only);
         db.set_import_dir(self.import_dir());
         db.set_csv_urls(self.csv_urls());
         db.set_procedures(self.procedures());
@@ -868,6 +934,9 @@ impl DatabaseManager {
         check_not_system(&name, "create")?;
         let storage = storage.unwrap_or_else(|| self.default_storage.clone());
         let mut cat = self.write();
+        if let Some(target) = cat.aliases.get(&name) {
+            return Err(Error::Constraint(format!("`{name}` is an alias for database `{target}`")));
+        }
         if cat.dbs.contains_key(&name) {
             match existing {
                 ExistingDatabase::Fail => {
@@ -894,8 +963,15 @@ impl DatabaseManager {
     }
 
     /// Drops a database and deletes its data. Returns `false` if it did not exist and
-    /// `if_exists` was set.
+    /// `if_exists` was set. Fails while aliases name it.
     pub fn drop_database(&self, name: &str, if_exists: bool) -> Result<bool> {
+        self.drop_database_with(name, if_exists, false)
+    }
+
+    /// [`drop_database`](Self::drop_database), first writing a backup of it to
+    /// `dumps/<name>-<unix seconds>/` in the data directory when `dump` is set
+    /// (`DROP DATABASE … DUMP DATA`).
+    pub fn drop_database_with(&self, name: &str, if_exists: bool, dump: bool) -> Result<bool> {
         let name = normalize_name(name)?;
         check_not_system(&name, "drop")?;
         let mut cat = self.write();
@@ -911,8 +987,112 @@ impl DatabaseManager {
                 "cannot drop the default database `{name}`"
             )));
         }
+        let aliases: Vec<&str> = cat.aliases.iter().filter(|(_, t)| **t == name).map(|(a, _)| a.as_str()).collect();
+        if !aliases.is_empty() {
+            return Err(Error::Constraint(format!(
+                "database `{name}` has aliases ({}); drop them first",
+                aliases.join(", ")
+            )));
+        }
+        if dump {
+            let Some(root) = &self.root else {
+                return Err(Error::Unsupported("DUMP DATA needs a data directory".into()));
+            };
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let dest = root.join(DUMPS_DIR).join(format!("{name}-{secs}"));
+            cat.dbs[&name].db.backup(&dest)?;
+        }
         self.remove(&mut cat, &name)?;
         Ok(true)
+    }
+
+    /// Sets database `name`'s access (`ALTER DATABASE … SET ACCESS`). Returns `false` if
+    /// it does not exist and `if_exists` was set.
+    pub fn alter_database(&self, name: &str, if_exists: bool, read_only: bool) -> Result<bool> {
+        let name = normalize_name(name)?;
+        check_not_system(&name, "alter")?;
+        let cat = self.write();
+        let Some(entry) = cat.dbs.get(&name) else {
+            return if if_exists { Ok(false) } else { Err(not_found(&name)) };
+        };
+        let was = entry.db.is_read_only();
+        entry.db.set_read_only(read_only);
+        if let Err(e) = self.save(&cat) {
+            entry.db.set_read_only(was);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Makes `alias` another name for database `target`. Returns `false` only for
+    /// [`ExistingDatabase::Keep`] when the alias exists; [`ExistingDatabase::Replace`]
+    /// points an existing alias at `target`.
+    pub fn create_alias(&self, alias: &str, target: &str, existing: ExistingDatabase) -> Result<bool> {
+        let (alias, target) = (normalize_name(alias)?, normalize_name(target)?);
+        check_not_system(&alias, "create an alias named")?;
+        let mut cat = self.write();
+        if cat.aliases.contains_key(&alias) {
+            match existing {
+                ExistingDatabase::Fail => return Err(Error::Constraint(format!("alias `{alias}` already exists"))),
+                ExistingDatabase::Keep => return Ok(false),
+                ExistingDatabase::Replace => {}
+            }
+        } else {
+            cat.check_free(&alias)?;
+        }
+        self.set_alias(&mut cat, alias, Some(target))?;
+        Ok(true)
+    }
+
+    /// Points `alias` at database `target`. Returns `false` if the alias does not exist
+    /// and `if_exists` was set.
+    pub fn alter_alias(&self, alias: &str, if_exists: bool, target: &str) -> Result<bool> {
+        let (alias, target) = (normalize_name(alias)?, normalize_name(target)?);
+        let mut cat = self.write();
+        if !cat.aliases.contains_key(&alias) {
+            return if if_exists { Ok(false) } else { Err(alias_not_found(&alias)) };
+        }
+        self.set_alias(&mut cat, alias, Some(target))?;
+        Ok(true)
+    }
+
+    /// Removes `alias`. Returns `false` if it does not exist and `if_exists` was set.
+    pub fn drop_alias(&self, alias: &str, if_exists: bool) -> Result<bool> {
+        let alias = normalize_name(alias)?;
+        let mut cat = self.write();
+        if !cat.aliases.contains_key(&alias) {
+            return if if_exists { Ok(false) } else { Err(alias_not_found(&alias)) };
+        }
+        self.set_alias(&mut cat, alias, None)?;
+        Ok(true)
+    }
+
+    /// Sets (or with `None` removes) `alias` and saves the catalog, undoing the change if
+    /// that fails. The target must be a database, not an alias.
+    fn set_alias(&self, cat: &mut Catalog, alias: String, target: Option<String>) -> Result<()> {
+        if let Some(t) = &target
+            && !cat.dbs.contains_key(t)
+        {
+            return Err(if cat.aliases.contains_key(t) {
+                Error::Constraint(format!("`{t}` is an alias; an alias must name a database"))
+            } else {
+                not_found(t)
+            });
+        }
+        let old = match target {
+            Some(t) => cat.aliases.insert(alias.clone(), t),
+            None => cat.aliases.remove(&alias),
+        };
+        if let Err(e) = self.save(cat) {
+            match old {
+                Some(t) => cat.aliases.insert(alias, t),
+                None => cat.aliases.remove(&alias),
+            };
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Closes a database, removes it from the catalog and deletes its files.
@@ -1000,6 +1180,12 @@ impl DatabaseManager {
                 }
             }
             text.push('\n');
+            if e.db.is_read_only() {
+                text.push_str(&format!("access {name} read-only\n"));
+            }
+        }
+        for (alias, target) in &cat.aliases {
+            text.push_str(&format!("alias {alias} {target}\n"));
         }
         let tmp = root.join(CATALOG_TMP);
         let mut f = File::create(&tmp).map_err(io(&tmp, "creating"))?;
@@ -1170,11 +1356,12 @@ impl<'m> Session<'m> {
         &self.current
     }
 
-    /// Makes `name` the current database. Fails if it does not exist.
+    /// Makes `name` (or the database alias `name` names) the current database. Fails if
+    /// it does not exist.
     pub fn use_database(&mut self, name: &str) -> Result<()> {
         let name = normalize_name(name)?;
         self.mgr.database(&name)?;
-        self.current = name;
+        self.current = self.mgr.resolve_name(&name);
         Ok(())
     }
 
@@ -1278,9 +1465,9 @@ impl<'m> Session<'m> {
                     ..Default::default()
                 }))
             }
-            DatabaseCommand::Drop { name, if_exists } => {
+            DatabaseCommand::Drop { name, if_exists, dump } => {
                 let name = normalize_name(&resolve(&name, params)?)?;
-                let dropped = self.mgr.drop_database(&name, if_exists)?;
+                let dropped = self.mgr.drop_database_with(&name, if_exists, dump)?;
                 if dropped && self.current == name {
                     self.current = self.mgr.default_database();
                 }
@@ -1289,9 +1476,41 @@ impl<'m> Session<'m> {
                     ..Default::default()
                 }))
             }
+            DatabaseCommand::Alter { name, if_exists, read_only } => {
+                let done = self.mgr.alter_database(&resolve(&name, params)?, if_exists, read_only)?;
+                Ok(empty(QueryStats { system_updates: done as usize, ..Default::default() }))
+            }
+            DatabaseCommand::CreateAlias { alias, target, existing } => {
+                let done = self.mgr.create_alias(&resolve(&alias, params)?, &resolve(&target, params)?, existing)?;
+                Ok(empty(QueryStats { system_updates: done as usize, ..Default::default() }))
+            }
+            DatabaseCommand::AlterAlias { alias, if_exists, target } => {
+                let done = self.mgr.alter_alias(&resolve(&alias, params)?, if_exists, &resolve(&target, params)?)?;
+                Ok(empty(QueryStats { system_updates: done as usize, ..Default::default() }))
+            }
+            DatabaseCommand::DropAlias { alias, if_exists } => {
+                let done = self.mgr.drop_alias(&resolve(&alias, params)?, if_exists)?;
+                Ok(empty(QueryStats { system_updates: done as usize, ..Default::default() }))
+            }
+            DatabaseCommand::ShowAliases(name) => {
+                let wanted = name.map(|n| resolve(&n, params)).transpose()?.map(|n| n.to_ascii_lowercase());
+                let rows = self
+                    .mgr
+                    .aliases()
+                    .into_iter()
+                    .filter(|(a, _)| wanted.as_ref().is_none_or(|w| w == a))
+                    .map(|(a, t)| vec![ResultValue::String(a), ResultValue::String(t)])
+                    .collect();
+                Ok(QueryResult {
+                    columns: vec!["name".into(), "database".into()],
+                    rows,
+                    stats: QueryStats::default(),
+                    plan: None,
+                })
+            }
             DatabaseCommand::Show(target) => {
                 let wanted = match &target {
-                    ShowDatabases::Named(n) => Some(resolve(n, params)?.to_ascii_lowercase()),
+                    ShowDatabases::Named(n) => Some(self.mgr.resolve_name(&resolve(n, params)?)),
                     _ => None,
                 };
                 let rows = self
@@ -1311,6 +1530,8 @@ impl<'m> Session<'m> {
                             ResultValue::Bool(d.name == self.current),
                             ResultValue::Int(d.nodes as i64),
                             ResultValue::Int(d.relationships as i64),
+                            ResultValue::String(if d.read_only { "read-only" } else { "read-write" }.into()),
+                            ResultValue::List(d.aliases.iter().cloned().map(ResultValue::String).collect()),
                         ]
                     })
                     .collect();
@@ -1322,6 +1543,8 @@ impl<'m> Session<'m> {
                         "current",
                         "nodes",
                         "relationships",
+                        "access",
+                        "aliases",
                     ]
                     .map(String::from)
                     .to_vec(),
@@ -1332,6 +1555,23 @@ impl<'m> Session<'m> {
             }
         }
     }
+}
+
+/// The [`DatabaseInfo`] of database `name`.
+fn info(cat: &Catalog, name: &str, e: &Entry) -> DatabaseInfo {
+    DatabaseInfo {
+        name: name.to_string(),
+        storage: e.storage.clone(),
+        default: name == cat.default,
+        nodes: e.db.node_count(),
+        relationships: e.db.relationship_count(),
+        read_only: e.db.is_read_only(),
+        aliases: cat.aliases.iter().filter(|(_, t)| *t == name).map(|(a, _)| a.clone()).collect(),
+    }
+}
+
+fn alias_not_found(alias: &str) -> Error {
+    Error::Semantic(format!("alias `{alias}` does not exist"))
 }
 
 fn resolve(name: &DbName, params: &BTreeMap<String, Value>) -> Result<String> {

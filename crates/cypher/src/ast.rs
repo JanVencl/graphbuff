@@ -835,10 +835,20 @@ pub enum DatabaseCommand {
         /// A map literal or a parameter.
         options: Option<Expr>,
     },
-    /// `DROP DATABASE name [IF EXISTS] [DESTROY DATA] [WAIT | NOWAIT]`
-    Drop { name: DbName, if_exists: bool },
+    /// `DROP DATABASE name [IF EXISTS] [DUMP DATA | DESTROY DATA] [WAIT | NOWAIT]`
+    Drop { name: DbName, if_exists: bool, dump: bool },
+    /// `ALTER DATABASE name [IF EXISTS] SET ACCESS READ ONLY | READ WRITE [WAIT | NOWAIT]`
+    Alter { name: DbName, if_exists: bool, read_only: bool },
     /// `SHOW DATABASES`, `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`
     Show(ShowDatabases),
+    /// `CREATE [OR REPLACE] ALIAS name [IF NOT EXISTS] FOR DATABASE target`
+    CreateAlias { alias: DbName, target: DbName, existing: ExistingDatabase },
+    /// `ALTER ALIAS name [IF EXISTS] SET DATABASE TARGET target`
+    AlterAlias { alias: DbName, if_exists: bool, target: DbName },
+    /// `DROP ALIAS name [IF EXISTS] FOR DATABASE`
+    DropAlias { alias: DbName, if_exists: bool },
+    /// `SHOW ALIASES [name] FOR DATABASES`
+    ShowAliases(Option<DbName>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -849,6 +859,11 @@ pub enum ShowDatabases {
 }
 
 impl DatabaseCommand {
+    /// Whether the command only reads the catalog (`SHOW DATABASES`, `SHOW ALIASES`).
+    pub fn is_show(&self) -> bool {
+        matches!(self, DatabaseCommand::Show(_) | DatabaseCommand::ShowAliases(_))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             DatabaseCommand::Create {
@@ -857,7 +872,16 @@ impl DatabaseCommand {
             } => "CREATE OR REPLACE DATABASE",
             DatabaseCommand::Create { .. } => "CREATE DATABASE",
             DatabaseCommand::Drop { .. } => "DROP DATABASE",
+            DatabaseCommand::Alter { .. } => "ALTER DATABASE",
             DatabaseCommand::Show(_) => "SHOW DATABASES",
+            DatabaseCommand::CreateAlias {
+                existing: ExistingDatabase::Replace,
+                ..
+            } => "CREATE OR REPLACE ALIAS",
+            DatabaseCommand::CreateAlias { .. } => "CREATE ALIAS",
+            DatabaseCommand::AlterAlias { .. } => "ALTER ALIAS",
+            DatabaseCommand::DropAlias { .. } => "DROP ALIAS",
+            DatabaseCommand::ShowAliases(_) => "SHOW ALIASES",
         }
     }
 }

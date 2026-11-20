@@ -84,8 +84,10 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   and `(n.a, n.b) IS UNIQUE | NODE KEY`; the older `ON … ASSERT …` form works too),
   `DROP CONSTRAINT name [IF EXISTS]`, `SHOW CONSTRAINTS`
 * **Databases** (through a `Session`): `CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {…}]`,
-  `DROP DATABASE name [IF EXISTS]`, `SHOW DATABASES`, `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`,
-  `USE name`, `USE name <query>`
+  `DROP DATABASE name [IF EXISTS] [DUMP DATA]`, `ALTER DATABASE name SET ACCESS READ ONLY | READ WRITE`,
+  `SHOW DATABASES`, `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`, `USE name`, `USE name <query>`,
+  `CREATE [OR REPLACE] ALIAS a FOR DATABASE db`, `ALTER ALIAS a SET DATABASE TARGET db`,
+  `DROP ALIAS a FOR DATABASE`, `SHOW ALIASES FOR DATABASES` ([Databases](Databases.md))
 * **Patterns:** labels, label expressions on nodes (`(n:A|B)`, `(n:A&B)`, `(n:A&!B)`, `(n:%)` for
   any label, `(n:!%)` for none, parentheses) and relationships (`[:A|B]`, `[:!A]`, `[:%]`; `[:A&B]`
   matches nothing), also in `WHERE n:A|B` and `WHERE r:T` (a relationship's type is its label;
@@ -232,8 +234,8 @@ recognise. Where there is another way to write it, it is given.
 
 | Missing | Error |
 |---------|-------|
-| `SHOW PRIVILEGES`, `SHOW ALIASES`, `SHOW FUNCTIONS EXECUTABLE` | `Unsupported` |
-| `ALTER DATABASE`, database aliases (`CREATE ALIAS`), `DROP DATABASE … DUMP DATA`, `TOPOLOGY` | syntax error or `Unsupported` |
+| `SHOW PRIVILEGES`, `SHOW FUNCTIONS EXECUTABLE`, `SHOW ALIASES … YIELD` | `Unsupported` |
+| `ALTER DATABASE` other than `SET ACCESS`, remote aliases (`AT 'url'`), composite databases, `TOPOLOGY` | `Unsupported` |
 | `CREATE ROLE`, `DENY`, privileges (`GRANT TRAVERSE …`): roles are the fixed `reader`, `editor` and `admin` | syntax error |
 | Account options: `SET HOME DATABASE`, `SET STATUS SUSPENDED`, `SET ENCRYPTED PASSWORD`, `SET AUTH`, `CHANGE REQUIRED`, `SHOW ROLES WITH USERS` | `Unsupported` |
 | User and role commands, `SHOW` / `TERMINATE TRANSACTIONS`, `SHOW SETTINGS` in the embedded engine | `Unsupported`: they need `graphbuff-server` |

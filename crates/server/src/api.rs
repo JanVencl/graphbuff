@@ -234,7 +234,7 @@ impl Ctx {
                 (needed, what, db)
             }
             Statement::Use(n) => (Access::Read, "reading", users::resolve(n, params, "database name")?),
-            Statement::Database(DatabaseCommand::Show(_)) => {
+            Statement::Database(cmd) if cmd.is_show() => {
                 return check(self.best_access(who), Access::Read, "reading");
             }
             Statement::Database(cmd) => {
@@ -242,7 +242,8 @@ impl Ctx {
             }
             Statement::User(_) | Statement::Transaction(_) | Statement::Settings(_) => return Ok(()),
         };
-        check(self.access_on(who, &db), needed, what)
+        // Roles are granted on databases, not on the aliases that name them.
+        check(self.access_on(who, &self.mgr.resolve_name(&db)), needed, what)
     }
 
     /// Runs a user command for `who`.
@@ -289,10 +290,20 @@ pub(crate) fn audit_action(stmt: &Statement, params: &BTreeMap<String, Value>) -
     let names = |ns: &[DbName]| ns.iter().map(name).collect::<Vec<_>>().join(", ");
     let on = |db: &Option<DbName>| db.as_ref().map_or_else(String::new, |d| format!(" ON DATABASE {}", name(d)));
     Some(match stmt {
-        Statement::Database(DatabaseCommand::Show(_)) => return None,
-        Statement::Database(cmd @ (DatabaseCommand::Create { name: n, .. } | DatabaseCommand::Drop { name: n, .. })) => {
-            format!("{} {}", cmd.name(), name(n))
-        }
+        Statement::Database(cmd) if cmd.is_show() => return None,
+        Statement::Database(cmd) => match cmd {
+            DatabaseCommand::Alter { name: n, read_only, .. } => {
+                format!("ALTER DATABASE {} SET ACCESS READ {}", name(n), if *read_only { "ONLY" } else { "WRITE" })
+            }
+            DatabaseCommand::Create { name: n, .. } | DatabaseCommand::Drop { name: n, .. } => {
+                format!("{} {}", cmd.name(), name(n))
+            }
+            DatabaseCommand::CreateAlias { alias, target, .. } | DatabaseCommand::AlterAlias { alias, target, .. } => {
+                format!("{} {} FOR DATABASE {}", cmd.name(), name(alias), name(target))
+            }
+            DatabaseCommand::DropAlias { alias, .. } => format!("DROP ALIAS {}", name(alias)),
+            _ => cmd.name().to_string(),
+        },
         Statement::User(cmd) if cmd.is_updating() => match cmd {
             UserCommand::Create { name: n, .. } | UserCommand::Alter { name: n, .. } | UserCommand::Drop { name: n, .. } => {
                 format!("{} {}", cmd.name(), name(n))

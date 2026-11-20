@@ -1,4 +1,5 @@
-//! Multiple databases: CREATE [OR REPLACE] / DROP / SHOW DATABASES, USE, and the catalog.
+//! Multiple databases: CREATE [OR REPLACE] / DROP / ALTER / SHOW DATABASES, aliases, USE,
+//! and the catalog.
 
 use std::fs;
 use std::path::PathBuf;
@@ -82,11 +83,11 @@ fn create_use_and_isolation() {
     assert_eq!(names(&mut s), vec!["graphbuff", "movies"]);
     assert_eq!(
         run(&mut s, "SHOW DATABASE movies"),
-        vec![r#""movies", "memory", false, true, 2, 0"#]
+        vec![r#""movies", "memory", false, true, 2, 0, "read-write", []"#]
     );
     assert_eq!(
         run(&mut s, "SHOW DEFAULT DATABASE"),
-        vec![r#""graphbuff", "memory", true, false, 1, 0"#]
+        vec![r#""graphbuff", "memory", true, false, 1, 0, "read-write", []"#]
     );
     assert!(run(&mut s, "SHOW DATABASE nope").is_empty());
 }
@@ -385,4 +386,130 @@ fn checkpoint_all_covers_durable_databases() {
     assert_eq!(count(&mut s), "1");
     s.use_database("p").unwrap();
     assert_eq!(count(&mut s), "1");
+}
+
+fn fails(s: &mut Session, q: &str, needle: &str) {
+    match s.execute(q) {
+        Err(e) => assert!(e.to_string().contains(needle), "`{q}`: {e}"),
+        Ok(_) => panic!("`{q}` should fail"),
+    }
+}
+
+#[test]
+fn read_only_databases() {
+    let dir = TempDir::new("read-only");
+    {
+        let mgr = DatabaseManager::open(&dir.0).unwrap();
+        let mut s = mgr.session();
+        run(&mut s, "CREATE DATABASE ro");
+        run(&mut s, "USE ro CREATE (:N {v: 1})");
+        let r = s.execute("ALTER DATABASE ro SET ACCESS READ ONLY").unwrap();
+        assert_eq!(r.stats.system_updates, 1);
+        assert_eq!(
+            run(&mut s, "SHOW DATABASE ro"),
+            ["\"ro\", \"hybrid\", false, false, 1, 0, \"read-only\", []"]
+        );
+        run(&mut s, "USE ro");
+        for q in [
+            "CREATE (:N)",
+            "MATCH (n) SET n.v = 2",
+            "MATCH (n) DETACH DELETE n",
+            "CREATE INDEX FOR (n:N) ON (n.v)",
+            "CREATE CONSTRAINT FOR (n:N) REQUIRE n.v IS UNIQUE",
+            "UNWIND [1, 2] AS i CALL { CREATE (:N) } IN TRANSACTIONS OF 1 ROW",
+        ] {
+            match s.execute(q) {
+                Err(Error::Forbidden(m)) => assert!(m.contains("read-only"), "`{q}`: {m}"),
+                other => panic!("`{q}` should be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(run(&mut s, "MATCH (n) RETURN n.v"), ["1"], "reads go on");
+        let db = mgr.database("ro").unwrap();
+        assert!(db.begin().unwrap().execute("CREATE (:N)").is_err(), "explicit transactions too");
+        // Other databases are not affected.
+        run(&mut s, "USE graphbuff CREATE (:M)");
+        assert!(s.execute("ALTER DATABASE nope SET ACCESS READ ONLY").is_err());
+        assert_eq!(s.execute("ALTER DATABASE nope IF EXISTS SET ACCESS READ ONLY").unwrap().stats.system_updates, 0);
+    }
+    // The access survives a restart, and READ WRITE lifts it.
+    let mgr = DatabaseManager::open(&dir.0).unwrap();
+    let mut s = mgr.session();
+    fails(&mut s, "USE ro CREATE (:N)", "read-only");
+    run(&mut s, "ALTER DATABASE ro SET ACCESS READ WRITE");
+    run(&mut s, "USE ro CREATE (:N)");
+    assert_eq!(run(&mut s, "USE ro MATCH (n) RETURN count(n)"), ["2"]);
+    drop(s);
+    drop(mgr);
+    let text = fs::read_to_string(dir.0.join("catalog")).unwrap();
+    assert!(!text.contains("access"), "{text}");
+}
+
+#[test]
+fn aliases() {
+    let dir = TempDir::new("aliases");
+    {
+        let mgr = DatabaseManager::open(&dir.0).unwrap();
+        let mut s = mgr.session();
+        run(&mut s, "CREATE DATABASE movies");
+        run(&mut s, "CREATE DATABASE other");
+        run(&mut s, "USE movies CREATE (:Movie)");
+        run(&mut s, "CREATE ALIAS films FOR DATABASE movies");
+        assert_eq!(run(&mut s, "USE films MATCH (n) RETURN count(n)"), ["1"]);
+        assert_eq!(count(&mut mgr.session()), "0");
+        run(&mut s, "USE FILMS");
+        assert_eq!(s.current_database(), "movies", "USE an alias switches to its database");
+        assert_eq!(mgr.database("films").unwrap().node_count(), 1);
+        assert_eq!(run(&mut s, "SHOW ALIASES FOR DATABASES"), ["\"films\", \"movies\""]);
+        assert!(run(&mut s, "SHOW DATABASE films")[0].ends_with("[\"films\"]"));
+
+        // Names are shared between databases and aliases.
+        fails(&mut s, "CREATE DATABASE films", "alias");
+        fails(&mut s, "CREATE ALIAS other FOR DATABASE movies", "already exists");
+        fails(&mut s, "CREATE ALIAS films FOR DATABASE other", "already exists");
+        fails(&mut s, "CREATE ALIAS x FOR DATABASE films", "an alias must name a database");
+        fails(&mut s, "CREATE ALIAS x FOR DATABASE nope", "nope");
+        fails(&mut s, "CREATE ALIAS system FOR DATABASE movies", "reserved");
+        assert_eq!(s.execute("CREATE ALIAS films IF NOT EXISTS FOR DATABASE other").unwrap().stats.system_updates, 0);
+        // A database with aliases cannot be dropped.
+        fails(&mut s, "DROP DATABASE movies", "films");
+
+        run(&mut s, "ALTER ALIAS films SET DATABASE TARGET other");
+        assert_eq!(run(&mut s, "USE films MATCH (n) RETURN count(n)"), ["0"]);
+        run(&mut s, "CREATE OR REPLACE ALIAS films FOR DATABASE movies");
+        run(&mut s, "CREATE ALIAS cinema FOR DATABASE movies");
+        fails(&mut s, "ALTER ALIAS nope SET DATABASE TARGET movies", "does not exist");
+        assert_eq!(s.execute("DROP ALIAS nope IF EXISTS FOR DATABASE").unwrap().stats.system_updates, 0);
+    }
+    let mgr = DatabaseManager::open(&dir.0).unwrap();
+    let mut s = mgr.session();
+    assert_eq!(run(&mut s, "SHOW ALIASES FOR DATABASE"), ["\"cinema\", \"movies\"", "\"films\", \"movies\""]);
+    assert_eq!(run(&mut s, "SHOW ALIAS films FOR DATABASE"), ["\"films\", \"movies\""]);
+    assert_eq!(run(&mut s, "USE films MATCH (n) RETURN count(n)"), ["1"]);
+    run(&mut s, "DROP ALIAS films FOR DATABASE");
+    run(&mut s, "DROP ALIAS cinema FOR DATABASE");
+    fails(&mut s, "USE films", "films");
+    run(&mut s, "DROP DATABASE movies");
+}
+
+#[test]
+fn drop_database_dump_data() {
+    let dir = TempDir::new("dump");
+    let mgr = DatabaseManager::open(&dir.0).unwrap();
+    let mut s = mgr.session();
+    run(&mut s, "CREATE DATABASE old");
+    run(&mut s, "USE old CREATE (:N {v: 7})");
+    run(&mut s, "USE graphbuff");
+    run(&mut s, "DROP DATABASE old DUMP DATA");
+    assert!(!names(&mut s).contains(&"old".to_string()));
+    let dumps: Vec<_> = fs::read_dir(dir.0.join("dumps")).unwrap().flatten().map(|e| e.path()).collect();
+    assert_eq!(dumps.len(), 1);
+    assert!(dumps[0].file_name().unwrap().to_string_lossy().starts_with("old-"));
+    // The dump restores.
+    mgr.restore_database("back", &dumps[0], false).unwrap();
+    assert_eq!(run(&mut s, "USE back MATCH (n) RETURN n.v"), ["7"]);
+
+    let mem = DatabaseManager::in_memory();
+    let mut s = mem.session();
+    run(&mut s, "CREATE DATABASE x");
+    fails(&mut s, "DROP DATABASE x DUMP DATA", "data directory");
 }

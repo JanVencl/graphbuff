@@ -156,6 +156,8 @@ pub(crate) struct Executor<'s> {
     /// reading their properties or labels afterwards fails, `type(r)` still answers.
     pub deleted_nodes: std::collections::HashSet<NodeId>,
     pub deleted_rels: HashMap<RelId, String>,
+    /// The database is read-only: [`Executor::store_mut`] fails.
+    pub read_only: bool,
 }
 
 /// Cached subquery plans: (query address, visible variables) → plan.
@@ -191,6 +193,7 @@ impl<'s> Executor<'s> {
             accel: None,
             deleted_nodes: Default::default(),
             deleted_rels: HashMap::new(),
+            read_only: false,
         };
         if !ex.store().constraints().is_empty() {
             ex.touched = Some(BTreeSet::new());
@@ -258,6 +261,11 @@ impl<'s> Executor<'s> {
     }
 
     pub fn store_mut(&mut self) -> Result<&mut dyn GraphStore> {
+        if self.read_only {
+            return Err(Error::Forbidden(
+                "the database is read-only (ALTER DATABASE … SET ACCESS READ WRITE allows writes)".into(),
+            ));
+        }
         match &mut self.store {
             StoreRef::Write(s) => Ok(&mut **s),
             StoreRef::Read(_) => Err(Error::Runtime(

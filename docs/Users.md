@@ -49,7 +49,7 @@ statement (a role granted or revoked applies to open connections at once):
 |------|-----|
 | `reader` | read queries, `EXPLAIN`, `SHOW DATABASES`, explicit transactions that only read |
 | `editor` | also write data, and create and drop indexes and constraints |
-| `admin` | also create and drop databases, and manage users |
+| `admin` | also create, alter and drop databases and aliases, and manage users |
 
 A user with no role may only log in, run `SHOW CURRENT USER` and change their own
 password. Once there is an administrator, no change may leave none: dropping the last

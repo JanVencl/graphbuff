@@ -140,6 +140,8 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     text_cache: Arc<fulltext::TextCache>,
     /// The kernel backend read queries use, and when they use it.
     kernels: RwLock<(Arc<dyn Kernels>, KernelMode)>,
+    /// Set by [`Database::set_read_only`]: queries that write fail.
+    read_only: std::sync::atomic::AtomicBool,
 }
 
 /// Settings for [`Database::open`].
@@ -206,6 +208,7 @@ impl<S: GraphStore> Database<S> {
             vector_cache,
             text_cache,
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
+            read_only: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -238,7 +241,19 @@ impl<S: GraphStore> Database<S> {
         ex.import_dir = self.import_dir();
         ex.csv_urls = self.csv_urls();
         ex.procedures = self.procedures();
+        ex.read_only = self.is_read_only();
         ex
+    }
+
+    /// Makes queries that write (data, indexes or constraints) fail with
+    /// [`Error::Forbidden`] while `read_only` is set; reads go on as before.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`set_read_only`](Self::set_read_only) is in force.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Lets `LOAD CSV` read files in `dir` (and its subdirectories); `None` (the
