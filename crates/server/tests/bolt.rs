@@ -221,10 +221,11 @@ fn handshake_negotiates_a_version() {
     let server = start(ServerConfig::default());
     let addr = server.bolt_addr().unwrap();
     // A range: the newest version both know.
-    assert_eq!(Bolt::handshake(addr, [[0, 8, 8, 5], V44, NONE, NONE]).version, [0, 0, 4, 5]);
-    // Proposals are tried in order.
+    assert_eq!(Bolt::handshake(addr, [[0, 8, 8, 5], V44, NONE, NONE]).version, [0, 0, 8, 5]);
+    assert_eq!(Bolt::handshake(addr, [[0, 4, 9, 5], V44, NONE, NONE]).version, [0, 0, 8, 5]);
+    // Proposals are tried in order (the manifest is tested in `manifest_handshake`).
     assert_eq!(Bolt::handshake(addr, [[0, 0, 1, 5], V5, NONE, NONE]).version, [0, 0, 1, 5]);
-    assert_eq!(Bolt::handshake(addr, [[0, 0, 1, 0xFF], V44, NONE, NONE]).version, [0, 0, 4, 4]);
+    assert_eq!(Bolt::handshake(addr, [[0, 0, 2, 0xFF], V44, NONE, NONE]).version, [0, 0, 4, 4]);
     // Nothing in common: zeros, then the server hangs up.
     let mut b = Bolt::handshake(addr, [[0, 0, 0, 3], [0, 0, 3, 4], NONE, NONE]);
     assert_eq!(b.version, [0; 4]);
@@ -944,4 +945,123 @@ fn call_in_transactions() {
     b.send(RESET, vec![]);
     b.success();
     assert_eq!(b.count("B"), 25);
+}
+
+// ---- Bolt 5.6–5.8 and the manifest handshake --------------------------------------------------
+
+/// HELLO and LOGON (no authentication) on a connection whose handshake is done.
+fn log_in(b: &mut Bolt) -> BTreeMap<String, PackValue> {
+    b.send(HELLO, vec![map(&[("user_agent", s("test"))])]);
+    let hello = b.success();
+    b.send(LOGON, vec![map(&[("scheme", s("none"))])]);
+    b.success();
+    hello
+}
+
+fn statuses(meta: &BTreeMap<String, PackValue>) -> Vec<String> {
+    let PackValue::List(list) = get(meta, "statuses") else { panic!() };
+    list.iter()
+        .map(|st| {
+            let PackValue::Map(m) = st else { panic!() };
+            let PackValue::String(code) = get(m, "gql_status") else { panic!() };
+            assert!(matches!(get(m, "status_description"), PackValue::String(_)));
+            code.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn bolt_5_8() {
+    let server = start(ServerConfig::default());
+    let addr = server.bolt_addr().unwrap();
+    // 5.8 down to 5.0; a 5.5 proposal alone is refused.
+    let mut b = Bolt::handshake(addr, [[0, 8, 8, 5], V44, NONE, NONE]);
+    assert_eq!(b.version, [0, 0, 8, 5]);
+    let hello = log_in(&mut b);
+    assert!(matches!(get(&hello, "server"), PackValue::String(s) if s.starts_with("Neo4j/5.8")));
+    // Only a manifest handshake reports the version in HELLO.
+    assert!(!hello.contains_key("protocol_version"));
+    let refused = Bolt::handshake(addr, [[0, 0, 5, 5], NONE, NONE, NONE]);
+    assert_eq!(refused.version, [0, 0, 0, 0]);
+
+    // The home database comes back with RUN (no `db` given), and statuses with PULL.
+    b.run("UNWIND [1, 2] AS x RETURN x", empty(), map(&[("notifications_disabled_classifications", PackValue::List(vec![s("HINT")]))]));
+    let run = b.success();
+    assert_eq!(get(&run, "db"), &s("graphbuff"));
+    b.pull(-1);
+    let (rows, done) = b.records();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(statuses(&done), ["00000"]);
+    b.run("UNWIND [] AS x RETURN x", empty(), map(&[("db", s("graphbuff"))]));
+    assert!(!b.success().contains_key("db"), "not when the client named the database");
+    b.pull(-1);
+    assert_eq!(statuses(&b.records().1), ["02000"]);
+    b.run("CREATE ()", empty(), empty());
+    b.success();
+    b.send(DISCARD, vec![map(&[("n", PackValue::Int(-1))])]);
+    assert_eq!(statuses(&b.success()), ["00001"]);
+
+    // BEGIN reports the home database too.
+    b.send(BEGIN, vec![empty()]);
+    assert_eq!(get(&b.success(), "db"), &s("graphbuff"));
+    b.send(ROLLBACK, vec![]);
+    b.success();
+
+    // Failures are GQL errors (5.7+).
+    b.run("RETURN 1 +", empty(), empty());
+    let (tag, fields) = b.recv();
+    assert_eq!(tag, FAILURE);
+    let PackValue::Map(m) = &fields[0] else { panic!() };
+    assert!(!m.contains_key("code"), "{m:?}");
+    assert_eq!(get(m, "neo4j_code"), &s("Neo.ClientError.Statement.SyntaxError"));
+    assert_eq!(get(m, "gql_status"), &s("42001"));
+    assert!(matches!(get(m, "description"), PackValue::String(d) if d.starts_with("error: ")));
+    assert!(matches!(get(m, "message"), PackValue::String(_)));
+    let PackValue::Map(record) = get(m, "diagnostic_record") else { panic!() };
+    assert_eq!(get(record, "_classification"), &s("CLIENT_ERROR"));
+    b.send(RESET, vec![]);
+    b.success();
+
+    // 5.4 keeps the older forms.
+    let mut old = Bolt::handshake(addr, [V5, NONE, NONE, NONE]);
+    log_in(&mut old);
+    old.run("RETURN 1", empty(), empty());
+    assert!(!old.success().contains_key("db"));
+    old.pull(-1);
+    assert!(!old.records().1.contains_key("statuses"));
+    old.run("RETURN 1 +", empty(), empty());
+    assert_eq!(old.failure(), "Neo.ClientError.Statement.SyntaxError");
+}
+
+#[test]
+fn manifest_handshake() {
+    let server = start(ServerConfig::default());
+    let addr = server.bolt_addr().unwrap();
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    tcp.write_all(&[0x60, 0x60, 0xB0, 0x17]).unwrap();
+    tcp.write_all(&[[0, 0, 1, 0xFF], [0, 8, 8, 5], [0, 0, 4, 4], NONE].concat()).unwrap();
+    let mut reply = [0u8; 18];
+    tcp.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, [0, 0, 1, 0xFF, 3, 0, 2, 8, 5, 0, 4, 4, 5, 0, 0, 4, 4, 0]);
+    // The client picks 5.7 and no capabilities, then goes straight on to HELLO.
+    tcp.write_all(&[0, 0, 7, 5, 0]).unwrap();
+    let mut b = Bolt { s: tcp, version: [0, 0, 7, 5] };
+    let hello = log_in(&mut b);
+    assert_eq!(get(&hello, "protocol_version"), &s("5.7"));
+    b.run("RETURN 1 AS one", empty(), empty());
+    let run = b.success();
+    assert!(!run.contains_key("db"), "5.7 has no home database in RUN");
+    b.pull(-1);
+    assert_eq!(statuses(&b.records().1), ["00000"]);
+
+    // A version the manifest did not offer closes the connection.
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    tcp.write_all(&[0x60, 0x60, 0xB0, 0x17]).unwrap();
+    tcp.write_all(&[[0, 0, 1, 0xFF], NONE, NONE, NONE].concat()).unwrap();
+    tcp.read_exact(&mut reply).unwrap();
+    tcp.write_all(&[0, 0, 5, 5, 0]).unwrap();
+    let mut b = Bolt { s: tcp, version: [0, 0, 5, 5] };
+    assert!(b.closed());
 }

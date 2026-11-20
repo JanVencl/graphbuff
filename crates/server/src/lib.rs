@@ -2,7 +2,7 @@
 //!
 //! An HTTP/JSON server for graphbuff, so that programs in any language (Java, Python,
 //! JavaScript, …) can run Cypher against a [`DatabaseManager`]. With
-//! [`ServerConfig::bolt`] set it also speaks Bolt (4.4 and 5.0–5.4), the protocol of the
+//! [`ServerConfig::bolt`] set it also speaks Bolt (4.4, 5.0–5.4 and 5.6–5.8), the protocol of the
 //! Neo4j drivers: auto-commit and explicit transactions, `PULL {n}`, `RESET`, and `ROUTE`
 //! (this server is its own routing table, so `neo4j://` URIs work too). With a token,
 //! Bolt clients send it as the password (`basic`, any user name) or as a `bearer` token.

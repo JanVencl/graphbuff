@@ -20,6 +20,20 @@ def test_verify_connectivity_and_server_info(driver):
     assert info.protocol_version >= (4, 4)
 
 
+def test_newest_bolt_and_gql_statuses(driver, session):
+    # The newest Bolt both speak: 5.8 for drivers that know it (5.28 and 6.x).
+    info = driver.get_server_info()
+    assert info.protocol_version == (5, 8)
+    summary = session.run("UNWIND [1, 2] AS x RETURN x").consume()
+    assert [s.gql_status for s in summary.gql_status_objects][:1] == ["00000"]
+    summary = session.run("UNWIND [] AS x RETURN x").consume()
+    assert [s.gql_status for s in summary.gql_status_objects][:1] == ["02000"]
+    with pytest.raises(ex.CypherSyntaxError) as e:
+        session.run("RETURN 1 +").consume()
+    assert e.value.gql_status == "42001"
+    assert e.value.code == "Neo.ClientError.Statement.SyntaxError"
+
+
 def test_routing_scheme(server):
     with GraphDatabase.driver(server["neo4j"], auth=server["auth"]) as d:
         d.verify_connectivity()
