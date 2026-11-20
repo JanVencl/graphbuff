@@ -925,3 +925,23 @@ fn slow_queries_and_failed_logins_are_logged() {
     assert!(queries.contains(" bolt graphbuff token CREATE (:Logged)"), "{queries}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn call_in_transactions() {
+    let server = start(ServerConfig::default());
+    let mut b = Bolt::open(server.bolt_addr().unwrap());
+    let (rows, _) = b.query_with(
+        "UNWIND range(1, 25) AS i CALL { WITH i CREATE (:B {i: i}) RETURN i AS j } IN TRANSACTIONS OF 10 ROWS RETURN sum(j)",
+        empty(),
+    );
+    assert_eq!(rows, vec![vec![PackValue::Int(325)]]);
+    assert_eq!(b.count("B"), 25);
+    // Not in an explicit transaction.
+    b.send(BEGIN, vec![empty()]);
+    b.success();
+    b.run("CALL { CREATE (:B) } IN TRANSACTIONS", empty(), empty());
+    assert_eq!(b.failure(), "Neo.ClientError.Statement.SemanticError");
+    b.send(RESET, vec![]);
+    b.success();
+    assert_eq!(b.count("B"), 25);
+}

@@ -25,6 +25,7 @@
 
 mod accel;
 mod aggregate;
+mod batched;
 mod context;
 mod csv;
 mod dbms;
@@ -308,6 +309,12 @@ impl<S: GraphStore> Database<S> {
         if let Some(i) = &interrupt {
             i.check_now()?;
         }
+        if ast.mode != QueryMode::Explain
+            && let Some(at) = batched::position(ast)?
+        {
+            self.check_no_transaction()?;
+            return self.run_in_transactions(ast, at, params, interrupt);
+        }
         if !writes(ast) || ast.mode == QueryMode::Explain {
             if self.snapshot().is_none() {
                 self.check_no_transaction()?;
@@ -360,6 +367,9 @@ impl<S: GraphStore> Database<S> {
         }
         if ast.mode == QueryMode::Explain {
             return explain_result(ast, &self.executor(StoreRef::Read(store), params));
+        }
+        if batched::position(ast)?.is_some() {
+            return Err(batched::in_explicit_transaction());
         }
         let store = if writes(ast) { StoreRef::Write(store) } else { StoreRef::Read(store) };
         let mut ex = self.executor(store, params);

@@ -829,6 +829,12 @@ pub(crate) fn transaction_query(name: &str, text: &str, params: &BTreeMap<String
                     )));
                 }
             }
+            if query.mode != QueryMode::Explain && query.calls_in_transactions() {
+                return Err(Error::Semantic(
+                    "CALL { … } IN TRANSACTIONS commits transactions of its own, so it can only run as a query                      of its own, not inside an explicit transaction"
+                        .into(),
+                ));
+            }
             Ok(query)
         }
         _ => Err(Error::Unsupported(

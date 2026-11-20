@@ -103,7 +103,7 @@ impl QueryOptions {
 const CLOCK_EVERY: u32 = 256;
 
 /// The limits of a running query, checked by the executor.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Interrupt {
     deadline: Option<(Instant, Duration)>,
     cancel: Option<CancelHandle>,

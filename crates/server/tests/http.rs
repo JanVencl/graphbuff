@@ -1033,3 +1033,28 @@ fn test_procedures_only_with_the_flag() {
     let r = c.query("/db/other/query", "CALL test.my.proc(1)", "{}");
     assert_ne!(r.status, 200);
 }
+
+#[test]
+fn call_in_transactions_over_http() {
+    let server = start(ServerConfig::default());
+    let mut c = Client::connect(server.local_addr());
+    let r = c.query(
+        "/query",
+        "UNWIND range(1, 25) AS i CALL { WITH i CREATE (:B {i: i}) } IN TRANSACTIONS OF 10 ROWS",
+        "{}",
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains(r#""nodesCreated":25"#), "{}", r.body);
+    assert_eq!(count(&mut c, "/query", "B"), 25);
+
+    // In an explicit transaction it is refused, and the transaction stays usable.
+    let tx = begin(&mut c, "/tx");
+    let r = c.query(&tx, "CALL { CREATE (:B) } IN TRANSACTIONS", "{}");
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("explicit transaction"), "{}", r.body);
+    assert!(!rolled_back(&r), "{}", r.body);
+    c.rows(&tx, "CREATE (:B)", "{}");
+    let r = c.request("POST", &format!("{tx}/commit"), None, &[]);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(count(&mut c, "/query", "B"), 26);
+}

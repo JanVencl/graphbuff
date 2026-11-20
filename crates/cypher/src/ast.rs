@@ -28,6 +28,15 @@ impl Query {
     pub fn is_updating(&self) -> bool {
         self.parts.iter().any(|p| p.clauses.iter().any(Clause::is_updating))
     }
+
+    /// Whether it has a `CALL { … } IN TRANSACTIONS` clause, which commits transactions of
+    /// its own (and so cannot run inside an explicit transaction).
+    pub fn calls_in_transactions(&self) -> bool {
+        self.parts
+            .iter()
+            .flat_map(|p| &p.clauses)
+            .any(|c| matches!(c, Clause::CallSubquery { in_transactions: Some(_), .. }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +77,9 @@ pub enum Clause {
     CallSubquery {
         scope: CallScope,
         query: Box<Query>,
+        /// `IN [n] [CONCURRENT] TRANSACTIONS …`: the subquery runs in batches of input
+        /// rows, each in a transaction of its own that commits before the next.
+        in_transactions: Option<InTransactions>,
     },
     /// `FOREACH (var IN list | updates)`: runs the update clauses once per list element,
     /// per row. Rows pass through unchanged.
@@ -236,6 +248,31 @@ impl Clause {
 }
 
 /// Body of `WITH` and `RETURN`.
+/// The options of `CALL { … } IN [n] [CONCURRENT] TRANSACTIONS [OF n ROWS]
+/// [ON ERROR CONTINUE | BREAK | FAIL] [REPORT STATUS AS var]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InTransactions {
+    /// `IN n CONCURRENT TRANSACTIONS` (`Some(None)` without `n`).
+    pub concurrency: Option<Option<Expr>>,
+    /// `OF n ROWS`: input rows per transaction (1000 when not given).
+    pub batch_size: Option<Expr>,
+    pub on_error: OnError,
+    /// `REPORT STATUS AS var`: a map per input row saying how its transaction went.
+    pub report_status: Option<String>,
+}
+
+/// What `CALL { … } IN TRANSACTIONS` does when a batch's transaction fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnError {
+    /// Stop with the error; batches committed before stay committed.
+    #[default]
+    Fail,
+    /// Roll the batch back and go on with the next one.
+    Continue,
+    /// Roll the batch back and stop without an error.
+    Break,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projection {
     pub distinct: bool,

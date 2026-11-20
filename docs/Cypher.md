@@ -16,6 +16,29 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `CALL { … }` subqueries (run once per row; import outer variables with `CALL (a, b) { … }`,
   `CALL (*) { … }` or a leading `WITH a, b`; they may change the graph, and a subquery without
   `RETURN` keeps each row once)
+* **Batched updates:** `CALL { … } IN [n] [CONCURRENT] TRANSACTIONS [OF n ROWS] [ON ERROR
+  CONTINUE | BREAK | FAIL] [REPORT STATUS AS s]` runs the subquery in batches of input rows
+  (1000 by default), each in a transaction of its own that commits before the next starts and
+  sees the ones before it, so one query can load or delete more than one transaction should
+  hold:
+
+  ```cypher
+  LOAD CSV WITH HEADERS FROM 'file:///people.csv' AS row
+  CALL (row) { CREATE (:Person {id: toInteger(row.id), name: row.name}) } IN TRANSACTIONS OF 10000 ROWS
+
+  MATCH (n:Old) CALL (n) { DETACH DELETE n } IN TRANSACTIONS
+  ```
+
+  The input rows are read from the state the query started on, a batch at a time. When a batch
+  fails, `ON ERROR FAIL` (the default) stops with the error, keeping the batches committed
+  before; `CONTINUE` goes on with the next batch, and `BREAK` runs no more. With `CONTINUE` or
+  `BREAK`, the rows of a batch that did not commit go on with `null` for what the subquery
+  returns, and `REPORT STATUS AS s` adds to every row a map `s` with `started`, `committed`,
+  `transactionId` and `errorMessage`. A timeout or cancellation stops the query, keeping the
+  committed batches. Statistics add up all committed batches. It runs only as a query of its
+  own, not in an explicit transaction, and the clauses before and after it may only read.
+  Batches run one at a time (`CONCURRENT` is accepted). One per query, not in a `UNION`, not
+  nested in a subquery; no `PROFILE`, no `ON ERROR RETRY`.
 * **Procedures:** `CALL db.labels() YIELD label AS l WHERE l STARTS WITH 'P'`, anywhere in a
   query (one call per row; `YIELD` is required there). A query that is only a `CALL` returns
   every output, and may leave out `YIELD` and the parentheses (`CALL db.labels`; arguments then
@@ -140,7 +163,7 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   (`vecbench`). More in [Vector search](Vectors.md).
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
-procedures that change the graph, `CALL { … } IN TRANSACTIONS`, `LOAD CSV` from URLs other than local files, relationship
+procedures that change the graph, `LOAD CSV` from URLs other than local files, relationship
 constraints,
 spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), approximate
 vector search (HNSW, quantization), the `VECTOR` value type, `db.create.setNodeVectorProperty`

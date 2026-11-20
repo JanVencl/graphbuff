@@ -861,13 +861,78 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LBrace, "'{' to start the subquery")?;
         let query = self.parse_union()?;
         self.expect(Tok::RBrace, "'}' to close the subquery")?;
-        if self.is_kw("IN") && self.kw_at(1, "TRANSACTIONS") {
-            return Err(Error::Unsupported("CALL { … } IN TRANSACTIONS is not supported yet".into()));
-        }
+        let in_transactions = if self.eat_kw("IN") { Some(self.parse_in_transactions()?) } else { None };
         Ok(Clause::CallSubquery {
             scope,
             query: Box::new(query),
+            in_transactions,
         })
+    }
+
+    /// After `CALL { … } IN`: `[n] [CONCURRENT] TRANSACTIONS` and the options
+    /// `OF n ROW[S]`, `ON ERROR …` and `REPORT STATUS AS var`, each at most once.
+    fn parse_in_transactions(&mut self) -> Result<InTransactions> {
+        let concurrency = if self.eat_kw("CONCURRENT") {
+            Some(None)
+        } else if self.is_kw("TRANSACTIONS") {
+            None
+        } else {
+            let n = self.parse_expr()?;
+            if !self.eat_kw("CONCURRENT") {
+                return self.err(format!("expected CONCURRENT TRANSACTIONS, found {}", self.describe()));
+            }
+            Some(Some(n))
+        };
+        self.expect_kw("TRANSACTIONS")?;
+        let mut options = InTransactions { concurrency, batch_size: None, on_error: OnError::Fail, report_status: None };
+        let (mut of, mut on_error) = (false, false);
+        loop {
+            if self.is_kw("OF") {
+                if of {
+                    return self.err("OF … ROWS is given twice");
+                }
+                self.advance();
+                of = true;
+                options.batch_size = Some(self.parse_expr()?);
+                if !(self.eat_kw("ROWS") || self.eat_kw("ROW")) {
+                    return self.err(format!("expected ROWS, found {}", self.describe()));
+                }
+            } else if self.is_kw("ON") && self.kw_at(1, "ERROR") {
+                if on_error {
+                    return self.err("ON ERROR is given twice");
+                }
+                self.advance();
+                self.advance();
+                on_error = true;
+                options.on_error = if self.eat_kw("CONTINUE") {
+                    OnError::Continue
+                } else if self.eat_kw("BREAK") {
+                    OnError::Break
+                } else if self.eat_kw("FAIL") {
+                    OnError::Fail
+                } else if self.is_kw("RETRY") {
+                    return Err(Error::Unsupported("ON ERROR RETRY is not supported".into()));
+                } else {
+                    return self.err(format!("expected CONTINUE, BREAK or FAIL, found {}", self.describe()));
+                };
+            } else if self.is_kw("REPORT") {
+                if options.report_status.is_some() {
+                    return self.err("REPORT STATUS is given twice");
+                }
+                self.advance();
+                self.expect_kw("STATUS")?;
+                self.expect_kw("AS")?;
+                options.report_status = Some(self.ident()?);
+            } else {
+                break;
+            }
+        }
+        if options.report_status.is_some() && options.on_error == OnError::Fail {
+            return Err(Error::Semantic(
+                "REPORT STATUS needs ON ERROR CONTINUE or ON ERROR BREAK: with ON ERROR FAIL a failure ends the query".into(),
+            ));
+        }
+        Ok(options)
     }
 
     /// After `EXISTS` / `COUNT` / `COLLECT`: `{ query }`, or for `EXISTS` and `COUNT`
