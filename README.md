@@ -107,6 +107,7 @@ login_lockout_seconds = 60            # doubling with each further failure, up t
 [queries]
 transaction_timeout_seconds = 60
 query_timeout_ms = 30000              # no limit when not set
+max_memory_mb = 4096                  # per query; default: a quarter of the memory (0: off)
 gpu = false                           # graph kernels on the GPU (`gpu` build feature)
 
 [logs]

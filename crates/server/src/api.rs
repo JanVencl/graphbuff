@@ -24,6 +24,8 @@ pub(crate) struct Ctx {
     pub txs: Arc<Transactions>,
     /// The longest a query may run; requests may ask for less.
     pub query_timeout: Option<Duration>,
+    /// The most memory a query may hold, in bytes.
+    pub query_max_memory: Option<u64>,
     /// Where backups go; `None` turns the backup and restore endpoints off.
     pub backup_dir: Option<std::path::PathBuf>,
     pub log: Option<Arc<Log>>,
@@ -126,6 +128,7 @@ impl Ctx {
                 (a, b) => a.or(b),
             },
             cancel: Some(self.abort.clone()),
+            max_memory: self.query_max_memory,
         }
     }
 
@@ -394,6 +397,7 @@ fn query_error(e: &Error) -> Response {
         Error::Storage(_) => 500,
         Error::TransactionTooLarge(_) => 413,
         Error::Timeout(_) => 408,
+        Error::MemoryLimit(_) => 413,
         Error::Forbidden(_) => 403,
     };
     Response::json(status, json::encode_error(e))

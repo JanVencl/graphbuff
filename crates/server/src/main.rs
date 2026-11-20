@@ -4,6 +4,10 @@ mod prompt;
 mod settings;
 mod signal;
 
+/// Counts the memory each thread holds, for the per-query memory limit.
+#[global_allocator]
+static ALLOCATOR: graphbuff::accounting::CountingAllocator = graphbuff::accounting::CountingAllocator;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -490,6 +494,8 @@ fn main() {
         config.transaction_timeout = d;
     }
     config.query_timeout = settings.query_timeout;
+    let query_memory = settings::query_memory(&settings);
+    config.query_max_memory = query_memory;
     if let Some(d) = settings.shutdown_timeout {
         config.shutdown_grace = d;
     }
@@ -640,7 +646,7 @@ fn main() {
     log.info(&listening);
     let fsync = if sync == SyncPolicy::EveryCommit { "fsync every commit" } else { "no fsync" };
     log.info(format_args!(
-        "config: {}; new databases: {}; log: {}; slow-query log: {}; logins: {}",
+        "config: {}; new databases: {}; log: {}; slow-query log: {}; logins: {}; query memory limit: {}",
         config_file.as_ref().map_or("none".into(), |f| f.display().to_string()),
         match (&data, persistent) {
             (None, _) => "in memory".to_string(),
@@ -649,7 +655,8 @@ fn main() {
         },
         log.dir().map_or("standard error".into(), |d| d.display().to_string()),
         log.slow_query().map_or("off".into(), |d| format!("{} ms", d.as_millis())),
-        if config.token.is_some() { "user accounts and token" } else { "user accounts" }
+        if config.token.is_some() { "user accounts and token" } else { "user accounts" },
+        query_memory.map_or("off".into(), |b| format!("{} MiB", b >> 20))
     ));
     if let Some((name, d)) = demo {
         if d.loaded {

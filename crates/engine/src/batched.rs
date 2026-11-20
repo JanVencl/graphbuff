@@ -195,7 +195,7 @@ impl Batches<'_> {
                 }
                 Ok(())
             }
-            Err(e @ (Error::Timeout(_) | Error::Cancelled(_))) => Err(e),
+            Err(e @ (Error::Timeout(_) | Error::Cancelled(_) | Error::MemoryLimit(_))) => Err(e),
             Err(e) => match self.options.on_error {
                 OnError::Fail => Err(e),
                 OnError::Continue | OnError::Break => {

@@ -6,6 +6,7 @@ security, where it keeps data and logs, and how it stops. Settings are named as
 
 - [Transactions](#transactions)
 - [Timeouts](#timeouts)
+- [Memory](#memory)
 - [Values](#values)
 - [Errors](#errors)
 - [Security](#security)
@@ -41,6 +42,24 @@ An explicit transaction (`POST /db/{name}/tx`) works like this:
 - Rolling back a transaction, or shutting down, cancels the statement it is running, which
   then answers `409 Cancelled`.
 
+## Memory
+
+- `queries.max_memory_mb` stops a query that holds more memory than this. The default is a
+  quarter of the machine's memory (or of the container's memory limit, on Linux), at least
+  256 MiB; `0` turns the limit off. The start-up log names the limit in use.
+- The memory counted is what the query's thread took since the query started: its rows,
+  sort and aggregation buffers, collected lists, the result, and the changes of a writing
+  query. Caches shared by all queries (the persistent store's page cache, the graph kernel
+  and vector index caches) are not counted, even when the query fills them.
+- A query over its limit is rolled back and answers `413 MemoryLimit`. Inside an explicit
+  transaction, the whole transaction rolls back (the limit applies to each statement). With
+  `CALL { … } IN TRANSACTIONS`, batches committed before stay committed.
+- Over Bolt the error is `Neo.TransientError.General.MemoryPoolOutOfMemoryError`, as Neo4j
+  reports it.
+- Embedded servers get the same with `ServerConfig::query_max_memory` (and
+  `QueryOptions::with_max_memory` for queries), when the program uses
+  `graphbuff::accounting::CountingAllocator` as its global allocator.
+
 ## Values
 
 | Cypher | JSON |
@@ -70,7 +89,7 @@ Errors have the form:
 | 404 | `DatabaseNotFound`, `TransactionNotFound` |
 | 408 | `Timeout` |
 | 409 | `ConstraintError`, `Cancelled` |
-| 413 | body over 16 MiB, or `TransactionTooLarge` (transaction past its database's size cap; rolled back) |
+| 413 | body over 16 MiB, `TransactionTooLarge` (transaction past its database's size cap; rolled back), or `MemoryLimit` (query past its memory limit; rolled back) |
 | 429 | `TooManyRequests`: too many failed logins from this client; `Retry-After` says when to try again |
 | 500 | `StorageError` |
 

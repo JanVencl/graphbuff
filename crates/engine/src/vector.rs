@@ -499,6 +499,11 @@ impl VectorCache {
 
     /// The matrix of index `def` in `snapshot`.
     fn matrix(&self, snapshot: &Snapshot, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Arc<Matrix>> {
+        // The cache outlives the query that fills it: not the query's memory.
+        graphbuff_core::accounting::exempt(|| self.build_matrix(snapshot, def, interrupt))
+    }
+
+    fn build_matrix(&self, snapshot: &Snapshot, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Arc<Matrix>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.base.as_ref().is_some_and(|b| is(b, snapshot)) {
             if let Some(at) = st.log.iter().position(|(w, _)| is(w, snapshot)) {

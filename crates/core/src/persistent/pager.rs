@@ -237,17 +237,21 @@ impl Pager {
 
     fn load(&mut self, key: PageKey) -> Result<()> {
         if !self.frames.contains_key(&key) {
-            self.evict_to(self.capacity - 1)?;
-            let data = self.read_disk(key)?;
-            self.frames.insert(
-                key,
-                Frame {
-                    data,
-                    dirty: false,
-                    pinned: false,
-                    tick: 0,
-                },
-            );
+            // The cache is shared by every query: not the memory of the one that fills it.
+            crate::accounting::exempt(|| -> Result<()> {
+                self.evict_to(self.capacity - 1)?;
+                let data = self.read_disk(key)?;
+                self.frames.insert(
+                    key,
+                    Frame {
+                        data,
+                        dirty: false,
+                        pinned: false,
+                        tick: 0,
+                    },
+                );
+                Ok(())
+            })?;
         }
         let f = self.frames.get_mut(&key).expect("loaded above");
         // A page used among the last eighth of the cache's accesses is recent enough:
