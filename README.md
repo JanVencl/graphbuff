@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/JanVencl/graphbuff)](https://github.com/JanVencl/graphbuff/releases)
 [![Build](https://github.com/JanVencl/graphbuff/actions/workflows/release.yml/badge.svg)](https://github.com/JanVencl/graphbuff/actions/workflows/release.yml)
 [![License: AGPL-3.0](https://img.shields.io/github/license/JanVencl/graphbuff)](LICENSE)
-[![Rust 1.100+](https://img.shields.io/badge/rust-1.100?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-blue?logo=rust)](https://www.rust-lang.org)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fjanvencl%2Fgraphbuff-blue?logo=docker)](https://github.com/JanVencl/graphbuff/pkgs/container/graphbuff)
 [![Website](https://img.shields.io/badge/web-graphbuff.com-informational)](https://graphbuff.com)
 ## Graph database engine written in Rust and queried with **Cypher**.
