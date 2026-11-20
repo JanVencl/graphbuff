@@ -151,6 +151,12 @@ More in [Command-line client](./docs/CLI.md).
 | [Supported Cypher](./docs/Cypher.md) | clauses, functions, procedures, what is missing |
 | [Layout](./docs/Architecture.md) | crates, storage internals, concurrency, execution |
 
+## Contributing and security
+
+Changes per release are in [CHANGELOG.md](CHANGELOG.md). To contribute, see
+[CONTRIBUTING.md](CONTRIBUTING.md); to report a vulnerability, see
+[SECURITY.md](SECURITY.md).
+
 ## License
 
 graphbuff is licensed under the GNU Affero General Public License v3.0 only
