@@ -44,7 +44,8 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   every output, and may leave out `YIELD` and the parentheses (`CALL db.labels`; arguments then
   come from the parameters of the same names). Built in: `db.labels()`,
   `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
-  `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`; `SHOW PROCEDURES` lists them.
+  `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`, the vector and full-text
+  index procedures (`db.index.vector.*`, `db.index.fulltext.*`); `SHOW PROCEDURES` lists them.
   Applications add read-only procedures in Rust with `Database::register_procedure` (or
   `DatabaseManager::register_procedure` for every database):
 
@@ -67,8 +68,8 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
-  type, label or type, properties, `RANGE` or `VECTOR`, options), vector indexes (see
-  *Vectors* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
+  type, label or type, properties, `RANGE`, `VECTOR` or `FULLTEXT`, options), vector indexes (see
+  *Vectors* below), full-text indexes (see *Full-text* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
   and `(n.a, n.b) IS UNIQUE | NODE KEY`; the older `ON … ASSERT …` form works too),
   `DROP CONSTRAINT name [IF EXISTS]`, `SHOW CONSTRAINTS`
 * **Databases** (through a `Session`): `CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {…}]`,
@@ -161,11 +162,21 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   rows near the cut are re-scored exactly, so the results do not change: on an RX 5700 XT,
   200,000 768-dimensional vectors answer in about 6 ms against 43 ms on 4 CPU threads
   (`vecbench`). More in [Vector search](Vectors.md).
+* **Full-text:** ``CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.p, n.q]
+  [OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}]`` (also `FOR ()-[r:A|B]-()`)
+  indexes STRING and LIST<STRING> properties. `CALL db.index.fulltext.queryNodes('name',
+  'matrix AND "blade runner"', {limit: 10}) YIELD node, score` (and `queryRelationships`)
+  returns the matches best first, scored with BM25. Lucene's classic query syntax (`AND` /
+  `OR` / `NOT`, `+` / `-`, phrases, `field:`, `*` / `?` wildcards, fuzzy `~`, boosts `^n`)
+  and seven analyzers (`standard-no-stop-words`, `standard`, `english`, `simple`, `stop`,
+  `whitespace`, `keyword`; `db.index.fulltext.listAvailableAnalyzers()`). The inverted index
+  is kept in memory and updated with each commit. More in [Full-text search](FullText.md).
 
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `LOAD CSV` from URLs other than local files, relationship
 constraints,
 spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), approximate
-vector search (HNSW, quantization), the `VECTOR` value type, `db.create.setNodeVectorProperty`
+vector search (HNSW, quantization), the `VECTOR` value type, full-text ranges, regular
+expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`), text and point indexes, `db.create.setNodeVectorProperty`
 (use `SET n.p = $vector`), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).

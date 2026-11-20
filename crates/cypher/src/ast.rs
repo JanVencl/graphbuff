@@ -107,16 +107,17 @@ pub enum Clause {
     /// `SHOW PROCEDURES`
     ShowProcedures,
     /// `CREATE [RANGE | VECTOR] INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, …)
-    /// [OPTIONS {…}]`, `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`.
+    /// [OPTIONS {…}]`, `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`;
+    /// `CREATE FULLTEXT INDEX [name] [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.a, …]
+    /// [OPTIONS {…}]` (or `FOR ()-[r:A|B]-()`).
     CreateIndex {
         name: Option<String>,
         entity: IndexEntity,
-        /// The label, or the relationship type.
-        label: String,
+        /// The label, or the relationship type (several for a full-text index).
+        labels: Vec<String>,
         properties: Vec<String>,
         if_not_exists: bool,
-        /// `CREATE VECTOR INDEX`.
-        vector: bool,
+        kind: IndexType,
         /// The `OPTIONS` map (or parameter).
         options: Option<Expr>,
     },
@@ -173,6 +174,14 @@ pub enum SubqueryKind {
     Count,
     /// `COLLECT { … }`: the values of its single column, as a list.
     Collect,
+}
+
+/// The kind of index `CREATE … INDEX` makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexType {
+    Range,
+    Vector,
+    Fulltext,
 }
 
 /// How `DROP INDEX` identifies its index.

@@ -21,6 +21,7 @@
 * **durable transactions**
 * **bulk CSV import** ([details](./docs/Import.md))
 * **vector search** ([details](./docs/Vectors.md))
+* **full-text search** ([details](./docs/FullText.md))
 * [More features](./docs/Features.md)
 
 ## Quick start
@@ -145,6 +146,7 @@ More in [Command-line client](./docs/CLI.md).
 | [Bolt](./docs/Bolt.md) | Neo4j drivers |
 | [Users and TLS](./docs/Users.md) | accounts, roles, HTTPS and Bolt over TLS |
 | [Vector search](./docs/Vectors.md) | similarity functions and vector indexes |
+| [Full-text search](./docs/FullText.md) | full-text indexes, query syntax, analyzers |
 | [Supported Cypher](./docs/Cypher.md) | clauses, functions, procedures, what is missing |
 | [Layout](./docs/Architecture.md) | crates, storage internals, concurrency, execution |
 

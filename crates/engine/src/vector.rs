@@ -6,19 +6,23 @@
 //! similar.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, Weak};
 
 use graphbuff_core::{
-    Changes, Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result, Snapshot,
+    Changes, Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result,
     Value, VectorRows, VectorSimilarity as Similarity,
 };
+use graphbuff_cypher::ast::IndexType;
 
+use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
 
-/// The kind of index `CREATE [VECTOR] INDEX … OPTIONS {…}` asks for. A vector index needs
-/// `indexConfig: {`vector.dimensions`: n}` and may name `vector.similarity_function`
-/// (`'cosine'`, the default, or `'euclidean'`); `indexProvider` is accepted and ignored.
-pub fn index_kind(vector: bool, options: &BTreeMap<String, Value>) -> Result<IndexKind> {
+/// The kind of index `CREATE [VECTOR | FULLTEXT] INDEX … OPTIONS {…}` asks for. A vector
+/// index needs `indexConfig: {`vector.dimensions`: n}` and may name
+/// `vector.similarity_function` (`'cosine'`, the default, or `'euclidean'`); a full-text
+/// index takes `fulltext.analyzer` and `fulltext.eventually_consistent` (see
+/// [`fulltext_kind`](crate::fulltext::fulltext_kind)); `indexProvider` is accepted and
+/// ignored.
+pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<IndexKind> {
     let mut config = BTreeMap::new();
     for (k, v) in options {
         match (k.as_str(), v) {
@@ -31,7 +35,10 @@ pub fn index_kind(vector: bool, options: &BTreeMap<String, Value>) -> Result<Ind
             _ => return Err(Error::Semantic(format!("unknown index option `{k}`"))),
         }
     }
-    if !vector {
+    if kind == IndexType::Fulltext {
+        return crate::fulltext::fulltext_kind(&config);
+    }
+    if kind == IndexType::Range {
         if let Some(k) = config.keys().next() {
             return Err(Error::Semantic(format!("unknown index setting `{k}` for a range index")));
         }
@@ -83,11 +90,20 @@ pub fn index_row(d: IndexDef) -> Vec<Value> {
                 ("vector.similarity_function".to_string(), Value::String(similarity.name().into())),
             ])),
         )]),
+        IndexKind::Fulltext { analyzer } => BTreeMap::from([(
+            "indexConfig".to_string(),
+            Value::Map(BTreeMap::from([
+                ("fulltext.analyzer".to_string(), Value::String(analyzer.name().into())),
+                ("fulltext.eventually_consistent".to_string(), Value::Bool(false)),
+            ])),
+        )]),
     };
+    // A full-text index on several labels shows them as `A|B`.
+    let labels = d.labels().collect::<Vec<_>>().join("|");
     vec![
         Value::String(d.name),
         Value::String(d.entity.text().into()),
-        Value::String(d.label),
+        Value::String(labels),
         Value::List(d.properties.into_iter().map(Value::String).collect()),
         Value::String(d.kind.text().into()),
         Value::Map(options),
@@ -179,7 +195,7 @@ fn indexed_vector(value: &Value, dimensions: u32, similarity: Similarity) -> Opt
 fn vector_params(def: &IndexDef) -> (u32, Similarity) {
     match def.kind {
         IndexKind::Vector { dimensions, similarity } => (dimensions, similarity),
-        IndexKind::Range => unreachable!("a vector index"),
+        IndexKind::Range | IndexKind::Fulltext { .. } => unreachable!("a vector index"),
     }
 }
 
@@ -414,129 +430,22 @@ impl Matrix {
     }
 }
 
-type WeakSnapshot = Weak<dyn GraphStore + Send + Sync>;
-
-fn is(w: &WeakSnapshot, snapshot: &Snapshot) -> bool {
-    std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(snapshot))
-}
-
-/// The vector index matrices of one committed state, kept up to date with later commits:
-/// [`Database`](crate::Database) reports each commit's changes ([`VectorCache::published`]),
-/// and the first query on a later state applies them to the matrices instead of building
-/// them again.
-#[derive(Default)]
-pub(crate) struct VectorCache {
-    state: Mutex<CacheState>,
-}
-
-#[derive(Default)]
-struct CacheState {
-    /// The last committed state published.
-    latest: Option<WeakSnapshot>,
-    /// The state the matrices are of.
-    base: Option<WeakSnapshot>,
-    matrices: HashMap<String, Arc<Matrix>>,
-    /// The states published after `base`, oldest first, with what each commit changed.
-    log: Vec<(WeakSnapshot, Changes)>,
-    /// The ids in `log`.
-    logged: usize,
-}
-
-impl CacheState {
-    /// Forgets the matrices (and the log, of no use without them).
-    fn clear(&mut self) {
-        self.base = None;
-        self.matrices.clear();
-        self.log.clear();
-        self.logged = 0;
+impl Cached for Matrix {
+    fn def(&self) -> &IndexDef {
+        &self.def
     }
 
-    /// Makes the matrices those of `snapshot`, entry `at` of the log, applying the
-    /// changes of the commits up to it.
-    fn advance(&mut self, snapshot: &Snapshot, at: usize, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
-        let mut changes = Changes::default();
-        for (_, c) in self.log.drain(..=at) {
-            changes.extend(c);
-        }
-        self.logged = self.log.iter().map(|(_, c)| c.len()).sum();
-        self.base = Some(Arc::downgrade(snapshot));
-        if changes.unknown {
-            self.matrices.clear();
-            return Ok(());
-        }
-        changes.normalize();
-        let names: Vec<String> = self.matrices.keys().cloned().collect();
-        for name in names {
-            let m = self.matrices.remove(&name).expect("listed above");
-            // In place, unless a query still reads it.
-            let mut m = Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone());
-            m.apply(&**snapshot, &changes, interrupt)?;
-            self.matrices.insert(name, Arc::new(m));
-        }
-        Ok(())
+    fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Matrix> {
+        Matrix::build(store, def, interrupt)
+    }
+
+    fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
+        Matrix::apply(self, store, changes, interrupt)
     }
 }
 
-impl VectorCache {
-    /// Records a commit: `snapshot` is the new committed state, `changes` what the store
-    /// says changed since the state published before it.
-    pub fn published(&self, snapshot: &Snapshot, changes: Changes) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.latest = Some(Arc::downgrade(snapshot));
-        if !st.matrices.is_empty() {
-            // Drop the matrices of indexes that are gone.
-            let defs = snapshot.indexes();
-            st.matrices.retain(|_, m| defs.contains(&m.def));
-        }
-        if st.matrices.is_empty() || changes.unknown || st.logged + changes.len() > Changes::LIMIT {
-            // Nothing to keep up to date, or more changes than are worth applying.
-            st.clear();
-            return;
-        }
-        st.logged += changes.len();
-        st.log.push((Arc::downgrade(snapshot), changes));
-    }
-
-    /// The matrix of index `def` in `snapshot`.
-    fn matrix(&self, snapshot: &Snapshot, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Arc<Matrix>> {
-        // The cache outlives the query that fills it: not the query's memory.
-        graphbuff_core::accounting::exempt(|| self.build_matrix(snapshot, def, interrupt))
-    }
-
-    fn build_matrix(&self, snapshot: &Snapshot, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Arc<Matrix>> {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !st.base.as_ref().is_some_and(|b| is(b, snapshot)) {
-            if let Some(at) = st.log.iter().position(|(w, _)| is(w, snapshot)) {
-                if let Err(e) = st.advance(snapshot, at, interrupt) {
-                    st.clear();
-                    return Err(e);
-                }
-            } else if st.latest.as_ref().is_some_and(|l| is(l, snapshot)) {
-                st.clear();
-                st.base = Some(Arc::downgrade(snapshot));
-            } else {
-                // An earlier state, read by a query that began before the last commits.
-                drop(st);
-                return Ok(Arc::new(Matrix::build(&**snapshot, def, interrupt)?));
-            }
-        }
-        if let Some(m) = st.matrices.get(&def.name)
-            && m.def == *def
-        {
-            return Ok(m.clone());
-        }
-        let m = Arc::new(Matrix::build(&**snapshot, def, interrupt)?);
-        st.matrices.insert(def.name.clone(), m.clone());
-        Ok(m)
-    }
-
-    /// The rows of the matrix of index `name`, if one is kept: for tests.
-    #[cfg(test)]
-    fn rows(&self, name: &str) -> Option<VectorRows> {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.matrices.get(name).map(|m| m.rows.clone())
-    }
-}
+/// The vector index matrices of a committed state.
+pub(crate) type VectorCache = IndexCache<Matrix>;
 
 /// `db.index.vector.queryNodes(indexName, k, vector)` (`entity` Node) and
 /// `db.index.vector.queryRelationships(…)`: the `k` indexed entities most similar to
@@ -593,7 +502,7 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
     let mut best: Vec<(f64, u64)> = match ctx.vectors() {
         // A committed state: the cached matrix, then exact scores near the cut.
         Some((cache, snapshot)) => {
-            let m = cache.matrix(snapshot, &def, &interrupt)?;
+            let m = cache.get(snapshot, &def, &interrupt)?;
             let (all, tolerance) = m.approximate(&q, &*ctx.kernels());
             let approx: Vec<(f64, u64)> =
                 all.into_iter().zip(&m.ids).filter(|(_, id)| **id != FREE).map(|(s, id)| (s, *id)).collect();
@@ -674,29 +583,29 @@ mod tests {
         db.execute("CREATE VECTOR INDEX v FOR (n:V) ON n.e OPTIONS {indexConfig: {`vector.dimensions`: 2}}").unwrap();
         db.execute("UNWIND range(1, 100) AS i CREATE (:V {k: i, e: [0, 1]})").unwrap();
         db.execute(q).unwrap();
-        let first = db.vector_cache.rows("v").expect("built");
+        let first = db.vector_cache.entry("v").map(|m| m.rows.clone()).expect("built");
         assert_eq!(first.len(), 100 + 16);
         // Two commits, then a query: the rows they changed are written in place.
         db.execute("MATCH (n:V {k: 7}) SET n.e = [1, 0]").unwrap();
         db.execute("CREATE (:V {k: 0, e: [1, 0.1]})").unwrap();
         let r = db.execute(q).unwrap();
         assert_eq!(r.rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>(), ["7", "0"]);
-        let patched = db.vector_cache.rows("v").expect("kept");
+        let patched = db.vector_cache.entry("v").map(|m| m.rows.clone()).expect("kept");
         assert_eq!(patched.len(), first.len());
         let since: Vec<(u64, Vec<u32>)> = patched.changed_since().map(|(id, rows)| (id, rows.to_vec())).collect();
         assert_eq!(since, [(first.id(), vec![6, 100])]);
         // A commit that changes no indexed entity leaves the rows as they are.
         db.execute("CREATE (:W {e: [1, 0]})").unwrap();
         db.execute(q).unwrap();
-        assert_eq!(db.vector_cache.rows("v").unwrap().id(), patched.id());
+        assert_eq!(db.vector_cache.entry("v").map(|m| m.rows.clone()).unwrap().id(), patched.id());
         // More new entities than free rows: laid out anew.
         db.execute("UNWIND range(1, 40) AS i CREATE (:V {k: 1000 + i, e: [0, 1]})").unwrap();
         db.execute(q).unwrap();
-        let grown = db.vector_cache.rows("v").unwrap();
+        let grown = db.vector_cache.entry("v").map(|m| m.rows.clone()).unwrap();
         assert_eq!(grown.len(), 141 + 141 / 8);
         assert_eq!(grown.changed_since().count(), 0);
         // A dropped index's matrix goes with it.
         db.execute("DROP INDEX v").unwrap();
-        assert!(db.vector_cache.rows("v").is_none());
+        assert!(db.vector_cache.entry("v").map(|m| m.rows.clone()).is_none());
     }
 }

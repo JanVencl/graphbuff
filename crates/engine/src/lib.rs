@@ -32,8 +32,10 @@ mod dbms;
 mod demo;
 mod eval;
 mod exec;
+mod fulltext;
 mod functions;
 mod import;
+mod index_cache;
 mod matcher;
 mod ops;
 #[cfg(test)]
@@ -129,6 +131,8 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     kernel_cache: Arc<accel::KernelCache>,
     /// The vector index matrices of a committed state.
     vector_cache: Arc<vector::VectorCache>,
+    /// The full-text index postings of a committed state.
+    text_cache: Arc<fulltext::TextCache>,
     /// The kernel backend read queries use, and when they use it.
     kernels: RwLock<(Arc<dyn Kernels>, KernelMode)>,
 }
@@ -180,8 +184,10 @@ impl<S: GraphStore> Database<S> {
         drop(store.take_changes());
         let committed = store.snapshot();
         let vector_cache = Arc::<vector::VectorCache>::default();
+        let text_cache = Arc::<fulltext::TextCache>::default();
         if let Some(s) = &committed {
             vector_cache.published(s, graphbuff_core::Changes::unknown());
+            text_cache.published(s, graphbuff_core::Changes::unknown());
         }
         Database {
             committed: RwLock::new(committed),
@@ -192,6 +198,7 @@ impl<S: GraphStore> Database<S> {
             tx_thread: Mutex::new(None),
             kernel_cache: Arc::default(),
             vector_cache,
+            text_cache,
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
         }
     }
@@ -445,6 +452,7 @@ impl<S: GraphStore> Database<S> {
     fn publish(&self, store: &mut S) -> Option<Snapshot> {
         let changes = store.take_changes();
         let snapshot = store.snapshot()?;
+        self.text_cache.published(&snapshot, changes.clone());
         self.vector_cache.published(&snapshot, changes);
         self.committed.write().unwrap_or_else(|e| e.into_inner()).replace(snapshot)
     }
@@ -473,6 +481,7 @@ impl<S: GraphStore> Database<S> {
                 ex.accel = Some(accel::Accel {
                     cache: self.kernel_cache.clone(),
                     vectors: self.vector_cache.clone(),
+                    texts: self.text_cache.clone(),
                     snapshot: snapshot.clone(),
                     kernels,
                     mode,

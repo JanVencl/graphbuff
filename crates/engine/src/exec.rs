@@ -11,7 +11,7 @@ use graphbuff_core::clock::Instant;
 use graphbuff_core::{
     ConstraintDef, Direction, Error, IndexDef, IndexEntity, NodeId, Path, RelId, Result, Value,
 };
-use graphbuff_cypher::ast::{
+use graphbuff_cypher::ast::{IndexType, 
     Clause, Expr, IndexTarget, NodePattern, PatternPart, RelDirection, RemoveItem,
     SetItem, SortItem,
 };
@@ -314,10 +314,10 @@ impl Executor<'_> {
             Clause::CreateIndex {
                 name,
                 entity,
-                label,
+                labels,
                 properties,
                 if_not_exists,
-                vector,
+                kind,
                 options,
             } => {
                 let options = match options {
@@ -331,22 +331,28 @@ impl Executor<'_> {
                     }
                     None => BTreeMap::new(),
                 };
-                let kind = crate::vector::index_kind(*vector, &options)?;
-                let prefix = if *vector { "vector" } else { "index" };
+                let prefix = match kind {
+                    IndexType::Range => "index",
+                    IndexType::Vector => "vector",
+                    IndexType::Fulltext => "fulltext",
+                };
+                let mut labels = labels.iter();
+                let label = labels.next().cloned().unwrap_or_default();
                 let def = IndexDef {
-                    name: name
-                        .clone()
-                        .unwrap_or_else(|| format!("{prefix}_{label}_{}", properties.join("_"))),
+                    name: name.clone().unwrap_or_else(|| {
+                        let mut parts = vec![prefix.to_string(), label.clone()];
+                        parts.extend(labels.clone().cloned());
+                        parts.extend(properties.iter().cloned());
+                        parts.join("_")
+                    }),
                     entity: *entity,
-                    label: label.clone(),
+                    label,
+                    extra_labels: labels.cloned().collect(),
                     properties: properties.clone(),
-                    kind,
+                    kind: crate::vector::index_kind(*kind, &options)?,
                 };
                 let existing = self.store().indexes();
-                let exists = existing.iter().any(|d| {
-                    d.name == def.name
-                        || (d.is_vector() == def.is_vector() && d.same_schema(def.entity, &def.label, &def.properties))
-                });
+                let exists = existing.iter().any(|d| d.name == def.name || d.same_index(&def));
                 if exists && *if_not_exists {
                     return Ok(empty);
                 }

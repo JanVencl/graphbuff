@@ -701,8 +701,69 @@ impl VectorSimilarity {
     }
 }
 
-/// What an index is: a property index answering seeks, or a vector index answering
-/// nearest-neighbour queries over one list-of-numbers property.
+/// How a full-text index splits text into terms (Lucene's analyzers, as Neo4j names
+/// them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Analyzer {
+    /// Words (Unicode word boundaries), lowercased.
+    #[default]
+    StandardNoStopWords,
+    /// Words, lowercased, without English stop words.
+    Standard,
+    /// Words, lowercased, without English stop words and possessive `'s`, stemmed
+    /// (Porter).
+    English,
+    /// Runs of letters, lowercased.
+    Simple,
+    /// Runs of letters, lowercased, without English stop words.
+    Stop,
+    /// Runs of non-whitespace characters, as written.
+    Whitespace,
+    /// The whole value as one term, as written.
+    Keyword,
+}
+
+impl Analyzer {
+    pub const ALL: [Analyzer; 7] = [
+        Analyzer::StandardNoStopWords,
+        Analyzer::Standard,
+        Analyzer::English,
+        Analyzer::Simple,
+        Analyzer::Stop,
+        Analyzer::Whitespace,
+        Analyzer::Keyword,
+    ];
+
+    /// Its name in index options, such as `standard-no-stop-words`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Analyzer::StandardNoStopWords => "standard-no-stop-words",
+            Analyzer::Standard => "standard",
+            Analyzer::English => "english",
+            Analyzer::Simple => "simple",
+            Analyzer::Stop => "stop",
+            Analyzer::Whitespace => "whitespace",
+            Analyzer::Keyword => "keyword",
+        }
+    }
+
+    /// The analyzer named `name` (any case).
+    pub fn parse(name: &str) -> Option<Analyzer> {
+        Analyzer::ALL.into_iter().find(|a| a.name().eq_ignore_ascii_case(name))
+    }
+
+    fn code(self) -> u8 {
+        Analyzer::ALL.iter().position(|a| *a == self).expect("listed") as u8 + 1
+    }
+
+    fn from_code(code: u8) -> Option<Analyzer> {
+        Analyzer::ALL.get(usize::from(code).checked_sub(1)?).copied()
+    }
+}
+
+/// What an index is: a property index answering seeks, a vector index answering
+/// nearest-neighbour queries over one list-of-numbers property, or a full-text index
+/// answering text queries over string properties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum IndexKind {
     #[default]
@@ -711,26 +772,33 @@ pub enum IndexKind {
         dimensions: u32,
         similarity: VectorSimilarity,
     },
+    Fulltext {
+        analyzer: Analyzer,
+    },
 }
 
 impl IndexKind {
-    /// `RANGE` or `VECTOR`, as `SHOW INDEXES` lists it.
+    /// `RANGE`, `VECTOR` or `FULLTEXT`, as `SHOW INDEXES` lists it.
     pub fn text(self) -> &'static str {
         match self {
             IndexKind::Range => "RANGE",
             IndexKind::Vector { .. } => "VECTOR",
+            IndexKind::Fulltext { .. } => "FULLTEXT",
         }
     }
 }
 
 /// An index on one or more properties of the nodes with a label, or of the
-/// relationships of a type: a property (range) index, or a vector index.
+/// relationships of a type: a property (range) index, a vector index, or a full-text
+/// index (which may cover several labels or types).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDef {
     pub name: String,
     pub entity: IndexEntity,
     /// The label (node index) or relationship type (relationship index).
     pub label: String,
+    /// Further labels or types of a full-text index; empty for other indexes.
+    pub extra_labels: Vec<String>,
     /// One property, or several for a composite index (in order).
     pub properties: Vec<String>,
     pub kind: IndexKind,
@@ -743,6 +811,7 @@ impl IndexDef {
             name: name.into(),
             entity: IndexEntity::Node,
             label: label.into(),
+            extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Range,
         }
@@ -762,13 +831,58 @@ impl IndexDef {
             name: name.into(),
             entity,
             label: label.into(),
+            extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Vector { dimensions, similarity },
         }
     }
 
+    /// A full-text index on `properties` of the nodes with any of `labels`, or of the
+    /// relationships of any of the types (`entity`).
+    pub fn fulltext(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        labels: Vec<String>,
+        properties: Vec<String>,
+        analyzer: Analyzer,
+    ) -> IndexDef {
+        let mut labels = labels.into_iter();
+        IndexDef {
+            name: name.into(),
+            entity,
+            label: labels.next().unwrap_or_default(),
+            extra_labels: labels.collect(),
+            properties,
+            kind: IndexKind::Fulltext { analyzer },
+        }
+    }
+
     pub fn is_vector(&self) -> bool {
         matches!(self.kind, IndexKind::Vector { .. })
+    }
+
+    pub fn is_fulltext(&self) -> bool {
+        matches!(self.kind, IndexKind::Fulltext { .. })
+    }
+
+    /// The labels (or types) the index covers: [`label`](Self::label), then the
+    /// [`extra_labels`](Self::extra_labels) of a full-text index.
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.label.as_str()).chain(self.extra_labels.iter().map(String::as_str))
+    }
+
+    /// Whether `self` and `other` are indexes of the same kind (range, vector or
+    /// full-text) on the same labels or types and properties: one makes the other
+    /// redundant.
+    pub fn same_index(&self, other: &IndexDef) -> bool {
+        let mut a: Vec<&str> = self.labels().collect();
+        let mut b: Vec<&str> = other.labels().collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        std::mem::discriminant(&self.kind) == std::mem::discriminant(&other.kind)
+            && self.entity == other.entity
+            && a == b
+            && self.properties == other.properties
     }
 
     /// A single-property relationship index.
@@ -781,6 +895,7 @@ impl IndexDef {
             name: name.into(),
             entity: IndexEntity::Relationship,
             label: rel_type.into(),
+            extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Range,
         }
@@ -797,12 +912,14 @@ impl IndexDef {
         self.entity == entity && self.label == label && self.properties == properties
     }
 
-    /// The indexed schema in Cypher style: `:Label(a, b)` or `[:TYPE](a)`.
+    /// The indexed schema in Cypher style: `:Label(a, b)` or `[:TYPE](a)` (`:A|B(a)` for a
+    /// full-text index on several labels).
     pub fn target(&self) -> String {
         let props = self.properties.join(", ");
+        let labels = self.labels().collect::<Vec<_>>().join("|");
         match self.entity {
-            IndexEntity::Node => format!(":{}({props})", self.label),
-            IndexEntity::Relationship => format!("[:{}]({props})", self.label),
+            IndexEntity::Node => format!(":{labels}({props})"),
+            IndexEntity::Relationship => format!("[:{labels}]({props})"),
         }
     }
 
@@ -819,6 +936,14 @@ impl IndexDef {
                 return Err(Error::Semantic(format!(
                     "a vector index needs 1 to {MAX_VECTOR_DIMENSIONS} dimensions, not {dimensions}"
                 )));
+            }
+        }
+        if !self.extra_labels.is_empty() && !self.is_fulltext() {
+            return Err(Error::Semantic("only a full-text index covers several labels or types".into()));
+        }
+        for (i, l) in self.extra_labels.iter().enumerate() {
+            if *l == self.label || self.extra_labels[..i].contains(l) {
+                return Err(Error::Semantic(format!("`{l}` is repeated in the index")));
             }
         }
         if self.properties.len() > MAX_INDEX_PROPERTIES {
@@ -840,10 +965,14 @@ impl IndexDef {
                     self.name
                 )));
             }
-            if ix.is_vector() == self.is_vector() && ix.same_schema(self.entity, &self.label, &self.properties) {
+            if ix.same_index(self) {
                 return Err(Error::Constraint(format!(
                     "{} index on {} already exists",
-                    if self.is_vector() { "a vector" } else { "an" },
+                    match self.kind {
+                        IndexKind::Range => "an",
+                        IndexKind::Vector { .. } => "a vector",
+                        IndexKind::Fulltext { .. } => "a full-text",
+                    },
                     self.target()
                 )));
             }
@@ -878,6 +1007,7 @@ impl IndexDef {
             name,
             entity,
             label,
+            extra_labels: Vec::new(),
             properties,
             kind: IndexKind::Range,
         })
@@ -913,9 +1043,11 @@ impl IndexDef {
         Ok(def)
     }
 
+    /// Encodes the vector indexes among `defs`.
     pub(crate) fn encode_vector_list(defs: &[IndexDef], e: &mut Encoder) {
-        e.len(defs.len());
-        for d in defs {
+        let vectors: Vec<&IndexDef> = defs.iter().filter(|d| d.is_vector()).collect();
+        e.len(vectors.len());
+        for d in vectors {
             d.encode_vector(e);
         }
     }
@@ -923,6 +1055,41 @@ impl IndexDef {
     pub(crate) fn decode_vector_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
         let n = d.len(8)?;
         (0..n).map(|_| IndexDef::decode_vector(d)).collect()
+    }
+
+    /// Encodes a full-text index: the definition as [`encode`](Self::encode) writes it,
+    /// then its further labels and its analyzer (persistent format 10, hybrid log op 15,
+    /// memory snapshot 7).
+    pub(crate) fn encode_fulltext(&self, e: &mut Encoder) {
+        let IndexKind::Fulltext { analyzer } = self.kind else {
+            unreachable!("encode_fulltext of another index")
+        };
+        self.encode(e);
+        e.strings(&self.extra_labels);
+        e.u8(analyzer.code());
+    }
+
+    pub(crate) fn decode_fulltext(d: &mut Decoder) -> Result<IndexDef> {
+        let mut def = IndexDef::decode(d)?;
+        def.extra_labels = d.strings()?;
+        let code = d.u8()?;
+        let analyzer = Analyzer::from_code(code).ok_or_else(|| d.corrupt(format!("unknown analyzer {code}")))?;
+        def.kind = IndexKind::Fulltext { analyzer };
+        Ok(def)
+    }
+
+    /// Encodes the full-text indexes among `defs`.
+    pub(crate) fn encode_fulltext_list(defs: &[IndexDef], e: &mut Encoder) {
+        let texts: Vec<&IndexDef> = defs.iter().filter(|d| d.is_fulltext()).collect();
+        e.len(texts.len());
+        for d in texts {
+            d.encode_fulltext(e);
+        }
+    }
+
+    pub(crate) fn decode_fulltext_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
+        let n = d.len(8)?;
+        (0..n).map(|_| IndexDef::decode_fulltext(d)).collect()
     }
 
     /// Decodes a single-property node index as older formats wrote it: name, label,

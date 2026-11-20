@@ -659,12 +659,14 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             if self.eat_kw("INDEX") {
-                return self.parse_create_index(false);
+                return self.parse_create_index(IndexType::Range);
             }
-            if self.is_kw("VECTOR") && self.kw_at(1, "INDEX") {
-                self.advance();
-                self.advance();
-                return self.parse_create_index(true);
+            for (kw, kind) in [("VECTOR", IndexType::Vector), ("FULLTEXT", IndexType::Fulltext)] {
+                if self.is_kw(kw) && self.kw_at(1, "INDEX") {
+                    self.advance();
+                    self.advance();
+                    return self.parse_create_index(kind);
+                }
             }
             if self.eat_kw("CONSTRAINT") {
                 return self.parse_create_constraint();
@@ -1024,17 +1026,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// After `CREATE INDEX` or (`vector`) `CREATE VECTOR INDEX`.
-    fn parse_create_index(&mut self, vector: bool) -> Result<Clause> {
-        if !vector && self.eat_kw("ON") {
+    /// After `CREATE INDEX`, `CREATE VECTOR INDEX` or `CREATE FULLTEXT INDEX` (`kind`).
+    fn parse_create_index(&mut self, kind: IndexType) -> Result<Clause> {
+        let fulltext = kind == IndexType::Fulltext;
+        if kind == IndexType::Range && self.eat_kw("ON") {
             let (label, properties) = self.parse_legacy_index_target()?;
             return Ok(Clause::CreateIndex {
                 name: None,
                 entity: IndexEntity::Node,
-                label,
+                labels: vec![label],
                 properties,
                 if_not_exists: false,
-                vector: false,
+                kind,
                 options: None,
             });
         }
@@ -1052,15 +1055,20 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw("FOR")?;
         self.expect(Tok::LParen, "'('")?;
-        let (entity, var, label) = if self.eat(&Tok::RParen) {
+        let (entity, var, labels) = if self.eat(&Tok::RParen) {
             // `()-[r:TYPE]-()`, in any direction.
             let offset = self.offset();
             let rel = self.parse_rel_pattern()?;
             self.expect(Tok::LParen, "'('")?;
             self.expect(Tok::RParen, "')'")?;
-            let (Some(var), [rel_type]) = (rel.var, &rel.types[..]) else {
+            let types_ok = if fulltext { !rel.types.is_empty() } else { rel.types.len() == 1 };
+            let (Some(var), true) = (rel.var, types_ok) else {
                 return Err(Error::syntax(
-                    "a relationship index needs a variable and one type, as in ()-[r:TYPE]-()",
+                    if fulltext {
+                        "a full-text relationship index needs a variable and types, as in ()-[r:A|B]-()"
+                    } else {
+                        "a relationship index needs a variable and one type, as in ()-[r:TYPE]-()"
+                    },
                     offset,
                 ));
             };
@@ -1070,19 +1078,32 @@ impl<'a> Parser<'a> {
                     offset,
                 ));
             }
-            (IndexEntity::Relationship, var, rel_type.clone())
+            (IndexEntity::Relationship, var, rel.types)
         } else {
             let var = self.ident()?;
             self.expect(Tok::Colon, "':' and a label")?;
-            let label = self.ident()?;
+            let mut labels = vec![self.ident()?];
+            while fulltext && self.eat(&Tok::Pipe) {
+                labels.push(self.ident()?);
+            }
             self.expect(Tok::RParen, "')'")?;
-            (IndexEntity::Node, var, label)
+            (IndexEntity::Node, var, labels)
         };
         self.expect_kw("ON")?;
-        // A vector index is on one property, with or without parentheses.
-        let parens = !vector || matches!(self.peek(), Tok::LParen);
-        if parens {
-            self.expect(Tok::LParen, "'('")?;
+        // A full-text index lists its properties as `EACH [n.a, …]`; a vector index is on
+        // one property, with or without parentheses.
+        let (open, close) = if fulltext {
+            self.expect_kw("EACH")?;
+            (Some(Tok::LBracket), Tok::RBracket)
+        } else if kind == IndexType::Range || matches!(self.peek(), Tok::LParen) {
+            (Some(Tok::LParen), Tok::RParen)
+        } else {
+            (None, Tok::RParen)
+        };
+        let parens = open.is_some();
+        if let Some(open) = open {
+            let what = if fulltext { "'['" } else { "'('" };
+            self.expect(open, what)?;
         }
         let mut properties = Vec::new();
         loop {
@@ -1101,7 +1122,8 @@ impl<'a> Parser<'a> {
             }
         }
         if parens {
-            self.expect(Tok::RParen, "')'")?;
+            let what = if fulltext { "']'" } else { "')'" };
+            self.expect(close, what)?;
         }
         let options = if self.eat_kw("OPTIONS") {
             if !matches!(self.peek(), Tok::LBrace | Tok::Param(_)) {
@@ -1117,10 +1139,10 @@ impl<'a> Parser<'a> {
         Ok(Clause::CreateIndex {
             name,
             entity,
-            label,
+            labels,
             properties,
             if_not_exists,
-            vector,
+            kind,
             options,
         })
     }
@@ -2349,10 +2371,10 @@ mod tests {
             Clause::CreateIndex {
                 name: Some("person_name".into()),
                 entity: IndexEntity::Node,
-                label: "Person".into(),
+                labels: vec!["Person".into()],
                 properties: vec!["name".into()],
                 if_not_exists: true,
-                vector: false,
+                kind: IndexType::Range,
                 options: None,
             }
         );
@@ -2365,10 +2387,10 @@ mod tests {
             Clause::CreateIndex {
                 name: None,
                 entity: IndexEntity::Node,
-                label: "Person".into(),
+                labels: vec!["Person".into()],
                 properties: vec!["first".into(), "last".into()],
                 if_not_exists: false,
-                vector: false,
+                kind: IndexType::Range,
                 options: None,
             }
         );
@@ -2382,10 +2404,10 @@ mod tests {
                 Clause::CreateIndex {
                     name: Some("since".into()),
                     entity: IndexEntity::Relationship,
-                    label: "KNOWS".into(),
+                    labels: vec!["KNOWS".into()],
                     properties: vec!["since".into()],
                     if_not_exists: false,
-                    vector: false,
+                    kind: IndexType::Range,
                     options: None,
                 },
                 "{q}"
@@ -2411,14 +2433,35 @@ mod tests {
             "CREATE VECTOR INDEX emb FOR (d:Doc) ON (d.embedding) OPTIONS $opts",
         ] {
             assert!(
-                matches!(&single(q)[0], Clause::CreateIndex { vector: true, options: Some(_), properties, .. } if properties == &["embedding"]),
+                matches!(&single(q)[0], Clause::CreateIndex { kind: IndexType::Vector, options: Some(_), properties, .. } if properties == &["embedding"]),
                 "{q}"
             );
         }
         assert!(matches!(
             &single("CREATE VECTOR INDEX FOR ()-[r:SIMILAR]-() ON r.v")[0],
-            Clause::CreateIndex { vector: true, entity: IndexEntity::Relationship, options: None, .. }
+            Clause::CreateIndex { kind: IndexType::Vector, entity: IndexEntity::Relationship, options: None, .. }
         ));
+        let c = single("CREATE FULLTEXT INDEX titles IF NOT EXISTS FOR (n:Movie|Book) ON EACH [n.title, n.tagline] OPTIONS {indexConfig: {}}");
+        assert!(matches!(
+            &c[0],
+            Clause::CreateIndex { name: Some(n), entity: IndexEntity::Node, labels, properties, if_not_exists: true, kind: IndexType::Fulltext, options: Some(_) }
+                if n == "titles" && labels == &["Movie", "Book"] && properties == &["title", "tagline"]
+        ));
+        assert!(matches!(
+            &single("CREATE FULLTEXT INDEX FOR ()-[r:REVIEWED|RATED]-() ON EACH [r.summary]")[0],
+            Clause::CreateIndex { kind: IndexType::Fulltext, entity: IndexEntity::Relationship, labels, .. } if labels.len() == 2
+        ));
+        for bad in [
+            "CREATE FULLTEXT INDEX FOR (n:Movie) ON (n.title)",
+            "CREATE FULLTEXT INDEX FOR (n:Movie) ON EACH n.title",
+            "CREATE FULLTEXT INDEX FOR (n:Movie) ON EACH [n.title",
+            "CREATE FULLTEXT INDEX ON :Movie(title)",
+            "CREATE FULLTEXT INDEX FOR ()-[r]-() ON EACH [r.title]",
+            "CREATE INDEX FOR (n:A|B) ON (n.title)",
+            "CREATE TEXT INDEX FOR (n:Movie) ON (n.title)",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         for bad in [
             "CREATE VECTOR INDEX ON :Doc(embedding)",
             "CREATE VECTOR INDEX FOR (d:Doc) ON d.a, d.b",
