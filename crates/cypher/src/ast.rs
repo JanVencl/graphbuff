@@ -893,10 +893,11 @@ pub enum UserCommand {
     },
     /// `DROP USER name [IF EXISTS]`
     Drop { name: DbName, if_exists: bool },
-    /// `GRANT ROLE[S] r, … TO u, …`
-    Grant { roles: Vec<DbName>, users: Vec<DbName> },
-    /// `REVOKE ROLE[S] r, … FROM u, …`
-    Revoke { roles: Vec<DbName>, users: Vec<DbName> },
+    /// `GRANT ROLE[S] r, … [ON DATABASE db] TO u, …`: everywhere, or (`database`) on one
+    /// database only.
+    Grant { roles: Vec<DbName>, database: Option<DbName>, users: Vec<DbName> },
+    /// `REVOKE ROLE[S] r, … [ON DATABASE db] FROM u, …`
+    Revoke { roles: Vec<DbName>, database: Option<DbName>, users: Vec<DbName> },
 }
 
 impl UserCommand {

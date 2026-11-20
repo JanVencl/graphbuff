@@ -739,3 +739,86 @@ fn metrics_show_store_size() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- roles on one database --------------------------------------------------------------------
+
+#[test]
+fn roles_on_one_database() {
+    let server = start(users(), None);
+    let (addr, bolt) = (server.local_addr(), server.bolt_addr().unwrap());
+    let root = basic("root", "rootpw");
+    let ok = |auth: &str, q: &str| {
+        let r = query(addr, auth, q);
+        assert_eq!(r.status, 200, "{q}: {}", r.body);
+    };
+    ok(&root, "CREATE DATABASE movies");
+    ok(&root, "CREATE DATABASE other");
+    ok(&root, "CREATE USER m SET PASSWORD 'mpw'");
+    ok(&root, "GRANT ROLE editor ON DATABASE Movies TO m");
+    ok(&root, "GRANT ROLES reader ON DATABASE other TO m");
+    let refused = query(addr, &root, "GRANT ROLE admin ON DATABASE movies TO m");
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.body.contains("without ON DATABASE"), "{}", refused.body);
+    let missing = query(addr, &root, "GRANT ROLE reader ON DATABASE nope TO m");
+    assert_eq!(missing.status, 400, "{}", missing.body);
+    assert!(missing.body.contains("does not exist"), "{}", missing.body);
+    // Only administrators grant.
+    assert_eq!(query(addr, &basic("ed", "edpw"), "GRANT ROLE editor ON DATABASE movies TO ed").status, 403);
+
+    let m = basic("m", "mpw");
+    let on = |db: &str, q: &str| {
+        let mut body = String::from(r#"{"query":"#);
+        json::write_str(&mut body, q);
+        body.push('}');
+        http(addr, "POST", &format!("/db/{db}/query"), Some(&m), Some(&body)).status
+    };
+    assert_eq!(on("movies", "CREATE (:Movie)"), 200);
+    assert_eq!(on("other", "MATCH (n) RETURN count(n)"), 200);
+    assert_eq!(on("other", "CREATE (:X)"), 403);
+    // Nothing on the default database; USE picks the database that counts.
+    assert_eq!(query(addr, &m, "MATCH (n) RETURN count(n)").status, 403);
+    assert_eq!(query(addr, &m, "USE movies CREATE (:Movie)").status, 200);
+    assert_eq!(on("movies", "USE graphbuff MATCH (n) RETURN n"), 403);
+    // Listing databases needs a role somewhere.
+    assert_eq!(http(addr, "GET", "/db", Some(&m), None).status, 200);
+    assert_eq!(query(addr, &m, "SHOW DATABASES").status, 200);
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("nobody", "nopw")), None).status, 403);
+    // Database commands and user management stay with administrators.
+    assert_eq!(query(addr, &m, "CREATE DATABASE mine").status, 403);
+    assert_eq!(query(addr, &m, "SHOW USERS").status, 403);
+
+    // Explicit transactions.
+    let begin = http(addr, "POST", "/db/movies/tx", Some(&m), Some(""));
+    assert_eq!(begin.status, 201, "{}", begin.body);
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    assert_eq!(http(addr, "POST", &path, Some(&m), Some(r#"{"query":"CREATE (:Movie)"}"#)).status, 200);
+    assert_eq!(http(addr, "POST", &format!("{path}/commit"), Some(&m), Some("")).status, 200);
+    assert_eq!(http(addr, "POST", "/db/graphbuff/tx", Some(&m), Some("")).status, 403);
+    let begin = http(addr, "POST", "/db/other/tx", Some(&m), Some(""));
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    assert_eq!(http(addr, "POST", &path, Some(&m), Some(r#"{"query":"CREATE (:X)"}"#)).status, 403);
+    // A refused statement leaves the transaction open; it holds the database until rolled back.
+    assert_eq!(http(addr, "DELETE", &path, Some(&m), None).status, 200);
+
+    // Bolt.
+    let mut b = Bolt::connect(bolt);
+    assert_eq!(b.logon("m", "mpw").0, SUCCESS);
+    assert_eq!(b.run("MATCH (n:Movie) RETURN count(n)", Some("movies")).unwrap(), vec![vec![PackValue::Int(3)]]);
+    assert_eq!(b.run("MATCH (n) RETURN n", None).unwrap_err(), FORBIDDEN);
+    assert_eq!(b.run("CREATE (:X)", Some("other")).unwrap_err(), FORBIDDEN);
+    b.send(BEGIN, vec![PackValue::map([("db", s("other"))])]);
+    assert_eq!(b.recv().0, SUCCESS);
+    b.send(RUN, vec![s("CREATE (:X)"), PackValue::Map(BTreeMap::new()), PackValue::Map(BTreeMap::new())]);
+    let (tag, fields) = b.recv();
+    assert_eq!((tag, failure_code(&fields)), (FAILURE, FORBIDDEN.to_string()));
+
+    // Listed by SHOW USERS; revoking takes the access away.
+    let users = query(addr, &root, "SHOW USERS");
+    let row = users.rows().iter().map(enc).find(|r| r.starts_with(r#"["m","#)).unwrap();
+    assert_eq!(row, r#"["m",[],false,false,null,{"movies":["editor"],"other":["reader"]}]"#);
+    ok(&root, "REVOKE ROLE editor ON DATABASE movies FROM m");
+    assert_eq!(on("movies", "CREATE (:Movie)"), 403);
+    // A role held everywhere still counts on every database.
+    ok(&root, "GRANT ROLE reader TO m");
+    assert_eq!(query(addr, &m, "MATCH (n) RETURN count(n)").status, 200);
+}

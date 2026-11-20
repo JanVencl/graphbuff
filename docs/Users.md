@@ -57,11 +57,36 @@ one, revoking their role or replacing their account is refused. New passwords ne
 least 8 characters and must differ from the user name. Administrators manage accounts with Neo4j's commands (on the `system` database
 over Bolt, or anywhere in auto-commit): `CREATE [OR REPLACE] USER name [IF NOT EXISTS]
 SET [PLAINTEXT] PASSWORD 'pw' | $pw [CHANGE NOT REQUIRED]`, `ALTER USER name SET PASSWORD
-…`, `RENAME USER a TO b`, `DROP USER name [IF EXISTS]`, `GRANT ROLE[S] r, … TO u, …`,
-`REVOKE ROLE[S] r FROM u`, `SHOW USERS`, `SHOW ROLES`; every user may run `SHOW CURRENT
-USER` and `ALTER CURRENT USER SET PASSWORD FROM 'old' TO 'new'`. Explicit HTTP
-transactions belong to the client that began them. Not supported: custom roles and
-privileges (`GRANT MATCH …`), `CHANGE REQUIRED`, suspended users, home databases.
+…`, `RENAME USER a TO b`, `DROP USER name [IF EXISTS]`, `GRANT ROLE[S] r, … [ON DATABASE
+db] TO u, …`, `REVOKE ROLE[S] r [ON DATABASE db] FROM u`, `SHOW USERS`, `SHOW ROLES`; every
+user may run `SHOW CURRENT USER` and `ALTER CURRENT USER SET PASSWORD FROM 'old' TO 'new'`.
+Explicit HTTP transactions belong to the client that began them. Not supported: custom
+roles and privileges (`GRANT MATCH …`), `CHANGE REQUIRED`, suspended users, home databases.
+
+**Roles on one database.** `reader` and `editor` can be granted on a single database:
+
+```cypher
+GRANT ROLE editor ON DATABASE movies TO alice
+GRANT ROLE reader ON DATABASE analytics TO alice
+REVOKE ROLE editor ON DATABASE movies FROM alice
+```
+
+- On each database, a user may do what the strongest role they hold there allows: a
+  role granted without `ON DATABASE` (or `ON DATABASES *`) counts everywhere, one granted
+  `ON DATABASE db` only on `db`.
+- A query needs the role on the database it runs on: the one named in the request
+  (`/db/{name}/query`, Bolt's `db`) or by `USE`, else the default database. So does an
+  explicit transaction.
+- `SHOW DATABASES` and `GET /db` need a role on some database (they list all databases).
+- `admin` is held on every database only: creating and dropping databases, managing users,
+  backups, metrics and terminating others' transactions stay with administrators.
+- Granting needs an existing database; names are case-insensitive. Grants stay when a
+  database is dropped (and apply again if one of that name is created); revoke them to
+  remove them.
+- `SHOW USERS` and `SHOW CURRENT USER` list them in the `databaseRoles` column, a map from
+  database to roles.
+- The system database keeps them in each user's `databaseRoles` property. Older versions
+  ignore them, so after a downgrade those users have only the roles held everywhere.
 
 **Failed logins** lock a client out for a while, over HTTP and Bolt alike. They are counted
 per client address and user name, and per client address over all names. After

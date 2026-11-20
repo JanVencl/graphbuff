@@ -519,12 +519,24 @@ impl<'a> Parser<'a> {
             let grant = self.is_kw("GRANT");
             self.pos += 2;
             let roles = self.name_list()?;
+            // `ON DATABASE db`; `ON DATABASES *` is the same as no `ON`.
+            let database = if self.eat_kw("ON") {
+                if self.eat_kw("DATABASES") {
+                    self.expect(Tok::Star, "'*'")?;
+                    None
+                } else {
+                    self.expect_kw("DATABASE")?;
+                    Some(self.db_name()?)
+                }
+            } else {
+                None
+            };
             self.expect_kw(if grant { "TO" } else { "FROM" })?;
             let users = self.name_list()?;
             if grant {
-                UserCommand::Grant { roles, users }
+                UserCommand::Grant { roles, database, users }
             } else {
-                UserCommand::Revoke { roles, users }
+                UserCommand::Revoke { roles, database, users }
             }
         } else {
             return Ok(None);
@@ -2688,6 +2700,7 @@ mod tests {
             user("GRANT ROLES reader, editor TO a, $b"),
             UserCommand::Grant {
                 roles: vec![name("reader"), name("editor")],
+                database: None,
                 users: vec![name("a"), DbName::Param("b".into())]
             }
         );
@@ -2695,9 +2708,29 @@ mod tests {
             user("REVOKE ROLE admin FROM a"),
             UserCommand::Revoke {
                 roles: vec![name("admin")],
+                database: None,
                 users: vec![name("a")]
             }
         );
+        assert_eq!(
+            user("GRANT ROLE reader ON DATABASE movies.v2 TO a"),
+            UserCommand::Grant { roles: vec![name("reader")], database: Some(name("movies.v2")), users: vec![name("a")] }
+        );
+        assert_eq!(
+            user("REVOKE ROLE editor ON DATABASE $db FROM a"),
+            UserCommand::Revoke {
+                roles: vec![name("editor")],
+                database: Some(DbName::Param("db".into())),
+                users: vec![name("a")]
+            }
+        );
+        assert_eq!(
+            user("GRANT ROLE reader ON DATABASES * TO a"),
+            UserCommand::Grant { roles: vec![name("reader")], database: None, users: vec![name("a")] }
+        );
+        for bad in ["GRANT ROLE reader ON GRAPH g TO a", "GRANT ROLE reader ON DATABASE TO a", "GRANT ROLE reader ON DATABASES g TO a"] {
+            assert!(parse_statement(bad).is_err(), "{bad}");
+        }
         for unsupported in [
             "CREATE USER a SET PASSWORD 'x' CHANGE REQUIRED",
             "CREATE USER a SET ENCRYPTED PASSWORD 'x'",

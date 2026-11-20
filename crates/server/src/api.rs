@@ -162,12 +162,60 @@ impl Ctx {
         }
     }
 
-    /// What `who` may do now; `None` if the account no longer exists.
+    /// What `who` may do now on every database; `None` if the account no longer exists.
     pub(crate) fn access(&self, who: &Principal) -> Option<Access> {
         match who {
             Principal::Open | Principal::Token => Some(Access::Admin),
             Principal::User(name) => self.users.as_ref()?.access(name),
         }
+    }
+
+    /// What `who` may do on database `db` (roles held everywhere, or there).
+    pub(crate) fn access_on(&self, who: &Principal, db: &str) -> Access {
+        match who {
+            Principal::Open | Principal::Token => Access::Admin,
+            Principal::User(name) => self.users.as_ref().and_then(|u| u.access_on(name, db)).unwrap_or(Access::None),
+        }
+    }
+
+    /// The most `who` may do on some database.
+    pub(crate) fn best_access(&self, who: &Principal) -> Access {
+        match who {
+            Principal::Open | Principal::Token => Access::Admin,
+            Principal::User(name) => self.users.as_ref().and_then(|u| u.best_access(name)).unwrap_or(Access::None),
+        }
+    }
+
+    /// Checks that `who` may run `stmt`, whose session is on database `current` (user and
+    /// transaction commands check for themselves). A query needs the role on the database
+    /// it runs on (its `USE`, else `current`); `SHOW DATABASES` a role on some database;
+    /// other database commands the admin role.
+    pub(crate) fn authorize(
+        &self,
+        who: &Principal,
+        stmt: &Statement,
+        current: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<(), Error> {
+        let (needed, what, db) = match stmt {
+            Statement::Query { use_db, query } => {
+                let (needed, what) = authorize_query(query);
+                let db = match use_db {
+                    Some(n) => users::resolve(n, params, "database name")?,
+                    None => current.to_string(),
+                };
+                (needed, what, db)
+            }
+            Statement::Use(n) => (Access::Read, "reading", users::resolve(n, params, "database name")?),
+            Statement::Database(DatabaseCommand::Show(_)) => {
+                return check(self.best_access(who), Access::Read, "reading");
+            }
+            Statement::Database(cmd) => {
+                return check(self.access(who).unwrap_or(Access::None), Access::Admin, cmd.name());
+            }
+            Statement::User(_) | Statement::Transaction(_) => return Ok(()),
+        };
+        check(self.access_on(who, &db), needed, what)
     }
 
     /// Runs a user command for `who`.
@@ -184,20 +232,16 @@ impl Ctx {
                 cmd.name()
             )));
         };
+        // A role is granted on a database that exists (revoking cleans up after one that
+        // is gone, too).
+        if let graphbuff::cypher::ast::UserCommand::Grant { database: Some(db), .. } = cmd
+            && access == Access::Admin
+        {
+            let db = users::resolve(db, params, "database name")?;
+            self.mgr.database(&db)?;
+        }
         users::run(users, who, access, cmd, params)
     }
-}
-
-/// Checks that a client that may do `access` may run `stmt` (user commands check for
-/// themselves).
-pub(crate) fn authorize(access: Access, stmt: &Statement) -> Result<(), Error> {
-    let (needed, what) = match stmt {
-        Statement::Query { query, .. } => authorize_query(query),
-        Statement::Use(_) | Statement::Database(DatabaseCommand::Show(_)) => (Access::Read, "reading"),
-        Statement::Database(cmd) => (Access::Admin, cmd.name()),
-        Statement::User(_) | Statement::Transaction(_) => return Ok(()),
-    };
-    check(access, needed, what)
 }
 
 /// The access `query` needs, and what it does.
@@ -428,7 +472,7 @@ fn metrics(&(ctx, me): &Req) -> Response {
 }
 
 fn list_databases(&(ctx, me): &Req) -> Response {
-    if let Err(e) = check(me.access, Access::Read, "listing databases") {
+    if let Err(e) = check(ctx.best_access(me.who), Access::Read, "listing databases") {
         return query_error(&e);
     }
     let mut body = String::from(r#"{"databases":["#);
@@ -490,7 +534,8 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
             Err(e) => query_error(&e),
         };
     }
-    if let Err(e) = authorize(me.access, &statement) {
+    let current = db.map_or_else(|| ctx.mgr.default_database(), String::from);
+    if let Err(e) = ctx.authorize(me.who, &statement, &current, &params) {
         return query_error(&e);
     }
     let mut session = ctx.mgr.session();
@@ -775,7 +820,7 @@ fn tx_path(db: &str, id: &str) -> String {
 
 /// `POST /db/{name}/tx`: begins a transaction. The body may be empty or `{}`.
 fn begin(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
-    if let Err(e) = check(me.access, Access::Read, "a transaction") {
+    if let Err(e) = check(ctx.access_on(me.who, &tx_database(ctx, db)), Access::Read, "a transaction") {
         return query_error(&e);
     }
     let text = match json_body(req) {
@@ -841,7 +886,7 @@ fn in_transaction(&(ctx, me): &Req, db: Option<&str>, id: &str, req: &Request) -
         Err(e) => return query_error(&e),
     };
     let (needed, what) = authorize_query(&parsed);
-    if let Err(e) = check(me.access, needed, what) {
+    if let Err(e) = check(ctx.access_on(me.who, &name), needed, what) {
         return query_error(&e);
     }
     let started = Instant::now();

@@ -2,8 +2,9 @@
 //! ([`Users::system`]).
 //!
 //! In the system database each account is a node
-//! `(:User {name, password, roles})` (`password` is the encoded hash, `roles` a list of
-//! role names), with a uniqueness constraint on `name`. A `(:SystemInfo {version})` node
+//! `(:User {name, password, roles, databaseRoles})` (`password` is the encoded hash,
+//! `roles` a list of role names, `databaseRoles` a list of `role:database` strings), with
+//! a uniqueness constraint on `name`. A `(:SystemInfo {version})` node
 //! records the layout, so a newer layout is refused rather than misread. Every change
 //! is one statement, so it is applied completely or not at all, and is synced to disk
 //! before it takes effect.
@@ -15,7 +16,9 @@
 //! fast salted hash) until the password changes, so clients that open many connections
 //! pay the slow hash once.
 //!
-//! Each user has a set of roles; the strongest one decides what the user may do:
+//! Each user has a set of roles, held everywhere or (reader and editor) on one database
+//! only; on each database, the strongest role the user holds there decides what they may
+//! do:
 //!
 //! | Role | May |
 //! |------|-----|
@@ -207,7 +210,15 @@ impl PasswordHash {
 #[derive(Clone)]
 struct Account {
     password: PasswordHash,
+    /// Roles held on every database.
     roles: BTreeSet<Role>,
+    /// Roles held on one database (by lowercase name) only.
+    databases: BTreeMap<String, BTreeSet<Role>>,
+}
+
+/// The key of database `name` in [`Account::databases`].
+fn db_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 impl Account {
@@ -357,10 +368,10 @@ impl Users {
             rows => return Err(bad(format!("{} SystemInfo nodes, expected one", rows.len()))),
         }
 
-        let rows = db.execute("MATCH (u:User) RETURN u.name, u.password, u.roles")?.rows;
+        let rows = db.execute("MATCH (u:User) RETURN u.name, u.password, u.roles, u.databaseRoles")?.rows;
         let mut accounts = BTreeMap::new();
         for row in rows {
-            let [ResultValue::String(name), ResultValue::String(hash), roles] = row.as_slice() else {
+            let [ResultValue::String(name), ResultValue::String(hash), roles, db_roles] = row.as_slice() else {
                 return Err(bad(format!("invalid user record {row:?}")));
             };
             check_name(name).map_err(|_| bad(format!("invalid user name `{name}`")))?;
@@ -376,7 +387,27 @@ impl Users {
                 ResultValue::Null => BTreeSet::new(),
                 other => return Err(bad(format!("invalid roles {other:?} of `{name}`"))),
             };
-            if accounts.insert(name.clone(), Account { password, roles }).is_some() {
+            let mut databases: BTreeMap<String, BTreeSet<Role>> = BTreeMap::new();
+            match db_roles {
+                ResultValue::Null => {}
+                ResultValue::List(list) => {
+                    for r in list {
+                        let parsed = match r {
+                            ResultValue::String(s) => s
+                                .split_once(':')
+                                .and_then(|(role, db)| Some((Role::parse(role).ok()?, db)))
+                                .filter(|(role, db)| *role != Role::Admin && !db.is_empty()),
+                            _ => None,
+                        };
+                        let Some((role, db)) = parsed else {
+                            return Err(bad(format!("invalid database role {r:?} of `{name}`")));
+                        };
+                        databases.entry(db_key(db)).or_default().insert(role);
+                    }
+                }
+                other => return Err(bad(format!("invalid database roles {other:?} of `{name}`"))),
+            }
+            if accounts.insert(name.clone(), Account { password, roles, databases }).is_some() {
                 return Err(bad(format!("duplicate user `{name}`")));
             }
         }
@@ -442,11 +473,35 @@ impl Users {
         self.read().accounts.get(name).map(|a| a.roles.iter().copied().collect())
     }
 
-    /// What `name` may do; `None` if there is no such user (any more).
+    /// The roles `name` holds on database `db` only, by database, if the user exists.
+    pub fn database_roles(&self, name: &str) -> Option<BTreeMap<String, Vec<Role>>> {
+        let st = self.read();
+        let a = st.accounts.get(name)?;
+        Some(a.databases.iter().map(|(db, r)| (db.clone(), r.iter().copied().collect())).collect())
+    }
+
+    /// What `name` may do everywhere (its roles held on every database); `None` if there
+    /// is no such user (any more).
     pub(crate) fn access(&self, name: &str) -> Option<Access> {
         let st = self.read();
         let account = st.accounts.get(name)?;
         Some(account.roles.iter().map(|r| r.access()).max().unwrap_or(Access::None))
+    }
+
+    /// What `name` may do on database `db`: its strongest role held everywhere or there.
+    pub(crate) fn access_on(&self, name: &str, db: &str) -> Option<Access> {
+        let st = self.read();
+        let account = st.accounts.get(name)?;
+        let here = account.databases.get(&db_key(db)).into_iter().flatten();
+        Some(account.roles.iter().chain(here).map(|r| r.access()).max().unwrap_or(Access::None))
+    }
+
+    /// The most `name` may do on some database.
+    pub(crate) fn best_access(&self, name: &str) -> Option<Access> {
+        let st = self.read();
+        let account = st.accounts.get(name)?;
+        let all = account.roles.iter().chain(account.databases.values().flatten());
+        Some(all.map(|r| r.access()).max().unwrap_or(Access::None))
     }
 
     /// Whether `password` is `name`'s password. A hash made with parameters other than
@@ -531,7 +586,7 @@ impl Users {
                 }
             }
             let roles = roles.iter().copied().collect();
-            accounts.insert(name.to_string(), Account { password, roles });
+            accounts.insert(name.to_string(), Account { password, roles, databases: BTreeMap::new() });
             Ok(true)
         })
     }
@@ -557,6 +612,34 @@ impl Users {
     /// Takes `role` from `name`; returns whether the user had it.
     pub fn revoke(&self, name: &str, role: Role) -> Result<bool> {
         self.change(|accounts| Ok(accounts.get_mut(name).ok_or_else(|| no_user(name))?.roles.remove(&role)))
+    }
+
+    /// Gives `role` (reader or editor) to `name` on database `db` only; returns whether
+    /// the user lacked it there.
+    pub fn grant_on(&self, name: &str, db: &str, role: Role) -> Result<bool> {
+        if role == Role::Admin {
+            return Err(Error::Semantic(
+                "the admin role is held on every database; grant it without ON DATABASE".into(),
+            ));
+        }
+        self.change(|accounts| {
+            let a = accounts.get_mut(name).ok_or_else(|| no_user(name))?;
+            Ok(a.databases.entry(db_key(db)).or_default().insert(role))
+        })
+    }
+
+    /// Takes `role` from `name` on database `db`; returns whether the user had it there.
+    pub fn revoke_on(&self, name: &str, db: &str, role: Role) -> Result<bool> {
+        self.change(|accounts| {
+            let a = accounts.get_mut(name).ok_or_else(|| no_user(name))?;
+            let key = db_key(db);
+            let Some(roles) = a.databases.get_mut(&key) else { return Ok(false) };
+            let had = roles.remove(&role);
+            if roles.is_empty() {
+                a.databases.remove(&key);
+            }
+            Ok(had)
+        })
     }
 
     /// Removes a user; returns whether there was one.
@@ -597,7 +680,7 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
         .iter()
         .filter(|(name, a)| {
             old.get(*name)
-                .is_none_or(|o| o.roles != a.roles || o.password != a.password)
+                .is_none_or(|o| o.roles != a.roles || o.databases != a.databases || o.password != a.password)
         })
         .map(|(name, a)| {
             Value::Map(BTreeMap::from([
@@ -606,6 +689,15 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
                 (
                     "roles".to_string(),
                     Value::List(a.roles.iter().map(|r| Value::String(r.name().into())).collect()),
+                ),
+                (
+                    "databaseRoles".to_string(),
+                    Value::List(
+                        a.databases
+                            .iter()
+                            .flat_map(|(db, roles)| roles.iter().map(move |r| Value::String(format!("{}:{db}", r.name()))))
+                            .collect(),
+                    ),
                 ),
             ]))
         })
@@ -619,7 +711,7 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
          WITH count(*) AS ignored \
          UNWIND $upsert AS a \
          MERGE (u:User {name: a.name}) \
-         SET u.password = a.password, u.roles = a.roles",
+         SET u.password = a.password, u.roles = a.roles, u.databaseRoles = a.databaseRoles",
         &BTreeMap::from([
             ("remove".to_string(), Value::List(remove)),
             ("upsert".to_string(), Value::List(upsert)),
@@ -641,7 +733,7 @@ pub(crate) enum Principal {
     User(String),
 }
 
-fn resolve(name: &DbName, params: &BTreeMap<String, Value>, what: &str) -> Result<String> {
+pub(crate) fn resolve(name: &DbName, params: &BTreeMap<String, Value>, what: &str) -> Result<String> {
     match name {
         DbName::Name(n) => Ok(n.clone()),
         DbName::Param(p) => match params.get(p) {
@@ -671,19 +763,22 @@ fn changed(n: usize) -> QueryResult {
     }
 }
 
-fn user_row(name: &str, roles: &[Role]) -> Vec<ResultValue> {
+fn user_row(users: &Users, name: &str, roles: &[Role]) -> Vec<ResultValue> {
+    let databases = users.database_roles(name).unwrap_or_default();
+    let roles_of = |roles: &[Role]| ResultValue::List(roles.iter().map(|r| ResultValue::String(r.name().into())).collect());
     vec![
         ResultValue::String(name.to_string()),
-        ResultValue::List(roles.iter().map(|r| ResultValue::String(r.name().into())).collect()),
+        roles_of(roles),
         ResultValue::Bool(false),
         ResultValue::Bool(false),
         ResultValue::Null,
+        ResultValue::Map(databases.iter().map(|(db, r)| (db.clone(), roles_of(r))).collect()),
     ]
 }
 
 fn user_table(rows: Vec<Vec<ResultValue>>) -> QueryResult {
     QueryResult {
-        columns: ["user", "roles", "passwordChangeRequired", "suspended", "home"]
+        columns: ["user", "roles", "passwordChangeRequired", "suspended", "home", "databaseRoles"]
             .map(String::from)
             .to_vec(),
         rows,
@@ -705,10 +800,10 @@ pub(crate) fn run(
         return Err(Error::Forbidden(format!("{} needs the admin role", cmd.name())));
     }
     match cmd {
-        UserCommand::ShowUsers => Ok(user_table(users.list().iter().map(|(n, r)| user_row(n, r)).collect())),
+        UserCommand::ShowUsers => Ok(user_table(users.list().iter().map(|(n, r)| user_row(users, n, r)).collect())),
         UserCommand::ShowCurrentUser => {
             let rows = match who {
-                Principal::User(name) => users.roles(name).map(|r| user_row(name, &r)).into_iter().collect(),
+                Principal::User(name) => users.roles(name).map(|r| user_row(users, name, &r)).into_iter().collect(),
                 _ => Vec::new(),
             };
             Ok(user_table(rows))
@@ -781,7 +876,7 @@ pub(crate) fn run(
                 false => Err(no_user(&name)),
             }
         }
-        UserCommand::Grant { roles, users: names } | UserCommand::Revoke { roles, users: names } => {
+        UserCommand::Grant { roles, database, users: names } | UserCommand::Revoke { roles, database, users: names } => {
             let grant = matches!(cmd, UserCommand::Grant { .. });
             let roles = roles
                 .iter()
@@ -794,10 +889,22 @@ pub(crate) fn run(
             if let Some(missing) = names.iter().find(|n| users.roles(n).is_none()) {
                 return Err(no_user(missing));
             }
+            let database = database.as_ref().map(|d| resolve(d, params, "database name")).transpose()?;
+            // Checked before anything changes (grant_on refuses it too).
+            if grant && database.is_some() && roles.contains(&Role::Admin) {
+                return Err(Error::Semantic(
+                    "the admin role is held on every database; grant it without ON DATABASE".into(),
+                ));
+            }
             let mut n = 0;
             for name in &names {
                 for &role in &roles {
-                    let did = if grant { users.grant(name, role)? } else { users.revoke(name, role)? };
+                    let did = match (&database, grant) {
+                        (None, true) => users.grant(name, role)?,
+                        (None, false) => users.revoke(name, role)?,
+                        (Some(db), true) => users.grant_on(name, db, role)?,
+                        (Some(db), false) => users.revoke_on(name, db, role)?,
+                    };
                     n += did as usize;
                 }
             }
@@ -990,6 +1097,14 @@ mod tests {
             // Failing changes leave nothing behind.
             assert!(users.rename("robert", "alice").is_err());
             assert!(users.grant("nobody", Role::Admin).is_err());
+            // Roles on one database, kept with the account through a rename.
+            assert!(users.grant_on("carol", "Movies", Role::Editor).unwrap());
+            assert!(users.grant_on("carol", "other", Role::Reader).unwrap());
+            assert!(!users.grant_on("carol", "movies", Role::Editor).unwrap());
+            assert!(users.grant_on("carol", "movies", Role::Admin).is_err());
+            assert!(users.grant_on("robert", "gone", Role::Reader).unwrap());
+            assert!(users.revoke_on("robert", "gone", Role::Reader).unwrap());
+            assert!(!users.revoke_on("robert", "gone", Role::Reader).unwrap());
         }
         let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
         let system = mgr.system_database().unwrap();
@@ -1006,6 +1121,17 @@ mod tests {
         assert!(users.authenticate("robert", "pw2"));
         assert!(users.authenticate("carol", "new"));
         assert!(!users.authenticate("carol", "pw3"));
+        assert_eq!(
+            users.database_roles("carol").unwrap(),
+            BTreeMap::from([("movies".to_string(), vec![Role::Editor]), ("other".to_string(), vec![Role::Reader])])
+        );
+        assert!(users.database_roles("robert").unwrap().is_empty());
+        assert_eq!(users.access("carol"), Some(Access::None));
+        assert_eq!(users.access_on("carol", "MOVIES"), Some(Access::Write));
+        assert_eq!(users.access_on("carol", "other"), Some(Access::Read));
+        assert_eq!(users.access_on("carol", "third"), Some(Access::None));
+        assert_eq!(users.best_access("carol"), Some(Access::Write));
+        assert_eq!(users.access_on("robert", "movies"), Some(Access::Read));
         // Opening again does not add a second constraint or SystemInfo.
         drop(users);
         Users::system(Arc::clone(&system)).unwrap();
