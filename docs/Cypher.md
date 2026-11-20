@@ -81,8 +81,11 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
   type, label or type, properties, `RANGE`, `VECTOR` or `FULLTEXT`, options), vector indexes (see
   *Vectors* below), full-text indexes (see *Full-text* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
-  and `(n.a, n.b) IS UNIQUE | NODE KEY`; the older `ON … ASSERT …` form works too),
-  `DROP CONSTRAINT name [IF EXISTS]`, `SHOW CONSTRAINTS`
+  `(n.a, n.b) IS UNIQUE | NODE KEY`, and property types `n.p IS :: INTEGER | FLOAT`
+  (`IS TYPED`, `LIST<STRING NOT NULL>`); the older `ON … ASSERT …` form works too), the same
+  on relationships `FOR ()-[r:T]-() REQUIRE r.p IS UNIQUE | NOT NULL | :: <type>` and
+  `(r.a, r.b) IS RELATIONSHIP KEY`, `DROP CONSTRAINT name [IF EXISTS]`, `SHOW CONSTRAINTS`
+  (name, type, label or type, properties, entity type, property type)
 * **Databases** (through a `Session`): `CREATE [OR REPLACE] DATABASE name [IF NOT EXISTS] [OPTIONS {…}]`,
   `DROP DATABASE name [IF EXISTS] [DUMP DATA]`, `ALTER DATABASE name SET ACCESS READ ONLY | READ WRITE`,
   `SHOW DATABASES`, `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`, `USE name`, `USE name <query>`,
@@ -210,8 +213,7 @@ recognise. Where there is another way to write it, it is given.
 |---------|-------|
 | `CREATE TEXT INDEX`, `CREATE POINT INDEX`, `CREATE LOOKUP INDEX` | `Unsupported` (range, full-text and vector indexes exist) |
 | Spatial index seeks for `point.distance` / `point.withinBBox` | none: they filter every candidate |
-| Relationship constraints (`FOR ()-[r:R]-() REQUIRE …`) | syntax error |
-| Property type constraints (`REQUIRE n.p IS :: INTEGER`, `IS TYPED`) | syntax error |
+| Property type constraints on `MAP`, `NODE`, `PATH`, `ANY` or nullable list elements (`LIST<INTEGER>`) | syntax error: properties cannot hold them, and lists of properties hold no nulls |
 | Quantization of vector indexes, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
 | Full-text ranges, regular expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`) | `Unsupported` |
 | Index or constraint settings graphbuff does not know | `Unsupported` |

@@ -130,6 +130,8 @@ pub(crate) struct Executor<'s> {
     /// Nodes this query created or changed (properties, labels), to check against the
     /// constraints before commit. `None` when the store has no constraints.
     pub touched: Option<BTreeSet<NodeId>>,
+    /// Relationships this query created or changed, likewise.
+    pub touched_rels: Option<BTreeSet<RelId>>,
     /// While a `CALL { … }` subquery with updates runs: its start row (the imported
     /// variables), which replaces the single empty row at the bottom of its plan.
     pub argument: Option<(Scope, Row)>,
@@ -182,6 +184,7 @@ impl<'s> Executor<'s> {
             stats: QueryStats::default(),
             profile: None,
             touched: None,
+            touched_rels: None,
             argument: None,
             subplans: RefCell::default(),
             regexes: RefCell::default(),
@@ -197,6 +200,7 @@ impl<'s> Executor<'s> {
         };
         if !ex.store().constraints().is_empty() {
             ex.touched = Some(BTreeSet::new());
+            ex.touched_rels = Some(BTreeSet::new());
         }
         ex
     }
@@ -239,6 +243,13 @@ impl<'s> Executor<'s> {
     /// Notes that node `id` was created or changed (see [`Executor::touched`]).
     pub fn touch(&mut self, id: NodeId) {
         if let Some(t) = &mut self.touched {
+            t.insert(id);
+        }
+    }
+
+    /// Notes that relationship `id` was created or changed (see [`Executor::touched_rels`]).
+    pub fn touch_rel(&mut self, id: RelId) {
+        if let Some(t) = &mut self.touched_rels {
             t.insert(id);
         }
     }

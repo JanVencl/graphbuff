@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use graphbuff_core::clock::Instant;
 
 use graphbuff_core::{
-    ConstraintDef, Direction, Error, IndexDef, IndexEntity, NodeId, Path, RelId, Result, Value,
+    ConstraintDef, ConstraintKind, Direction, Error, IndexDef, IndexEntity, NodeId, Path, RelId, Result, Value,
 };
 use graphbuff_cypher::ast::{IndexType, 
     Clause, Expr, IndexTarget, NodePattern, PatternPart, RelDirection, RemoveItem,
@@ -469,6 +469,7 @@ impl Executor<'_> {
             }),
             Clause::CreateConstraint {
                 name,
+                entity,
                 kind,
                 label,
                 properties,
@@ -478,15 +479,13 @@ impl Executor<'_> {
                     name: name
                         .clone()
                         .unwrap_or_else(|| format!("constraint_{label}_{}", properties.join("_"))),
+                    entity: *entity,
                     kind: *kind,
                     label: label.clone(),
                     properties: properties.clone(),
                 };
                 let existing = self.store().constraints();
-                let clash = existing.iter().any(|c| {
-                    c.name == def.name
-                        || (c.kind == def.kind && c.label == def.label && c.properties == def.properties)
-                });
+                let clash = existing.iter().any(|c| c.name == def.name || c.same_target(&def));
                 if clash && *if_not_exists {
                     return Ok(empty);
                 }
@@ -506,7 +505,7 @@ impl Executor<'_> {
                 // The index it created, if it is still the one it needs.
                 if def.requires_unique() {
                     let owned = self.store().indexes().into_iter().any(|ix| {
-                        ix.name == def.name && ix.covers(IndexEntity::Node, &def.label, &def.properties[..1])
+                        ix.name == def.name && ix.covers(def.entity, &def.label, &def.properties[..1])
                     });
                     if owned && self.check_index_unused(&def.name).is_ok() {
                         self.store_mut()?.drop_index(&def.name)?;
@@ -524,20 +523,8 @@ impl Executor<'_> {
                 rows: self.procedures.listing(),
             }),
             Clause::ShowConstraints => Ok(RawResult {
-                columns: ["name", "type", "label", "properties"].map(String::from).to_vec(),
-                rows: self
-                    .store()
-                    .constraints()
-                    .into_iter()
-                    .map(|c| {
-                        vec![
-                            Value::String(c.name),
-                            Value::String(c.kind.text().into()),
-                            Value::String(c.label),
-                            Value::List(c.properties.into_iter().map(Value::String).collect()),
-                        ]
-                    })
-                    .collect(),
+                columns: CONSTRAINT_COLUMNS.map(String::from).to_vec(),
+                rows: self.store().constraints().into_iter().map(constraint_row).collect(),
             }),
             _ => unreachable!("not a schema clause"),
         }
@@ -547,24 +534,22 @@ impl Executor<'_> {
 
     /// Creates `def` (already checked against the existing constraints): first the index a
     /// uniqueness check seeks on, if there is none, then the constraint, then checks every
-    /// node that has its label. On error, the query rolls all of it back.
+    /// entity that has its label (type). On error, the query rolls all of it back.
     fn create_constraint(&mut self, def: ConstraintDef) -> Result<()> {
-        if def.requires_unique() && !self.store().has_index(&def.label, &def.properties[0]) {
-            self.store_mut()?.create_index(IndexDef::node(
-                def.name.clone(),
-                def.label.clone(),
-                def.properties[0].clone(),
-            ))?;
+        if def.requires_unique()
+            && self.store().schema_index_stats(def.entity, &def.label, &def.properties[..1]).is_none()
+        {
+            let (name, label, property) = (def.name.clone(), def.label.clone(), def.properties[0].clone());
+            self.store_mut()?.create_index(match def.entity {
+                IndexEntity::Node => IndexDef::node(name, label, property),
+                IndexEntity::Relationship => IndexDef::relationship(name, label, property),
+            })?;
             self.stats.indexes_added += 1;
         }
         self.store_mut()?.create_constraint(def.clone())?;
         self.stats.constraints_added += 1;
-        let nodes: Vec<NodeId> = self
-            .store()
-            .nodes_with_label(&def.label)
-            .collect::<Result<_>>()?;
-        for id in nodes {
-            self.check_node(&def, id).map_err(|e| match e {
+        for id in self.entities_with(def.entity, &def.label)? {
+            self.check_entity(&def, id).map_err(|e| match e {
                 Error::Constraint(msg) => Error::Constraint(format!(
                     "cannot create constraint `{}`: existing data violates it: {msg}",
                     def.name
@@ -575,13 +560,31 @@ impl Executor<'_> {
         Ok(())
     }
 
+    /// The nodes with label `label`, or the relationships of type `label`, by id.
+    fn entities_with(&self, entity: IndexEntity, label: &str) -> Result<Vec<u64>> {
+        let store = self.store();
+        match entity {
+            IndexEntity::Node => store.nodes_with_label(label).map(|id| id.map(|id| id.0)).collect(),
+            IndexEntity::Relationship => {
+                let mut out = Vec::new();
+                for id in store.all_relationships() {
+                    let id = id?;
+                    if store.relationship_type(id)?.as_deref() == Some(label) {
+                        out.push(id.0);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Fails if index `name` is the one a uniqueness constraint seeks on.
     fn check_index_unused(&self, name: &str) -> Result<()> {
         let Some(ix) = self.store().indexes().into_iter().find(|ix| ix.name == name) else {
             return Ok(());
         };
         match self.store().constraints().into_iter().find(|c| {
-            c.requires_unique() && ix.covers(IndexEntity::Node, &c.label, &c.properties[..1])
+            c.requires_unique() && ix.covers(c.entity, &c.label, &c.properties[..1])
         }) {
             Some(c) => Err(Error::Constraint(format!(
                 "index `{name}` is used by constraint `{}`; drop the constraint first",
@@ -591,49 +594,80 @@ impl Executor<'_> {
         }
     }
 
-    /// Checks every node this query created or changed against the constraints of its
-    /// labels. Runs once, after the last clause and before commit, so a query may pass
-    /// through violating states (swap two unique values, create a node and then set its
-    /// key) as long as it ends in a valid one.
+    /// Checks every node and relationship this query created or changed against the
+    /// constraints of its labels (type). Runs once, after the last clause and before
+    /// commit, so a query may pass through violating states (swap two unique values,
+    /// create a node and then set its key) as long as it ends in a valid one.
     pub(crate) fn check_constraints(&mut self) -> Result<()> {
-        let Some(touched) = self.touched.take() else {
+        let nodes = self.touched.take().unwrap_or_default();
+        let rels = self.touched_rels.take().unwrap_or_default();
+        if nodes.is_empty() && rels.is_empty() {
             return Ok(());
-        };
+        }
         let constraints = self.store().constraints();
-        for id in touched {
+        for id in nodes {
             if !self.store().node_exists(id)? {
                 continue;
             }
             let labels = self.store().node_labels(id)?;
-            for c in constraints.iter().filter(|c| labels.contains(&c.label)) {
-                self.check_node(c, id)?;
+            for c in constraints.iter().filter(|c| c.entity == IndexEntity::Node && labels.contains(&c.label)) {
+                self.check_entity(c, id.0)?;
+            }
+        }
+        for id in rels {
+            let Some(rel_type) = self.store().relationship_type(id)? else { continue };
+            for c in constraints.iter().filter(|c| c.entity == IndexEntity::Relationship && c.label == rel_type) {
+                self.check_entity(c, id.0)?;
             }
         }
         Ok(())
     }
 
-    /// Checks node `id`, which has `c`'s label, against `c`.
-    fn check_node(&self, c: &ConstraintDef, id: NodeId) -> Result<()> {
+    /// Checks entity `id` (a node with `c`'s label or a relationship of its type)
+    /// against `c`.
+    fn check_entity(&self, c: &ConstraintDef, id: u64) -> Result<()> {
         let store = self.store();
+        let property = |id: u64, p: &str| match c.entity {
+            IndexEntity::Node => store.node_property(NodeId(id), p),
+            IndexEntity::Relationship => store.relationship_property(RelId(id), p),
+        };
+        let what = |id: u64| match c.entity {
+            IndexEntity::Node => format!("node {id} with label `{}`", c.label),
+            IndexEntity::Relationship => format!("relationship {id} of type `{}`", c.label),
+        };
         let mut values = Vec::with_capacity(c.properties.len());
         for p in &c.properties {
-            values.push(store.node_property(id, p)?);
+            values.push(property(id, p)?);
+        }
+        if let ConstraintKind::Typed(t) = c.kind {
+            return match &values[0] {
+                Some(v) if !t.accepts(v) => Err(Error::Constraint(format!(
+                    "{} has `{}` of type {}, but constraint `{}` requires {t}",
+                    what(id),
+                    c.properties[0],
+                    v.type_name(),
+                    c.name
+                ))),
+                _ => Ok(()),
+            };
         }
         if c.requires_properties()
             && let Some(i) = values.iter().position(Option::is_none)
         {
             return Err(Error::Constraint(format!(
-                "node {id} with label `{}` must have the property `{}` (constraint `{}`)",
-                c.label, c.properties[i], c.name
+                "{} must have the property `{}` (constraint `{}`)",
+                what(id),
+                c.properties[i],
+                c.name
             )));
         }
         if !c.requires_unique() || values.iter().any(Option::is_none) {
             return Ok(());
         }
         let values: Vec<Value> = values.into_iter().flatten().collect();
-        let candidates = match store.index_seek(&c.label, &c.properties[0], &values[0])? {
+        let candidates = match store.schema_index_seek(c.entity, &c.label, &c.properties[..1], &values[..1])? {
             Some(ids) => ids,
-            None => store.nodes_with_label(&c.label).collect::<Result<_>>()?,
+            None => self.entities_with(c.entity, &c.label)?,
         };
         for other in candidates {
             if other == id {
@@ -641,7 +675,7 @@ impl Executor<'_> {
             }
             let mut same = true;
             for (p, v) in c.properties.iter().zip(&values) {
-                let w = store.node_property(other, p)?;
+                let w = property(other, p)?;
                 if !w.is_some_and(|w| cypher_eq(v, &w) == Some(true)) {
                     same = false;
                     break;
@@ -654,9 +688,12 @@ impl Executor<'_> {
                     .zip(&values)
                     .map(|(p, v)| format!("{p} = {v}"))
                     .collect();
+                let (plural, label) = match c.entity {
+                    IndexEntity::Node => ("nodes", format!("with label `{}`", c.label)),
+                    IndexEntity::Relationship => ("relationships", format!("of type `{}`", c.label)),
+                };
                 return Err(Error::Constraint(format!(
-                    "nodes {other} and {id} with label `{}` both have {} (constraint `{}`)",
-                    c.label,
+                    "{plural} {other} and {id} {label} both have {} (constraint `{}`)",
                     shown.join(", "),
                     c.name
                 )));
@@ -798,6 +835,7 @@ impl Executor<'_> {
             let id = self
                 .store_mut()?
                 .create_relationship(s, e, &rp.types[0], props)?;
+            self.touch_rel(id);
             self.stats.relationships_created += 1;
             self.stats.properties_set += n_props;
             if let Some(i) = slot {
@@ -877,9 +915,10 @@ impl Executor<'_> {
                 self.store_mut()?.set_node_property(*id, key, value)?;
                 self.touch(*id);
             }
-            Value::Rel(id) => self
-                .store_mut()?
-                .set_relationship_property(*id, key, value)?,
+            Value::Rel(id) => {
+                self.store_mut()?.set_relationship_property(*id, key, value)?;
+                self.touch_rel(*id);
+            }
             other => {
                 return Err(Error::Type(format!(
                     "cannot set properties on a {}",
@@ -1258,4 +1297,23 @@ impl Grouping {
         }
         Ok(out)
     }
+}
+
+/// The columns of `SHOW CONSTRAINTS` and `db.constraints()`.
+pub(crate) const CONSTRAINT_COLUMNS: [&str; 6] = ["name", "type", "label", "properties", "entityType", "propertyType"];
+
+/// One row of `SHOW CONSTRAINTS`: `label` is the label or relationship type, and
+/// `propertyType` is null unless the constraint is a property type constraint.
+pub(crate) fn constraint_row(c: ConstraintDef) -> Vec<Value> {
+    vec![
+        Value::String(c.name),
+        Value::String(c.kind.text(c.entity).into()),
+        Value::String(c.label),
+        Value::List(c.properties.into_iter().map(Value::String).collect()),
+        Value::String(c.entity.text().into()),
+        match c.kind {
+            ConstraintKind::Typed(t) => Value::String(t.to_string()),
+            _ => Value::Null,
+        },
+    ]
 }

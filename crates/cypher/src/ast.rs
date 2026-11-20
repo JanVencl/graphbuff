@@ -1,6 +1,6 @@
 //! Abstract syntax tree for the supported Cypher subset.
 
-pub use graphbuff_core::{ConstraintKind, IndexEntity};
+pub use graphbuff_core::{ConstraintKind, IndexEntity, PropertyType};
 use graphbuff_core::Value;
 
 /// A full statement: one or more single queries joined by `UNION` / `UNION ALL`.
@@ -138,9 +138,11 @@ pub enum Clause {
     /// `SHOW INDEXES`
     ShowIndexes,
     /// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.p IS UNIQUE`
-    /// (or `(n.a, n.b) IS UNIQUE`, `n.p IS NOT NULL`, `(n.a, …) IS NODE KEY`).
+    /// (or `(n.a, n.b) IS UNIQUE`, `n.p IS NOT NULL`, `(n.a, …) IS NODE KEY`,
+    /// `n.p IS :: INTEGER`), or the same `FOR ()-[r:TYPE]-()` (`RELATIONSHIP KEY`).
     CreateConstraint {
         name: Option<String>,
+        entity: IndexEntity,
         kind: ConstraintKind,
         label: String,
         properties: Vec<String>,

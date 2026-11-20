@@ -1164,35 +1164,42 @@ impl IndexDef {
     }
 }
 
-/// A schema constraint on the nodes with a label.
+/// A schema constraint on the nodes with a label or the relationships of a type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstraintDef {
     pub name: String,
+    pub entity: IndexEntity,
     pub kind: ConstraintKind,
+    /// The label (nodes) or relationship type (relationships).
     pub label: String,
-    /// One property for `NotNull`; one or more for `Unique` and `NodeKey`.
+    /// One property for `NotNull` and `Typed`; one or more for `Unique` and `Key`.
     pub properties: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstraintKind {
-    /// `IS UNIQUE`: no two nodes with the label have equal values for all of the
-    /// properties (nodes missing one of them are not compared).
+    /// `IS UNIQUE`: no two entities with the label (type) have equal values for all of
+    /// the properties (entities missing one of them are not compared).
     Unique,
-    /// `IS NOT NULL`: every node with the label has the property.
+    /// `IS NOT NULL`: every entity with the label (type) has the property.
     NotNull,
-    /// `IS NODE KEY`: every node with the label has all of the properties, and their
-    /// values are unique.
-    NodeKey,
+    /// `IS NODE KEY` / `IS RELATIONSHIP KEY`: every entity has all of the properties,
+    /// and their values are unique.
+    Key,
+    /// `IS :: <type>`: the property, where present, has one of these types.
+    Typed(PropertyType),
 }
 
 impl ConstraintKind {
-    /// The Cypher spelling: `UNIQUE`, `NOT NULL` or `NODE KEY`.
-    pub fn text(self) -> &'static str {
+    /// The Cypher spelling for `entity`: `UNIQUE`, `NOT NULL`, `NODE KEY`,
+    /// `RELATIONSHIP KEY` or `PROPERTY TYPE`.
+    pub fn text(self, entity: IndexEntity) -> &'static str {
         match self {
             ConstraintKind::Unique => "UNIQUE",
             ConstraintKind::NotNull => "NOT NULL",
-            ConstraintKind::NodeKey => "NODE KEY",
+            ConstraintKind::Key if entity == IndexEntity::Node => "NODE KEY",
+            ConstraintKind::Key => "RELATIONSHIP KEY",
+            ConstraintKind::Typed(_) => "PROPERTY TYPE",
         }
     }
 
@@ -1200,20 +1207,129 @@ impl ConstraintKind {
         match self {
             ConstraintKind::Unique => 1,
             ConstraintKind::NotNull => 2,
-            ConstraintKind::NodeKey => 3,
+            ConstraintKind::Key => 3,
+            ConstraintKind::Typed(_) => 4,
         }
     }
 }
 
-impl ConstraintDef {
-    /// Whether nodes need all of the properties (`NOT NULL`, `NODE KEY`).
-    pub fn requires_properties(&self) -> bool {
-        matches!(self.kind, ConstraintKind::NotNull | ConstraintKind::NodeKey)
+/// The property types a `Typed` constraint allows: a union of scalar types and lists of
+/// them (`LIST<INTEGER NOT NULL>`), as a bit set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PropertyType(u32);
+
+impl PropertyType {
+    /// The scalar types, by bit, in the order `SHOW CONSTRAINTS` lists them.
+    pub const SCALARS: [&'static str; 11] = [
+        "BOOLEAN",
+        "STRING",
+        "INTEGER",
+        "FLOAT",
+        "DATE",
+        "LOCAL TIME",
+        "ZONED TIME",
+        "LOCAL DATETIME",
+        "ZONED DATETIME",
+        "DURATION",
+        "POINT",
+    ];
+    const LIST: u32 = 16;
+
+    /// The scalar type named `name` (one of [`SCALARS`](Self::SCALARS)), or a list of it.
+    pub fn scalar(name: &str, list: bool) -> Option<PropertyType> {
+        let i = Self::SCALARS.iter().position(|s| *s == name)? as u32;
+        Some(PropertyType(1 << (i + if list { Self::LIST } else { 0 })))
     }
 
-    /// Whether value combinations must be unique (`UNIQUE`, `NODE KEY`).
+    pub fn union(self, other: PropertyType) -> PropertyType {
+        PropertyType(self.0 | other.0)
+    }
+
+    /// The bit of a scalar value's type, or `None` if it has none (null, maps, entities).
+    fn bit(v: &Value) -> Option<u32> {
+        use crate::temporal::Temporal;
+        Some(match v {
+            Value::Bool(_) => 0,
+            Value::String(_) => 1,
+            Value::Int(_) => 2,
+            Value::Float(_) => 3,
+            Value::Temporal(t) => match t {
+                Temporal::Date(_) => 4,
+                Temporal::LocalTime(_) => 5,
+                Temporal::Time { .. } => 6,
+                Temporal::LocalDateTime { .. } => 7,
+                Temporal::DateTime { .. } => 8,
+                Temporal::Duration(_) => 9,
+            },
+            Value::Point(_) => 10,
+            _ => return None,
+        })
+    }
+
+    /// Whether a property value has one of the types. An empty list has every list type;
+    /// a list with nulls or mixed types has none.
+    pub fn accepts(self, v: &Value) -> bool {
+        match v {
+            Value::List(items) => {
+                let Some(first) = items.first() else {
+                    return self.0 >> Self::LIST != 0;
+                };
+                let Some(bit) = Self::bit(first) else { return false };
+                items.iter().all(|x| Self::bit(x) == Some(bit)) && self.0 & (1 << (bit + Self::LIST)) != 0
+            }
+            v => Self::bit(v).is_some_and(|b| self.0 & (1 << b) != 0),
+        }
+    }
+
+    fn from_bits(bits: u32) -> Option<PropertyType> {
+        let valid = (1u32 << Self::SCALARS.len()) - 1;
+        let valid = valid | valid << Self::LIST;
+        (bits != 0 && bits & !valid == 0).then_some(PropertyType(bits))
+    }
+}
+
+impl std::fmt::Display for PropertyType {
+    /// `INTEGER | FLOAT`, `LIST<STRING NOT NULL>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (shift, list) in [(0, false), (Self::LIST, true)] {
+            for (i, name) in Self::SCALARS.iter().enumerate() {
+                if self.0 & (1 << (i as u32 + shift)) == 0 {
+                    continue;
+                }
+                if !first {
+                    f.write_str(" | ")?;
+                }
+                first = false;
+                if list {
+                    write!(f, "LIST<{name} NOT NULL>")?;
+                } else {
+                    f.write_str(name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ConstraintDef {
+    /// Whether entities need all of the properties (`NOT NULL`, `KEY`).
+    pub fn requires_properties(&self) -> bool {
+        matches!(self.kind, ConstraintKind::NotNull | ConstraintKind::Key)
+    }
+
+    /// Whether value combinations must be unique (`UNIQUE`, `KEY`).
     pub fn requires_unique(&self) -> bool {
-        matches!(self.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
+        matches!(self.kind, ConstraintKind::Unique | ConstraintKind::Key)
+    }
+
+    /// Whether `other` constrains the same thing: the same kind (any property type for
+    /// `Typed`), entity, label and properties.
+    pub fn same_target(&self, other: &ConstraintDef) -> bool {
+        std::mem::discriminant(&self.kind) == std::mem::discriminant(&other.kind)
+            && self.entity == other.entity
+            && self.label == other.label
+            && self.properties == other.properties
     }
 
     /// Checks that `self` is well formed and does not clash with `existing`.
@@ -1221,10 +1337,11 @@ impl ConstraintDef {
         if self.properties.is_empty() {
             return Err(Error::Semantic("a constraint needs at least one property".into()));
         }
-        if self.kind == ConstraintKind::NotNull && self.properties.len() > 1 {
-            return Err(Error::Semantic(
-                "a NOT NULL constraint takes exactly one property".into(),
-            ));
+        if matches!(self.kind, ConstraintKind::NotNull | ConstraintKind::Typed(_)) && self.properties.len() > 1 {
+            return Err(Error::Semantic(format!(
+                "a {} constraint takes exactly one property",
+                self.kind.text(self.entity)
+            )));
         }
         for (i, p) in self.properties.iter().enumerate() {
             if self.properties[..i].contains(p) {
@@ -1240,33 +1357,51 @@ impl ConstraintDef {
                     self.name
                 )));
             }
-            if c.kind == self.kind && c.label == self.label && c.properties == self.properties {
-                return Err(Error::Constraint(format!(
-                    "an equivalent constraint `{}` already exists",
-                    c.name
-                )));
+            if c.same_target(self) {
+                return Err(Error::Constraint(if c.kind == self.kind {
+                    format!("an equivalent constraint `{}` already exists", c.name)
+                } else {
+                    format!("constraint `{}` already gives the property a type", c.name)
+                }));
             }
         }
         Ok(())
     }
 
+    /// Relationship constraints set this bit in the kind tag.
+    const RELATIONSHIP: u8 = 0x10;
+
     pub(crate) fn encode(&self, e: &mut Encoder) {
         e.str(&self.name);
-        e.u8(self.kind.tag());
+        let rel = if self.entity == IndexEntity::Relationship { Self::RELATIONSHIP } else { 0 };
+        e.u8(self.kind.tag() | rel);
+        if let ConstraintKind::Typed(t) = self.kind {
+            e.u32(t.0);
+        }
         e.str(&self.label);
         e.strings(&self.properties);
     }
 
     pub(crate) fn decode(d: &mut Decoder) -> Result<ConstraintDef> {
         let name = d.str()?;
-        let kind = match d.u8()? {
+        let tag = d.u8()?;
+        let entity = if tag & Self::RELATIONSHIP != 0 { IndexEntity::Relationship } else { IndexEntity::Node };
+        let kind = match tag & !Self::RELATIONSHIP {
             1 => ConstraintKind::Unique,
             2 => ConstraintKind::NotNull,
-            3 => ConstraintKind::NodeKey,
+            3 => ConstraintKind::Key,
+            4 => {
+                let bits = d.u32()?;
+                match PropertyType::from_bits(bits) {
+                    Some(t) => ConstraintKind::Typed(t),
+                    None => return Err(d.corrupt(format!("unknown property types {bits:#x}"))),
+                }
+            }
             t => return Err(d.corrupt(format!("unknown constraint kind {t}"))),
         };
         Ok(ConstraintDef {
             name,
+            entity,
             kind,
             label: d.str()?,
             properties: d.strings()?,
