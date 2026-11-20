@@ -115,7 +115,16 @@ slow_query_ms = 500                   # log queries that take this long to query
 ## Command-line client
 
 `graphbuff-cli` runs Cypher against a server over the HTTP API: statements on the command
-line, scripts from files or standard input, or an interactive prompt.
+line, scripts from files or standard input, or an interactive prompt. It ships next to
+`graphbuff-server` in the release archives and the Docker image:
+
+```bash
+graphbuff-cli -u admin "MATCH (n) RETURN count(n);"
+docker exec -it CONTAINER graphbuff-cli -u admin     # the server in a container
+```
+
+`graphbuff-cli --help` lists its options.
+
 ## License
 
 graphbuff is licensed under the GNU Affero General Public License v3.0 only

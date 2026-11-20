@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# graphbuff-server without a Rust toolchain:
+# graphbuff-server (and the client graphbuff-cli) without a Rust toolchain:
 #
 #   docker build -t graphbuff .
 #   docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
@@ -22,6 +22,10 @@
 #   docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server graphbuff admin init
 #   docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server graphbuff \
 #     admin reset-password admin
+#
+# The client runs inside the server's container (the server's own address and login):
+#
+#   docker exec -it CONTAINER graphbuff-cli -u admin
 #
 # The build stage runs on the build machine's own architecture and cross-compiles for
 # the target platform, so `docker buildx build --platform linux/amd64,linux/arm64` needs
@@ -48,9 +52,10 @@ COPY crates crates
 COPY examples/movies.cypher examples/movies.cypher
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=graphbuff-target-$TARGETARCH \
-    cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-server \
+    cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-server -p graphbuff-cli \
  && mkdir -p /out/bin /out/data \
- && cp "target/$(cat /target-triple)/release/graphbuff-server" /out/bin/
+ && cp "target/$(cat /target-triple)/release/graphbuff-server" \
+       "target/$(cat /target-triple)/release/graphbuff-cli" /out/bin/
 
 # glibc, libgcc and CA certificates only; runs as the unprivileged user `nonroot` (65532).
 FROM gcr.io/distroless/cc-debian12:nonroot
