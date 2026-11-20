@@ -1179,6 +1179,7 @@ impl<'m> Session<'m> {
                 "{} needs graphbuff-server with user accounts",
                 cmd.name()
             ))),
+            Statement::Transaction(cmd) => Err(Error::Unsupported(format!("{} needs graphbuff-server", cmd.name()))),
         }
     }
 

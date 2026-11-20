@@ -68,6 +68,7 @@ mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
 mod tls;
+mod running;
 mod throttle;
 mod tx;
 pub mod users;
@@ -230,7 +231,8 @@ impl Server {
         let bolt_addr = bolt.as_ref().map(TcpListener::local_addr).transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
-        let txs = Transactions::new(config.transaction_timeout, config.query_max_memory);
+        let running = Arc::new(crate::running::Running::default());
+        let txs = Transactions::new(config.transaction_timeout, config.query_max_memory, Arc::clone(&running));
         let abort = CancelHandle::new();
         let shared = Arc::new(Shared {
             ctx: Ctx {
@@ -245,6 +247,7 @@ impl Server {
                 abort: abort.clone(),
                 test_procedures: config.test_procedures,
                 throttle: crate::throttle::Throttle::new(config.login_limits),
+                running,
             },
             tls,
             limits: Limits {

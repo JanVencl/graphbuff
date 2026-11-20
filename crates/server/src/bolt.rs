@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use graphbuff::cypher::ast::{Query, Statement, UserCommand};
 
 use crate::users::{Access, Principal};
+use crate::running::{Guard, Info, Stop};
 use graphbuff::temporal::{self, NANOS_PER_DAY, NANOS_PER_SECOND};
 use graphbuff::{
     BoxedStore, CancelHandle, Crs, Error, NodeData, PathData, PlanDescription, Point, QueryOptions, QueryResult,
@@ -176,6 +177,8 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
             who: None,
             failed: false,
             pending_failure: None,
+            connection: "bolt".into(),
+            tx_stop: None,
         };
         let _ = conn.run();
         let _ = conn.out.flush();
@@ -321,6 +324,8 @@ enum Event {
     Message(u8, Vec<PackValue>),
     /// No message before the deadline.
     Idle,
+    /// The open transaction was terminated (`TERMINATE TRANSACTIONS`).
+    Terminated,
     /// The client left or broke the protocol, or the server is stopping.
     Close,
 }
@@ -365,6 +370,10 @@ struct Conn<'s> {
     failed: bool,
     /// A failure to report on the next message (a transaction that timed out).
     pending_failure: Option<Failure>,
+    /// The connection's id (`bolt-N`), set by `HELLO`.
+    connection: String,
+    /// While an explicit transaction is open: cancelled by `TERMINATE TRANSACTIONS`.
+    tx_stop: Option<CancelHandle>,
 }
 
 type Fields = Vec<PackValue>;
@@ -409,6 +418,10 @@ impl Conn<'_> {
 
     /// The next message, flushing the answers written so far before waiting.
     fn next(&mut self, deadline: Option<Instant>) -> io::Result<Event> {
+        let terminated = |c: &Self| c.tx_stop.as_ref().is_some_and(CancelHandle::is_cancelled);
+        if terminated(self) {
+            return Ok(Event::Terminated);
+        }
         let incoming = match self.inbox.try_recv() {
             Ok(m) => m,
             Err(TryRecvError::Disconnected) => return Ok(Event::Close),
@@ -417,6 +430,9 @@ impl Conn<'_> {
                 loop {
                     if self.shared.stop() {
                         return Ok(Event::Close);
+                    }
+                    if terminated(self) {
+                        return Ok(Event::Terminated);
                     }
                     let mut wait = POLL;
                     if let Some(d) = deadline {
@@ -461,7 +477,7 @@ impl Conn<'_> {
         timeout: Option<Duration>,
         f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
     ) -> Option<graphbuff::Result<T>> {
-        let cancel = self.shared.ctx.abort.child();
+        let cancel = self.tx_stop.as_ref().unwrap_or(&self.shared.ctx.abort).child();
         *self.control.running() = Some(cancel.clone());
         // Checked after publishing the handle: a RESET read from now on cancels it.
         let result = if self.control.reset_pending() {
@@ -487,7 +503,7 @@ impl Conn<'_> {
         loop {
             let (tag, fields) = match self.next(None)? {
                 Event::Message(t, f) => (t, f),
-                Event::Idle | Event::Close => return Ok(()),
+                Event::Idle | Event::Close | Event::Terminated => return Ok(()),
             };
             match tag {
                 GOODBYE => return Ok(()),
@@ -625,7 +641,8 @@ impl Conn<'_> {
                 env!("CARGO_PKG_VERSION")
             )),
         );
-        meta.insert("connection_id".into(), PackValue::String(format!("bolt-{id}")));
+        self.connection = format!("bolt-{id}");
+        meta.insert("connection_id".into(), PackValue::String(self.connection.clone()));
         if self.version == (4, 4)
             && let Some(PackValue::List(patches)) = extra.get("patch_bolt")
             && patches.contains(&PackValue::str("utc"))
@@ -748,11 +765,18 @@ impl Conn<'_> {
         };
         let ctx = &self.shared.ctx;
         let system = self.is_system(&db);
+        let (connection, peer) = (self.connection.clone(), self.peer.clone());
         let result = self.interruptible(timeout, |options| {
             let statement = graphbuff::cypher::parse_statement(&query)?;
             if let Statement::User(cmd) = &statement {
                 return ctx.user_command(&who, access, cmd, &params);
             }
+            if let Statement::Transaction(cmd) = &statement {
+                return ctx.transaction_command(&who, access, cmd, &params);
+            }
+            let info = Info { database: db.clone(), who: who.clone(), protocol: "bolt", connection, client: peer };
+            let stop = Stop::Cancel(options.cancel.clone().expect("interruptible sets one"));
+            let _listed = ctx.running.begin(info, stop, Some(&query));
             api::authorize(access, &statement)?;
             let mut session = ctx.mgr.session();
             if system {
@@ -914,9 +938,35 @@ impl Conn<'_> {
     /// transaction: committing it does nothing more and rolling it back undoes nothing.
     fn transaction(
         &mut self,
+        tx: Option<Transaction<'_, BoxedStore>>,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<Flow> {
+        // A store transaction is listed for SHOW TRANSACTIONS, and can be terminated.
+        let listed = tx.as_ref().map(|_| {
+            let stop = self.shared.ctx.abort.child();
+            self.tx_stop = Some(stop.clone());
+            let info = Info {
+                database: name.to_string(),
+                who: self.who.clone().unwrap_or(Principal::Open),
+                protocol: "bolt",
+                connection: self.connection.clone(),
+                client: self.peer.clone(),
+            };
+            self.shared.ctx.running.begin(info, Stop::Cancel(stop), None)
+        });
+        let flow = self.serve_transaction(tx, name, deadline, listed.as_ref());
+        self.tx_stop = None;
+        drop(listed);
+        flow
+    }
+
+    fn serve_transaction(
+        &mut self,
         mut tx: Option<Transaction<'_, BoxedStore>>,
         name: &str,
         deadline: Option<Instant>,
+        listed: Option<&Guard>,
     ) -> io::Result<Flow> {
         let mut results: Vec<Option<Pending>> = Vec::new();
         let idle = self.shared.ctx.txs.timeout();
@@ -924,6 +974,16 @@ impl Conn<'_> {
             let (tag, fields) = match self.next(Some(Instant::now() + idle))? {
                 Event::Message(t, f) => (t, f),
                 Event::Close => return Ok(Flow::Close),
+                Event::Terminated => {
+                    if let Some(tx) = tx {
+                        tx.rollback();
+                    }
+                    self.pending_failure = Some(Failure::new(
+                        "Neo.ClientError.Transaction.Terminated",
+                        "the transaction was terminated (TERMINATE TRANSACTIONS) and rolled back",
+                    ));
+                    return Ok(Flow::Continue);
+                }
                 Event::Idle => {
                     if let Some(tx) = tx {
                         tx.rollback();
@@ -990,7 +1050,13 @@ impl Conn<'_> {
                         (_, TxStatement::User(cmd)) => ctx.user_command(&who, access, cmd, &params),
                         (None, TxStatement::Query(_)) => unreachable!("system transactions only take database commands"),
                     };
+                    if let Some(l) = listed {
+                        l.query(Some(&source));
+                    }
                     let result = self.interruptible(timeout, run);
+                    if let Some(l) = listed {
+                        l.query(None);
+                    }
                     if let Some(r) = &result {
                         let who = self.who.clone().unwrap_or(Principal::Open);
                         ctx.finished("bolt", name, &who, &source, started.elapsed(), r.as_ref().err());

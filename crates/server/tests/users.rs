@@ -483,3 +483,172 @@ fn failed_logins_lock_the_client_out() {
     // The health check needs no login.
     assert_eq!(http(addr, "GET", "/health", None, None).status, 200);
 }
+
+// ---- SHOW / TERMINATE TRANSACTIONS ----------------------------------------------------------
+
+/// A query that runs until it is stopped.
+const ENDLESS: &str = "UNWIND range(1, 1000000) AS i UNWIND range(1, 1000000) AS endless WITH endless WHERE endless = -1 RETURN count(*)";
+
+/// The rows of `q` as root, as compact JSON.
+fn rows_of(addr: SocketAddr, auth: &str, q: &str) -> Vec<String> {
+    let r = query(addr, auth, q);
+    assert_eq!(r.status, 200, "{q}: {}", r.body);
+    r.rows().iter().map(enc).collect()
+}
+
+/// Waits until `q` (as `auth`) returns a row, and returns the rows.
+fn wait_for(addr: SocketAddr, auth: &str, q: &str) -> Vec<String> {
+    for _ in 0..200 {
+        let rows = rows_of(addr, auth, q);
+        if !rows.is_empty() {
+            return rows;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("no rows for {q}");
+}
+
+fn first_string(row: &str) -> String {
+    match json::parse(row).unwrap() {
+        Json::Array(v) => match &v[0] {
+            Json::String(s) => s.clone(),
+            o => panic!("{o:?}"),
+        },
+        o => panic!("{o:?}"),
+    }
+}
+
+#[test]
+fn show_and_terminate_transactions_over_http() {
+    let server = start(users(), None);
+    let addr = server.local_addr();
+    let (root, ed) = (basic("root", "rootpw"), basic("ed", "edpw"));
+
+    // A query run on its own, by ed.
+    let runner = {
+        let ed = ed.clone();
+        std::thread::spawn(move || query(addr, &ed, ENDLESS))
+    };
+    let find = "SHOW TRANSACTIONS YIELD transactionId, currentQuery, username, status, protocol
+                WHERE currentQuery CONTAINS 'AS endless'
+                RETURN transactionId, username, status, protocol";
+    let rows = wait_for(addr, &root, find);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].ends_with(r#","ed","Running","http"]"#), "{rows:?}");
+    let id = first_string(&rows[0]);
+    assert!(id.starts_with("graphbuff-transaction-"), "{id}");
+    // The default columns.
+    let r = query(addr, &root, "SHOW TRANSACTIONS");
+    let Ok(Json::Object(m)) = json::parse(&r.body) else { panic!() };
+    let Json::Array(columns) = &m["columns"] else { panic!() };
+    let names: Vec<String> = columns.iter().map(enc).collect();
+    assert_eq!(
+        names.join(","),
+        r#""database","transactionId","currentQueryId","connectionId","clientAddress","username","currentQuery","startTime","status","elapsedTime""#
+    );
+
+    // Others see only their own; rita cannot terminate it.
+    let rita = basic("rita", "ritapw");
+    assert!(rows_of(addr, &rita, find).is_empty());
+    let r = rows_of(addr, &rita, &format!("TERMINATE TRANSACTION '{id}'"));
+    assert_eq!(r, [format!(r#"["{id}",null,"Transaction not found."]"#)]);
+    // ed sees and terminates their own.
+    assert_eq!(rows_of(addr, &ed, find).len(), 1);
+    let r = rows_of(addr, &ed, &format!("TERMINATE TRANSACTIONS '{id}', 'nope'"));
+    assert_eq!(r, [format!(r#"["{id}","ed","Transaction terminated."]"#), r#"["nope",null,"Transaction not found."]"#.into()]);
+    let stopped = runner.join().unwrap();
+    assert_eq!((stopped.status, stopped.code()), (409, "Cancelled".to_string()), "{}", stopped.body);
+    assert!(rows_of(addr, &root, find).is_empty());
+
+    // An explicit transaction: listed while open, idle between statements.
+    let begin = http(addr, "POST", "/tx", Some(&ed), Some(""));
+    assert_eq!(begin.status, 201, "{}", begin.body);
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    let run = |q: &str| http(addr, "POST", &path, Some(&ed), Some(&format!(r#"{{"query":"{q}"}}"#)));
+    assert_eq!(run("CREATE (:Doomed)").status, 200);
+    let idle = rows_of(addr, &root, "SHOW TRANSACTIONS YIELD transactionId, status, username WHERE status = 'Idle'");
+    assert_eq!(idle.len(), 1, "{idle:?}");
+    assert!(idle[0].ends_with(r#","Idle","ed"]"#), "{idle:?}");
+    let id = first_string(&idle[0]);
+    let r = rows_of(addr, &root, &format!("TERMINATE TRANSACTION '{id}' YIELD message"));
+    assert_eq!(r, [r#"["Transaction terminated."]"#]);
+    // Rolled back: gone, its changes undone, and the database is free for other writers.
+    assert_eq!(run("RETURN 1").status, 404);
+    assert_eq!(rows_of(addr, &root, "MATCH (d:Doomed) RETURN count(d)"), ["[0]"]);
+    assert_eq!(query(addr, &root, "CREATE (:After)").status, 200);
+
+    // Ids by parameter; nothing listed for unknown ids.
+    let body = r#"{"query": "SHOW TRANSACTIONS $ids", "params": {"ids": ["x", "y"]}}"#;
+    let r = http(addr, "POST", "/query", Some(&root), Some(body));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.rows().is_empty());
+    // Not inside a transaction.
+    let begin = http(addr, "POST", "/tx", Some(&root), Some(""));
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    let r = http(addr, "POST", &path, Some(&root), Some(r#"{"query":"SHOW TRANSACTIONS"}"#));
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+#[test]
+fn terminate_bolt_transactions() {
+    let server = start(users(), None);
+    let (http_addr, bolt) = (server.local_addr(), server.bolt_addr().unwrap());
+    let root = basic("root", "rootpw");
+
+    // An explicit Bolt transaction holding the write lock, idle.
+    let mut b = Bolt::connect(bolt);
+    assert_eq!(b.logon("ed", "edpw").0, SUCCESS);
+    b.send(BEGIN, vec![PackValue::Map(BTreeMap::new())]);
+    assert_eq!(b.recv().0, SUCCESS);
+    b.run("CREATE (:Held)", None).unwrap();
+    let rows = rows_of(
+        http_addr,
+        &root,
+        "SHOW TRANSACTIONS YIELD transactionId, protocol, connectionId, status WHERE protocol = 'bolt' RETURN transactionId, connectionId, status",
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].contains(r#""bolt-"#) && rows[0].ends_with(r#","Idle"]"#), "{rows:?}");
+    let id = first_string(&rows[0]);
+
+    // Terminated over Bolt by an administrator.
+    let mut admin = Bolt::connect(bolt);
+    assert_eq!(admin.logon("root", "rootpw").0, SUCCESS);
+    let r = admin.run(&format!("TERMINATE TRANSACTION '{id}'"), None).unwrap();
+    assert_eq!(r[0][2], PackValue::str("Transaction terminated."));
+    // Its connection rolls it back without waiting for a message: other writers go on.
+    assert_eq!(query(http_addr, &root, "CREATE (:Other)").status, 200);
+    assert_eq!(rows_of(http_addr, &root, "MATCH (h:Held) RETURN count(h)"), ["[0]"]);
+    // The client learns at its next message.
+    b.send(RUN, vec![PackValue::str("RETURN 1"), PackValue::Map(BTreeMap::new()), PackValue::Map(BTreeMap::new())]);
+    let (tag, fields) = b.recv();
+    assert_eq!(tag, FAILURE, "{fields:?}");
+    let PackValue::Map(m) = &fields[0] else { panic!() };
+    assert_eq!(m["code"], PackValue::str("Neo.ClientError.Transaction.Terminated"));
+
+    // A Bolt query run on its own, terminated while it runs.
+    let runner = std::thread::spawn(move || {
+        let mut c = Bolt::connect(bolt);
+        assert_eq!(c.logon("ed", "edpw").0, SUCCESS);
+        c.run(ENDLESS, None)
+    });
+    let find = "SHOW TRANSACTIONS YIELD transactionId, currentQuery WHERE currentQuery CONTAINS 'AS endless' RETURN transactionId";
+    let id = first_string(&wait_for(http_addr, &root, find)[0]);
+    assert_eq!(
+        rows_of(http_addr, &root, &format!("TERMINATE TRANSACTION '{id}' YIELD message")),
+        [r#"["Transaction terminated."]"#]
+    );
+    assert_eq!(runner.join().unwrap().unwrap_err(), "Neo.ClientError.Transaction.Terminated");
+}
+
+/// Compact JSON for a parsed value (strings unescaped: only test data).
+fn enc(j: &Json) -> String {
+    match j {
+        Json::Null => "null".into(),
+        Json::Bool(b) => b.to_string(),
+        Json::Int(i) => i.to_string(),
+        Json::Float(f) => f.to_string(),
+        Json::String(s) => format!("\"{s}\""),
+        Json::Array(v) => format!("[{}]", v.iter().map(enc).collect::<Vec<_>>().join(",")),
+        Json::Object(m) => format!("{{{}}}", m.iter().map(|(k, v)| format!("\"{k}\":{}", enc(v))).collect::<Vec<_>>().join(",")),
+    }
+}
