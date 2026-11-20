@@ -10,6 +10,7 @@ security, where it keeps data and logs, and how it stops. Settings are named as
 - [Values](#values)
 - [Errors](#errors)
 - [Security](#security)
+- [Metrics](#metrics)
 - [Implementation](#implementation)
 - [Data directory and logs](#data-directory-and-logs)
 - [Stopping](#stopping)
@@ -147,6 +148,41 @@ Errors have the form:
 - Failed logins lock the client out for a while: `security.max_failed_logins` (default 10)
   and `security.login_lockout_seconds` (default 60); see [Users and TLS](Users.md).
 - Passwords are hashed with Argon2. Query parameters are never logged.
+
+## Metrics
+
+`GET /metrics` returns metrics in the Prometheus text format (`text/plain; version=0.0.4`),
+for administrators and the `security.token` (Prometheus can send it as a bearer token).
+Counters start at zero when the server starts.
+
+| Metric | Type | What |
+|--------|------|------|
+| `graphbuff_info{version}` | gauge | always 1; the server's version |
+| `graphbuff_uptime_seconds` | gauge | seconds since the server started |
+| `graphbuff_queries_total{protocol, outcome}` | counter | queries run over `http` or `bolt`; `outcome` is `ok`, `error`, `timeout`, `cancelled` or `memory_limit` |
+| `graphbuff_query_duration_seconds{protocol}` | histogram | how long queries ran (buckets from 1 ms to 10 s) |
+| `graphbuff_transactions{protocol, status}` | gauge | open transactions and queries run on their own, `running` or `idle` (as `SHOW TRANSACTIONS` lists them) |
+| `graphbuff_connections{protocol}` | gauge | connections open now |
+| `graphbuff_connections_accepted_total{protocol}` | counter | connections accepted |
+| `graphbuff_connections_refused_total` | counter | connections refused because `server.max_connections` were open |
+| `graphbuff_failed_logins_total{protocol}` | counter | requests and Bolt logons with wrong or missing credentials |
+| `graphbuff_login_lockouts_total` | counter | clients locked out by `security.max_failed_logins` |
+| `graphbuff_database_nodes{database}` | gauge | nodes |
+| `graphbuff_database_relationships{database}` | gauge | relationships |
+| `graphbuff_database_store_bytes{database}` | gauge | size of a durable database's files (not for in-memory databases) |
+| `graphbuff_database_cached_indexes{database}` | gauge | vector and full-text indexes whose contents are held in memory |
+| `graphbuff_memory_bytes` | gauge | memory the server process has allocated |
+
+A scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: graphbuff
+    authorization:
+      credentials: change-me      # security.token
+    static_configs:
+      - targets: ["localhost:7475"]
+```
 
 ## Implementation
 

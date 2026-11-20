@@ -68,6 +68,7 @@ mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
 mod tls;
+mod metrics;
 mod running;
 mod throttle;
 mod tx;
@@ -248,6 +249,7 @@ impl Server {
                 test_procedures: config.test_procedures,
                 throttle: crate::throttle::Throttle::new(config.login_limits),
                 running,
+                metrics: crate::metrics::Metrics::default(),
             },
             tls,
             limits: Limits {
@@ -366,6 +368,7 @@ fn accept_loop(
                     shared.max_connections
                 ));
             }
+            shared.ctx.metrics.refused();
             // A Bolt client sees the connection close during the handshake.
             if let Protocol::Http = protocol {
                 let resp = api::error(503, "Busy", "too many connections; try again later");
@@ -378,6 +381,7 @@ fn accept_loop(
             log.debug(format_args!("{name} connection from {}", peer(&stream)));
         }
         shared.active.fetch_add(1, Ordering::SeqCst);
+        shared.ctx.metrics.connection_opened(name);
         let s = Arc::clone(&shared);
         let spawned = thread::Builder::new()
             .name("graphbuff-conn".into())
@@ -390,6 +394,7 @@ fn accept_loop(
                     }
                 }
                 s.active.fetch_sub(1, Ordering::SeqCst);
+                s.ctx.metrics.connection_closed(name);
             });
         let mut list = conns.lock().unwrap_or_else(|e| e.into_inner());
         list.retain(|h| !h.is_finished());
@@ -397,6 +402,7 @@ fn accept_loop(
             Ok(h) => list.push(h),
             Err(_) => {
                 shared.active.fetch_sub(1, Ordering::SeqCst);
+                shared.ctx.metrics.connection_closed(name);
             }
         }
     }

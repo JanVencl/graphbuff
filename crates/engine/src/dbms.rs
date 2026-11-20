@@ -564,6 +564,28 @@ impl DatabaseManager {
             .ok_or_else(|| not_found(name))
     }
 
+    /// The bytes of the files database `name` keeps on disk; `None` for an in-memory
+    /// database, an unknown one, or a manager without a directory.
+    pub fn disk_bytes(&self, name: &str) -> Option<u64> {
+        let key = name.to_ascii_lowercase();
+        let cat = self.read();
+        let entry = cat.dbs.get(&key)?;
+        if matches!(entry.storage, StorageKind::InMemory) {
+            return None;
+        }
+        fn size(p: &Path) -> u64 {
+            match fs::symlink_metadata(p) {
+                Ok(m) if m.is_dir() => fs::read_dir(p)
+                    .map(|entries| entries.flatten().map(|e| size(&e.path())).sum())
+                    .unwrap_or(0),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            }
+        }
+        let dir = self.root.as_ref()?.join(DATABASES_DIR).join(&key);
+        Some(size(&dir))
+    }
+
     pub fn databases(&self) -> Vec<DatabaseInfo> {
         let cat = self.read();
         cat.dbs

@@ -652,3 +652,90 @@ fn enc(j: &Json) -> String {
         Json::Object(m) => format!("{{{}}}", m.iter().map(|(k, v)| format!("\"{k}\":{}", enc(v))).collect::<Vec<_>>().join(",")),
     }
 }
+
+// ---- metrics ----------------------------------------------------------------------------------
+
+/// The samples of a Prometheus text body: `name{labels}` → value.
+fn samples(body: &str) -> BTreeMap<String, f64> {
+    body.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let (k, v) = l.rsplit_once(' ').unwrap();
+            (k.to_string(), v.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn metrics_count_queries_logins_and_connections() {
+    let server = start(users(), Some("tok"));
+    let (addr, bolt) = (server.local_addr(), server.bolt_addr().unwrap());
+    let (root, ed) = (basic("root", "rootpw"), basic("ed", "edpw"));
+
+    // Administrators and the token only.
+    assert_eq!(http(addr, "GET", "/metrics", None, None).status, 401);
+    let r = http(addr, "GET", "/metrics", Some(&basic("rita", "ritapw")), None);
+    assert_eq!((r.status, r.code()), (403, "Forbidden".to_string()), "{}", r.body);
+    assert_eq!(http(addr, "POST", "/metrics", Some(&root), Some("")).status, 405);
+
+    assert_eq!(query(addr, &ed, "CREATE (:A), (:A)-[:R]->(:B)").status, 200);
+    assert_eq!(query(addr, &ed, "RETURN 1").status, 200);
+    assert_eq!(query(addr, &ed, "RETURN 1 +").status, 400);
+    assert_eq!(http(addr, "GET", "/db", Some(&basic("ed", "wrong")), None).status, 401);
+    let mut b = Bolt::connect(bolt);
+    assert_eq!(b.logon("ed", "edpw").0, SUCCESS);
+    b.run("MATCH (n) RETURN count(n)", None).unwrap();
+
+    let r = http(addr, "GET", "/metrics", Some("Bearer tok"), None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let ct = r.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("content-type")).unwrap();
+    assert_eq!(ct.1, "text/plain; version=0.0.4; charset=utf-8");
+    assert!(r.body.contains("# TYPE graphbuff_query_duration_seconds histogram\n"), "{}", r.body);
+    let m = samples(&r.body);
+    let get = |k: &str| *m.get(k).unwrap_or_else(|| panic!("no {k} in\n{}", r.body));
+    assert_eq!(get(r#"graphbuff_queries_total{protocol="http",outcome="ok"}"#), 2.0);
+    assert_eq!(get(r#"graphbuff_queries_total{protocol="http",outcome="error"}"#), 1.0);
+    assert_eq!(get(r#"graphbuff_queries_total{protocol="bolt",outcome="ok"}"#), 1.0);
+    assert_eq!(get(r#"graphbuff_queries_total{protocol="bolt",outcome="timeout"}"#), 0.0);
+    assert_eq!(get(r#"graphbuff_query_duration_seconds_count{protocol="http"}"#), 3.0);
+    assert_eq!(get(r#"graphbuff_query_duration_seconds_bucket{protocol="http",le="+Inf"}"#), 3.0);
+    assert!(get(r#"graphbuff_query_duration_seconds_bucket{protocol="http",le="10"}"#) <= 3.0);
+    // The request without credentials and the wrong password.
+    assert_eq!(get(r#"graphbuff_failed_logins_total{protocol="http"}"#), 2.0);
+    assert_eq!(get(r#"graphbuff_login_lockouts_total"#), 0.0);
+    assert_eq!(get(r#"graphbuff_connections{protocol="bolt"}"#), 1.0);
+    // This scrape's own connection is open.
+    assert!(get(r#"graphbuff_connections{protocol="http"}"#) >= 1.0);
+    assert!(get(r#"graphbuff_connections_accepted_total{protocol="http"}"#) >= 7.0);
+    assert_eq!(get(r#"graphbuff_database_nodes{database="graphbuff"}"#), 3.0);
+    assert_eq!(get(r#"graphbuff_database_relationships{database="graphbuff"}"#), 1.0);
+    assert_eq!(get(r#"graphbuff_database_cached_indexes{database="graphbuff"}"#), 0.0);
+    assert_eq!(get(r#"graphbuff_transactions{protocol="http",status="idle"}"#), 0.0);
+    assert!(m.keys().any(|k| k.starts_with("graphbuff_info{version=")));
+    assert!(!r.body.contains("graphbuff_database_store_bytes{"), "in-memory databases have no files");
+
+    // An open transaction shows, idle between statements.
+    b.send(BEGIN, vec![PackValue::Map(BTreeMap::new())]);
+    assert_eq!(b.recv().0, SUCCESS);
+    let m = samples(&http(addr, "GET", "/metrics", Some(&root), None).body);
+    assert_eq!(m[r#"graphbuff_transactions{protocol="bolt",status="idle"}"#], 1.0);
+    drop(b);
+}
+
+#[test]
+fn metrics_show_store_size() {
+    let dir = std::env::temp_dir().join(format!("graphbuff-metrics-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = Server::start(
+        Arc::new(DatabaseManager::open(&dir).unwrap()),
+        ServerConfig { bind: "127.0.0.1:0".into(), token: Some("tok".into()), ..ServerConfig::default() },
+    )
+    .unwrap();
+    let addr = server.local_addr();
+    assert_eq!(query(addr, "Bearer tok", "UNWIND range(1, 100) AS i CREATE (:N {i: i})").status, 200);
+    let m = samples(&http(addr, "GET", "/metrics", Some("Bearer tok"), None).body);
+    assert!(m[r#"graphbuff_database_store_bytes{database="graphbuff"}"#] > 0.0, "{m:?}");
+    assert_eq!(m[r#"graphbuff_database_nodes{database="graphbuff"}"#], 100.0);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
