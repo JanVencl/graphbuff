@@ -10,6 +10,9 @@ the same notes.
 - `ALTER DATABASE … SET ACCESS READ ONLY | READ WRITE`, database aliases
   (`CREATE` / `ALTER` / `DROP ALIAS`, `SHOW ALIASES`) and `DROP DATABASE … DUMP DATA`
   (a backup in `dumps/` first). `SHOW DATABASES` gains `access` and `aliases` columns.
+- Relationship constraints (`FOR ()-[r:T]-() REQUIRE … IS UNIQUE | IS NOT NULL |
+  IS RELATIONSHIP KEY`) and property type constraints (`REQUIRE n.p IS :: INTEGER | FLOAT`)
+  on nodes and relationships. `SHOW CONSTRAINTS` gains `entityType` and `propertyType`.
 - A release archive for ARM64 Linux, `graphbuff-linux-aarch64.tar.gz` (static, musl).
 - `graphbuff-cli`, a command-line client for `graphbuff-server` (line editor, Cypher
   highlighting, colors), shipped in the release archives and the Docker image.
