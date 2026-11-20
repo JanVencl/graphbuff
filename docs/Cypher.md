@@ -44,8 +44,16 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   every output, and may leave out `YIELD` and the parentheses (`CALL db.labels`; arguments then
   come from the parameters of the same names). Built in: `db.labels()`,
   `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
-  `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`, the vector and full-text
-  index procedures (`db.index.vector.*`, `db.index.fulltext.*`); `SHOW PROCEDURES` lists them.
+  `db.awaitIndexes()`, `dbms.procedures()`, `dbms.functions()`, `dbms.components()`, the
+  vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`);
+  `SHOW PROCEDURES` lists them. `OPTIONAL CALL proc(…) YIELD …` and `OPTIONAL CALL { … }` keep
+  an input row the call returns nothing for, with the new variables null (no `YIELD … WHERE`
+  after `OPTIONAL CALL`: filter in a `WITH … WHERE`).
+* **Introspection:** `SHOW [ALL | BUILT IN | USER DEFINED] FUNCTIONS` lists the built-in
+  functions (name, category, signature, description, aggregating, isBuiltIn; filter with
+  `CALL dbms.functions() YIELD … WHERE …`). On `graphbuff-server`, `SHOW SETTINGS [names]
+  [YIELD … | WHERE …]` lists the config file's settings for administrators (name, value,
+  isDynamic, defaultValue, description; the token's value is hidden).
   Applications add read-only procedures in Rust with `Database::register_procedure` (or
   `DatabaseManager::register_procedure` for every database):
 
@@ -187,7 +195,6 @@ recognise. Where there is another way to write it, it is given.
 | `SHORTEST k`, `ALL SHORTEST`, `ANY` path selectors | `shortestPath(…)`, `allShortestPaths(…)` |
 | Match modes: `DIFFERENT RELATIONSHIPS`, `REPEATABLE ELEMENTS` | relationships are never repeated within a match, as in `DIFFERENT RELATIONSHIPS` |
 | GQL clauses: `FINISH`, `FILTER`, `LET`, `WHEN … THEN`, `NEXT`, standalone `ORDER BY` / `OFFSET` | `WITH … WHERE`, `WITH x AS y`, `CASE`, `SKIP` |
-| `OPTIONAL CALL` | `OPTIONAL MATCH`, or a `CALL { … }` subquery that returns a row anyway |
 | Dynamic labels and types: `n:$(expr)`, `[:$(expr)]` | none yet |
 | Type predicates: `x IS :: STRING` | `valueType(x) = 'STRING NOT NULL'` |
 | `USE graph.byName(…)` | `USE name` |
@@ -222,8 +229,8 @@ recognise. Where there is another way to write it, it is given.
 
 | Missing | Error |
 |---------|-------|
-| `SHOW FUNCTIONS`, `SHOW SETTINGS`, `SHOW PRIVILEGES`, `SHOW ALIASES` | `Unsupported` |
+| `SHOW PRIVILEGES`, `SHOW ALIASES`, `SHOW FUNCTIONS EXECUTABLE` | `Unsupported` |
 | `ALTER DATABASE`, database aliases (`CREATE ALIAS`), `DROP DATABASE … DUMP DATA`, `TOPOLOGY` | syntax error or `Unsupported` |
 | `CREATE ROLE`, `DENY`, privileges (`GRANT TRAVERSE …`): roles are the fixed `reader`, `editor` and `admin` | syntax error |
 | Account options: `SET HOME DATABASE`, `SET STATUS SUSPENDED`, `SET ENCRYPTED PASSWORD`, `SET AUTH`, `CHANGE REQUIRED`, `SHOW ROLES WITH USERS` | `Unsupported` |
-| User and role commands, `SHOW` / `TERMINATE TRANSACTIONS` in the embedded engine | `Unsupported`: they need `graphbuff-server` |
+| User and role commands, `SHOW` / `TERMINATE TRANSACTIONS`, `SHOW SETTINGS` in the embedded engine | `Unsupported`: they need `graphbuff-server` |

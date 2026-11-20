@@ -1999,3 +1999,73 @@ fn apoc_style_functions() {
     );
     assert!(matches!(db.execute("RETURN apoc.coll.shuffle([1])"), Err(Error::Unsupported(_))));
 }
+
+#[test]
+fn show_functions_lists_every_builtin() {
+    let db = Database::in_memory();
+    let r = run(&db, "SHOW FUNCTIONS");
+    assert_eq!(r.columns, ["name", "category", "signature", "description", "aggregating", "isBuiltIn"]);
+    assert!(r.rows.len() > 100, "{}", r.rows.len());
+    let names: Vec<String> = r.rows.iter().map(|row| match &row[0] {
+        ResultValue::String(s) => s.clone(),
+        o => panic!("{o:?}"),
+    }).collect();
+    let mut sorted = names.clone();
+    sorted.sort_by_key(|n| n.to_ascii_lowercase());
+    sorted.dedup_by_key(|n| n.to_ascii_lowercase());
+    assert_eq!(sorted, names, "sorted and unique");
+    // Every listed function exists: calling it fails, if at all, for its arguments.
+    for (name, row) in names.iter().zip(&r.rows) {
+        if name == "exists" || row[4] == ResultValue::Bool(true) {
+            continue;
+        }
+        if let Err(e) = db.execute(&format!("RETURN {name}() AS x")) {
+            assert!(!e.to_string().contains("unknown function"), "{name}: {e}");
+        }
+    }
+    assert_eq!(rows(&run(&db, "SHOW BUILT IN FUNCTIONS")).len(), names.len());
+    assert_eq!(rows(&run(&db, "SHOW ALL FUNCTIONS")).len(), names.len());
+    assert!(run(&db, "SHOW USER DEFINED FUNCTIONS").rows.is_empty());
+    let agg = scalar(&db, "CALL dbms.functions() YIELD name, aggregating WHERE aggregating RETURN count(*)");
+    assert_eq!(agg.as_int(), Some(10));
+    let sig = scalar(&db, "CALL dbms.functions() YIELD name, signature WHERE name = 'toUpper' RETURN signature");
+    assert_eq!(sig.as_str(), Some("toUpper(input :: STRING) :: STRING"));
+}
+
+#[test]
+fn optional_call() {
+    let db = db_with("CREATE (:P {name: 'a'})-[:K]->(:P {name: 'b'}), (:P {name: 'c'})");
+    // A subquery with no rows for an input row: the row stays, with nulls.
+    let r = run(
+        &db,
+        "MATCH (p:P) OPTIONAL CALL (p) { MATCH (p)-[:K]->(q) RETURN q.name AS knows } \
+         RETURN p.name, knows ORDER BY p.name",
+    );
+    assert_eq!(rows(&r), ["\"a\", \"b\"", "\"b\", null", "\"c\", null"]);
+    // Plain CALL drops those rows.
+    let r = run(&db, "MATCH (p:P) CALL (p) { MATCH (p)-[:K]->(q) RETURN q.name AS knows } RETURN p.name");
+    assert_eq!(rows(&r), ["\"a\""]);
+    // An updating subquery too.
+    let r = run(
+        &db,
+        "UNWIND [1, 2] AS i OPTIONAL CALL (i) { WITH i WHERE i = 1 CREATE (n:New {i: i}) RETURN n.i AS made } \
+         RETURN i, made ORDER BY i",
+    );
+    assert_eq!(rows(&r), ["1, 1", "2, null"]);
+    // A procedure.
+    let r = run(
+        &db,
+        "UNWIND ['P', 'Nope'] AS l OPTIONAL CALL db.labels() YIELD label WITH l, label WHERE label IS NULL OR label = l \
+         RETURN l, label ORDER BY l",
+    );
+    assert_eq!(rows(&r), ["\"P\", \"P\""]);
+    let empty = Database::in_memory();
+    let r = run(&empty, "UNWIND [1, 2] AS i OPTIONAL CALL db.labels() YIELD label RETURN i, label");
+    assert_eq!(rows(&r), ["1, null", "2, null"]);
+    assert!(run(&empty, "UNWIND [1, 2] AS i CALL db.labels() YIELD label RETURN i, label").rows.is_empty());
+    assert!(matches!(
+        db.execute("OPTIONAL CALL db.labels() YIELD label WHERE label = 'P' RETURN label"),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(db.execute("UNWIND [1] AS i OPTIONAL CALL (i) { CREATE () } IN TRANSACTIONS RETURN i").is_err());
+}

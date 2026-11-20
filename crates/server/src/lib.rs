@@ -160,6 +160,19 @@ pub struct ServerConfig {
     /// Page origins whose browser apps may call the HTTP API (CORS), such as
     /// `https://app.example.com`, or `*` for every origin. Default: none.
     pub cors: http::Cors,
+    /// What `SHOW SETTINGS` lists (for administrators). Default: nothing.
+    pub settings: Vec<Setting>,
+}
+
+/// A row of `SHOW SETTINGS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Setting {
+    /// `section.key`, as in the config file, such as `server.bind`.
+    pub name: String,
+    /// The value in use (`None`: not set).
+    pub value: Option<String>,
+    pub default: Option<String>,
+    pub description: String,
 }
 
 impl Default for ServerConfig {
@@ -182,6 +195,7 @@ impl Default for ServerConfig {
             test_procedures: false,
             login_limits: LoginLimits::default(),
             cors: http::Cors::default(),
+            settings: Vec::new(),
         }
     }
 }
@@ -256,6 +270,7 @@ impl Server {
                 throttle: crate::throttle::Throttle::new(config.login_limits),
                 running,
                 metrics: crate::metrics::Metrics::default(),
+                settings: config.settings,
             },
             tls,
             limits: Limits {

@@ -1105,3 +1105,26 @@ fn cors_for_allowed_origins() {
     );
     assert_eq!(r.status, 401);
 }
+
+#[test]
+fn show_settings() {
+    let setting = |name: &str, value: Option<&str>| graphbuff_server::Setting {
+        name: name.into(),
+        value: value.map(String::from),
+        default: Some("d".into()),
+        description: "what it does".into(),
+    };
+    let server = start(ServerConfig {
+        settings: vec![setting("server.bind", Some("127.0.0.1:0")), setting("storage.demo", None)],
+        ..ServerConfig::default()
+    });
+    let mut c = Client::connect(server.local_addr());
+    let r = c.query("/query", "SHOW SETTINGS", "{}");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains(r#""columns":["name","value","isDynamic","defaultValue","description"]"#), "{}", r.body);
+    assert!(r.body.contains(r#"["server.bind","127.0.0.1:0",false,"d","what it does"]"#), "{}", r.body);
+    let rows = c.rows("/query", "SHOW SETTINGS $n YIELD name, value RETURN value", r#"{"n": ["storage.demo"]}"#);
+    assert_eq!(rows.len(), 1);
+    let rows = c.rows("/query", "SHOW SETTING WHERE value IS NOT NULL", "{}");
+    assert_eq!(rows.len(), 1);
+}

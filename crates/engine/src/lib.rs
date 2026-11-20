@@ -26,6 +26,7 @@
 mod accel;
 mod aggregate;
 mod batched;
+mod catalog;
 mod context;
 mod csv;
 mod dbms;

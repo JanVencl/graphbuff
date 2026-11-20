@@ -477,6 +477,7 @@ fn main() {
         backup_dir: settings.backup_dir.clone(),
         test_procedures: settings.test_procedures,
         cors: settings.cors_origins.clone(),
+        settings: settings.listing(),
         login_limits: LoginLimits {
             max_failures: settings.max_failed_logins,
             lockout: settings.login_lockout,

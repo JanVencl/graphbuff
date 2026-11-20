@@ -80,6 +80,9 @@ pub enum Clause {
         /// `IN [n] [CONCURRENT] TRANSACTIONS …`: the subquery runs in batches of input
         /// rows, each in a transaction of its own that commits before the next.
         in_transactions: Option<InTransactions>,
+        /// `OPTIONAL CALL { … }`: an input row for which the subquery returns no rows is
+        /// kept once, with its columns null.
+        optional: bool,
     },
     /// `FOREACH (var IN list | updates)`: runs the update clauses once per list element,
     /// per row. Rows pass through unchanged.
@@ -103,9 +106,15 @@ pub enum Clause {
         name: String,
         args: Option<Vec<Expr>>,
         yields: Option<ProcedureYield>,
+        /// `OPTIONAL CALL`: an input row for which the procedure returns no rows is kept
+        /// once, with the yielded variables null.
+        optional: bool,
     },
     /// `SHOW PROCEDURES`
     ShowProcedures,
+    /// `SHOW [ALL | BUILT IN | USER DEFINED] FUNCTIONS`; `user_defined`: only those (there
+    /// are none).
+    ShowFunctions { user_defined: bool },
     /// `CREATE [RANGE | VECTOR] INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, …)
     /// [OPTIONS {…}]`, `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`;
     /// `CREATE FULLTEXT INDEX [name] [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.a, …]
@@ -225,6 +234,7 @@ impl Clause {
                 | Clause::DropConstraint { .. }
                 | Clause::ShowConstraints
                 | Clause::ShowProcedures
+                | Clause::ShowFunctions { .. }
         )
     }
 
@@ -241,11 +251,13 @@ impl Clause {
             Clause::Unwind { .. } => "UNWIND",
             Clause::With(_) => "WITH",
             Clause::Return(_) => "RETURN",
+            Clause::CallSubquery { optional: true, .. } | Clause::CallProcedure { optional: true, .. } => "OPTIONAL CALL",
             Clause::CallSubquery { .. } => "CALL",
             Clause::Foreach { .. } => "FOREACH",
             Clause::LoadCsv { .. } => "LOAD CSV",
             Clause::CallProcedure { .. } => "CALL",
             Clause::ShowProcedures => "SHOW PROCEDURES",
+            Clause::ShowFunctions { .. } => "SHOW FUNCTIONS",
             Clause::CreateIndex { .. } => "CREATE INDEX",
             Clause::DropIndex { .. } => "DROP INDEX",
             Clause::ShowIndexes => "SHOW INDEXES",
@@ -758,6 +770,17 @@ pub enum Statement {
     /// `SHOW TRANSACTIONS`, `TERMINATE TRANSACTIONS`: the transactions open on
     /// `graphbuff-server`.
     Transaction(Box<TransactionCommand>),
+    /// `SHOW SETTINGS`: the settings of `graphbuff-server`.
+    Settings(Box<SettingsCommand>),
+}
+
+/// `SHOW SETTING[S] [name, … | $names] [tail]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsCommand {
+    /// Setting names: string expressions, or parameters holding a string or a list of
+    /// strings. Empty: every setting.
+    pub names: Vec<Expr>,
+    pub tail: ShowTail,
 }
 
 /// `SHOW TRANSACTION[S] [ids] [tail]` or `TERMINATE TRANSACTION[S] ids [tail]`.

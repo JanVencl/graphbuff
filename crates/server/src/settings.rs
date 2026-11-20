@@ -223,52 +223,59 @@ impl Toml {
     }
 }
 
-/// Every setting, by section, and what it holds.
-const SETTINGS: &[(&str, &[(&str, Kind)])] = &[
+/// Every setting, by section: what it holds, and what it does (for `SHOW SETTINGS`).
+const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
     (
         "server",
         &[
-            ("bind", Kind::Str),
-            ("bolt", Kind::Str),
-            ("max_connections", Kind::Positive),
-            ("keep_alive_seconds", Kind::Count),
-            ("shutdown_timeout_seconds", Kind::Count),
-            ("cors_origins", Kind::Str),
+            ("bind", Kind::Str, "HTTP address."),
+            ("bolt", Kind::Str, "Bolt address (off when not set)."),
+            ("max_connections", Kind::Positive, "Connections served at once."),
+            ("keep_alive_seconds", Kind::Count, "Idle keep-alive timeout of a connection."),
+            ("shutdown_timeout_seconds", Kind::Count, "On stop, how long running queries may take before they are cancelled."),
+            ("cors_origins", Kind::Str, "Web page origins whose browser apps may call the HTTP API (CORS)."),
         ],
     ),
     (
         "storage",
         &[
-            ("mode", Kind::Str),
-            ("data", Kind::Path),
-            ("fsync", Kind::Bool),
-            ("import_dir", Kind::Path),
-            ("backup_dir", Kind::Path),
-            ("demo", Kind::Str),
+            ("mode", Kind::Str, "How new databases keep their data: hybrid, persistent or memory."),
+            ("data", Kind::Path, "The data folder: databases, user accounts and (by default) logs."),
+            ("fsync", Kind::Bool, "Sync every commit to disk."),
+            ("import_dir", Kind::Path, "Folder LOAD CSV may read files from (off when not set)."),
+            ("backup_dir", Kind::Path, "Folder of backups and restores (off when not set)."),
+            ("demo", Kind::Str, "Demo graph loaded into an empty default database."),
         ],
     ),
     (
         "security",
         &[
-            ("token", Kind::Str),
-            ("tls_cert", Kind::Path),
-            ("tls_key", Kind::Path),
-            ("tls_allow_plain", Kind::Bool),
-            ("max_failed_logins", Kind::Count),
-            ("login_lockout_seconds", Kind::Positive),
+            ("token", Kind::Str, "Token accepted as a bearer token or any user's password (value hidden)."),
+            ("tls_cert", Kind::Path, "PEM certificate chain for HTTPS and Bolt over TLS."),
+            ("tls_key", Kind::Path, "PEM private key for HTTPS and Bolt over TLS."),
+            ("tls_allow_plain", Kind::Bool, "With TLS, also accept clients without TLS."),
+            ("max_failed_logins", Kind::Count, "Failed logins of one client address and user name before a lockout (0: off)."),
+            ("login_lockout_seconds", Kind::Positive, "First lockout after too many failed logins; doubles up to an hour."),
         ],
     ),
     (
         "queries",
         &[
-            ("transaction_timeout_seconds", Kind::Positive),
-            ("query_timeout_ms", Kind::Positive),
-            ("max_memory_mb", Kind::Count),
-            ("gpu", Kind::Bool),
-            ("test_procedures", Kind::Bool),
+            ("transaction_timeout_seconds", Kind::Positive, "Roll back a transaction after this long without a request."),
+            ("query_timeout_ms", Kind::Positive, "Stop a query that runs longer (no limit when not set)."),
+            ("max_memory_mb", Kind::Count, "Stop a query that holds more memory (MiB; 0: no limit)."),
+            ("gpu", Kind::Bool, "Run graph kernels on the GPU."),
+            ("test_procedures", Kind::Bool, "Test procedures for the openCypher TCK."),
         ],
     ),
-    ("logs", &[("dir", Kind::Str), ("level", Kind::Str), ("slow_query_ms", Kind::Count)]),
+    (
+        "logs",
+        &[
+            ("dir", Kind::Str, "Folder of the logs; \"-\" for standard error."),
+            ("level", Kind::Str, "error, warn, info or debug."),
+            ("slow_query_ms", Kind::Count, "Log queries that take at least this long to query.log."),
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +389,69 @@ impl Config {
         Ok(c)
     }
 
+    /// The value of `section.key` in use, as `SHOW SETTINGS` shows it (`None`: not set);
+    /// `Err` for a setting this function does not know (a test checks there is none).
+    fn value_of(&self, section: &str, key: &str) -> Result<Option<String>, ()> {
+        let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
+        let secs = |d: &Option<Duration>| d.map(|d| d.as_secs().to_string());
+        let millis = |d: &Option<Duration>| d.map(|d| d.as_millis().to_string());
+        Ok(match (section, key) {
+            ("server", "bind") => self.bind.clone(),
+            ("server", "bolt") => self.bolt.clone(),
+            ("server", "max_connections") => self.max_connections.map(|n| n.to_string()),
+            ("server", "keep_alive_seconds") => secs(&self.keep_alive),
+            ("server", "shutdown_timeout_seconds") => secs(&self.shutdown_timeout),
+            ("server", "cors_origins") => self.cors_origins.is_on().then(|| self.cors_origins.origins().join(", ")),
+            ("storage", "mode") => Some(
+                match self.storage {
+                    Storage::Hybrid => "hybrid",
+                    Storage::Persistent => "persistent",
+                    Storage::Memory => "memory",
+                }
+                .into(),
+            ),
+            ("storage", "data") => path(&self.data),
+            ("storage", "fsync") => Some(self.fsync.to_string()),
+            ("storage", "import_dir") => path(&self.import_dir),
+            ("storage", "backup_dir") => path(&self.backup_dir),
+            ("storage", "demo") => self.demo.clone(),
+            ("security", "token") => self.token.as_ref().map(|_| "********".into()),
+            ("security", "tls_cert") => path(&self.tls_cert),
+            ("security", "tls_key") => path(&self.tls_key),
+            ("security", "tls_allow_plain") => Some(self.tls_allow_plain.to_string()),
+            ("security", "max_failed_logins") => Some(self.max_failed_logins.to_string()),
+            ("security", "login_lockout_seconds") => Some(self.login_lockout.as_secs().to_string()),
+            ("queries", "transaction_timeout_seconds") => secs(&self.transaction_timeout),
+            ("queries", "query_timeout_ms") => millis(&self.query_timeout),
+            ("queries", "max_memory_mb") => self.max_memory_mb.map(|n| n.to_string()),
+            ("queries", "gpu") => Some(self.gpu.to_string()),
+            ("queries", "test_procedures") => Some(self.test_procedures.to_string()),
+            ("logs", "dir") => match &self.log_dir {
+                LogDir::Default => None,
+                LogDir::StandardError => Some("-".into()),
+                LogDir::Dir(d) => Some(d.display().to_string()),
+            },
+            ("logs", "level") => Some(format!("{:?}", self.log_level).to_ascii_lowercase()),
+            ("logs", "slow_query_ms") => millis(&self.slow_query),
+            _ => return Err(()),
+        })
+    }
+
+    /// Every setting with its value and default, for `SHOW SETTINGS`.
+    pub fn listing(&self) -> Vec<graphbuff_server::Setting> {
+        let defaults = Config::default();
+        SETTINGS
+            .iter()
+            .flat_map(|(section, keys)| keys.iter().map(move |(key, _, description)| (*section, *key, *description)))
+            .map(|(section, key, description)| graphbuff_server::Setting {
+                name: format!("{section}.{key}"),
+                value: self.value_of(section, key).unwrap_or_default(),
+                default: defaults.value_of(section, key).unwrap_or_default(),
+                description: description.to_string(),
+            })
+            .collect()
+    }
+
     /// Applies the environment: GRAPHBUFF_TOKEN sets the token (a secret, kept out of the
     /// file in containers).
     pub fn apply_env(&mut self) {
@@ -410,7 +480,7 @@ type Values = HashMap<(String, String), (Toml, usize)>;
 /// Reads the TOML subset the config file uses, checking every section, key and value kind.
 fn read_toml(path: &Path, text: &str) -> Result<Values, String> {
     let mut out = HashMap::new();
-    let mut section: Option<&'static [(&'static str, Kind)]> = None;
+    let mut section: Option<&'static [(&'static str, Kind, &'static str)]> = None;
     let mut section_name = String::new();
     let mut seen_sections: Vec<String> = Vec::new();
     for (n, raw) in text.lines().enumerate() {
@@ -444,8 +514,8 @@ fn read_toml(path: &Path, text: &str) -> Result<Values, String> {
         let Some(keys) = section else {
             return Err(format!("{}: `{key}` is outside a section; settings go under [server], [storage], …", at()));
         };
-        let &(_, kind) = keys.iter().find(|(k, _)| *k == key).ok_or_else(|| {
-            let known: Vec<&str> = keys.iter().map(|(k, _)| *k).collect();
+        let &(_, kind, _) = keys.iter().find(|(k, ..)| *k == key).ok_or_else(|| {
+            let known: Vec<&str> = keys.iter().map(|(k, ..)| *k).collect();
             format!("{}: unknown setting `{key}` in [{section_name}] (settings: {})", at(), known.join(", "))
         })?;
         let value = parse_value(rest.trim()).map_err(|e| format!("{}: {key}: {e}", at()))?;
@@ -675,6 +745,26 @@ max_memory_mb = 512").unwrap();
         assert!(e("[server]\nbind = \"x").contains("no closing"));
         assert!(e("[server]\nbind = \"x\" y").contains("after the value"));
         assert!(e("[server]\ncors_origins = \"example.com\"").contains("server.cors_origins"));
+    }
+
+    #[test]
+    fn listing_shows_values_and_hides_the_token() {
+        let c = parse("[server]\nbind = \"0.0.0.0:1\"\n[security]\ntoken = \"s3cret\"\n[logs]\nlevel = \"warn\"").unwrap();
+        let list = c.listing();
+        let get = |n: &str| list.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n}"));
+        assert_eq!(get("server.bind").value.as_deref(), Some("0.0.0.0:1"));
+        assert_eq!(get("server.bind").default, None);
+        assert_eq!(get("security.token").value.as_deref(), Some("********"));
+        assert_eq!(get("logs.level").value.as_deref(), Some("warn"));
+        assert_eq!(get("logs.level").default.as_deref(), Some("info"));
+        assert_eq!(get("storage.mode").value.as_deref(), Some("hybrid"));
+        assert_eq!(list.len(), SETTINGS.iter().map(|(_, k)| k.len()).sum::<usize>());
+        assert!(!format!("{list:?}").contains("s3cret"));
+        for (section, keys) in SETTINGS {
+            for (key, ..) in keys.iter() {
+                assert!(c.value_of(section, key).is_ok(), "SHOW SETTINGS has no value for {section}.{key}");
+            }
+        }
     }
 
     #[test]

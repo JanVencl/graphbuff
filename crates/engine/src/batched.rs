@@ -282,7 +282,7 @@ impl<S: GraphStore> Database<S> {
         interrupt: Option<Interrupt>,
     ) -> Result<QueryResult> {
         let clauses = &ast.parts[0].clauses;
-        let Clause::CallSubquery { scope, query: sub, in_transactions: Some(options) } = &clauses[at] else {
+        let Clause::CallSubquery { scope, query: sub, in_transactions: Some(options), .. } = &clauses[at] else {
             unreachable!("position() found it");
         };
         let (before, after) = (&clauses[..at], &clauses[at + 1..]);
@@ -381,7 +381,12 @@ impl<S: GraphStore> Database<S> {
         interrupt: &Option<Interrupt>,
     ) -> Result<QueryResult> {
         let mut inner = unwind_rows(&names);
-        inner.push(Clause::CallSubquery { scope: scope.clone(), query: Box::new(sub.clone()), in_transactions: None });
+        inner.push(Clause::CallSubquery {
+            scope: scope.clone(),
+            query: Box::new(sub.clone()),
+            in_transactions: None,
+            optional: false,
+        });
         if returns {
             inner.push(Clause::Return(projection(Vec::new(), true)));
         }
