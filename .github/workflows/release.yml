@@ -1,5 +1,5 @@
 # Pushing a tag `vX.Y.Z` publishes a release:
-#   * archives of `graphbuff-server` and `graphbuff-cli` for Linux, macOS and Windows,
+#   * archives of `graphbuff-server` and `graphbuff-cli` (both with TLS) for Linux, macOS and Windows,
 #     plus SHA256SUMS, attached to the GitHub release of the tag;
 #   * the image ghcr.io/janvencl/graphbuff, tagged X.Y.Z and latest (amd64 and arm64).
 name: release
@@ -49,8 +49,14 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.target }}
+      # ring (the TLS crypto provider) compiles C: musl-gcc for the static Linux build.
+      - name: Install musl-gcc
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p graphbuff-server -p graphbuff-cli
+        run: >-
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p graphbuff-server -p graphbuff-cli --features graphbuff-server/tls,graphbuff-cli/tls
       - name: Package
         shell: bash
         run: |
