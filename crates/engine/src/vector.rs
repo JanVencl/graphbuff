@@ -8,17 +8,20 @@
 use std::collections::{BTreeMap, HashMap};
 
 use graphbuff_core::{
-    Changes, Error, GraphStore, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId, RelId, Result,
-    Value, VectorRows, VectorSimilarity as Similarity,
+    Changes, Error, GraphStore, HnswConfig, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId,
+    RelId, Result, Value, VectorRows, VectorSimilarity as Similarity,
 };
 use graphbuff_cypher::ast::IndexType;
 
+use crate::hnsw::{Graph, Metric};
 use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
 
 /// The kind of index `CREATE [VECTOR | FULLTEXT] INDEX … OPTIONS {…}` asks for. A vector
 /// index needs `indexConfig: {`vector.dimensions`: n}` and may name
-/// `vector.similarity_function` (`'cosine'`, the default, or `'euclidean'`); a full-text
+/// `vector.similarity_function` (`'cosine'`, the default, or `'euclidean'`); it is
+/// approximate (HNSW) with `vector.hnsw.enabled: true` or when `vector.hnsw.m` or
+/// `vector.hnsw.ef_construction` is given (defaults 16 and 100); a full-text
 /// index takes `fulltext.analyzer` and `fulltext.eventually_consistent` (see
 /// [`fulltext_kind`](crate::fulltext::fulltext_kind)); `indexProvider` is accepted and
 /// ignored.
@@ -45,8 +48,23 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
         return Ok(IndexKind::Range);
     }
     let (mut dimensions, mut similarity) = (None, Similarity::Cosine);
+    let (mut enabled, mut m, mut ef) = (None, None, None);
+    let hnsw_int = |k: &str, v: &Value, min: u16, max: u16| -> Result<u16> {
+        match v {
+            Value::Int(n) if (i64::from(min)..=i64::from(max)).contains(n) => Ok(*n as u16),
+            o => Err(Error::Semantic(format!("`{k}` needs an integer from {min} to {max}, not {o}"))),
+        }
+    };
     for (k, v) in &config {
         match (k.as_str(), v) {
+            ("vector.hnsw.enabled", Value::Bool(b)) => enabled = Some(*b),
+            ("vector.hnsw.enabled", o) => {
+                return Err(Error::Type(format!("`vector.hnsw.enabled` needs a BOOLEAN, not {}", o.type_name())));
+            }
+            ("vector.hnsw.m", v) => m = Some(hnsw_int(k, v, 2, HnswConfig::MAX_M)?),
+            ("vector.hnsw.ef_construction", v) => {
+                ef = Some(hnsw_int(k, v, 1, HnswConfig::MAX_EF_CONSTRUCTION)?);
+            }
             ("vector.dimensions", Value::Int(n)) if (1..=i64::from(MAX_VECTOR_DIMENSIONS)).contains(n) => {
                 dimensions = Some(*n as u32);
             }
@@ -75,7 +93,20 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
     let dimensions = dimensions.ok_or_else(|| {
         Error::Semantic("a vector index needs OPTIONS {indexConfig: {`vector.dimensions`: n}}".into())
     })?;
-    Ok(IndexKind::Vector { dimensions, similarity })
+    let hnsw = match enabled {
+        Some(false) if m.is_some() || ef.is_some() => {
+            return Err(Error::Semantic(
+                "`vector.hnsw.m` and `vector.hnsw.ef_construction` need `vector.hnsw.enabled: true`".into(),
+            ));
+        }
+        Some(false) => None,
+        None if m.is_none() && ef.is_none() => None,
+        _ => Some(HnswConfig {
+            m: m.unwrap_or(HnswConfig::DEFAULT.m),
+            ef_construction: ef.unwrap_or(HnswConfig::DEFAULT.ef_construction),
+        }),
+    };
+    Ok(IndexKind::Vector { dimensions, similarity, hnsw })
 }
 
 /// A `SHOW INDEXES` / `db.indexes()` row: name, entity type, label or type, properties,
@@ -83,13 +114,18 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
 pub fn index_row(d: IndexDef) -> Vec<Value> {
     let options = match d.kind {
         IndexKind::Range => BTreeMap::new(),
-        IndexKind::Vector { dimensions, similarity } => BTreeMap::from([(
-            "indexConfig".to_string(),
-            Value::Map(BTreeMap::from([
+        IndexKind::Vector { dimensions, similarity, hnsw } => {
+            let mut config = BTreeMap::from([
                 ("vector.dimensions".to_string(), Value::Int(i64::from(dimensions))),
                 ("vector.similarity_function".to_string(), Value::String(similarity.name().into())),
-            ])),
-        )]),
+                ("vector.hnsw.enabled".to_string(), Value::Bool(hnsw.is_some())),
+            ]);
+            if let Some(h) = hnsw {
+                config.insert("vector.hnsw.m".into(), Value::Int(i64::from(h.m)));
+                config.insert("vector.hnsw.ef_construction".into(), Value::Int(i64::from(h.ef_construction)));
+            }
+            BTreeMap::from([("indexConfig".to_string(), Value::Map(config))])
+        }
         IndexKind::Fulltext { analyzer } => BTreeMap::from([(
             "indexConfig".to_string(),
             Value::Map(BTreeMap::from([
@@ -194,7 +230,7 @@ fn indexed_vector(value: &Value, dimensions: u32, similarity: Similarity) -> Opt
 /// The dimensions and similarity of a vector index.
 fn vector_params(def: &IndexDef) -> (u32, Similarity) {
     match def.kind {
-        IndexKind::Vector { dimensions, similarity } => (dimensions, similarity),
+        IndexKind::Vector { dimensions, similarity, .. } => (dimensions, similarity),
         IndexKind::Range | IndexKind::Fulltext { .. } => unreachable!("a vector index"),
     }
 }
@@ -247,6 +283,32 @@ fn matrix_row(value: &Value, dimensions: u32, similarity: Similarity) -> Option<
         Similarity::Euclidean => 1.0,
     };
     Some(v.iter().map(|x| (x * scale) as f32).collect())
+}
+
+/// The row entity `id` has in `store` for index `def`, or `None` if the index skips it
+/// (or it is gone).
+fn current_row(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Option<Vec<f32>>> {
+    let (dimensions, similarity) = vector_params(def);
+    let key = &def.properties[0];
+    let value = match def.entity {
+        IndexEntity::Node => {
+            let n = NodeId(id);
+            if store.node_exists(n)? && store.node_has_label(n, &def.label)? {
+                store.node_property(n, key)?
+            } else {
+                None
+            }
+        }
+        IndexEntity::Relationship => {
+            let r = RelId(id);
+            if store.relationship_exists(r)? && store.relationship_type(r)?.as_deref() == Some(def.label.as_str()) {
+                store.relationship_property(r, key)?
+            } else {
+                None
+            }
+        }
+    };
+    Ok(value.and_then(|v| matrix_row(&v, dimensions, similarity)))
 }
 
 /// [`Matrix::ids`] of a row not in use.
@@ -307,29 +369,7 @@ impl Matrix {
 
     /// The row entity `id` has in `store`, or `None` if the index skips it (or it is gone).
     fn current(&self, store: &dyn GraphStore, id: u64) -> Result<Option<Vec<f32>>> {
-        let (dimensions, similarity) = vector_params(&self.def);
-        let key = &self.def.properties[0];
-        let value = match self.def.entity {
-            IndexEntity::Node => {
-                let n = NodeId(id);
-                if store.node_exists(n)? && store.node_has_label(n, &self.def.label)? {
-                    store.node_property(n, key)?
-                } else {
-                    None
-                }
-            }
-            IndexEntity::Relationship => {
-                let r = RelId(id);
-                if store.relationship_exists(r)?
-                    && store.relationship_type(r)?.as_deref() == Some(self.def.label.as_str())
-                {
-                    store.relationship_property(r, key)?
-                } else {
-                    None
-                }
-            }
-        };
-        Ok(value.and_then(|v| matrix_row(&v, dimensions, similarity)))
+        current_row(store, &self.def, id)
     }
 
     /// Brings the matrix to `store`, a later committed state, given (a superset of) the
@@ -430,27 +470,156 @@ impl Matrix {
     }
 }
 
-impl Cached for Matrix {
-    fn def(&self) -> &IndexDef {
-        &self.def
+/// An approximate vector index of one committed state: an HNSW graph of its vectors
+/// (unit length for cosine), one slot per indexed entity. A changed entity's old slot is
+/// deleted and its vector inserted anew; the graph is built again once deleted slots
+/// outnumber live ones.
+#[derive(Clone)]
+pub(crate) struct Approximate {
+    def: IndexDef,
+    graph: Graph,
+    /// The entity of each slot.
+    ids: Vec<u64>,
+    /// The live slot of each entity.
+    slot_of: HashMap<u64, u32>,
+}
+
+impl Approximate {
+    fn new(def: &IndexDef) -> Approximate {
+        let (dimensions, similarity) = vector_params(def);
+        let IndexKind::Vector { hnsw: Some(h), .. } = def.kind else { unreachable!("an approximate index") };
+        let metric = match similarity {
+            Similarity::Cosine => Metric::Cosine,
+            Similarity::Euclidean => Metric::Euclidean,
+        };
+        Approximate {
+            def: def.clone(),
+            graph: Graph::new(dimensions as usize, metric, usize::from(h.m), usize::from(h.ef_construction)),
+            ids: Vec::new(),
+            slot_of: HashMap::new(),
+        }
     }
 
-    fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Matrix> {
-        Matrix::build(store, def, interrupt)
+    /// The graph of `entries`, inserted in order.
+    fn with(def: &IndexDef, entries: Vec<(u64, Vec<f32>)>, interrupt: &dyn Fn() -> Result<()>) -> Result<Approximate> {
+        let mut a = Approximate::new(def);
+        for (n, (id, row)) in entries.into_iter().enumerate() {
+            if n % 256 == 255 {
+                interrupt()?;
+            }
+            a.insert(id, &row);
+        }
+        Ok(a)
+    }
+
+    fn insert(&mut self, id: u64, row: &[f32]) {
+        let slot = self.graph.insert(row);
+        debug_assert_eq!(slot as usize, self.ids.len());
+        self.ids.push(id);
+        self.slot_of.insert(id, slot);
+    }
+
+    fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Approximate> {
+        let (dimensions, similarity) = vector_params(def);
+        let mut entries = Vec::new();
+        for_each_entity(store, def, interrupt, |id, value| {
+            if let Some(row) = matrix_row(&value, dimensions, similarity) {
+                entries.push((id, row));
+            }
+        })?;
+        Approximate::with(def, entries, interrupt)
     }
 
     fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
-        Matrix::apply(self, store, changes, interrupt)
+        let changed = match self.def.entity {
+            IndexEntity::Node => &changes.nodes,
+            IndexEntity::Relationship => &changes.rels,
+        };
+        for (n, &id) in changed.iter().enumerate() {
+            if n % 256 == 255 {
+                interrupt()?;
+            }
+            let row = current_row(store, &self.def, id)?;
+            if let Some(slot) = self.slot_of.get(&id).copied() {
+                if row.as_deref() == Some(self.graph.vector(slot)) {
+                    continue;
+                }
+                self.graph.remove(slot);
+                self.slot_of.remove(&id);
+            }
+            if let Some(row) = row {
+                self.insert(id, &row);
+            }
+        }
+        if self.graph.removed() > 64 && self.graph.removed() > self.graph.live() {
+            let mut entries: Vec<(u64, Vec<f32>)> =
+                self.slot_of.iter().map(|(&id, &slot)| (id, self.graph.vector(slot).to_vec())).collect();
+            entries.sort_unstable_by_key(|e| e.0);
+            *self = Approximate::with(&self.def, entries, interrupt)?;
+        }
+        Ok(())
+    }
+
+    /// The entities of the (up to) `n` vectors the graph finds closest to `q`.
+    fn candidates(&self, q: &[f64], n: usize) -> Vec<u64> {
+        let (_, similarity) = vector_params(&self.def);
+        let scale = match similarity {
+            Similarity::Cosine => 1.0 / q.iter().map(|x| x * x).sum::<f64>().sqrt(),
+            Similarity::Euclidean => 1.0,
+        };
+        let q: Vec<f32> = q.iter().map(|x| (x * scale) as f32).collect();
+        self.graph.search(&q, n, n).into_iter().map(|(_, slot)| self.ids[slot as usize]).collect()
     }
 }
 
-/// The vector index matrices of a committed state.
-pub(crate) type VectorCache = IndexCache<Matrix>;
+/// The in-memory contents of a vector index of one committed state.
+#[derive(Clone)]
+pub(crate) enum VectorIndex {
+    /// Exact: every vector is scored.
+    Flat(Matrix),
+    Approximate(Approximate),
+}
+
+impl Cached for VectorIndex {
+    fn def(&self) -> &IndexDef {
+        match self {
+            VectorIndex::Flat(m) => &m.def,
+            VectorIndex::Approximate(a) => &a.def,
+        }
+    }
+
+    fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<VectorIndex> {
+        Ok(match def.kind {
+            IndexKind::Vector { hnsw: Some(_), .. } => VectorIndex::Approximate(Approximate::build(store, def, interrupt)?),
+            _ => VectorIndex::Flat(Matrix::build(store, def, interrupt)?),
+        })
+    }
+
+    fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
+        match self {
+            VectorIndex::Flat(m) => m.apply(store, changes, interrupt),
+            VectorIndex::Approximate(a) => a.apply(store, changes, interrupt),
+        }
+    }
+}
+
+/// The vector indexes of a committed state.
+pub(crate) type VectorCache = IndexCache<VectorIndex>;
+
+/// How many candidates an approximate search for `k` neighbours keeps (`ef`, four times
+/// `k` and at least 200: recall@10 0.99 on clustered 128-dimension vectors): those are
+/// scored exactly, and the best `k` returned.
+fn search_width(k: usize) -> usize {
+    k.saturating_mul(4).max(200)
+}
 
 /// `db.index.vector.queryNodes(indexName, k, vector)` (`entity` Node) and
 /// `db.index.vector.queryRelationships(…)`: the `k` indexed entities most similar to
-/// `vector`, as `[entity, score]` rows, best first (ties by id). Exact: the scores and
-/// order are those of `vector.similarity.*` over the stored vectors.
+/// `vector`, as `[entity, score]` rows, best first (ties by id). The scores and order are
+/// those of `vector.similarity.*` over the stored vectors. Exact, except for an
+/// approximate (HNSW) index on a committed state: its graph proposes
+/// [`search_width`]`(k)` candidates, which are scored exactly, so a true neighbour the
+/// search misses can be absent.
 pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Value]) -> Result<ProcedureRows> {
     let procedure = match entity {
         IndexEntity::Node => "db.index.vector.queryNodes",
@@ -499,10 +668,26 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
     let store = ctx.store();
     let exact = |value: &Value| indexed_vector(value, dimensions, similarity).and_then(|v| similarity.score(&v, &q));
 
-    let mut best: Vec<(f64, u64)> = match ctx.vectors() {
+    let best: Vec<(f64, u64)> = match ctx.vectors() {
         // A committed state: the cached matrix, then exact scores near the cut.
         Some((cache, snapshot)) => {
-            let m = cache.get(snapshot, &def, &interrupt)?;
+            let index = cache.get(snapshot, &def, &interrupt)?;
+            let m = match &*index {
+                VectorIndex::Flat(m) => m,
+                VectorIndex::Approximate(a) => {
+                    let mut out = Vec::new();
+                    for id in a.candidates(&q, search_width(k)) {
+                        let value = match entity {
+                            IndexEntity::Node => store.node_property(NodeId(id), &def.properties[0])?,
+                            IndexEntity::Relationship => store.relationship_property(RelId(id), &def.properties[0])?,
+                        };
+                        if let Some(score) = value.as_ref().and_then(exact) {
+                            out.push((score, id));
+                        }
+                    }
+                    return Ok(rows(out, k, entity));
+                }
+            };
             let (all, tolerance) = m.approximate(&q, &*ctx.kernels());
             let approx: Vec<(f64, u64)> =
                 all.into_iter().zip(&m.ids).filter(|(_, id)| **id != FREE).map(|(s, id)| (s, *id)).collect();
@@ -542,9 +727,14 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
             out
         }
     };
-    best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    best.truncate(k);
-    Ok(best
+    Ok(rows(best, k, entity))
+}
+
+/// The best `k` of `scored`, as `[entity, score]` rows, best first (ties by id).
+fn rows(mut scored: Vec<(f64, u64)>, k: usize, entity: IndexEntity) -> ProcedureRows {
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.truncate(k);
+    scored
         .into_iter()
         .map(|(score, id)| {
             let e = match entity {
@@ -553,12 +743,19 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
             };
             vec![e, Value::Float(score)]
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat(e: &VectorIndex) -> &Matrix {
+        match e {
+            VectorIndex::Flat(m) => m,
+            VectorIndex::Approximate(_) => panic!("an exact index"),
+        }
+    }
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-12
@@ -583,29 +780,29 @@ mod tests {
         db.execute("CREATE VECTOR INDEX v FOR (n:V) ON n.e OPTIONS {indexConfig: {`vector.dimensions`: 2}}").unwrap();
         db.execute("UNWIND range(1, 100) AS i CREATE (:V {k: i, e: [0, 1]})").unwrap();
         db.execute(q).unwrap();
-        let first = db.vector_cache.entry("v").map(|m| m.rows.clone()).expect("built");
+        let first = db.vector_cache.entry("v").map(|e| flat(&e).rows.clone()).expect("built");
         assert_eq!(first.len(), 100 + 16);
         // Two commits, then a query: the rows they changed are written in place.
         db.execute("MATCH (n:V {k: 7}) SET n.e = [1, 0]").unwrap();
         db.execute("CREATE (:V {k: 0, e: [1, 0.1]})").unwrap();
         let r = db.execute(q).unwrap();
         assert_eq!(r.rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>(), ["7", "0"]);
-        let patched = db.vector_cache.entry("v").map(|m| m.rows.clone()).expect("kept");
+        let patched = db.vector_cache.entry("v").map(|e| flat(&e).rows.clone()).expect("kept");
         assert_eq!(patched.len(), first.len());
         let since: Vec<(u64, Vec<u32>)> = patched.changed_since().map(|(id, rows)| (id, rows.to_vec())).collect();
         assert_eq!(since, [(first.id(), vec![6, 100])]);
         // A commit that changes no indexed entity leaves the rows as they are.
         db.execute("CREATE (:W {e: [1, 0]})").unwrap();
         db.execute(q).unwrap();
-        assert_eq!(db.vector_cache.entry("v").map(|m| m.rows.clone()).unwrap().id(), patched.id());
+        assert_eq!(db.vector_cache.entry("v").map(|e| flat(&e).rows.clone()).unwrap().id(), patched.id());
         // More new entities than free rows: laid out anew.
         db.execute("UNWIND range(1, 40) AS i CREATE (:V {k: 1000 + i, e: [0, 1]})").unwrap();
         db.execute(q).unwrap();
-        let grown = db.vector_cache.entry("v").map(|m| m.rows.clone()).unwrap();
+        let grown = db.vector_cache.entry("v").map(|e| flat(&e).rows.clone()).unwrap();
         assert_eq!(grown.len(), 141 + 141 / 8);
         assert_eq!(grown.changed_since().count(), 0);
         // A dropped index's matrix goes with it.
         db.execute("DROP INDEX v").unwrap();
-        assert!(db.vector_cache.entry("v").map(|m| m.rows.clone()).is_none());
+        assert!(db.vector_cache.entry("v").map(|e| flat(&e).rows.clone()).is_none());
     }
 }

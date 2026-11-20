@@ -650,6 +650,9 @@ pub const MAX_INDEX_PROPERTIES: usize = 16;
 /// Most dimensions a vector index may have.
 pub const MAX_VECTOR_DIMENSIONS: u32 = 4096;
 
+/// Set in the similarity byte of an encoded vector index that is approximate (HNSW).
+const HNSW_FLAG: u8 = 0x80;
+
 /// How vectors are compared. Scores are normalized to [0, 1] as Neo4j does, higher
 /// meaning more similar: cosine `(1 + cos) / 2`, euclidean `1 / (1 + d²)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -761,6 +764,29 @@ impl Analyzer {
     }
 }
 
+/// The settings of an approximate vector index: a graph of the vectors (HNSW) searched
+/// instead of every vector. `m` is the number of neighbours a vector keeps per layer
+/// (twice that on the bottom layer), `ef_construction` how many candidates an insertion
+/// considers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HnswConfig {
+    pub m: u16,
+    pub ef_construction: u16,
+}
+
+impl HnswConfig {
+    /// Neo4j's defaults.
+    pub const DEFAULT: HnswConfig = HnswConfig { m: 16, ef_construction: 100 };
+    /// The largest `m` (Neo4j's).
+    pub const MAX_M: u16 = 512;
+    /// The largest `ef_construction` (Neo4j's).
+    pub const MAX_EF_CONSTRUCTION: u16 = 3200;
+
+    pub fn is_valid(self) -> bool {
+        (2..=Self::MAX_M).contains(&self.m) && (1..=Self::MAX_EF_CONSTRUCTION).contains(&self.ef_construction)
+    }
+}
+
 /// What an index is: a property index answering seeks, a vector index answering
 /// nearest-neighbour queries over one list-of-numbers property, or a full-text index
 /// answering text queries over string properties.
@@ -771,6 +797,8 @@ pub enum IndexKind {
     Vector {
         dimensions: u32,
         similarity: VectorSimilarity,
+        /// Approximate search (HNSW); `None`: exact search over every vector.
+        hnsw: Option<HnswConfig>,
     },
     Fulltext {
         analyzer: Analyzer,
@@ -833,8 +861,16 @@ impl IndexDef {
             label: label.into(),
             extra_labels: Vec::new(),
             properties: vec![property.into()],
-            kind: IndexKind::Vector { dimensions, similarity },
+            kind: IndexKind::Vector { dimensions, similarity, hnsw: None },
         }
+    }
+
+    /// The same vector index, searched approximately with `hnsw`.
+    pub fn with_hnsw(mut self, hnsw: HnswConfig) -> IndexDef {
+        if let IndexKind::Vector { hnsw: h, .. } = &mut self.kind {
+            *h = Some(hnsw);
+        }
+        self
     }
 
     /// A full-text index on `properties` of the nodes with any of `labels`, or of the
@@ -928,7 +964,14 @@ impl IndexDef {
         if self.properties.is_empty() {
             return Err(Error::Semantic("an index needs at least one property".into()));
         }
-        if let IndexKind::Vector { dimensions, .. } = self.kind {
+        if let IndexKind::Vector { dimensions, hnsw, .. } = self.kind {
+            if hnsw.is_some_and(|h| !h.is_valid()) {
+                return Err(Error::Semantic(format!(
+                    "HNSW needs `vector.hnsw.m` from 2 to {} and `vector.hnsw.ef_construction` from 1 to {}",
+                    HnswConfig::MAX_M,
+                    HnswConfig::MAX_EF_CONSTRUCTION
+                )));
+            }
             if self.properties.len() != 1 {
                 return Err(Error::Semantic("a vector index is on exactly one property".into()));
             }
@@ -1015,31 +1058,51 @@ impl IndexDef {
 
     /// Encodes a vector index: the definition as [`encode`](Self::encode) writes it, then
     /// its dimensions and similarity (persistent format 9, hybrid log op 14, memory
-    /// snapshot 6).
+    /// snapshot 6). An approximate index sets [`HNSW_FLAG`] in the similarity byte and
+    /// follows it with `m` and `ef_construction`.
     pub(crate) fn encode_vector(&self, e: &mut Encoder) {
-        let IndexKind::Vector { dimensions, similarity } = self.kind else {
+        let IndexKind::Vector { dimensions, similarity, hnsw } = self.kind else {
             unreachable!("encode_vector of a range index")
         };
         self.encode(e);
         e.u32(dimensions);
-        e.u8(match similarity {
+        let code = match similarity {
             VectorSimilarity::Cosine => 1,
             VectorSimilarity::Euclidean => 2,
-        });
+        };
+        match hnsw {
+            None => e.u8(code),
+            Some(h) => {
+                e.u8(code | HNSW_FLAG);
+                e.u32(u32::from(h.m));
+                e.u32(u32::from(h.ef_construction));
+            }
+        }
     }
 
     pub(crate) fn decode_vector(d: &mut Decoder) -> Result<IndexDef> {
         let mut def = IndexDef::decode(d)?;
         let dimensions = d.u32()?;
-        let similarity = match d.u8()? {
+        let code = d.u8()?;
+        let similarity = match code & !HNSW_FLAG {
             1 => VectorSimilarity::Cosine,
             2 => VectorSimilarity::Euclidean,
             t => return Err(d.corrupt(format!("unknown vector similarity {t}"))),
         };
+        let hnsw = if code & HNSW_FLAG != 0 {
+            let (m, ef) = (d.u32()?, d.u32()?);
+            let h = HnswConfig { m: u16::try_from(m).unwrap_or(0), ef_construction: u16::try_from(ef).unwrap_or(0) };
+            if !h.is_valid() {
+                return Err(d.corrupt(format!("bad HNSW settings of vector index `{}`", def.name)));
+            }
+            Some(h)
+        } else {
+            None
+        };
         if def.properties.len() != 1 || dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
             return Err(d.corrupt(format!("bad vector index `{}`", def.name)));
         }
-        def.kind = IndexKind::Vector { dimensions, similarity };
+        def.kind = IndexKind::Vector { dimensions, similarity, hnsw };
         Ok(def)
     }
 

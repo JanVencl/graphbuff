@@ -175,8 +175,8 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
 **Not yet supported** (these return an `Unsupported` error rather than a wrong result):
 procedures that change the graph, `LOAD CSV` from URLs other than local files, relationship
 constraints,
-spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), approximate
-vector search (HNSW, quantization), the `VECTOR` value type, full-text ranges, regular
+spatial index seeks for `point.distance` / `point.withinBBox` (they filter instead), quantization of
+vector indexes, the `VECTOR` value type, full-text ranges, regular
 expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`), text and point indexes, `db.create.setNodeVectorProperty`
 (use `SET n.p = $vector`), the `trim(BOTH | LEADING | TRAILING 'x' FROM s)` form
 (use `btrim` / `ltrim` / `rtrim` with a second argument).

@@ -33,6 +33,7 @@ mod demo;
 mod eval;
 mod exec;
 mod fulltext;
+mod hnsw;
 mod functions;
 mod import;
 mod index_cache;

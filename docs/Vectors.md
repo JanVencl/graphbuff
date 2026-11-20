@@ -40,8 +40,10 @@ OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.similarity_function`: 'co
 
 - `FOR ()-[r:TYPE]-() ON r.prop` indexes relationships instead of nodes.
 - `vector.dimensions` (1 to 4096) is required. `vector.similarity_function` is `'cosine'`
-  (default) or `'euclidean'`. `indexProvider` is accepted and ignored; any other option
-  is an error.
+  (default) or `'euclidean'`. `vector.hnsw.enabled`, `vector.hnsw.m` and
+  `vector.hnsw.ef_construction` make the index approximate (see
+  [Approximate indexes](#approximate-indexes-hnsw)). `indexProvider` is accepted and
+  ignored; any other option is an error.
 - One property per index. Without a name, the index is called `vector_<Label>_<prop>`.
 - A vector index and a range index may sit on the same property.
 - `SHOW INDEXES` and `CALL db.indexes()` list it with type `VECTOR` and its options;
@@ -67,14 +69,45 @@ RETURN node.title, score
   more than you need when it is selective.
 - Inside a transaction that has written, the query sees those writes.
 
-The results are **exact**. When every `Doc` has a valid embedding, they are the same rows,
-scores and order as this query, only much faster:
+The results of an index without `vector.hnsw` options are **exact**. When every `Doc` has a
+valid embedding, they are the same rows, scores and order as this query, only much faster:
 
 ```cypher
 MATCH (d:Doc)
 RETURN d, vector.similarity.cosine(d.embedding, $embedding) AS score
 ORDER BY score DESC, id(d) LIMIT 10
 ```
+
+## Approximate indexes (HNSW)
+
+An exact index scores every vector, so its queries slow down linearly as the index grows.
+An approximate index searches a graph of the vectors (HNSW, as Neo4j's vector indexes do)
+and looks at a small part of them:
+
+```cypher
+CREATE VECTOR INDEX doc_embedding FOR (d:Doc) ON d.embedding
+OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.hnsw.enabled`: true}}
+```
+
+- `vector.hnsw.m` (2 to 512, default 16): neighbours each vector keeps in the graph (twice
+  that on the bottom layer). More gives better recall and a slower build.
+- `vector.hnsw.ef_construction` (1 to 3200, default 100): candidates each insertion
+  considers. More gives a better graph and a slower build.
+- Giving `m` or `ef_construction` turns HNSW on; `vector.hnsw.enabled: false` with either
+  is an error. `SHOW INDEXES` lists all three.
+- A query takes the best `max(4 × k, 200)` candidates the graph search finds and scores
+  them exactly from the stored property, so every score is the exact score and the order
+  is exact among the results. A true neighbour the search misses can be absent: on
+  clustered 128-dimension vectors (100,000 of them), recall@10 is 0.99, at about 0.9 ms
+  per query against 12 ms for the exact index.
+- The graph is built in memory on the index's first query (about 5 seconds for those
+  100,000 vectors, on one core; uniformly random vectors, the worst case, take several
+  times longer), and again after a restart. Commits keep it current: a changed vector is
+  inserted anew and its old node is marked deleted; once deleted nodes outnumber live
+  ones, the graph is built again.
+- Inside an explicit transaction, the index is searched exactly, as the transaction sees
+  the data.
+- Memory: the vectors as for an exact index, plus about `2 × m` links of 4 bytes per vector.
 
 ## What gets indexed
 
@@ -89,6 +122,8 @@ MATCH (d:Doc {id: $id}) SET d.embedding = $embedding
 
 ## How it works
 
+This is how an exact index works; for HNSW, see above.
+
 - The index keeps each indexed vector as one row of 32-bit floats in memory (normalized
   for cosine), built from the committed data on its first query.
 - Each commit updates only the rows of the entities it changed, so the index stays
@@ -102,9 +137,11 @@ MATCH (d:Doc {id: $id}) SET d.embedding = $embedding
 
 ## Limits
 
-- The search is exact (brute force over all vectors), so its cost grows linearly with
-  the number of vectors. There is no approximate index (HNSW) or quantization yet.
-- The in-memory rows are rebuilt after a restart, on each index's first query.
+- An exact search scores all vectors, so its cost grows linearly with their number; an
+  HNSW index does not, but is approximate. There is no quantization, and no filtered
+  search (a `WHERE` runs on the `k` results).
+- The in-memory rows and HNSW graphs are rebuilt after a restart, on each index's first
+  query; the HNSW build runs on one core.
 - Building a relationship vector index scans all relationships.
 - `db.create.setNodeVectorProperty` / `setRelationshipVectorProperty` are not available;
   use `SET`.

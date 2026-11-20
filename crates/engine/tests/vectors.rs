@@ -117,9 +117,9 @@ fn vector_index_definitions() {
         run(&db, "CREATE VECTOR INDEX FOR ()-[r:NEAR]-() ON (r.v) OPTIONS {indexConfig: {`vector.dimensions`: 2}}");
         let db = reopen(db);
         let want = [
-            "\"doc_emb\", \"NODE\", \"Doc\", [\"emb\"], \"VECTOR\", {indexConfig: {vector.dimensions: 3, vector.similarity_function: \"EUCLIDEAN\"}}",
+            "\"doc_emb\", \"NODE\", \"Doc\", [\"emb\"], \"VECTOR\", {indexConfig: {vector.dimensions: 3, vector.hnsw.enabled: false, vector.similarity_function: \"EUCLIDEAN\"}}",
             "\"doc_emb_range\", \"NODE\", \"Doc\", [\"emb\"], \"RANGE\", {}",
-            "\"vector_NEAR_v\", \"RELATIONSHIP\", \"NEAR\", [\"v\"], \"VECTOR\", {indexConfig: {vector.dimensions: 2, vector.similarity_function: \"COSINE\"}}",
+            "\"vector_NEAR_v\", \"RELATIONSHIP\", \"NEAR\", [\"v\"], \"VECTOR\", {indexConfig: {vector.dimensions: 2, vector.hnsw.enabled: false, vector.similarity_function: \"COSINE\"}}",
         ];
         assert_eq!(rows(&db, "SHOW INDEXES"), want, "{store}");
         assert_eq!(rows(&db, "CALL db.indexes() YIELD name, type RETURN name, type").len(), 3);
@@ -157,6 +157,22 @@ fn bad_vector_index_options() {
             "'cosine' or 'euclidean'",
         ),
         ("CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {colour: 'red'}", "unknown index option"),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.hnsw.m`: 1}}",
+            "from 2 to 512",
+        ),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.hnsw.ef_construction`: 3201}}",
+            "from 1 to 3200",
+        ),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.hnsw.enabled`: 'yes'}}",
+            "needs a BOOLEAN",
+        ),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.hnsw.enabled`: false, `vector.hnsw.m`: 8}}",
+            "need `vector.hnsw.enabled: true`",
+        ),
         ("CREATE INDEX r FOR (d:Doc) ON (d.e) OPTIONS {indexConfig: {`vector.dimensions`: 3}}", "for a range index"),
         (
             "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.quantization.enabled`: true}}",
@@ -512,4 +528,104 @@ fn kept_up_to_date_on_the_gpu() {
         churn(db, function, similarity, dims, 21, None);
         assert!(gpu.gpu_runs() > before, "{similarity}: the scores ran on the GPU");
     }
+}
+
+/// The `options` `SHOW INDEXES` lists for index `name`.
+fn show(db: &Db, name: &str) -> String {
+    let line = rows(db, "SHOW INDEXES").into_iter().find(|r| r.starts_with(&format!("\"{name}\","))).unwrap();
+    line[line.find('{').unwrap()..].to_string()
+}
+
+#[test]
+fn approximate_index_definitions() {
+    on_every_store(|store, db, reopen| {
+        run(
+            &db,
+            "CREATE VECTOR INDEX a FOR (d:A) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 4, `vector.hnsw.m`: 8, `vector.hnsw.ef_construction`: 50}}",
+        );
+        run(&db, "CREATE VECTOR INDEX b FOR (d:B) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 4, `vector.hnsw.enabled`: true}}");
+        run(&db, "CREATE (:A {e: [1, 0, 0, 0]}), (:B {e: [0, 1, 0, 0]})");
+        let db = reopen(db);
+        assert_eq!(
+            show(&db, "a"),
+            "{indexConfig: {vector.dimensions: 4, vector.hnsw.ef_construction: 50, vector.hnsw.enabled: true, vector.hnsw.m: 8, vector.similarity_function: \"COSINE\"}}",
+            "{store}"
+        );
+        assert_eq!(
+            show(&db, "b"),
+            "{indexConfig: {vector.dimensions: 4, vector.hnsw.ef_construction: 100, vector.hnsw.enabled: true, vector.hnsw.m: 16, vector.similarity_function: \"COSINE\"}}",
+            "{store}"
+        );
+        assert_eq!(rows(&db, "CALL db.index.vector.queryNodes('a', 3, [1, 0, 0, 0]) YIELD score RETURN score"), ["1.0"], "{store}");
+    });
+}
+
+/// `id, score` of the `k` nearest by node index `name`.
+fn nearest(db: &Db, name: &str, k: usize, q: &[f64]) -> Vec<String> {
+    rows(db, &format!("CALL db.index.vector.queryNodes('{name}', {k}, {}) YIELD node, score RETURN id(node), score", vec_lit(q)))
+}
+
+/// The share of the exact index's results that the approximate one finds, over `queries`;
+/// every score the approximate index gives is the exact score.
+fn recall(db: &Db, queries: &[Vec<f64>], k: usize) -> f64 {
+    let mut hits = 0;
+    for q in queries {
+        let exact = nearest(db, "exact", k, q);
+        let approx = nearest(db, "approx", k, q);
+        let id = |r: &String| r.split(", ").next().unwrap().to_string();
+        let exact_ids: Vec<String> = exact.iter().map(id).collect();
+        for r in &approx {
+            let score = rows(db, &format!("MATCH (n) WHERE id(n) = {} RETURN vector.similarity.cosine(n.e, {})", id(r), vec_lit(q)));
+            assert_eq!(r.split(", ").nth(1).unwrap(), score[0]);
+        }
+        hits += approx.iter().filter(|r| exact_ids.contains(&id(r))).count();
+    }
+    hits as f64 / (queries.len() * k) as f64
+}
+
+#[test]
+fn approximate_search() {
+    let db = mem();
+    let dims = 16;
+    run(&db, &format!("CREATE VECTOR INDEX exact FOR (n:X) ON n.e OPTIONS {{indexConfig: {{`vector.dimensions`: {dims}}}}}"));
+    run(
+        &db,
+        &format!("CREATE VECTOR INDEX approx FOR (n:H) ON n.e OPTIONS {{indexConfig: {{`vector.dimensions`: {dims}, `vector.hnsw.enabled`: true}}}}"),
+    );
+    let mut g = Lcg(42);
+    let mut point = || (0..dims).map(|_| (g.next() % 2001) as f64 / 1000.0 - 1.0).collect::<Vec<f64>>();
+    let vectors: Vec<String> = (0..1500).map(|_| vec_lit(&point())).collect();
+    run(&db, &format!("UNWIND [{}] AS e CREATE (:X:H {{e: e}})", vectors.join(", ")));
+    let queries: Vec<Vec<f64>> = (0..20).map(|_| point()).collect();
+    let r = recall(&db, &queries, 10);
+    assert!(r >= 0.9, "recall {r}");
+
+    // A changed vector is found with its new value; an entity that left the index is gone.
+    let q = queries[0].clone();
+    let first = rows(&db, "MATCH (n:H) RETURN id(n) ORDER BY id(n) LIMIT 1")[0].clone();
+    run(&db, &format!("MATCH (n) WHERE id(n) = {first} SET n.e = {}", vec_lit(&q)));
+    assert_eq!(nearest(&db, "approx", 1, &q), [format!("{first}, 1.0")]);
+    run(&db, &format!("MATCH (n) WHERE id(n) = {first} REMOVE n:H"));
+    assert!(nearest(&db, "approx", 5, &q).iter().all(|r| !r.starts_with(&format!("{first},"))));
+    // Inside a transaction the index is searched exactly, as the transaction sees it.
+    let mut tx = db.begin().unwrap();
+    tx.execute(&format!("MATCH (n) WHERE id(n) = {first} SET n:H")).unwrap();
+    let r = tx
+        .execute(&format!("CALL db.index.vector.queryNodes('approx', 1, {}) YIELD node RETURN id(node)", vec_lit(&q)))
+        .unwrap();
+    assert_eq!(r.rows[0][0].to_string(), first);
+    drop(tx);
+
+    // Most vectors replaced: the graph is built again from the live ones and still finds them.
+    let replaced: Vec<String> = (0..1200).map(|_| vec_lit(&point())).collect();
+    run(
+        &db,
+        &format!(
+            "MATCH (n:H) WITH n ORDER BY id(n) WITH collect(n)[..1200] AS ns, [{}] AS es UNWIND range(0, 1199) AS i WITH ns[i] AS n, es[i] AS e SET n.e = e",
+            replaced.join(", ")
+        ),
+    );
+    let queries: Vec<Vec<f64>> = (0..20).map(|_| point()).collect();
+    let r = recall(&db, &queries, 10);
+    assert!(r >= 0.9, "recall after updates {r}");
 }
