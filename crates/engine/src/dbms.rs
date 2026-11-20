@@ -1232,6 +1232,7 @@ impl<'m> Session<'m> {
                 cmd.name()
             ))),
             Statement::Transaction(cmd) => Err(Error::Unsupported(format!("{} needs graphbuff-server", cmd.name()))),
+            Statement::Settings(_) => Err(Error::Unsupported("SHOW SETTINGS needs graphbuff-server".into())),
         }
     }
 

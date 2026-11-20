@@ -691,6 +691,11 @@ fn register_builtins(p: &mut Procedures) {
             .description("The procedures that CALL can run (as SHOW PROCEDURES)."),
         |ctx, _| Ok(ctx.procedures().listing()),
     );
+    add(
+        ProcedureSignature::new("dbms.functions", NONE, crate::catalog::FUNCTION_COLUMNS)
+            .description("The built-in functions (as SHOW FUNCTIONS)."),
+        |_, _| Ok(crate::catalog::function_rows()),
+    );
     let config = || Value::Map(BTreeMap::new());
     add(
         ProcedureSignature::new("algo.pageRank", NONE, ["node", "score"])

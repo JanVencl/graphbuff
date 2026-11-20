@@ -186,9 +186,10 @@ impl Executor<'_> {
                 columns,
                 returns,
                 updating: true,
+                optional,
             } => {
                 let frame = self.run_op(input, None)?;
-                self.exec_call(frame, plan, imports, columns, *returns)?
+                self.exec_call(frame, plan, imports, columns, *returns, *optional)?
             }
             O::Foreach {
                 input,
@@ -248,6 +249,7 @@ impl Executor<'_> {
         imports: &[String],
         columns: &[String],
         returns: bool,
+        optional: bool,
     ) -> Result<Frame> {
         let slots: Vec<usize> = imports
             .iter()
@@ -273,6 +275,11 @@ impl Executor<'_> {
             self.argument = prev;
             let result = result?;
             if !returns {
+                rows.push(row);
+                continue;
+            }
+            if optional && result.rows.is_empty() {
+                row.extend(columns.iter().map(|_| Value::Null));
                 rows.push(row);
                 continue;
             }
@@ -508,6 +515,10 @@ impl Executor<'_> {
                 }
                 Ok(empty)
             }
+            Clause::ShowFunctions { user_defined } => Ok(RawResult {
+                columns: crate::catalog::FUNCTION_COLUMNS.map(String::from).to_vec(),
+                rows: if *user_defined { Vec::new() } else { crate::catalog::function_rows() },
+            }),
             Clause::ShowProcedures => Ok(RawResult {
                 columns: ["name", "signature", "description"].map(String::from).to_vec(),
                 rows: self.procedures.listing(),

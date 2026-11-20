@@ -291,6 +291,7 @@ fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<B
             procedure,
             args,
             fields,
+            optional,
         } => {
             let input = build(ex, input, base)?;
             let in_scope = input.scope().clone();
@@ -309,6 +310,7 @@ fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<B
                     procedure,
                     args,
                     fields,
+                    optional: *optional,
                     in_scope,
                     width,
                     out: Vec::new().into_iter(),
@@ -322,6 +324,7 @@ fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<B
             columns,
             returns,
             updating: false,
+            optional,
         } => {
             let input = build(ex, input, base)?;
             let mut scope = input.scope().clone();
@@ -342,6 +345,7 @@ fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<B
                     arg_scope: Scope::from_names(imports.iter().cloned())?,
                     columns,
                     returns: *returns,
+                    optional: *optional,
                     width,
                     out: Vec::new().into_iter(),
                 },
@@ -355,6 +359,7 @@ struct ProcedureStep<'a> {
     procedure: &'a crate::procedures::Procedure,
     args: &'a [Expr],
     fields: &'a [(usize, String)],
+    optional: bool,
     in_scope: Scope,
     width: usize,
     out: std::vec::IntoIter<Row>,
@@ -373,6 +378,9 @@ impl<'a> Expander<'a> for ProcedureStep<'a> {
         };
         let rows = self.procedure.call(&ctx, &args)?;
         self.out = if self.procedure.signature.outputs.is_empty() {
+            vec![row].into_iter()
+        } else if self.optional && rows.is_empty() {
+            row.extend(self.fields.iter().map(|_| Value::Null));
             vec![row].into_iter()
         } else {
             rows.into_iter()
@@ -465,6 +473,7 @@ struct CallStep<'a> {
     arg_scope: Scope,
     columns: &'a [String],
     returns: bool,
+    optional: bool,
     /// Width of the input rows.
     width: usize,
     out: std::vec::IntoIter<Row>,
@@ -479,6 +488,11 @@ impl<'a> Expander<'a> for CallStep<'a> {
         }
         let arg: Row = self.slots.iter().map(|&i| row[i].clone()).collect();
         let (names, rows) = ex.stream_subquery(self.plan, &self.arg_scope, &arg, usize::MAX)?;
+        if self.optional && rows.is_empty() {
+            row.extend(self.columns.iter().map(|_| Value::Null));
+            self.out = vec![row].into_iter();
+            return Ok(());
+        }
         let pos: Vec<usize> = self
             .columns
             .iter()

@@ -411,6 +411,11 @@ impl Cors {
         Ok(Cors { origins })
     }
 
+    /// The allowed origins, lower-cased (`*` for every origin).
+    pub fn origins(&self) -> &[String] {
+        &self.origins
+    }
+
     /// Whether any origin is allowed.
     pub fn is_on(&self) -> bool {
         !self.origins.is_empty()

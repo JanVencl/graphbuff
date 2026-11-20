@@ -32,6 +32,7 @@ pub fn parse(src: &str) -> Result<Query> {
             cmd.name()
         ))),
         Statement::Transaction(cmd) => Err(Error::Unsupported(format!("{} needs graphbuff-server", cmd.name()))),
+        Statement::Settings(_) => Err(Error::Unsupported("SHOW SETTINGS needs graphbuff-server".into())),
     }
 }
 
@@ -212,6 +213,11 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             return self.parse_transaction_command(terminate);
         }
+        if self.is_kw("SHOW") && (self.kw_at(1, "SETTINGS") || self.kw_at(1, "SETTING")) {
+            self.pos += 2;
+            let (names, tail) = self.parse_show_names_and_tail("SHOW SETTINGS")?;
+            return Ok(Statement::Settings(Box::new(SettingsCommand { names, tail })));
+        }
         if let Some(cmd) = self.parse_user_command()? {
             return Ok(Statement::User(cmd));
         }
@@ -387,6 +393,16 @@ impl<'a> Parser<'a> {
     /// After `SHOW TRANSACTIONS` / `TERMINATE TRANSACTIONS`: `[id, … | $ids]` (required to
     /// terminate), then `YIELD … [RETURN …]` or `WHERE …`.
     fn parse_transaction_command(&mut self, terminate: bool) -> Result<Statement> {
+        let (ids, tail) = self.parse_show_names_and_tail("SHOW or TERMINATE TRANSACTIONS")?;
+        if terminate && ids.is_empty() {
+            return self.err("TERMINATE TRANSACTIONS needs the ids of the transactions to terminate");
+        }
+        Ok(Statement::Transaction(Box::new(TransactionCommand { terminate, ids, tail })))
+    }
+
+    /// After a `SHOW` command such as `SHOW TRANSACTIONS`: `[name, … | $names]`, then
+    /// `YIELD … [RETURN …]` or `WHERE …`, and the end of the statement.
+    fn parse_show_names_and_tail(&mut self, what: &str) -> Result<(Vec<Expr>, ShowTail)> {
         let mut ids = Vec::new();
         let at_tail = |p: &Self| {
             p.is_kw("YIELD") || p.is_kw("WHERE") || p.is_kw("RETURN") || matches!(p.peek(), Tok::Eof | Tok::Semicolon)
@@ -399,9 +415,6 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if terminate && ids.is_empty() {
-            return self.err("TERMINATE TRANSACTIONS needs the ids of the transactions to terminate");
-        }
         let mut tail = ShowTail::default();
         if self.eat_kw("YIELD") {
             tail.yields = Some(self.parse_projection(true)?);
@@ -411,17 +424,17 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("WHERE") {
             tail.where_ = Some(self.parse_expr()?);
         } else if self.is_kw("RETURN") {
-            return self.err("RETURN after SHOW or TERMINATE TRANSACTIONS needs a YIELD before it");
+            return self.err(format!("RETURN after {what} needs a YIELD before it"));
         }
         self.end_of_statement()?;
-        Ok(Statement::Transaction(Box::new(TransactionCommand { terminate, ids, tail })))
+        Ok((ids, tail))
     }
 
     // ---- user commands ----
 
     /// A user command, if the statement starts like one.
     fn parse_user_command(&mut self) -> Result<Option<UserCommand>> {
-        let cmd = if self.is_kw("SHOW") && (self.kw_at(1, "USERS") || self.kw_at(1, "USER")) {
+        let cmd = if self.is_kw("SHOW") && (self.kw_at(1, "USERS") || (self.kw_at(1, "USER") && !self.kw_at(2, "DEFINED"))) {
             self.pos += 2;
             UserCommand::ShowUsers
         } else if self.is_kw("SHOW") && self.kw_at(1, "CURRENT") && self.kw_at(2, "USER") {
@@ -660,6 +673,26 @@ impl<'a> Parser<'a> {
 
     fn parse_clause(&mut self) -> Result<Clause> {
         if self.eat_kw("OPTIONAL") {
+            if self.eat_kw("CALL") {
+                let mut clause = if matches!(self.peek(), Tok::LBrace | Tok::LParen) {
+                    self.parse_call_subquery()?
+                } else {
+                    self.parse_call_procedure()?
+                };
+                match &mut clause {
+                    Clause::CallSubquery { in_transactions: Some(_), .. } => {
+                        return self.err("OPTIONAL CALL cannot run IN TRANSACTIONS");
+                    }
+                    Clause::CallProcedure { yields: Some(ProcedureYield { where_: Some(_), .. }), .. } => {
+                        return Err(Error::Unsupported(
+                            "OPTIONAL CALL … YIELD … WHERE is not supported; filter in a WITH … WHERE after it".into(),
+                        ));
+                    }
+                    Clause::CallSubquery { optional, .. } | Clause::CallProcedure { optional, .. } => *optional = true,
+                    _ => unreachable!("a CALL clause"),
+                }
+                return Ok(clause);
+            }
             self.expect_kw("MATCH")?;
             return self.parse_match(true);
         }
@@ -833,6 +866,27 @@ impl<'a> Parser<'a> {
             self.advance();
             return Ok(Clause::ShowProcedures);
         }
+        if self.is_kw("SHOW") {
+            // SHOW [ALL | BUILT IN | USER DEFINED] FUNCTION[S]
+            let (skip, user_defined) = if self.kw_at(1, "ALL") {
+                (2, false)
+            } else if self.kw_at(1, "BUILT") && self.kw_at(2, "IN") {
+                (3, false)
+            } else if self.kw_at(1, "USER") && self.kw_at(2, "DEFINED") {
+                (3, true)
+            } else {
+                (1, false)
+            };
+            if self.kw_at(skip, "FUNCTIONS") || self.kw_at(skip, "FUNCTION") {
+                self.pos += skip + 1;
+                if self.is_kw("EXECUTABLE") {
+                    return Err(Error::Unsupported(
+                        "SHOW FUNCTIONS EXECUTABLE is not supported; every function may be executed".into(),
+                    ));
+                }
+                return Ok(Clause::ShowFunctions { user_defined });
+            }
+        }
         for unsupported in ["CALL", "LOAD", "USE", "DROP", "SHOW"] {
             if self.is_kw(unsupported) {
                 return Err(Error::Unsupported(format!(
@@ -888,7 +942,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Clause::CallProcedure { name, args, yields })
+        Ok(Clause::CallProcedure { name, args, yields, optional: false })
     }
 
     /// After `CALL`: `[(vars | *)] { query }`.
@@ -921,6 +975,7 @@ impl<'a> Parser<'a> {
             scope,
             query: Box::new(query),
             in_transactions,
+            optional: false,
         })
     }
 

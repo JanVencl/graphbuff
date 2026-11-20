@@ -969,6 +969,9 @@ impl Conn<'_> {
             if let Statement::Transaction(cmd) = &statement {
                 return ctx.transaction_command(&who, access, cmd, &params)?.feed(&mut streamer);
             }
+            if let Statement::Settings(cmd) = &statement {
+                return ctx.settings_command(access, cmd, &params)?.feed(&mut streamer);
+            }
             let info = Info { database: db.clone(), who: who.clone(), protocol: "bolt", connection, client: peer };
             let stop = Stop::Cancel(options.cancel.clone().expect("interruptible sets one"));
             let _listed = ctx.running.begin(info, stop, Some(&query));

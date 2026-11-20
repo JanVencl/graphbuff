@@ -41,6 +41,8 @@ pub(crate) struct Ctx {
     pub running: Arc<crate::running::Running>,
     /// Counters for `GET /metrics`.
     pub metrics: crate::metrics::Metrics,
+    /// What `SHOW SETTINGS` lists.
+    pub settings: Vec<crate::Setting>,
 }
 
 /// Why a login was refused.
@@ -238,7 +240,7 @@ impl Ctx {
             Statement::Database(cmd) => {
                 return check(self.access(who).unwrap_or(Access::None), Access::Admin, cmd.name());
             }
-            Statement::User(_) | Statement::Transaction(_) => return Ok(()),
+            Statement::User(_) | Statement::Transaction(_) | Statement::Settings(_) => return Ok(()),
         };
         check(self.access_on(who, &db), needed, what)
     }
@@ -606,6 +608,12 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request, out: &mut Out<'_
     if let Some(result) = command {
         audit(result.as_ref().err());
         return match result {
+            Ok(r) => Response::json(200, encode_result(&r)),
+            Err(e) => query_error(&e),
+        };
+    }
+    if let Statement::Settings(cmd) = &statement {
+        return match ctx.settings_command(me.access, cmd, &params) {
             Ok(r) => Response::json(200, encode_result(&r)),
             Err(e) => query_error(&e),
         };

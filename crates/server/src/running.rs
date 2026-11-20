@@ -324,7 +324,35 @@ fn project(
     Database::in_memory().execute_query(&query, &params)
 }
 
+/// The columns of `SHOW SETTINGS`.
+const SETTINGS_COLUMNS: &[(&str, &str, bool)] = &[
+    ("name", "r[0]", true),
+    ("value", "r[1]", true),
+    ("isDynamic", "false", true),
+    ("defaultValue", "r[2]", true),
+    ("description", "r[3]", true),
+];
+
 impl Ctx {
+    /// Runs `SHOW SETTINGS` for a client with `access`: administrators only.
+    pub(crate) fn settings_command(
+        &self,
+        access: Access,
+        cmd: &graphbuff::cypher::ast::SettingsCommand,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, Error> {
+        crate::api::check(access, Access::Admin, "SHOW SETTINGS")?;
+        let wanted = ids(&cmd.names, params)?;
+        let opt = |v: &Option<String>| v.as_deref().map_or(Value::Null, s);
+        let rows = self
+            .settings
+            .iter()
+            .filter(|x| wanted.is_empty() || wanted.contains(&x.name))
+            .map(|x| Value::List(vec![s(&x.name), opt(&x.value), opt(&x.default), s(&x.description)]))
+            .collect();
+        project(SETTINGS_COLUMNS, rows, &cmd.tail, params)
+    }
+
     /// Whether `who` (who may do `access`) sees the transactions of `owner`: their own,
     /// or everyone's for administrators.
     fn sees(who: &Principal, access: Access, owner: &Principal) -> bool {

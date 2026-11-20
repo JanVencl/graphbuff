@@ -157,6 +157,9 @@ pub(crate) enum Operator {
         columns: Vec<String>,
         returns: bool,
         updating: bool,
+        /// `OPTIONAL CALL`: an input row the subquery returns nothing for is kept, with
+        /// `columns` null.
+        optional: bool,
     },
     /// `FOREACH (var IN list | …)`: per input row and element of `list`, runs `body`
     /// from a row holding `imports` (the variables in scope, then `var`). Passes the
@@ -177,6 +180,9 @@ pub(crate) enum Operator {
         /// One per parameter (defaults filled in).
         args: Vec<Expr>,
         fields: Vec<(usize, String)>,
+        /// `OPTIONAL CALL`: an input row the procedure returns nothing for is kept, with
+        /// `fields` null.
+        optional: bool,
     },
     /// Computes `op` with batched kernels over the CSR export ([`crate::accel`]), in
     /// place of `fallback` (the row operators), which runs instead if the kernels cannot
@@ -747,7 +753,7 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 var: var.clone(),
             },
             Clause::With(p) | Clause::Return(p) => plan_projection(input, p),
-            Clause::CallSubquery { scope, query, in_transactions } => {
+            Clause::CallSubquery { scope, query, in_transactions, optional } => {
                 let imports = call_imports(scope, query, &bound)?;
                 let (plan, mut columns) = QueryPlan::build_subquery(query, ex, &imports)?;
                 if let Some(c) = columns.iter().find(|c| bound.contains(c)) {
@@ -772,6 +778,7 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                     columns,
                     returns,
                     updating,
+                    optional: *optional,
                 }
             }
             Clause::Foreach { var, list, body } => {
@@ -834,7 +841,7 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                     terminator,
                 }
             }
-            Clause::CallProcedure { name, args, yields } => plan_procedure_call(
+            Clause::CallProcedure { name, args, yields, optional } => plan_procedure_call(
                 ex,
                 input,
                 name,
@@ -842,6 +849,7 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 yields.as_ref(),
                 &bound,
                 q.clauses.len() == 1,
+                *optional,
             )?,
             Clause::CreateIndex { .. }
             | Clause::DropIndex { .. }
@@ -849,7 +857,8 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             | Clause::CreateConstraint { .. }
             | Clause::DropConstraint { .. }
             | Clause::ShowConstraints
-            | Clause::ShowProcedures => {
+            | Clause::ShowProcedures
+            | Clause::ShowFunctions { .. } => {
                 unreachable!("schema clauses are planned above")
             }
         };
@@ -931,6 +940,7 @@ fn plan_procedure_call(
     yields: Option<&ProcedureYield>,
     bound: &[String],
     standalone: bool,
+    optional: bool,
 ) -> Result<Operator> {
     let procedure = ex.procedures.resolve(name)?.clone();
     let sig = &procedure.signature;
@@ -1022,6 +1032,7 @@ fn plan_procedure_call(
         procedure,
         args,
         fields,
+        optional,
     };
     Ok(match yields.and_then(|y| y.where_.as_ref()) {
         Some(predicate) => {
