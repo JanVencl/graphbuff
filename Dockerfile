@@ -53,6 +53,7 @@ COPY examples/movies.cypher examples/movies.cypher
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=graphbuff-target-$TARGETARCH \
     cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-server -p graphbuff-cli \
+       --features graphbuff-server/tls,graphbuff-cli/tls \
  && mkdir -p /out/bin /out/data \
  && cp "target/$(cat /target-triple)/release/graphbuff-server" \
        "target/$(cat /target-triple)/release/graphbuff-cli" /out/bin/
