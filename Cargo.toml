@@ -11,7 +11,7 @@ default-members = ["crates/cli", "crates/core", "crates/cypher", "crates/engine"
 version = "0.4.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-rust-version = "1.89"
+rust-version = "1.100"
 
 [workspace.dependencies]
 graphbuff-core = { path = "crates/core" }
