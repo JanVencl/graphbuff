@@ -53,6 +53,9 @@ jobs:
         run: cargo +nightly fuzz build --debug-assertions ${{ matrix.target }}
       - name: Fuzz
         env:
+          # Allocations too large to make return null, as without the sanitizer, so code
+          # that handles a failed `try_reserve` is exercised instead of reported.
+          ASAN_OPTIONS: allocator_may_return_null=1
           SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}

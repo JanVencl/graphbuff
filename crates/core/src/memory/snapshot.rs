@@ -115,6 +115,16 @@ impl MemoryGraph {
     /// Rebuilds a graph from data written by [`encode_snapshot`](Self::encode_snapshot),
     /// in layout `version` (1 to [`SNAPSHOT_VERSION`]).
     pub(crate) fn decode_snapshot(d: &mut Decoder, version: u8) -> Result<MemoryGraph> {
+        Self::decode_snapshot_limited(d, version, usize::MAX)
+    }
+
+    /// [`decode_snapshot`](Self::decode_snapshot), failing when the snapshot asks for
+    /// more than `max_slots` node or relationship slots (the fuzz target's bound).
+    ///
+    /// The slot counts come from the file and are allocated before the records are read
+    /// (deleted ids keep their slots), so a corrupt count must fail as an error, not abort
+    /// the process on an allocation it cannot make.
+    pub(crate) fn decode_snapshot_limited(d: &mut Decoder, version: u8, max_slots: usize) -> Result<MemoryGraph> {
         let labels = Interner::from_names(d.strings()?, d)?;
         let rel_types = Interner::from_names(d.strings()?, d)?;
         let keys = Interner::from_names(d.strings()?, d)?;
@@ -124,7 +134,7 @@ impl MemoryGraph {
         if node_count > slab {
             return Err(d.corrupt("more live nodes than node slots"));
         }
-        let mut nodes: Vec<Option<NodeRecord>> = Vec::new();
+        let mut nodes: Vec<Option<NodeRecord>> = slots(d, slab, max_slots, "node")?;
         nodes.resize_with(slab, || None);
         let mut label_index: HashMap<Token, PSet<NodeId>> = HashMap::new();
         let mut prev = None;
@@ -154,7 +164,7 @@ impl MemoryGraph {
             return Err(d.corrupt("more live relationships than relationship slots"));
         }
         let mut nodes: PVec<Option<NodeRecord>> = nodes.into_iter().collect();
-        let mut rels: Vec<Option<RelRecord>> = Vec::new();
+        let mut rels: Vec<Option<RelRecord>> = slots(d, slab, max_slots, "relationship")?;
         rels.resize_with(slab, || None);
         let mut prev = None;
         for _ in 0..rel_count {
@@ -232,6 +242,16 @@ impl MemoryGraph {
     }
 }
 
+/// An empty vector with room for `n` slots, or a corruption error if that is more than
+/// `max` or does not fit in memory.
+fn slots<T>(d: &Decoder, n: usize, max: usize, what: &str) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    if n > max || v.try_reserve_exact(n).is_err() {
+        return Err(d.corrupt(format!("{n} {what} slots do not fit in memory")));
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -292,5 +312,16 @@ mod tests {
         // Ids keep increasing after a reload: the deleted slot is not reused.
         let c = h.create_node(&[], BTreeMap::new()).unwrap();
         assert!(c > gone);
+    }
+
+    /// Found by the `storage` fuzz target: a node slot count of about 2^40 made the
+    /// decoder abort on the allocation instead of failing.
+    #[test]
+    fn huge_slot_count_is_an_error() {
+        let body = [0x02, 0x09, 0x05, 0x00, 0x01, 0x18, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x08, 0xb3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut d = Decoder::new(&body, "snapshot");
+        d.u64().unwrap();
+        let e = MemoryGraph::decode_snapshot(&mut d, SNAPSHOT_VERSION).err().expect("an error");
+        assert!(e.to_string().contains("slots do not fit"), "{e}");
     }
 }

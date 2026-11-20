@@ -1087,7 +1087,8 @@ pub(crate) fn fuzz_snapshot(bytes: &[u8]) {
     let Some((&v, body)) = bytes.split_first() else { return };
     let mut d = Decoder::new(body, "snapshot");
     if d.u64().is_ok() {
-        let _ = MemoryGraph::decode_snapshot(&mut d, 1 + v % SNAPSHOT_VERSION);
+        // Up to 2^16 slots: larger counts are allocated as asked (see decode_snapshot_limited).
+        let _ = MemoryGraph::decode_snapshot_limited(&mut d, 1 + v % SNAPSHOT_VERSION, 1 << 16);
     }
 }
 
