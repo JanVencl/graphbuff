@@ -28,6 +28,8 @@ pub struct Config {
     pub max_connections: Option<usize>,
     pub keep_alive: Option<Duration>,
     pub shutdown_timeout: Option<Duration>,
+    /// `server.cors_origins`, checked.
+    pub cors_origins: graphbuff_server::Cors,
     // [storage]
     pub storage: Storage,
     /// The data directory; `None`: the per-user default ([`default_data_dir`]).
@@ -64,6 +66,7 @@ impl Default for Config {
             max_connections: None,
             keep_alive: None,
             shutdown_timeout: None,
+            cors_origins: graphbuff_server::Cors::default(),
             storage: Storage::Hybrid,
             data: None,
             fsync: true,
@@ -130,6 +133,9 @@ max_connections = 256
 keep_alive_seconds = 30
 # On stop (SIGTERM, Ctrl-C): how long running queries may take before they are cancelled.
 shutdown_timeout_seconds = 5
+# Web pages from these origins may call the HTTP API from the browser (CORS): a
+# comma-separated list such as "https://app.example.com, http://localhost:5173", or "*".
+# cors_origins = "https://app.example.com"
 
 [storage]
 # hybrid: in memory, made durable by a log and snapshots in the data folder (default)
@@ -227,6 +233,7 @@ const SETTINGS: &[(&str, &[(&str, Kind)])] = &[
             ("max_connections", Kind::Positive),
             ("keep_alive_seconds", Kind::Count),
             ("shutdown_timeout_seconds", Kind::Count),
+            ("cors_origins", Kind::Str),
         ],
     ),
     (
@@ -303,6 +310,10 @@ impl Config {
                 ("server", "max_connections") => c.max_connections = Some(int_of(value) as usize),
                 ("server", "keep_alive_seconds") => c.keep_alive = Some(Duration::from_secs(int_of(value))),
                 ("server", "shutdown_timeout_seconds") => c.shutdown_timeout = Some(Duration::from_secs(int_of(value))),
+                ("server", "cors_origins") => {
+                    c.cors_origins = graphbuff_server::Cors::parse(&str_of(value))
+                        .map_err(|e| format!("{}: server.cors_origins: {e}", at()))?;
+                }
                 ("storage", "mode") => {
                     c.storage = match str_of(value).as_str() {
                         "hybrid" => Storage::Hybrid,
@@ -663,6 +674,7 @@ max_memory_mb = 512").unwrap();
         assert!(e("[logs]\nlevel = \"loud\"").contains("logs.level"));
         assert!(e("[server]\nbind = \"x").contains("no closing"));
         assert!(e("[server]\nbind = \"x\" y").contains("after the value"));
+        assert!(e("[server]\ncors_origins = \"example.com\"").contains("server.cors_origins"));
     }
 
     #[test]

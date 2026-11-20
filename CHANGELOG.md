@@ -24,6 +24,8 @@ the same notes.
 - Approximate vector indexes (HNSW): `vector.hnsw.enabled`, `vector.hnsw.m` and
   `vector.hnsw.ef_construction` in `indexConfig`. Candidates are rescored exactly; indexes
   without these settings stay exact.
+- `server.cors_origins`: browser apps on the listed origins may call the HTTP API (CORS
+  headers and preflights).
 - `Database::execute_streaming` and `Session::execute_streaming` with a `RowSink`, for
   rows handed over as a read-only query produces them.
 

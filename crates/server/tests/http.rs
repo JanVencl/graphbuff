@@ -1058,3 +1058,50 @@ fn call_in_transactions_over_http() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(count(&mut c, "/query", "B"), 26);
 }
+
+#[test]
+fn cors_for_allowed_origins() {
+    let server = start(ServerConfig {
+        token: Some("s3cret".into()),
+        cors: graphbuff_server::Cors::parse("https://app.example.com").unwrap(),
+        ..ServerConfig::default()
+    });
+    let mut c = Client::connect(server.local_addr());
+    // The preflight needs no credentials.
+    let r = c.request(
+        "OPTIONS",
+        "/query",
+        None,
+        &[
+            ("Origin", "https://app.example.com"),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", "authorization, content-type"),
+        ],
+    );
+    assert_eq!(r.status, 204);
+    assert_eq!(r.header("access-control-allow-origin"), Some("https://app.example.com"));
+    assert!(r.header("access-control-allow-headers").unwrap().contains("Authorization"));
+    // Errors carry the headers too, so the page can read them.
+    let r = c.request("GET", "/db", None, &[("Origin", "https://app.example.com")]);
+    assert_eq!(r.status, 401);
+    assert_eq!(r.header("access-control-allow-origin"), Some("https://app.example.com"));
+    let r = c.request(
+        "GET",
+        "/db",
+        None,
+        &[("Origin", "https://app.example.com"), ("Authorization", "Bearer s3cret")],
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("vary"), Some("Origin"));
+    // Other origins get nothing: the browser blocks the page from reading the response.
+    let r = c.request("GET", "/db", None, &[("Origin", "https://evil.example"), ("Authorization", "Bearer s3cret")]);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("access-control-allow-origin"), None);
+    let r = c.request(
+        "OPTIONS",
+        "/query",
+        None,
+        &[("Origin", "https://evil.example"), ("Access-Control-Request-Method", "POST")],
+    );
+    assert_eq!(r.status, 401);
+}

@@ -77,6 +77,7 @@ pub mod users;
 /// The JSON reader and writer, and the JSON form of results and errors.
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
+pub use http::Cors;
 pub use net::TlsConfig;
 pub use throttle::{LoginLimits, MAX_LOCKOUT};
 pub use users::{HashParams, MIN_PASSWORD_LENGTH, Role, Users};
@@ -156,6 +157,9 @@ pub struct ServerConfig {
     /// How failed logins lock a client out (see [`LoginLimits`]). Default: 10 failures of
     /// one client address and user name, then a minute, doubling up to an hour.
     pub login_limits: LoginLimits,
+    /// Page origins whose browser apps may call the HTTP API (CORS), such as
+    /// `https://app.example.com`, or `*` for every origin. Default: none.
+    pub cors: http::Cors,
 }
 
 impl Default for ServerConfig {
@@ -177,6 +181,7 @@ impl Default for ServerConfig {
             shutdown_grace: Duration::from_secs(5),
             test_procedures: false,
             login_limits: LoginLimits::default(),
+            cors: http::Cors::default(),
         }
     }
 }
@@ -204,6 +209,7 @@ struct Shared {
     stop: Arc<AtomicBool>,
     active: AtomicUsize,
     max_connections: usize,
+    cors: http::Cors,
 }
 
 impl Shared {
@@ -260,6 +266,7 @@ impl Server {
             stop: Arc::clone(&stop),
             active: AtomicUsize::new(0),
             max_connections: config.max_connections.max(1),
+            cors: config.cors,
         });
         let mut server = Server {
             addr,
@@ -446,11 +453,21 @@ fn serve(stream: Stream, shared: &Shared) {
             Ok(None) => return,
             Ok(Some(req)) => {
                 let keep = req.keep_alive && !stop();
-                let mut out = http::Out { w: &mut writer, keep_alive: keep, written: None };
-                let resp = api::handle(&shared.ctx, &req, &peer, &mut out);
+                if let Some(resp) = shared.cors.preflight(&req) {
+                    if http::write_response(&mut writer, &resp, keep).is_err() || !keep {
+                        return;
+                    }
+                    continue;
+                }
+                let cors = shared.cors.headers(&req);
+                let mut out = http::Out { w: &mut writer, keep_alive: keep, headers: cors, written: None };
+                let mut resp = api::handle(&shared.ctx, &req, &peer, &mut out);
                 let sent = match out.written {
                     Some(r) => r,
-                    None => http::write_response(&mut writer, &resp, keep),
+                    None => {
+                        resp.headers.append(&mut out.headers);
+                        http::write_response(&mut writer, &resp, keep)
+                    }
                 };
                 if sent.is_err() || !keep {
                     return;
