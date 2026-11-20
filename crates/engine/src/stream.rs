@@ -5,7 +5,8 @@
 //! `max` rows, and every stream asks its own input for no more than it can use. A
 //! `LIMIT 10` therefore asks for 10 rows, which asks the expansion below it for 10, which
 //! reads only as much of the adjacency list as it needs. Operators that need all of their
-//! input (aggregation, sorting) pull it in batches of [`BATCH`].
+//! input (aggregation, sorting) pull it in batches of [`BATCH`]; aggregation keeps only
+//! its groups, not the rows.
 //!
 //! Streams borrow the store immutably for `'a`; updates run outside of them (see
 //! `Executor::run_op`).
@@ -23,34 +24,59 @@ use graphbuff_core::{
 };
 use graphbuff_cypher::ast::{Expr, NodePattern, RelPattern, SortItem, VarLength};
 
-/// What a [`Blocking`] stream does with all of its input.
-trait Whole<'a> {
-    fn apply(&self, ex: &'a Executor<'_>, frame: Frame) -> Result<Frame>;
+/// What a [`Blocking`] stream does with all of its input: it takes the rows batch by
+/// batch, keeping only what it needs, then hands out its own rows.
+trait Collect {
+    fn add(&mut self, ex: &Executor<'_>, batch: Vec<Row>) -> Result<()>;
+    fn finish(&mut self, ex: &Executor<'_>) -> Result<Vec<Row>>;
 }
 
-struct Aggregation<'a> {
-    star: bool,
-    items: &'a [Item],
-}
+/// Grouping and aggregation: keeps one entry per group, not the input rows.
+struct Aggregation(Option<Grouping>);
 
-impl<'a> Whole<'a> for Aggregation<'a> {
-    fn apply(&self, ex: &'a Executor<'_>, frame: Frame) -> Result<Frame> {
-        ex.exec_aggregate(self.star, self.items, frame)
+impl Collect for Aggregation {
+    fn add(&mut self, ex: &Executor<'_>, batch: Vec<Row>) -> Result<()> {
+        let grouping = self.0.as_mut().expect("not finished");
+        for row in batch {
+            grouping.add(ex, row)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, ex: &Executor<'_>) -> Result<Vec<Row>> {
+        self.0.take().expect("finished once").finish(ex)
     }
 }
 
+/// `ORDER BY`: keeps every row with its sort keys, then sorts them (stably).
 struct Sorting<'a> {
     keys: &'a [SortItem],
     items: &'a [Item],
+    /// The input's scope and the source scope behind it.
+    scope: Scope,
+    src: Scope,
+    keyed: Vec<(Vec<Value>, Row)>,
 }
 
-impl<'a> Whole<'a> for Sorting<'a> {
-    fn apply(&self, ex: &'a Executor<'_>, frame: Frame) -> Result<Frame> {
-        ex.exec_sort(self.keys, self.items, frame)
+impl Collect for Sorting<'_> {
+    fn add(&mut self, ex: &Executor<'_>, batch: Vec<Row>) -> Result<()> {
+        for row in batch {
+            let k = ex.sort_keys(self.keys, self.items, &self.scope, &self.src, &row)?;
+            self.keyed.push((k, row));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &Executor<'_>) -> Result<Vec<Row>> {
+        let keys = self.keys;
+        let mut keyed = std::mem::take(&mut self.keyed);
+        keyed.sort_by(|(a, _), (b, _)| compare_sort_keys(keys, a, b));
+        Ok(keyed.into_iter().map(|(_, r)| r).collect())
     }
 }
 
 use crate::context::{Env, Executor, Frame, Row, Scope};
+use crate::exec::Grouping;
 use crate::exec::compare_sort_keys;
 use crate::matcher::SeekKind;
 use crate::ops::cypher_eq;
@@ -166,14 +192,21 @@ fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<B
         }
         O::Aggregate { input, star, items } => {
             let input = build(ex, input, base)?;
-            let (_, scope) = ex.projection_items(*star, items, input.scope())?;
+            let (grouping, scope) = ex.grouping(*star, items, input.scope())?;
             let hidden = Some(input.scope().clone());
-            Box::new(Blocking::new(input, scope, hidden, Aggregation { star: *star, items }))
+            Box::new(Blocking::new(input, scope, hidden, Aggregation(Some(grouping))))
         }
         O::Sort { input, keys, items } => {
             let input = build(ex, input, base)?;
             let (scope, hidden) = (input.scope().clone(), input.hidden().cloned());
-            Box::new(Blocking::new(input, scope, hidden, Sorting { keys, items }))
+            let sorting = Sorting {
+                keys,
+                items,
+                scope: scope.clone(),
+                src: hidden.clone().unwrap_or_default(),
+                keyed: Vec::new(),
+            };
+            Box::new(Blocking::new(input, scope, hidden, sorting))
         }
         O::Top {
             input,
@@ -647,7 +680,7 @@ impl<'a, W> Blocking<'a, W> {
     }
 }
 
-impl<'a, W: Whole<'a>> Stream<'a> for Blocking<'a, W> {
+impl<'a, W: Collect> Stream<'a> for Blocking<'a, W> {
     fn scope(&self) -> &Scope {
         &self.scope
     }
@@ -658,16 +691,10 @@ impl<'a, W: Whole<'a>> Stream<'a> for Blocking<'a, W> {
 
     fn next(&mut self, ex: &'a Executor<'_>, max: usize) -> Result<Option<Vec<Row>>> {
         if let Some(mut input) = self.input.take() {
-            let mut rows = Vec::new();
             while let Some(batch) = input.next(ex, BATCH)? {
-                rows.extend(batch);
+                self.op.add(ex, batch)?;
             }
-            let frame = Frame {
-                scope: input.scope().clone(),
-                rows,
-                hidden: input.hidden().cloned(),
-            };
-            self.out = self.op.apply(ex, frame)?.rows.into();
+            self.out = self.op.finish(ex)?.into();
         }
         if self.out.is_empty() {
             return Ok(None);

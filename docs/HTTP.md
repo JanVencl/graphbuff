@@ -30,6 +30,10 @@ with the movies demo graph.
 | `POST /db/{name}/check` | consistency check of a persistent database: `{"check":{"consistent","errors",...}}`; admins only |
 
 A query returns `{"columns":[...],"rows":[[...]],"stats":{"nodesCreated":1,...,"containsUpdates":true}}`.
+A read-only query's rows are written as they are produced: a result over 64 KiB is sent as
+a chunked `200` response while the query runs. If the query fails after that, the object
+ends with the error instead of `stats`: `{"columns":[...],"rows":[...],"error":{"code":...,"message":...}}`;
+check for `error` in a `200` body too.
 A query request is its own transaction. Database commands (`CREATE DATABASE`,
 `SHOW DATABASES`, `USE x MATCH ...`) work through either query endpoint.
 

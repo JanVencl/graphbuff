@@ -390,35 +390,52 @@ pub fn encode_error(e: &Error) -> String {
 /// `"plan"` for `EXPLAIN` and `PROFILE`.
 pub fn encode_result(r: &QueryResult) -> String {
     let mut out = String::with_capacity(64 + r.rows.len() * 32);
-    out.push_str(r#"{"columns":["#);
-    for (i, c) in r.columns.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_str(&mut out, c);
-    }
-    out.push_str(r#"],"rows":["#);
+    write_result_head(&mut out, &r.columns);
     for (i, row) in r.rows.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        out.push('[');
-        for (j, v) in row.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            write_result_value(&mut out, v);
-        }
-        out.push(']');
+        write_row(&mut out, row);
     }
+    write_result_tail(&mut out, &r.stats, r.plan.as_ref());
+    out
+}
+
+/// The start of [`encode_result`]'s object, up to the opening of `rows`; then come the
+/// rows ([`write_row`], separated by commas) and [`write_result_tail`]. For writing a
+/// result as its rows are produced.
+pub fn write_result_head(out: &mut String, columns: &[String]) {
+    out.push_str(r#"{"columns":["#);
+    for (i, c) in columns.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(out, c);
+    }
+    out.push_str(r#"],"rows":["#);
+}
+
+/// One row as a JSON array.
+pub fn write_row(out: &mut String, row: &[ResultValue]) {
+    out.push('[');
+    for (j, v) in row.iter().enumerate() {
+        if j > 0 {
+            out.push(',');
+        }
+        write_result_value(out, v);
+    }
+    out.push(']');
+}
+
+/// The end of [`encode_result`]'s object, from the end of `rows`.
+pub fn write_result_tail(out: &mut String, stats: &QueryStats, plan: Option<&PlanDescription>) {
     out.push_str(r#"],"stats":"#);
-    write_stats(&mut out, &r.stats);
-    if let Some(plan) = &r.plan {
+    write_stats(out, stats);
+    if let Some(plan) = plan {
         out.push_str(r#","plan":"#);
-        write_plan(&mut out, plan);
+        write_plan(out, plan);
     }
     out.push('}');
-    out
 }
 
 /// `{"profiled": bool, "lines": [{"depth", "operator", "estimatedRows", "rows", "timeMs"}]}`;

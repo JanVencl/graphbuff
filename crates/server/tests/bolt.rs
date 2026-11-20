@@ -8,8 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use graphbuff::DatabaseManager;
+use graphbuff::accounting::CountingAllocator;
 use graphbuff_server::packstream::{self, PackValue};
 use graphbuff_server::{Level, Log, LogConfig, Server, ServerConfig};
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 const HELLO: u8 = 0x01;
 const GOODBYE: u8 = 0x02;
@@ -486,6 +490,88 @@ fn pull_in_batches_and_discard() {
     assert_eq!(b.query("RETURN 4"), vec![vec![PackValue::Int(4)]]);
     b.send(GOODBYE, vec![]);
     assert!(b.closed());
+}
+
+#[test]
+fn auto_commit_results_stream() {
+    let server = start(ServerConfig {
+        query_max_memory: Some(16 << 20),
+        ..ServerConfig::default()
+    });
+    let mut b = Bolt::open(server.bolt_addr().unwrap());
+    // Collected (as in a transaction), the rows are over the limit; streamed, they pass.
+    let q = "UNWIND range(1, 400) AS i UNWIND range(1, 1000) AS j RETURN i, toString(j) AS s";
+    b.send(BEGIN, vec![empty()]);
+    b.success();
+    b.run(q, empty(), empty());
+    assert_eq!(b.failure(), "Neo.TransientError.General.MemoryPoolOutOfMemoryError");
+    b.send(RESET, vec![]);
+    b.success();
+    b.run(q, empty(), empty());
+    assert_eq!(get(&b.success(), "fields"), &PackValue::List(vec![s("i"), s("s")]));
+    let mut n = 0;
+    loop {
+        b.pull(100000);
+        let (rows, meta) = b.records();
+        n += rows.len();
+        if !meta.contains_key("has_more") {
+            assert_eq!(get(&meta, "type"), &s("r"));
+            break;
+        }
+    }
+    assert_eq!(n, 400000);
+
+    // A failure after rows went out answers the PULL that reaches it.
+    b.run("UNWIND range(1, 2000) AS i RETURN 10 / (1000 - i) AS x", empty(), empty());
+    b.success();
+    b.pull(10);
+    assert_eq!(b.records().0.len(), 10);
+    b.pull(-1);
+    let mut n = 10;
+    let code = loop {
+        match b.recv() {
+            (RECORD, _) => n += 1,
+            (FAILURE, f) => match &f[0] {
+                PackValue::Map(m) => break get(m, "code").clone(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(code, s("Neo.ClientError.Statement.ArgumentError"));
+    assert!((10..1000).contains(&n), "{n}");
+    b.send(RESET, vec![]);
+    b.success();
+
+    // RESET while a result waits for its next PULL ends it.
+    b.run("UNWIND range(1, 100000) AS i RETURN i", empty(), empty());
+    b.success();
+    b.pull(5);
+    assert_eq!(b.records().0.len(), 5);
+    b.send(RESET, vec![]);
+    b.success();
+    // A result whose time runs out while it waits for a PULL stops; the PULL fails.
+    b.run("UNWIND range(1, 100000) AS i RETURN i", empty(), map(&[("tx_timeout", PackValue::Int(300))]));
+    b.success();
+    b.pull(5);
+    assert_eq!(b.records().0.len(), 5);
+    std::thread::sleep(Duration::from_millis(600));
+    b.pull(5);
+    assert_eq!(b.failure(), "Neo.ClientError.Transaction.TransactionTimedOut");
+    b.send(RESET, vec![]);
+    b.success();
+    // ROUTE and TELEMETRY are answered on the way; DISCARD then ends it.
+    b.run("UNWIND range(1, 100000) AS i RETURN i", empty(), empty());
+    b.success();
+    b.pull(5);
+    assert_eq!(b.records().0.len(), 5);
+    b.send(TELEMETRY, vec![PackValue::Int(0)]);
+    b.success();
+    b.send(DISCARD, vec![map(&[("n", PackValue::Int(-1))])]);
+    let (rows, meta) = b.records();
+    assert!(rows.is_empty());
+    assert!(meta.contains_key("bookmark"));
+    assert_eq!(b.query("RETURN 4"), vec![vec![PackValue::Int(4)]]);
 }
 
 #[test]

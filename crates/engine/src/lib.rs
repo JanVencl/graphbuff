@@ -95,7 +95,7 @@ pub fn gpu_kernels() -> Result<Arc<dyn Kernels>> {
     }
 }
 pub use interrupt::{CancelHandle, QueryOptions};
-pub use result::{
+pub use result::{RowSink, 
     NodeData, PathData, PlanDescription, PlanLine, QueryResult, QueryStats, RelData, ResultValue,
 };
 
@@ -307,6 +307,82 @@ impl<S: GraphStore> Database<S> {
         options: &QueryOptions,
     ) -> Result<QueryResult> {
         self.run(ast, params, Interrupt::start(options))
+    }
+
+    /// Runs a statement as [`Database::execute_with_options`] does, handing the rows to
+    /// `sink` as they are produced; the result returned has no rows.
+    ///
+    /// A read-only query on a store that takes snapshots streams: its rows go to the sink
+    /// while it runs, so a large result is never held in memory (only what operators
+    /// such as `ORDER BY` or `DISTINCT` must keep). An error from the sink stops it. A
+    /// query that writes runs and commits first, then its rows are handed over. Rows
+    /// already handed over stay valid when a query fails later on.
+    ///
+    /// ```
+    /// use graphbuff::{Database, QueryOptions, ResultValue, RowSink};
+    ///
+    /// struct Sum(i64);
+    /// impl RowSink for Sum {
+    ///     fn columns(&mut self, _: &[String]) -> graphbuff::Result<()> { Ok(()) }
+    ///     fn row(&mut self, row: Vec<ResultValue>) -> graphbuff::Result<()> {
+    ///         self.0 += row[0].as_int().unwrap_or(0);
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let db = Database::in_memory();
+    /// let mut sum = Sum(0);
+    /// let r = db.execute_streaming("UNWIND range(1, 100) AS i RETURN i", &Default::default(),
+    ///     &QueryOptions::default(), &mut sum)?;
+    /// assert_eq!((sum.0, r.columns, r.rows.len()), (5050, vec!["i".to_string()], 0));
+    /// # Ok::<(), graphbuff::Error>(())
+    /// ```
+    pub fn execute_streaming(
+        &self,
+        query: &str,
+        params: &BTreeMap<String, Value>,
+        options: &QueryOptions,
+        sink: &mut dyn RowSink,
+    ) -> Result<QueryResult> {
+        let interrupt = Interrupt::start(options);
+        let ast = graphbuff_cypher::parse(query)?;
+        self.run_streaming(&ast, params, interrupt, sink)
+    }
+
+    /// [`Database::execute_streaming`] for an already parsed query.
+    pub fn execute_query_streaming(
+        &self,
+        ast: &cypher::ast::Query,
+        params: &BTreeMap<String, Value>,
+        options: &QueryOptions,
+        sink: &mut dyn RowSink,
+    ) -> Result<QueryResult> {
+        self.run_streaming(ast, params, Interrupt::start(options), sink)
+    }
+
+    fn run_streaming(
+        &self,
+        ast: &cypher::ast::Query,
+        params: &BTreeMap<String, Value>,
+        interrupt: Option<Interrupt>,
+        sink: &mut dyn RowSink,
+    ) -> Result<QueryResult> {
+        // Without a snapshot a reader holds the store's lock, which a slow consumer would
+        // keep from writers: such results are collected first.
+        let streams = ast.mode != QueryMode::Explain
+            && !writes(ast)
+            && batched::position(ast)?.is_none()
+            && self.snapshot().is_some();
+        if !streams {
+            return self.run(ast, params, interrupt)?.feed(sink);
+        }
+        if let Some(i) = &interrupt {
+            i.check_now()?;
+        }
+        self.view_with_kernels(params, |mut ex| {
+            ex.interrupt = interrupt;
+            run_query_into(&mut ex, ast, sink)
+        })
     }
 
     fn run(
@@ -644,6 +720,41 @@ fn run_query(ex: &mut Executor, ast: &cypher::ast::Query) -> Result<QueryResult>
         result.plan = Some(plan.describe(Some(&profile.borrow())));
     }
     Ok(result)
+}
+
+/// [`run_query`], handing the rows to `sink` as they are produced.
+fn run_query_into(ex: &mut Executor, ast: &cypher::ast::Query, sink: &mut dyn RowSink) -> Result<QueryResult> {
+    struct Materialize<'s>(&'s mut dyn RowSink);
+    impl exec::RawSink for Materialize<'_> {
+        fn columns(&mut self, columns: &[String]) -> Result<()> {
+            self.0.columns(columns)
+        }
+        fn rows(&mut self, ex: &Executor, rows: Vec<context::Row>) -> Result<()> {
+            for r in rows {
+                let row = r
+                    .into_iter()
+                    .map(|v| ResultValue::materialize(v, ex.store()))
+                    .collect::<Result<_>>()?;
+                self.0.row(row)?;
+            }
+            ex.check_interrupt()
+        }
+    }
+    let plan = plan::QueryPlan::build(ast, ex)?;
+    if ast.mode == QueryMode::Profile {
+        ex.profile = Some(Default::default());
+    }
+    let columns = ex.run_plan_into(&plan, &mut Materialize(sink))?;
+    ex.check_constraints()?;
+    if let Some(i) = &ex.interrupt {
+        i.check_now()?;
+    }
+    Ok(QueryResult {
+        columns,
+        rows: Vec::new(),
+        stats: ex.stats.clone(),
+        plan: ex.profile.as_ref().map(|profile| plan.describe(Some(&profile.borrow()))),
+    })
 }
 
 /// Materializes the result rows. Runs inside the query's transaction, so a failed read

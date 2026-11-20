@@ -515,6 +515,10 @@ fn decode_outcome(raw: String) -> Result<Outcome, Error> {
     let Ok(Json::Object(mut m)) = json::parse(&raw) else {
         return Err(Error::Protocol("the result is not a JSON object".into()));
     };
+    // A result streamed by the server that failed after its first rows went out.
+    if m.contains_key("error") {
+        return Err(decode_error(Reply { status: 200, body: raw }));
+    }
     let columns = match m.remove("columns") {
         Some(Json::Array(c)) => c
             .into_iter()
@@ -644,6 +648,13 @@ mod tests {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foobar", "Zm9vYmFy")] {
             assert_eq!(base64(i.as_bytes()), o);
         }
+    }
+
+    #[test]
+    fn an_error_after_streamed_rows() {
+        let raw = r#"{"columns":["x"],"rows":[[1]],"error":{"code":"RuntimeError","message":"division by zero"}}"#;
+        let e = decode_outcome(raw.into()).unwrap_err();
+        assert_eq!(e.to_string(), "RuntimeError: division by zero");
     }
 
     #[test]

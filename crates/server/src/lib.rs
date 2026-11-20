@@ -445,9 +445,14 @@ fn serve(stream: Stream, shared: &Shared) {
         match http::read_request(&mut reader, &mut writer, &shared.limits, &stop) {
             Ok(None) => return,
             Ok(Some(req)) => {
-                let resp = api::handle(&shared.ctx, &req, &peer);
                 let keep = req.keep_alive && !stop();
-                if http::write_response(&mut writer, &resp, keep).is_err() || !keep {
+                let mut out = http::Out { w: &mut writer, keep_alive: keep, written: None };
+                let resp = api::handle(&shared.ctx, &req, &peer, &mut out);
+                let sent = match out.written {
+                    Some(r) => r,
+                    None => http::write_response(&mut writer, &resp, keep),
+                };
+                if sent.is_err() || !keep {
                     return;
                 }
             }

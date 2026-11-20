@@ -122,8 +122,14 @@ on a value from the other side, it stays an index lookup per row.
 Read operators run as pull-based streams (`crates/engine/src/stream.rs`): each asks its
 input for at most as many rows as it can still use, so `MATCH (s)-[:LIKES]->(x) RETURN x
 LIMIT 10` reads ten relationships, not the whole adjacency list. Sorting and aggregation
-read all of their input. Updates are eager: everything below an update runs to
+read all of their input; aggregation keeps only one entry per group (its key, accumulators
+and first row), not the rows. Updates are eager: everything below an update runs to
 completion first, so `SET`/`DELETE`/`CREATE` always apply to every row, as in Neo4j.
+
+The result of a read-only query streams too (`Database::execute_streaming`, a `RowSink`):
+its rows go to the caller batch by batch as the top stream yields them, so the server
+writes them to Bolt `PULL`s or a chunked HTTP response without holding the whole result.
+A query that writes runs and commits first, then hands over its rows.
 
 A pattern part can start at either end, in one of these ways:
 

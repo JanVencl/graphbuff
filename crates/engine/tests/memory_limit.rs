@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use graphbuff::accounting::{self, CountingAllocator};
-use graphbuff::{BoxedStore, Database, Error, QueryOptions, ResultValue, StorageMode};
+use graphbuff::{BoxedStore, Database, Error, QueryOptions, ResultValue, RowSink, StorageMode};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -115,7 +115,63 @@ fn shared_caches_are_not_the_querys() {
     // The kernel cache (a CSR export of the graph) is built by the query that needs it.
     let r = limited(&db, "MATCH (:P)-[:R]->(q) RETURN count(q) AS n", 4).unwrap();
     assert_eq!(r.rows[0][0], ResultValue::Int(100000));
-    // Aggregation holds its input rows: that is the query's memory.
-    let e = limited(&db, "MATCH (p:P) RETURN count(p.s)", 4).unwrap_err();
+    // Aggregation keeps its groups, not its input rows.
+    let r = limited(&db, "MATCH (p:P) RETURN count(p.s) AS n", 4).unwrap();
+    assert_eq!(r.rows[0][0], ResultValue::Int(100000));
+    // Sorting holds its input rows: that is the query's memory.
+    let e = limited(&db, "MATCH (p:P) WITH p.s AS s ORDER BY s RETURN count(s)", 4).unwrap_err();
     assert!(matches!(e, Error::MemoryLimit(_)), "{e}");
+}
+
+/// Counts the rows it is handed, keeping none.
+#[derive(Default)]
+struct Counter {
+    columns: Vec<String>,
+    rows: usize,
+    stop_after: Option<usize>,
+}
+
+impl RowSink for Counter {
+    fn columns(&mut self, columns: &[String]) -> graphbuff::Result<()> {
+        self.columns = columns.to_vec();
+        Ok(())
+    }
+
+    fn row(&mut self, _: Vec<ResultValue>) -> graphbuff::Result<()> {
+        self.rows += 1;
+        if self.stop_after == Some(self.rows) {
+            return Err(Error::Cancelled("enough".into()));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_streamed_result_is_not_held() {
+    let dir = TempDir::new("streamed");
+    let db = Database::open(StorageMode::persistent(&dir.0)).unwrap();
+    let q = "UNWIND range(1, 1000) AS i UNWIND range(1, 2000) AS j RETURN i, toString(j) AS s";
+    let options = QueryOptions::default().with_max_memory(32 * MIB);
+    // Collected, the rows are over the limit; streamed, they pass through.
+    assert!(matches!(limited(&db, q, 32), Err(Error::MemoryLimit(_))));
+    let mut sink = Counter::default();
+    let r = db.execute_streaming(q, &BTreeMap::new(), &options, &mut sink).unwrap();
+    assert_eq!((sink.columns, sink.rows, r.rows.len()), (vec!["i".to_string(), "s".to_string()], 2000000, 0));
+    // UNION drops repeats across its parts as they stream.
+    let mut sink = Counter::default();
+    db.execute_streaming("UNWIND [1, 2, 2] AS x RETURN x UNION UNWIND [2, 3] AS x RETURN x", &BTreeMap::new(), &options, &mut sink)
+        .unwrap();
+    assert_eq!(sink.rows, 3);
+    // An error from the sink stops the query.
+    let mut sink = Counter { stop_after: Some(10), ..Counter::default() };
+    let e = db.execute_streaming(q, &BTreeMap::new(), &options, &mut sink).unwrap_err();
+    assert!(matches!(e, Error::Cancelled(_)), "{e}");
+    assert_eq!(sink.rows, 10);
+    // A writing query commits, then hands its rows over.
+    let mut sink = Counter::default();
+    let r = db
+        .execute_streaming("UNWIND range(1, 5) AS i CREATE (n:W {i: i}) RETURN n", &BTreeMap::new(), &options, &mut sink)
+        .unwrap();
+    assert_eq!((sink.rows, r.stats.nodes_created), (5, 5));
+    assert_eq!(int(&db, "MATCH (n:W) RETURN count(n)"), 5);
 }

@@ -1184,7 +1184,37 @@ impl<'m> Session<'m> {
         params: &BTreeMap<String, Value>,
         options: &crate::QueryOptions,
     ) -> Result<QueryResult> {
+        self.run_statement(graphbuff_cypher::parse_statement(statement)?, params, options)
+    }
+
+    /// [`Session::execute_with_options`], handing the rows to `sink` as they are produced
+    /// (see [`Database::execute_streaming`]); the result returned has no rows.
+    pub fn execute_streaming(
+        &mut self,
+        statement: &str,
+        params: &BTreeMap<String, Value>,
+        options: &crate::QueryOptions,
+        sink: &mut dyn crate::RowSink,
+    ) -> Result<QueryResult> {
         match graphbuff_cypher::parse_statement(statement)? {
+            Statement::Query { use_db, query } => {
+                let db = match use_db {
+                    Some(n) => self.mgr.database(&resolve(&n, params)?)?,
+                    None => self.database()?,
+                };
+                db.execute_query_streaming(&query, params, options, sink)
+            }
+            other => self.run_statement(other, params, options)?.feed(sink),
+        }
+    }
+
+    fn run_statement(
+        &mut self,
+        statement: Statement,
+        params: &BTreeMap<String, Value>,
+        options: &crate::QueryOptions,
+    ) -> Result<QueryResult> {
+        match statement {
             Statement::Query { use_db, query } => {
                 let db = match use_db {
                     Some(n) => self.mgr.database(&resolve(&n, params)?)?,
