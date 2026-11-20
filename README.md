@@ -12,14 +12,14 @@
 * you can query and store graphs with millions of nodes and billions of relationships
 
 ## Supported features
-* **Cypher** queries
-* **Bolt** (Neo4j drivers)
-* **HTTP/JSON** (REST API)
-* **user accounts**
-* **GPU** (wgpu)
-* **persistent storage**
+* **Cypher** queries ([supported Cypher](./docs/Cypher.md))
+* **Bolt** ([Neo4j drivers](./docs/Bolt.md))
+* **HTTP/JSON** ([REST API](./docs/HTTP.md))
+* **user accounts** and **TLS** ([details](./docs/Users.md))
+* **GPU** (wgpu; [kernels and algorithms](./docs/Kernels.md))
+* **persistent storage** ([storage modes](./docs/Storage.md))
 * **durable transactions**
-* **bulk CSV import**
+* **bulk CSV import** ([details](./docs/Import.md))
 * **vector search** ([details](./docs/Vectors.md))
 * [More features](./docs/Features.md)
 
@@ -47,7 +47,7 @@ curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: applica
 | `POST /db/{name}/tx/{id}/commit` | commits: `{"committed":true}` |
 | `DELETE /db/{name}/tx/{id}` | rolls back (cancelling a running statement): `{"rolledBack":true}` |
 | `/tx`, `/tx/{id}`, `/tx/{id}/commit` | the same, against the default database |
-| `POST /db/{name}/backup` | online backup into `storage.backup_dir`: `{"backup": "name"}`; admins only ([details](#backup-restore-and-consistency-checks)) |
+| `POST /db/{name}/backup` | online backup into `storage.backup_dir`: `{"backup": "name"}`; admins only ([details](./docs/Backup.md)) |
 | `POST /db/{name}/restore` | creates the database from a backup: `{"backup": "name", "overwrite": false}`; admins only |
 | `POST /db/{name}/check` | consistency check of a persistent database: `{"check":{"consistent","errors",...}}`; admins only |
 
@@ -78,7 +78,7 @@ relative to the file's folder, so the shipped `data = "../data"` puts the data f
 to the program. A misspelt section or setting, or a value of the wrong kind, stops the
 server with the file and line. The only settings outside the file are secrets for
 containers: env `GRAPHBUFF_TOKEN` overrides `security.token`, and the first
-administrator's `GRAPHBUFF_ADMIN_*` (see [Users and TLS](#users-and-tls)).
+administrator's `GRAPHBUFF_ADMIN_*` (see [Users and TLS](./docs/Users.md)).
 
 ```toml
 [server]
@@ -124,7 +124,26 @@ graphbuff-cli -u admin "MATCH (n) RETURN count(n);"
 docker exec -it CONTAINER graphbuff-cli -u admin     # the server in a container
 ```
 
-`graphbuff-cli --help` lists its options.
+More in [Command-line client](./docs/CLI.md).
+
+## Documentation
+
+| Page | What |
+|------|------|
+| [Install without Rust](./docs/Install.md) | Docker image and prebuilt binaries |
+| [Storage modes](./docs/Storage.md) | hybrid, persistent and in-memory storage |
+| [Multiple databases](./docs/Databases.md) | `CREATE DATABASE`, `USE`, sessions |
+| [Bulk import](./docs/Import.md) | `neo4j-admin import`-style CSV import |
+| [Backup, restore and consistency checks](./docs/Backup.md) | online backups and checks |
+| [CSR adjacency export](./docs/Kernels.md) | graph kernels, algorithms, GPU |
+| [HTTP server](./docs/HTTP.md) | the REST API and a Java client |
+| [Features](./docs/Features.md) | transactions, timeouts, values, errors, logs, stopping |
+| [Command-line client](./docs/CLI.md) | `graphbuff-cli` |
+| [Bolt](./docs/Bolt.md) | Neo4j drivers |
+| [Users and TLS](./docs/Users.md) | accounts, roles, HTTPS and Bolt over TLS |
+| [Vector search](./docs/Vectors.md) | similarity functions and vector indexes |
+| [Supported Cypher](./docs/Cypher.md) | clauses, functions, procedures, what is missing |
+| [Layout](./docs/Architecture.md) | crates, storage internals, concurrency, execution |
 
 ## License
 
