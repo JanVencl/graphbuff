@@ -777,7 +777,7 @@ impl Conn<'_> {
             let info = Info { database: db.clone(), who: who.clone(), protocol: "bolt", connection, client: peer };
             let stop = Stop::Cancel(options.cancel.clone().expect("interruptible sets one"));
             let _listed = ctx.running.begin(info, stop, Some(&query));
-            api::authorize(access, &statement)?;
+            ctx.authorize(&who, &statement, &db, &params)?;
             let mut session = ctx.mgr.session();
             if system {
                 system_command(&statement)?;
@@ -890,7 +890,9 @@ impl Conn<'_> {
             }
         };
         let prepared = self.database_name(&extra).and_then(|name| {
-            let (_, access) = self.access()?;
+            let (who, _) = self.access()?;
+            let ctx = &self.shared.ctx;
+            let access = if self.is_system(&name) { ctx.best_access(who) } else { ctx.access_on(who, &name) };
             api::check(access, Access::Read, "a transaction").map_err(|e| Failure::from_error(&e))?;
             let limit = self.time_limit(&extra)?;
             if self.is_system(&name) {
@@ -1012,15 +1014,16 @@ impl Conn<'_> {
                     let started = Instant::now();
                     let prepared = Self::run_fields(fields).and_then(|(text, params, _)| {
                         let source = text.clone();
-                        let (_, access) = self.access()?;
+                        let (who, access) = self.access()?;
+                        let ctx = &self.shared.ctx;
                         let statement = match tx {
                             Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
                                 let (needed, what) = api::authorize_query(&q);
-                                api::check(access, needed, what)?;
+                                api::check(ctx.access_on(who, name), needed, what)?;
                                 Ok(TxStatement::Query(q))
                             }),
                             None => graphbuff::cypher::parse_statement(&text).and_then(|s| {
-                                api::authorize(access, &s)?;
+                                ctx.authorize(who, &s, name, &params)?;
                                 system_command(&s)?;
                                 Ok(match s {
                                     Statement::User(cmd) => TxStatement::User(cmd),

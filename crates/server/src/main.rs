@@ -72,7 +72,8 @@ User accounts:
   with storage.mode = \"memory\").
 
   Roles: reader (read queries), editor (also writes, indexes, constraints), admin (also
-  databases and users). Manage them with Cypher as an admin (CREATE USER alice SET
+  databases and users); reader and editor also on one database (GRANT ROLE editor ON
+  DATABASE movies TO alice). Manage them with Cypher as an admin (CREATE USER alice SET
   PASSWORD 's3cret-pw', GRANT ROLE editor TO alice, SHOW USERS, ALTER CURRENT USER SET PASSWORD
   FROM 'old' TO 'new', ...), or offline with `graphbuff-server users ...` on the data
   directory (the same config file as the server, or --config FILE), only while
