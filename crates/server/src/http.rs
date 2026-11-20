@@ -314,6 +314,41 @@ pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::
     w.flush()
 }
 
+/// Starts a `200` response whose body follows in chunks ([`write_chunk`], [`end_chunks`]).
+pub fn write_chunked_head(w: &mut Stream, content_type: &str, keep_alive: bool) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: {}\r\n\r\n",
+        if keep_alive { "keep-alive" } else { "close" }
+    );
+    w.write_all(head.as_bytes())
+}
+
+/// One chunk of a chunked body (nothing for no bytes: an empty chunk ends the body).
+pub fn write_chunk(w: &mut Stream, data: &[u8]) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut out = format!("{:X}\r\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    w.write_all(&out)
+}
+
+/// Ends a chunked body.
+pub fn end_chunks(w: &mut Stream) -> io::Result<()> {
+    w.write_all(b"0\r\n\r\n")?;
+    w.flush()
+}
+
+/// Where a handler writes its response: it returns a [`Response`], or writes one itself
+/// (a streamed result) and marks it written.
+pub struct Out<'w> {
+    pub w: &'w mut Stream,
+    pub keep_alive: bool,
+    /// The handler wrote the response; a failed write closes the connection.
+    pub written: Option<io::Result<()>>,
+}
+
 /// Reads from `r` until it would block, so that request bytes a client sent before we
 /// answered with an error are not left unread (which can turn the close into a reset).
 pub fn drain(r: &mut BufReader<Stream>) {

@@ -372,7 +372,26 @@ pub(crate) fn estimate_text(rows: f64) -> String {
     }
 }
 
+/// Receives a query's result as it is produced (see [`Database::execute_streaming`]).
+///
+/// [`Database::execute_streaming`]: crate::Database::execute_streaming
+pub trait RowSink {
+    /// The column names, once, before any row.
+    fn columns(&mut self, columns: &[String]) -> Result<()>;
+    /// The next row. An error stops the query, which then fails with it.
+    fn row(&mut self, row: Vec<ResultValue>) -> Result<()>;
+}
+
 impl QueryResult {
+    /// Hands the columns and rows to `sink`, returning the result without its rows.
+    pub fn feed(mut self, sink: &mut dyn RowSink) -> Result<QueryResult> {
+        sink.columns(&self.columns)?;
+        for row in std::mem::take(&mut self.rows) {
+            sink.row(row)?;
+        }
+        Ok(self)
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }

@@ -51,8 +51,11 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
 * **Tested with the official drivers:** Python 5.28 and 6.4, Java 5.28 and 6.0 (all
   negotiate Bolt 5.8), by the smoke suites in
   [`integration-tests/drivers`](../integration-tests/drivers/README.md).
-* **Not done:** Bolt 6; results are computed whole by `RUN` and then paged by `PULL`;
-  impersonation, notifications (none are produced, so notification filters are accepted
+* **Results stream:** an auto-commit read-only query runs while `PULL`s take its rows; it
+  waits for the next `PULL` once `n` rows are sent, and `DISCARD` (or `RESET`) stops it. A
+  failure after rows went out answers the `PULL` that reaches it. Results in an explicit
+  transaction, and of queries that write, are computed by `RUN` and then paged by `PULL`.
+* **Not done:** Bolt 6; impersonation, notifications (none are produced, so notification filters are accepted
   and have nothing to filter), and access modes (a write in a `READ` session runs). GQL
   status codes for errors are GQL's general class codes (`42001` invalid syntax, `42000`,
   `22000`, `40000`, `50N42`) rather than Neo4j's finer ones. The server agent reads

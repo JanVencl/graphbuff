@@ -28,6 +28,29 @@ pub(crate) struct RawResult {
     pub rows: Vec<Row>,
 }
 
+/// Where [`Executor::run_plan_into`] sends the result.
+pub(crate) trait RawSink {
+    /// The column names, once, before any row.
+    fn columns(&mut self, columns: &[String]) -> Result<()>;
+    /// The next rows (never empty); `ex` materializes their entities.
+    fn rows(&mut self, ex: &Executor, rows: Vec<Row>) -> Result<()>;
+}
+
+/// Sends the first part's columns to `sink`; later parts (of a `UNION`) must match them.
+fn same_columns(columns: &mut Option<Vec<String>>, these: &[String], sink: &mut dyn RawSink) -> Result<()> {
+    match columns {
+        None => {
+            sink.columns(these)?;
+            *columns = Some(these.to_vec());
+            Ok(())
+        }
+        Some(c) if c.as_slice() != these => Err(Error::Semantic(
+            "all sub queries in a UNION must have the same return column names".into(),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 impl Executor<'_> {
     #[cfg(test)]
     pub fn run(&mut self, q: &graphbuff_cypher::ast::Query) -> Result<RawResult> {
@@ -55,6 +78,40 @@ impl Executor<'_> {
             result.rows.retain(|r| seen.insert(r.clone()));
         }
         Ok(result)
+    }
+
+    /// [`run_plan`](Self::run_plan), handing the result rows to `sink` batch by batch as
+    /// the plan produces them instead of collecting them. Returns the column names.
+    pub fn run_plan_into(&mut self, plan: &QueryPlan, sink: &mut dyn RawSink) -> Result<Vec<String>> {
+        let mut columns: Option<Vec<String>> = None;
+        // `UNION` (without `ALL`): the rows sent so far, to drop repeats.
+        let mut seen = (plan.parts.len() > 1 && !plan.union_all).then(HashSet::new);
+        let mut send = |ex: &Executor, rows: Vec<Row>, sink: &mut dyn RawSink| -> Result<()> {
+            let rows = match &mut seen {
+                Some(seen) => rows.into_iter().filter(|r| seen.insert(r.clone())).collect(),
+                None => rows,
+            };
+            if rows.is_empty() { Ok(()) } else { sink.rows(ex, rows) }
+        };
+        for part in &plan.parts {
+            match part {
+                PartPlan::Pipeline { root, returns: true } if !root.is_update() => {
+                    let base = self.chain_input(root)?;
+                    let ex: &Executor = self;
+                    let mut stream = crate::stream::build(ex, root, base)?;
+                    same_columns(&mut columns, stream.scope().names(), sink)?;
+                    while let Some(batch) = stream.next(ex, crate::stream::BATCH)? {
+                        send(ex, batch, sink)?;
+                    }
+                }
+                _ => {
+                    let raw = self.run_part(part)?;
+                    same_columns(&mut columns, &raw.columns, sink)?;
+                    send(self, raw.rows, sink)?;
+                }
+            }
+        }
+        Ok(columns.unwrap_or_default())
     }
 
     fn run_part(&mut self, part: &PartPlan) -> Result<RawResult> {
@@ -147,13 +204,7 @@ impl Executor<'_> {
             _ => {
                 // A read-only chain: materialize the update it starts on (if any), then
                 // stream the rest.
-                let base = match op.chain_base() {
-                    Some(update) => self.run_op(update, None)?,
-                    None => match &self.argument {
-                        Some((scope, row)) => Frame::new(scope.clone(), vec![row.clone()]),
-                        None => Frame::new(Scope::default(), vec![Vec::new()]),
-                    },
-                };
+                let base = self.chain_input(op)?;
                 let ex: &Executor = self;
                 let mut stream = crate::stream::build(ex, op, base)?;
                 let cap = cap.unwrap_or(usize::MAX);
@@ -174,6 +225,18 @@ impl Executor<'_> {
         // Only updates get here: they run eagerly, outside of streams.
         self.record(crate::plan::profile_key(op), frame.rows.len(), started.elapsed());
         Ok(frame)
+    }
+
+    /// The input of the read-only chain ending in `op`: the materialized result of the
+    /// update it starts on, or the argument row (the single empty row at the top).
+    fn chain_input(&mut self, op: &Operator) -> Result<Frame> {
+        Ok(match op.chain_base() {
+            Some(update) => self.run_op(update, None)?,
+            None => match &self.argument {
+                Some((scope, row)) => Frame::new(scope.clone(), vec![row.clone()]),
+                None => Frame::new(Scope::default(), vec![Vec::new()]),
+            },
+        })
     }
 
     /// Runs a `CALL { … }` subquery that changes the graph, once per row of `frame`, in
@@ -972,10 +1035,10 @@ impl Executor<'_> {
         Ok((all, out))
     }
 
-    /// One row per group: projected values (keys and aggregates), then the group's first
-    /// source row (hidden until `Select`).
-    pub(crate) fn exec_aggregate(&self, star: bool, items: &[Item], frame: Frame) -> Result<Frame> {
-        let (all, out_scope) = self.projection_items(star, items, &frame.scope)?;
+    /// The grouping of an aggregating projection over rows of `scope`, and the scope of
+    /// its output rows.
+    pub(crate) fn grouping(&self, star: bool, items: &[Item], scope: &Scope) -> Result<(Grouping, Scope)> {
+        let (all, out_scope) = self.projection_items(star, items, scope)?;
         let mut aggs: Vec<AggSpec> = Vec::new();
         let rewritten: Vec<Expr> = all
             .iter()
@@ -995,7 +1058,7 @@ impl Executor<'_> {
                     _ => &[],
                 };
                 for n in names {
-                    if let Some(i) = frame.scope.get(n)
+                    if let Some(i) = scope.get(n)
                         && !implicit.contains(&i)
                     {
                         implicit.push(i);
@@ -1003,84 +1066,16 @@ impl Executor<'_> {
                 }
             });
         }
-        let Frame { scope, rows, .. } = frame;
-        let mut group_of: HashMap<Vec<Value>, usize> = HashMap::new();
-        let mut groups: Vec<(Vec<Value>, Row, Vec<Accumulator>)> = Vec::new();
-        for row in rows {
-            self.check_interrupt()?;
-            let env = Env::new(&scope, &row);
-            let mut key = key_idx
-                .iter()
-                .map(|i| self.eval(&rewritten[*i], &env))
-                .collect::<Result<Vec<_>>>()?;
-            key.extend(implicit.iter().map(|&i| row[i].clone()));
-            let gi = match group_of.get(&key) {
-                Some(gi) => *gi,
-                None => {
-                    let accs = aggs
-                        .iter()
-                        .map(Accumulator::new)
-                        .collect::<Result<Vec<_>>>()?;
-                    groups.push((key.clone(), row.clone(), accs));
-                    group_of.insert(key, groups.len() - 1);
-                    groups.len() - 1
-                }
-            };
-            for (ai, spec) in aggs.iter().enumerate() {
-                let v = match &spec.arg {
-                    None => Value::Null,
-                    Some(e) => self.eval(e, &env)?,
-                };
-                groups[gi].2[ai].update(v)?;
-            }
-        }
-        if groups.is_empty() && key_idx.is_empty() && implicit.is_empty() {
-            let accs = aggs
-                .iter()
-                .map(Accumulator::new)
-                .collect::<Result<Vec<_>>>()?;
-            groups.push((Vec::new(), vec![Value::Null; scope.len()], accs));
-        }
-        let mut out = Vec::with_capacity(groups.len());
-        for (key, first_row, accs) in groups {
-            let agg_values: Vec<Value> = accs.into_iter().map(Accumulator::finish).collect();
-            let mut vals = Vec::with_capacity(rewritten.len() + first_row.len());
-            let mut keys = key.into_iter();
-            for (i, e) in rewritten.iter().enumerate() {
-                if key_idx.contains(&i) {
-                    vals.push(keys.next().unwrap_or_default());
-                } else {
-                    let mut env = Env::new(&scope, &first_row);
-                    env.aggs = Some(&agg_values);
-                    vals.push(self.eval(e, &env)?);
-                }
-            }
-            vals.extend(first_row);
-            out.push(vals);
-        }
-        Ok(Frame {
-            scope: out_scope,
-            rows: out,
-            hidden: Some(scope),
-        })
-    }
-
-    /// Sorts projected rows. A key equal to a projection item reuses its value; other keys
-    /// see the source row, with the projected aliases shadowing its variables.
-    pub(crate) fn exec_sort(&self, keys: &[SortItem], items: &[Item], frame: Frame) -> Result<Frame> {
-        let Frame { scope, rows, hidden } = frame;
-        let src = hidden.unwrap_or_default();
-        let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
-        for row in rows {
-            self.check_interrupt()?;
-            keyed.push((self.sort_keys(keys, items, &scope, &src, &row)?, row));
-        }
-        keyed.sort_by(|(a, _), (b, _)| compare_sort_keys(keys, a, b));
-        Ok(Frame {
-            scope,
-            rows: keyed.into_iter().map(|(_, r)| r).collect(),
-            hidden: Some(src),
-        })
+        let grouping = Grouping {
+            scope: scope.clone(),
+            rewritten,
+            aggs,
+            key_idx,
+            implicit,
+            group_of: HashMap::new(),
+            groups: Vec::new(),
+        };
+        Ok((grouping, out_scope))
     }
 
     /// The `ORDER BY` key values of one projected row (`scope` columns, then the source
@@ -1161,4 +1156,95 @@ pub(crate) fn compare_sort_keys(keys: &[SortItem], a: &[Value], b: &[Value]) -> 
         }
     }
     std::cmp::Ordering::Equal
+}
+
+/// Aggregation as it goes: rows are added one at a time and only the groups are kept
+/// (their keys, accumulators and first source row), not the rows.
+pub(crate) struct Grouping {
+    /// The scope of the input rows.
+    scope: Scope,
+    /// The projection items, aggregate calls replaced by `Expr::AggregateRef`.
+    rewritten: Vec<Expr>,
+    aggs: Vec<AggSpec>,
+    /// The items without aggregates: the grouping keys.
+    key_idx: Vec<usize>,
+    /// Input columns used outside the aggregates of an aggregating item (they group too).
+    implicit: Vec<usize>,
+    group_of: HashMap<Vec<Value>, usize>,
+    /// Per group, in order of appearance: its first source row and its accumulators.
+    groups: Vec<(Row, Vec<Accumulator>)>,
+}
+
+impl Grouping {
+    pub(crate) fn add(&mut self, ex: &Executor, row: Row) -> Result<()> {
+        let env = Env::new(&self.scope, &row);
+        let mut key = self
+            .key_idx
+            .iter()
+            .map(|i| ex.eval(&self.rewritten[*i], &env))
+            .collect::<Result<Vec<_>>>()?;
+        key.extend(self.implicit.iter().map(|&i| row[i].clone()));
+        let (gi, new) = match self.group_of.get(&key) {
+            Some(gi) => (*gi, false),
+            None => {
+                let accs = self.aggs.iter().map(Accumulator::new).collect::<Result<Vec<_>>>()?;
+                self.groups.push((Vec::new(), accs));
+                self.group_of.insert(key, self.groups.len() - 1);
+                (self.groups.len() - 1, true)
+            }
+        };
+        for (ai, spec) in self.aggs.iter().enumerate() {
+            let v = match &spec.arg {
+                None => Value::Null,
+                Some(e) => ex.eval(e, &env)?,
+            };
+            self.groups[gi].1[ai].update(v)?;
+        }
+        drop(env);
+        if new {
+            self.groups[gi].0 = row;
+        }
+        Ok(())
+    }
+
+    /// One row per group: projected values (keys and aggregates), then the group's first
+    /// source row (hidden until `Select`).
+    pub(crate) fn finish(self, ex: &Executor) -> Result<Vec<Row>> {
+        let Grouping {
+            scope,
+            rewritten,
+            aggs,
+            key_idx,
+            implicit,
+            group_of,
+            mut groups,
+        } = self;
+        let mut keys: Vec<Vec<Value>> = vec![Vec::new(); groups.len()];
+        for (key, gi) in group_of {
+            keys[gi] = key;
+        }
+        if groups.is_empty() && key_idx.is_empty() && implicit.is_empty() {
+            let accs = aggs.iter().map(Accumulator::new).collect::<Result<Vec<_>>>()?;
+            groups.push((vec![Value::Null; scope.len()], accs));
+            keys.push(Vec::new());
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for ((first_row, accs), key) in groups.into_iter().zip(keys) {
+            let agg_values: Vec<Value> = accs.into_iter().map(Accumulator::finish).collect();
+            let mut vals = Vec::with_capacity(rewritten.len() + first_row.len());
+            let mut keys = key.into_iter();
+            for (i, e) in rewritten.iter().enumerate() {
+                if key_idx.contains(&i) {
+                    vals.push(keys.next().unwrap_or_default());
+                } else {
+                    let mut env = Env::new(&scope, &first_row);
+                    env.aggs = Some(&agg_values);
+                    vals.push(ex.eval(e, &env)?);
+                }
+            }
+            vals.extend(first_row);
+            out.push(vals);
+        }
+        Ok(out)
+    }
 }

@@ -1,16 +1,17 @@
 //! The JSON API: routes and request decoding.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use graphbuff::{CancelHandle, DatabaseManager, Error, QueryOptions, QueryResult, Value};
+use graphbuff::{CancelHandle, DatabaseManager, Error, QueryOptions, QueryResult, ResultValue, RowSink, Value};
 
 use graphbuff::cypher::ast::{DatabaseCommand, DbName, Query, QueryMode, Statement};
 
 use crate::crypto;
-use crate::http::{Request, Response};
+use crate::http::{self, Out, Request, Response};
 use crate::log::Log;
 use crate::throttle::{self, Throttle};
 use crate::json::{self, Json, encode_result, to_value, write_str};
@@ -265,7 +266,7 @@ pub(crate) fn check(access: Access, needed: Access, what: &str) -> Result<(), Er
     Err(Error::Forbidden(format!("{what} needs the {role} role (or a stronger one)")))
 }
 
-pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
+pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str, out: &mut Out<'_>) -> Response {
     let segments: Vec<String> = req
         .path
         .split('/')
@@ -318,11 +319,11 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
             _ => not_allowed("GET"),
         },
         ["query"] => match method {
-            "POST" => run_query(ctx, None, req),
+            "POST" => run_query(ctx, None, req, out),
             _ => not_allowed("POST"),
         },
         ["db", name, "query"] => match method {
-            "POST" => run_query(ctx, Some(name), req),
+            "POST" => run_query(ctx, Some(name), req, out),
             _ => not_allowed("POST"),
         },
         ["tx"] => match method {
@@ -504,7 +505,9 @@ fn json_body(req: &Request) -> Result<&str, Response> {
     std::str::from_utf8(&req.body).map_err(|_| error(400, "BadRequest", "the request body is not UTF-8"))
 }
 
-fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
+/// `POST /query`. Rows are written as the query produces them: a result that grows past
+/// [`SPILL`] bytes goes out as a chunked `200` (see [`Rows`]).
+fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request, out: &mut Out<'_>) -> Response {
     let text = match json_body(req) {
         Ok(t) => t,
         Err(r) => return r,
@@ -559,12 +562,93 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
     };
     let stop = crate::running::Stop::Cancel(options.cancel.clone().expect("query_options sets one"));
     let listed = ctx.running.begin(info, stop, Some(&query));
-    let result = session.execute_with_options(&query, &params, &options);
+    let mut rows = Rows { out, json: String::new(), rows: 0, chunked: false, failed: None };
+    let result = session.execute_streaming(&query, &params, &options, &mut rows);
     drop(listed);
-    ctx.finished("http", session.current_database(), me.who, &query, started.elapsed(), result.as_ref().err());
-    match result {
-        Ok(r) => Response::json(200, encode_result(&r)),
-        Err(e) => query_error(&e),
+    let failure = match (&result, &rows.failed) {
+        (Err(e), None) => Some(e),
+        _ => None,
+    };
+    ctx.finished("http", session.current_database(), me.who, &query, started.elapsed(), failure);
+    rows.finish(result)
+}
+
+/// Bytes of a result kept before it is sent as a chunked response.
+const SPILL: usize = 64 * 1024;
+
+/// Writes a result as its rows come. The JSON is built in memory up to [`SPILL`] bytes:
+/// a result that ends before then (or a query that fails) is answered as usual. Past it,
+/// the response starts (`200`, chunked) and the JSON goes out in chunks; a failure after
+/// that ends the object with `"error"` after the rows sent.
+struct Rows<'a, 'w> {
+    out: &'a mut Out<'w>,
+    json: String,
+    rows: usize,
+    /// The response has started.
+    chunked: bool,
+    /// Writing failed (the client left): the query stops.
+    failed: Option<io::Error>,
+}
+
+impl Rows<'_, '_> {
+    fn send(&mut self) -> io::Result<()> {
+        if !self.chunked {
+            self.chunked = true;
+            http::write_chunked_head(self.out.w, "application/json; charset=utf-8", self.out.keep_alive)?;
+        }
+        let r = http::write_chunk(self.out.w, self.json.as_bytes());
+        self.json.clear();
+        r
+    }
+
+    /// The response for `result`, or (when it was written) a placeholder.
+    fn finish(mut self, result: graphbuff::Result<QueryResult>) -> Response {
+        if let Some(e) = self.failed.take() {
+            self.out.written = Some(Err(e));
+            return error(500, "Internal", "the response could not be written");
+        }
+        let result = match (result, self.chunked) {
+            (Ok(r), false) => {
+                json::write_result_tail(&mut self.json, &r.stats, r.plan.as_ref());
+                return Response::json(200, self.json);
+            }
+            (Err(e), false) => return query_error(&e),
+            (r, true) => r,
+        };
+        match result {
+            Ok(r) => json::write_result_tail(&mut self.json, &r.stats, r.plan.as_ref()),
+            Err(e) => {
+                // `{"error": {...}}` without its braces, after the rows.
+                let body = json::encode_error(&e);
+                self.json.push_str("],");
+                self.json.push_str(&body[1..]);
+            }
+        }
+        let written = self.send().and_then(|()| http::end_chunks(self.out.w));
+        self.out.written = Some(written);
+        Response::json(200, String::new())
+    }
+}
+
+impl RowSink for Rows<'_, '_> {
+    fn columns(&mut self, columns: &[String]) -> graphbuff::Result<()> {
+        json::write_result_head(&mut self.json, columns);
+        Ok(())
+    }
+
+    fn row(&mut self, row: Vec<ResultValue>) -> graphbuff::Result<()> {
+        if self.rows > 0 {
+            self.json.push(',');
+        }
+        self.rows += 1;
+        json::write_row(&mut self.json, &row);
+        if self.json.len() >= SPILL
+            && let Err(e) = self.send()
+        {
+            self.failed = Some(e);
+            return Err(Error::Cancelled("the client left".into()));
+        }
+        Ok(())
     }
 }
 

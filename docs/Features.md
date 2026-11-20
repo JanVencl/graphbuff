@@ -92,8 +92,9 @@ transaction shows `Idle`.
   quarter of the machine's memory (or of the container's memory limit, on Linux), at least
   256 MiB; `0` turns the limit off. The start-up log names the limit in use.
 - The memory counted is what the query's thread took since the query started: its rows,
-  sort and aggregation buffers, collected lists, the result, and the changes of a writing
-  query. Caches shared by all queries (the persistent store's page cache, the graph kernel
+  sort buffers and aggregation groups, collected lists, the result, and the changes of a
+  writing query. The result of an auto-commit read-only query streams to the client
+  (Bolt `PULL`, chunked HTTP), so only the rows not yet sent count. Caches shared by all queries (the persistent store's page cache, the graph kernel
   and vector index caches) are not counted, even when the query fills them.
 - A query over its limit is rolled back and answers `413 MemoryLimit`. Inside an explicit
   transaction, the whole transaction rolls back (the limit applies to each statement). With

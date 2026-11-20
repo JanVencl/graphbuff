@@ -11,8 +11,11 @@
 //! [`CancelHandle`]); messages queued before the `RESET` are then answered `IGNORED`. The
 //! connection's own thread runs the messages in order and writes the answers.
 //!
-//! Results are computed by `RUN` and kept until `PULL` or `DISCARD` take them, `n` rows at
-//! a time. An explicit transaction (`BEGIN` … `COMMIT`) is owned by the connection's
+//! An auto-commit `RUN` of a read-only query streams: the query runs while `PULL`s take
+//! its rows, `n` at a time, and waits for the next `PULL` when `n` are sent, so a result
+//! is never held in memory. Other results (in an explicit transaction, or of a query
+//! that writes) are computed by `RUN` and kept until `PULL` or `DISCARD` take them. An
+//! explicit transaction (`BEGIN` … `COMMIT`) is owned by the connection's
 //! thread, which holds the database's write lock until it ends; it is rolled back when
 //! no message arrives for [`crate::ServerConfig::transaction_timeout`], or when the
 //! connection closes.
@@ -35,7 +38,7 @@ use crate::running::{Guard, Info, Stop};
 use graphbuff::temporal::{self, NANOS_PER_DAY, NANOS_PER_SECOND};
 use graphbuff::{
     BoxedStore, CancelHandle, Crs, Error, NodeData, PathData, PlanDescription, Point, QueryOptions, QueryResult,
-    QueryStats, RelData, ResultValue, Temporal, Transaction, Value,
+    QueryStats, RelData, ResultValue, RowSink, Temporal, Transaction, Value,
 };
 
 use crate::packstream::{self, PackValue};
@@ -269,6 +272,7 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
             pending_failure: None,
             connection: "bolt".into(),
             tx_stop: None,
+            stashed: None,
         };
         let _ = conn.run();
         let _ = conn.out.flush();
@@ -277,6 +281,34 @@ pub(crate) fn serve(mut stream: Stream, shared: &Shared) {
         drop(conn);
         stream.close_gracefully(LINGER, &|| !shared.stop());
     });
+}
+
+/// Runs `f` so that a `RESET` (or the client leaving, or shutdown, through `base`) can
+/// cancel it. `None`: a `RESET` came first, or cancelled it; the message is then ignored.
+fn interruptible<T>(
+    control: &Control,
+    base: &CancelHandle,
+    max_memory: Option<u64>,
+    timeout: Option<Duration>,
+    f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
+) -> Option<graphbuff::Result<T>> {
+    let cancel = base.child();
+    *control.running() = Some(cancel.clone());
+    // Checked after publishing the handle: a RESET read from now on cancels it.
+    let result = if control.reset_pending() {
+        None
+    } else {
+        Some(f(&QueryOptions {
+            timeout,
+            cancel: Some(cancel),
+            max_memory,
+        }))
+    };
+    *control.running() = None;
+    match result {
+        Some(Err(Error::Cancelled(_))) if control.reset_pending() => None,
+        r => r,
+    }
 }
 
 // ---- reading ------------------------------------------------------------------------------
@@ -510,6 +542,8 @@ struct Conn<'s> {
     connection: String,
     /// While an explicit transaction is open: cancelled by `TERMINATE TRANSACTIONS`.
     tx_stop: Option<CancelHandle>,
+    /// A message read while streaming that ended the stream, handled next.
+    stashed: Option<(u8, Fields)>,
 }
 
 type Fields = Vec<PackValue>;
@@ -565,6 +599,9 @@ impl Conn<'_> {
 
     /// The next message, flushing the answers written so far before waiting.
     fn next(&mut self, deadline: Option<Instant>) -> io::Result<Event> {
+        if let Some((tag, fields)) = self.stashed.take() {
+            return Ok(Event::Message(tag, fields));
+        }
         let terminated = |c: &Self| c.tx_stop.as_ref().is_some_and(CancelHandle::is_cancelled);
         if terminated(self) {
             return Ok(Event::Terminated);
@@ -624,23 +661,8 @@ impl Conn<'_> {
         timeout: Option<Duration>,
         f: impl FnOnce(&QueryOptions) -> graphbuff::Result<T>,
     ) -> Option<graphbuff::Result<T>> {
-        let cancel = self.tx_stop.as_ref().unwrap_or(&self.shared.ctx.abort).child();
-        *self.control.running() = Some(cancel.clone());
-        // Checked after publishing the handle: a RESET read from now on cancels it.
-        let result = if self.control.reset_pending() {
-            None
-        } else {
-            Some(f(&QueryOptions {
-                timeout,
-                cancel: Some(cancel),
-                max_memory: self.shared.ctx.query_max_memory,
-            }))
-        };
-        *self.control.running() = None;
-        match result {
-            Some(Err(Error::Cancelled(_))) if self.control.reset_pending() => None,
-            r => r,
-        }
+        let base = self.tx_stop.as_ref().unwrap_or(&self.shared.ctx.abort);
+        interruptible(self.control, base, self.shared.ctx.query_max_memory, timeout, f)
     }
 
     // ---- the message loop ----
@@ -894,7 +916,9 @@ impl Conn<'_> {
         Ok((query, params, extra))
     }
 
-    /// A `RUN` outside a transaction: the query is its own transaction.
+    /// A `RUN` outside a transaction: the query is its own transaction. A read-only query
+    /// streams its rows to the `PULL`s that follow (see [`Streamer`]); any other result
+    /// is returned, to be pulled.
     fn run_autocommit(&mut self, fields: Fields) -> io::Result<Option<Pending>> {
         let started = Instant::now();
         let prepared = Self::run_fields(fields).and_then(|(query, params, extra)| {
@@ -916,16 +940,31 @@ impl Conn<'_> {
                 return Ok(None);
             }
         };
-        let ctx = &self.shared.ctx;
+        let shared = self.shared;
+        let ctx = &shared.ctx;
         let system = self.is_system(&db);
         let (connection, peer) = (self.connection.clone(), self.peer.clone());
-        let result = self.interruptible(timeout, |options| {
+        let base = self.tx_stop.clone().unwrap_or_else(|| ctx.abort.clone());
+        let control = self.control;
+        // The home database it ran on, for the driver's cache (5.8+).
+        let resolved = (home && self.at_least(5, 8)).then(|| db.clone());
+        let mut streamer = Streamer {
+            conn: self,
+            started,
+            resolved,
+            deadline: timeout.map(|t| started + t),
+            columns: Vec::new(),
+            opened: false,
+            request: None,
+            ended: None,
+        };
+        let result = interruptible(control, &base, ctx.query_max_memory, timeout, |options| {
             let statement = graphbuff::cypher::parse_statement(&query)?;
             if let Statement::User(cmd) = &statement {
-                return ctx.user_command(&who, access, cmd, &params);
+                return ctx.user_command(&who, access, cmd, &params)?.feed(&mut streamer);
             }
             if let Statement::Transaction(cmd) = &statement {
-                return ctx.transaction_command(&who, access, cmd, &params);
+                return ctx.transaction_command(&who, access, cmd, &params)?.feed(&mut streamer);
             }
             let info = Info { database: db.clone(), who: who.clone(), protocol: "bolt", connection, client: peer };
             let stop = Stop::Cancel(options.cancel.clone().expect("interruptible sets one"));
@@ -937,32 +976,84 @@ impl Conn<'_> {
             } else {
                 session.use_database(&db)?;
             }
-            session.execute_with_options(&query, &params, options)
+            session.execute_streaming(&query, &params, options, &mut streamer)
         });
-        if let Some(r) = &result {
-            ctx.finished("bolt", &db, &who, &query, started.elapsed(), r.as_ref().err());
+        let Streamer {
+            opened,
+            ended,
+            resolved,
+            ..
+        } = streamer;
+        let failure = match (&result, &ended) {
+            // Stopped by the stream itself: not the query's failure.
+            (_, Some(_)) => None,
+            (Some(Err(e)), None) => Some(e),
+            _ => None,
+        };
+        if result.is_some() {
+            ctx.finished("bolt", &db, &who, &query, started.elapsed(), failure);
         }
-        match result {
-            None => {
-                self.ignored()?;
-                Ok(None)
-            }
-            Some(Err(e)) => {
-                self.fail(Failure::from_error(&e))?;
-                Ok(None)
-            }
-            Some(Ok(r)) => {
-                let resolved = (home && self.at_least(5, 8)).then(|| db.clone());
-                let (pending, columns) = Pending::new(r, db, started);
-                let mut meta = run_success(columns, started, None);
-                if let Some(db) = resolved {
-                    // The home database it ran on, for the driver's cache (5.8+).
-                    meta.insert("db".into(), PackValue::String(db));
+        if !opened {
+            // No row came: answer the RUN, as for a result computed by it.
+            return match (result, ended) {
+                (_, Some(Ended::Io(e))) => Err(e),
+                (None, _) => {
+                    self.ignored()?;
+                    Ok(None)
                 }
-                self.success(meta)?;
-                Ok(Some(pending))
-            }
+                (Some(Err(e)), _) => {
+                    self.fail(Failure::from_error(&e))?;
+                    Ok(None)
+                }
+                (Some(Ok(r)), _) => {
+                    let (pending, columns) = Pending::new(r, db, started);
+                    let mut meta = run_success(columns, started, None);
+                    if let Some(db) = resolved {
+                        meta.insert("db".into(), PackValue::String(db));
+                    }
+                    self.success(meta)?;
+                    Ok(Some(pending))
+                }
+            };
         }
+        let discarded = match ended {
+            Some(Ended::Io(e)) => return Err(e),
+            // Answered already, or the client is gone.
+            Some(Ended::Answered | Ended::Close) => return Ok(None),
+            Some(Ended::Stashed) => {
+                // Only a RESET, GOODBYE or LOGOFF ends a result early (and after a RESET,
+                // the messages before it are ignored).
+                if let Some((tag, _)) = &self.stashed
+                    && !matches!(*tag, RESET | GOODBYE | LOGOFF)
+                    && !control.reset_pending()
+                {
+                    self.stashed = None;
+                    self.fail(Failure::invalid("a result is still open: PULL or DISCARD it first"))?;
+                }
+                return Ok(None);
+            }
+            Some(Ended::Discarded) => true,
+            None => false,
+        };
+        // Answer the PULL or DISCARD that took the last rows.
+        let (stats, plan) = match result {
+            None => return self.ignored().map(|()| None),
+            Some(Ok(r)) => (r.stats, r.plan),
+            Some(Err(_)) if discarded => (QueryStats::default(), None),
+            Some(Err(e)) => return self.fail(Failure::from_error(&e)).map(|()| None),
+        };
+        let p = Pending {
+            rows: Vec::new().into_iter(),
+            has_columns: true,
+            has_rows: true,
+            stats,
+            plan,
+            db,
+            started,
+        };
+        let meta = self.summary(&p, true);
+        self.success(meta)?;
+        Ok(None)
     }
 
     /// `PULL` (or `DISCARD`, without sending the rows) `n` rows of `p`. Returns whether
@@ -974,17 +1065,10 @@ impl Conn<'_> {
         fields: &[PackValue],
         autocommit: bool,
     ) -> io::Result<bool> {
-        let n = match fields.first() {
-            Some(PackValue::Map(m)) => match m.get("n") {
-                Some(PackValue::Int(-1)) => usize::MAX,
-                Some(PackValue::Int(n)) if *n > 0 => *n as usize,
-                _ => {
-                    self.fail(Failure::invalid("`n` must be a positive number of rows, or -1 for all"))?;
-                    return Ok(false);
-                }
-            },
-            _ => {
-                self.fail(Failure::invalid("PULL and DISCARD take a map"))?;
+        let n = match pull_size(fields) {
+            Ok(n) => n,
+            Err(f) => {
+                self.fail(f)?;
                 return Ok(false);
             }
         };
@@ -1002,6 +1086,14 @@ impl Conn<'_> {
             self.success(BTreeMap::from([("has_more".into(), PackValue::Bool(true))]))?;
             return Ok(false);
         }
+        let meta = self.summary(p, autocommit);
+        self.success(meta)?;
+        Ok(true)
+    }
+
+    /// The `SUCCESS` that ends a result: its type, timing, database, statistics, plan and
+    /// (5.6+) GQL status; a bookmark when it ends an auto-commit transaction.
+    fn summary(&self, p: &Pending, autocommit: bool) -> BTreeMap<String, PackValue> {
         let mut meta = BTreeMap::new();
         if autocommit {
             meta.insert("bookmark".into(), PackValue::String(new_bookmark()));
@@ -1049,8 +1141,7 @@ impl Conn<'_> {
                 ])]),
             );
         }
-        self.success(meta)?;
-        Ok(true)
+        meta
     }
 
     // ---- explicit transactions ----
@@ -1358,6 +1449,170 @@ impl Conn<'_> {
 }
 
 /// A statement in a Bolt transaction.
+/// The rows `PULL` or `DISCARD` ask for: `n`, or -1 for all.
+fn pull_size(fields: &[PackValue]) -> Result<usize, Failure> {
+    match fields.first() {
+        Some(PackValue::Map(m)) => match m.get("n") {
+            Some(PackValue::Int(-1)) => Ok(usize::MAX),
+            Some(PackValue::Int(n)) if *n > 0 => Ok(*n as usize),
+            _ => Err(Failure::invalid("`n` must be a positive number of rows, or -1 for all")),
+        },
+        _ => Err(Failure::invalid("PULL and DISCARD take a map")),
+    }
+}
+
+/// A `PULL` or `DISCARD` being answered.
+struct Request {
+    /// Rows it still takes.
+    left: usize,
+    /// `PULL` (send them) or `DISCARD`.
+    send: bool,
+}
+
+/// Why a stream ended before its query did.
+enum Ended {
+    /// `DISCARD` of all the rows that are left: the query stops, the summary answers it.
+    Discarded,
+    /// The request was answered with a failure, or the next message will be (the query
+    /// was terminated or timed out while waiting for it): the query stops.
+    Answered,
+    /// Another message came (kept in [`Conn::stashed`]): the query stops.
+    Stashed,
+    /// The client left or the server is stopping.
+    Close,
+    Io(io::Error),
+}
+
+/// Streams an auto-commit query's rows to the client: `RUN`'s `SUCCESS` (with the columns)
+/// goes out with the first row, so that a query failing before it fails the `RUN` as
+/// before; then every row waits for a `PULL` (or `DISCARD`) with rows left to take, so
+/// rows go out only as the client asks for them.
+struct Streamer<'c, 's> {
+    conn: &'c mut Conn<'s>,
+    started: Instant,
+    /// The home database the query ran on (5.8+), sent with the `RUN`'s `SUCCESS`.
+    resolved: Option<String>,
+    /// When the query's time is up.
+    deadline: Option<Instant>,
+    columns: Vec<String>,
+    /// The `RUN` was answered.
+    opened: bool,
+    /// The request being answered, once the `RUN` is.
+    request: Option<Request>,
+    ended: Option<Ended>,
+}
+
+impl Streamer<'_, '_> {
+    /// Stops the query: the reason is in `ended`.
+    fn stop(&mut self, why: Ended) -> graphbuff::Result<()> {
+        self.ended = Some(why);
+        Err(Error::Cancelled("the result was closed".into()))
+    }
+
+    fn io(&mut self, r: io::Result<()>) -> graphbuff::Result<()> {
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) => self.stop(Ended::Io(e)),
+        }
+    }
+
+    /// Waits for the next `PULL` or `DISCARD`. `ROUTE` and `TELEMETRY` are answered on
+    /// the way; anything else ends the stream. A query terminated or out of time while it
+    /// waits stops (giving up its snapshot); the next message gets the failure.
+    fn await_request(&mut self) -> graphbuff::Result<()> {
+        loop {
+            let poll = Instant::now() + POLL;
+            let event = match self.conn.next(Some(self.deadline.map_or(poll, |d| d.min(poll)))) {
+                Ok(e) => e,
+                Err(e) => return self.stop(Ended::Io(e)),
+            };
+            let (tag, fields) = match event {
+                Event::Message(tag, fields) => (tag, fields),
+                Event::Idle => {
+                    let cancelled = self.conn.control.running().as_ref().is_some_and(CancelHandle::is_cancelled);
+                    let error = if cancelled {
+                        Error::Cancelled("the query was cancelled".into())
+                    } else if let Some(d) = self.deadline.filter(|d| Instant::now() >= *d) {
+                        let limit = d.duration_since(self.started).as_millis();
+                        Error::Timeout(format!("the query ran longer than its time limit of {limit} ms"))
+                    } else {
+                        continue;
+                    };
+                    self.conn.pending_failure = Some(Failure::from_error(&error));
+                    return self.stop(Ended::Answered);
+                }
+                Event::Close | Event::Terminated => return self.stop(Ended::Close),
+            };
+            match tag {
+                PULL | DISCARD if !self.conn.control.reset_pending() => {
+                    let left = match pull_size(&fields) {
+                        Ok(n) => n,
+                        Err(f) => {
+                            let r = self.conn.fail(f);
+                            self.io(r)?;
+                            return self.stop(Ended::Answered);
+                        }
+                    };
+                    self.request = Some(Request { left, send: tag == PULL });
+                    if tag == DISCARD && left == usize::MAX {
+                        return self.stop(Ended::Discarded);
+                    }
+                    return Ok(());
+                }
+                ROUTE if !self.conn.control.reset_pending() => {
+                    let r = self.conn.route(fields);
+                    self.io(r)?;
+                }
+                TELEMETRY if self.conn.at_least(5, 4) && !self.conn.control.reset_pending() => {
+                    let r = self.conn.success(BTreeMap::new());
+                    self.io(r)?;
+                }
+                _ => {
+                    self.conn.stashed = Some((tag, fields));
+                    return self.stop(Ended::Stashed);
+                }
+            }
+        }
+    }
+}
+
+impl RowSink for Streamer<'_, '_> {
+    fn columns(&mut self, columns: &[String]) -> graphbuff::Result<()> {
+        self.columns = columns.to_vec();
+        Ok(())
+    }
+
+    fn row(&mut self, row: Vec<ResultValue>) -> graphbuff::Result<()> {
+        if !self.opened {
+            self.opened = true;
+            let mut meta = run_success(std::mem::take(&mut self.columns), self.started, None);
+            if let Some(db) = self.resolved.take() {
+                meta.insert("db".into(), PackValue::String(db));
+            }
+            let r = self.conn.success(meta);
+            self.io(r)?;
+            self.await_request()?;
+        } else if self.request.as_ref().is_some_and(|r| r.left == 0) {
+            let more = BTreeMap::from([("has_more".into(), PackValue::Bool(true))]);
+            let r = self.conn.success(more);
+            self.io(r)?;
+            self.await_request()?;
+        }
+        let request = self.request.as_mut().expect("opening waited for a request");
+        request.left -= 1;
+        if request.send {
+            let enc = Encoder {
+                element_ids: self.conn.version.0 >= 5,
+                utc: self.conn.utc,
+            };
+            let values = row.iter().map(|v| enc.result(v)).collect();
+            let r = self.conn.send(RECORD, vec![PackValue::List(values)]);
+            self.io(r)?;
+        }
+        Ok(())
+    }
+}
+
 enum TxStatement {
     Query(Query),
     /// A database command, on the `system` database.
