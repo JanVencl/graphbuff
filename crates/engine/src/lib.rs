@@ -590,6 +590,12 @@ impl<S: GraphStore> Database<S> {
         f(&self.store.read().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// The vector and full-text indexes whose contents are cached in memory (built by a
+    /// query on the last committed state, and kept up to date since).
+    pub fn cached_indexes(&self) -> usize {
+        self.vector_cache.len() + self.text_cache.len()
+    }
+
     pub fn node_count(&self) -> usize {
         self.view(|s| s.node_count())
     }

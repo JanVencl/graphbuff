@@ -40,14 +40,21 @@ pub struct Response {
     pub status: u16,
     pub body: String,
     pub headers: Vec<(&'static str, String)>,
+    pub content_type: &'static str,
 }
 
 impl Response {
     pub fn json(status: u16, body: String) -> Response {
+        Response::text(status, body, "application/json; charset=utf-8")
+    }
+
+    /// A response with a body of another type than JSON.
+    pub fn text(status: u16, body: String, content_type: &'static str) -> Response {
         Response {
             status,
             body,
             headers: Vec::new(),
+            content_type,
         }
     }
 
@@ -286,9 +293,10 @@ fn reason(status: u16) -> &'static str {
 
 pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::Result<()> {
     let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: {}\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         resp.status,
         reason(resp.status),
+        resp.content_type,
         resp.body.len(),
         if keep_alive { "keep-alive" } else { "close" }
     );

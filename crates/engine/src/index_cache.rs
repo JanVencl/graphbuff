@@ -147,6 +147,11 @@ impl<T: Cached> IndexCache<T> {
         Ok(e)
     }
 
+    /// The number of indexes whose contents are kept.
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).entries.len()
+    }
+
     /// The entry of index `name`, if one is kept: for tests.
     #[cfg(test)]
     pub fn entry(&self, name: &str) -> Option<Arc<T>> {

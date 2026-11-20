@@ -38,6 +38,8 @@ pub(crate) struct Ctx {
     pub throttle: Throttle,
     /// The open transactions, for `SHOW TRANSACTIONS`.
     pub running: Arc<crate::running::Running>,
+    /// Counters for `GET /metrics`.
+    pub metrics: crate::metrics::Metrics,
 }
 
 /// Why a login was refused.
@@ -56,7 +58,8 @@ impl LoginError {
 }
 
 impl Ctx {
-    /// Logs a finished query: a slow one to the query log, a storage failure as an error.
+    /// Counts a finished query and logs it: a slow one to the query log, a storage failure
+    /// as an error.
     pub(crate) fn finished(
         &self,
         protocol: &str,
@@ -66,6 +69,7 @@ impl Ctx {
         elapsed: Duration,
         error: Option<&Error>,
     ) {
+        self.metrics.query(protocol, elapsed, error);
         let Some(log) = &self.log else { return };
         let user = match who {
             Principal::Open => "-",
@@ -80,6 +84,7 @@ impl Ctx {
 
     /// Logs a failed login from `peer`.
     pub(crate) fn login_failed(&self, protocol: &str, peer: &str, user: &str) {
+        self.metrics.failed_login(protocol);
         if let Some(log) = &self.log {
             let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
             log.warn(format_args!("failed login ({protocol}) from {peer}{user}"));
@@ -109,15 +114,15 @@ impl Ctx {
             return Ok(who);
         }
         self.login_failed(protocol, peer, user);
-        if counts
-            && let Some(lockout) = self.throttle.failed(addr, user, Instant::now())
-            && let Some(log) = &self.log
-        {
-            let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
-            log.warn(format_args!(
-                "too many failed logins ({protocol}) from {peer}{user}: locked out for {} s",
-                throttle::seconds(lockout)
-            ));
+        if counts && let Some(lockout) = self.throttle.failed(addr, user, Instant::now()) {
+            self.metrics.lockout();
+            if let Some(log) = &self.log {
+                let user = if user.is_empty() { String::new() } else { format!(" as `{user}`") };
+                log.warn(format_args!(
+                    "too many failed logins ({protocol}) from {peer}{user}: locked out for {} s",
+                    throttle::seconds(lockout)
+                ));
+            }
         }
         Err(LoginError::Wrong)
     }
@@ -258,6 +263,10 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str) -> Response {
     match segments.as_slice() {
         ["health"] => match method {
             "GET" => Response::json(200, r#"{"status":"ok"}"#.into()),
+            _ => not_allowed("GET"),
+        },
+        ["metrics"] => match method {
+            "GET" => metrics(ctx),
             _ => not_allowed("GET"),
         },
         ["db"] => match method {
@@ -410,6 +419,14 @@ fn query_error(e: &Error) -> Response {
 
 // ---- endpoints ----------------------------------------------------------------------------
 
+/// `GET /metrics`: the Prometheus text format, for administrators (and the token).
+fn metrics(&(ctx, me): &Req) -> Response {
+    if let Err(e) = check(me.access, Access::Admin, "reading metrics") {
+        return query_error(&e);
+    }
+    Response::text(200, crate::metrics::render(ctx), "text/plain; version=0.0.4; charset=utf-8")
+}
+
 fn list_databases(&(ctx, me): &Req) -> Response {
     if let Err(e) = check(me.access, Access::Read, "listing databases") {
         return query_error(&e);
@@ -455,7 +472,11 @@ fn run_query(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
 
     let statement = match graphbuff::cypher::parse_statement(&query) {
         Ok(s) => s,
-        Err(e) => return query_error(&e),
+        Err(e) => {
+            // Counted like a query that failed (Bolt parses as it runs).
+            ctx.metrics.query("http", Duration::ZERO, Some(&e));
+            return query_error(&e);
+        }
     };
     if let Statement::User(cmd) = &statement {
         return match ctx.user_command(me.who, me.access, cmd, &params) {

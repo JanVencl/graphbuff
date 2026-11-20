@@ -40,6 +40,7 @@ curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: applica
 | Request | Answer |
 |---------|--------|
 | `GET /health` | `{"status":"ok"}` (never needs the token) |
+| `GET /metrics` | server and database metrics in the Prometheus text format; admins and the token only ([details](./docs/Features.md#metrics)) |
 | `GET /db` | `{"databases":[{"name","storage","default","nodes","relationships"}]}` |
 | `POST /db/{name}/query` | runs `{"query": "...", "params": {...}, "timeoutMs": 5000}` against database `name` (`params` and `timeoutMs` optional) |
 | `POST /query` | the same, against the default database |

@@ -16,6 +16,7 @@ with the movies demo graph.
 | Request | Answer |
 |---------|--------|
 | `GET /health` | `{"status":"ok"}` (never needs the token) |
+| `GET /metrics` | server and database metrics in the Prometheus text format; admins and the token only ([details](Features.md#metrics)) |
 | `GET /db` | `{"databases":[{"name","storage","default","nodes","relationships"}]}` |
 | `POST /db/{name}/query` | runs `{"query": "...", "params": {...}, "timeoutMs": 5000}` against database `name` (`params` and `timeoutMs` optional) |
 | `POST /query` | the same, against the default database |
