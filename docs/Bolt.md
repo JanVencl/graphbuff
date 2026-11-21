@@ -48,8 +48,8 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   `SHOW DATABASES`, `CREATE USER`, `GRANT ROLE`, …), in auto-commit or in a transaction
   (where each command takes effect when it runs, and a rollback does not undo it). Other
   databases also run them in auto-commit.
-* **Tested with the official drivers:** Python 5.28 and 6.4, Java 5.28 and 6.0 (all
-  negotiate Bolt 5.8), by the smoke suites in
+* **Tested with the official drivers:** Python 5.28 and 6.4, Java 5.28 and 6.0,
+  JavaScript 5.28 and 6.3 (all negotiate Bolt 5.8), by the smoke suites in
   [`integration-tests/drivers`](../integration-tests/drivers/README.md).
 * **Results stream:** an auto-commit read-only query runs while `PULL`s take its rows; it
   waits for the next `PULL` once `n` rows are sent, and `DISCARD` (or `RESET`) stops it. A

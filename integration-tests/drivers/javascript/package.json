@@ -1,0 +1,15 @@
+{
+  "name": "graphbuff-driver-smoke-javascript",
+  "private": true,
+  "type": "module",
+  "description": "Smoke suite: the official Neo4j JavaScript driver against graphbuff-server over Bolt.",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "neo4j-driver": "5.28.3"
+  }
+}
