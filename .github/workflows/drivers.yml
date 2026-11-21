@@ -1,0 +1,110 @@
+# Runs the driver smoke suites (integration-tests/drivers/README.md): the official Neo4j
+# drivers for Python, Java, JavaScript and .NET, each on the 5.x LTS line and the newest
+# 6.x, against one graphbuff-server build. On a pull request that changes the suites or
+# the server, and on demand.
+name: drivers
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "integration-tests/drivers/**"
+      - "integration-tests/python/graphbuff_server.py"
+      - ".github/workflows/drivers.yml"
+      - "crates/server/**"
+      - "crates/core/src/**"
+      - "crates/cypher/src/**"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  server:
+    name: build graphbuff-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked -p graphbuff-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graphbuff-server
+          path: target/debug/graphbuff-server
+          retention-days: 3
+
+  suite:
+    name: ${{ matrix.suite }} ${{ matrix.driver }}
+    needs: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suite: python,     driver: "5.28.2" }
+          - { suite: python,     driver: "6.4.1" }
+          - { suite: java,       driver: "5.28.5" }
+          - { suite: java,       driver: "6.0.5" }
+          - { suite: javascript, driver: "5.28.3" }
+          - { suite: javascript, driver: "6.3.2" }
+          - { suite: dotnet,     driver: "5.28.4" }
+          - { suite: dotnet,     driver: "6.5.1" }
+    defaults:
+      run:
+        working-directory: integration-tests/drivers/${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: graphbuff-server
+          path: ${{ runner.temp }}/server
+      - name: Point the suite at the server
+        run: |
+          chmod +x "$RUNNER_TEMP/server/graphbuff-server"
+          echo "GRAPHBUFF_SERVER=$RUNNER_TEMP/server/graphbuff-server" >> "$GITHUB_ENV"
+
+      - if: matrix.suite == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.suite == 'python'
+        run: |
+          pip install -r requirements.txt
+          pip install "neo4j==${{ matrix.driver }}"
+          python -m pytest -q
+
+      - if: matrix.suite == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - if: matrix.suite == 'java'
+        run: mvn -B test -Dneo4j.driver.version=${{ matrix.driver }}
+
+      - if: matrix.suite == 'javascript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - if: matrix.suite == 'javascript'
+        run: |
+          npm ci
+          npm install --no-save "neo4j-driver@${{ matrix.driver }}"
+          npm test
+
+      - if: matrix.suite == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - if: matrix.suite == 'dotnet'
+        run: dotnet test -p:Neo4jDriverVersion=${{ matrix.driver }} --logger "console;verbosity=normal"
