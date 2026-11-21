@@ -48,8 +48,12 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   come from the parameters of the same names). Built in: `db.labels()`,
   `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
   `db.awaitIndexes()`, `dbms.procedures()`, `dbms.functions()`, `dbms.components()`, the
-  vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`);
-  `SHOW PROCEDURES` lists them. `OPTIONAL CALL proc(…) YIELD …` and `OPTIONAL CALL { … }` keep
+  vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`), and
+  the writing `db.create.setNodeVectorProperty(node, key, vector)` and
+  `db.create.setRelationshipVectorProperty(relationship, key, vector)` (the vector checked:
+  1 to 4096 finite numbers, stored as floats); `SHOW PROCEDURES` lists them, with their
+  `mode` (`READ` or `WRITE`). A query that calls a write procedure is a writing query (it
+  needs the editor role), and may end with a call to a `VOID` procedure. `OPTIONAL CALL proc(…) YIELD …` and `OPTIONAL CALL { … }` keep
   an input row the call returns nothing for, with the new variables null (no `YIELD … WHERE`
   after `OPTIONAL CALL`: filter in a `WITH … WHERE`).
 * **Introspection:** `SHOW [ALL | BUILT IN | USER DEFINED] FUNCTIONS` lists the built-in
@@ -57,7 +61,7 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `CALL dbms.functions() YIELD … WHERE …`). On `graphbuff-server`, `SHOW SETTINGS [names]
   [YIELD … | WHERE …]` lists the config file's settings for administrators (name, value,
   isDynamic, defaultValue, description; the token's value is hidden).
-  Applications add read-only procedures in Rust with `Database::register_procedure` (or
+  Applications add procedures in Rust with `Database::register_procedure` (or
   `DatabaseManager::register_procedure` for every database):
 
   ```rust
@@ -75,7 +79,10 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
 
   Parameters are `ANY` unless given types (`input_types`); an argument of another type
   fails the call, at compile time when it is a literal (`null` fits every type, an integer
-  fits `FLOAT` and `NUMBER`).
+  fits `FLOAT` and `NUMBER`). A procedure registered with `.writes()` may change the graph
+  through its context (`ctx.set_property(&node, key, value)`, `ctx.add_label`,
+  `ctx.remove_label`); the changes are made when the call returns, so the call for the next
+  row sees them and the call itself does not. A read procedure that tries fails the query.
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
@@ -231,7 +238,7 @@ recognise. Where there is another way to write it, it is given.
 |---------|---------|
 | `trim(BOTH \| LEADING \| TRAILING 'x' FROM s)` (syntax error) | `btrim(s, 'x')`, `ltrim(s, 'x')`, `rtrim(s, 'x')` |
 | Regular expressions with lookaround, atomic groups, backreferences, possessive quantifiers or nested classes (`RuntimeError`) | rewrite without them |
-| Procedures that change the graph, `db.create.setNodeVectorProperty` (no such procedure) | `SET n.p = $vector` |
+| Write procedures that create or delete nodes and relationships (a procedure's context sets properties and labels only) | `CREATE` / `DELETE` around the call |
 | `apoc.*` beyond the functions listed above (`Unsupported`) | the built-in functions |
 | `LOAD CSV` from URLs not allowed by `storage.load_csv_urls`, or other than `file:`, `http:` and `https:` | download the file into the import directory |
 | Two result columns with the same name (`RETURN 1 AS a, 2 AS a`, `SemanticError`) | distinct names |

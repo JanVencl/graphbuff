@@ -618,6 +618,44 @@ fn search_width(k: usize) -> usize {
     k.saturating_mul(4).max(200)
 }
 
+/// `db.create.setNodeVectorProperty(node, key, vector)` (`entity` Node) and
+/// `db.create.setRelationshipVectorProperty(relationship, key, vector)`: sets the property
+/// to `vector`, which must be a non-empty list of finite numbers (stored as floats). A
+/// `null` entity does nothing; a `null` vector removes the property.
+pub fn set_vector_property(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Value]) -> Result<ProcedureRows> {
+    let procedure = match entity {
+        IndexEntity::Node => "db.create.setNodeVectorProperty",
+        IndexEntity::Relationship => "db.create.setRelationshipVectorProperty",
+    };
+    let Value::String(key) = &args[1] else {
+        return Err(Error::Type(format!("{procedure} needs a property key, got {}", args[1].type_name())));
+    };
+    let value = match &args[2] {
+        Value::Null => Value::Null,
+        Value::List(items) if !items.is_empty() && items.len() <= MAX_VECTOR_DIMENSIONS as usize => Value::List(
+            items
+                .iter()
+                .map(|x| match x {
+                    Value::Int(i) => Ok(Value::Float(*i as f64)),
+                    Value::Float(f) if f.is_finite() => Ok(Value::Float(*f)),
+                    other => Err(Error::Type(format!(
+                        "{procedure} needs a vector of finite numbers, got an element {other}"
+                    ))),
+                })
+                .collect::<Result<_>>()?,
+        ),
+        Value::List(items) => {
+            return Err(Error::Runtime(format!(
+                "{procedure} needs a vector of 1 to {MAX_VECTOR_DIMENSIONS} numbers, got {}",
+                items.len()
+            )));
+        }
+        other => return Err(Error::Type(format!("{procedure} needs a vector (a list of numbers), got {}", other.type_name()))),
+    };
+    ctx.set_property(&args[0], key, value)?;
+    Ok(Vec::new())
+}
+
 /// `db.index.vector.queryNodes(indexName, k, vector)` (`entity` Node) and
 /// `db.index.vector.queryRelationships(…)`: the `k` indexed entities most similar to
 /// `vector`, as `[entity, score]` rows, best first (ties by id). The scores and order are

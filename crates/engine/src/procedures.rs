@@ -1,10 +1,17 @@
 //! Procedures run by `CALL name(args) YIELD …`, and the registry that names them.
 //!
 //! A procedure takes argument values and returns rows of output values, one value per
-//! output field of its [`ProcedureSignature`]. Procedures are read-only: they see the
-//! store through a [`ProcedureContext`]. The built-in ones (`db.labels()`,
+//! output field of its [`ProcedureSignature`]. A procedure sees the store through a
+//! [`ProcedureContext`]. Procedures read, unless their signature says
+//! [`ProcedureMode::Write`]: those change the graph through the context
+//! ([`ProcedureContext::set_property`], [`add_label`](ProcedureContext::add_label),
+//! [`remove_label`](ProcedureContext::remove_label)), and a query that calls one is a
+//! writing query (it runs as a write and needs write access). Their changes are made when
+//! the call returns, in order, so the next input row's call sees them; the call itself
+//! does not. The built-in ones (`db.labels()`,
 //! `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
-//! `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`, and the graph
+//! `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`, the writing
+//! `db.create.setNodeVectorProperty()` and `db.create.setRelationshipVectorProperty()`, and the graph
 //! algorithms `algo.pageRank`, `algo.wcc`, `algo.triangleCount`, `algo.bfs`) are in every
 //! registry; applications add their own with [`crate::Database::register_procedure`].
 //!
@@ -31,6 +38,7 @@
 //! # Ok::<(), graphbuff::Error>(())
 //! ```
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -54,6 +62,29 @@ pub struct ProcedureSignature {
     /// of the query unchanged.
     pub outputs: Vec<String>,
     pub description: String,
+    /// Whether the procedure only reads ([`ProcedureMode::Read`], the default) or may
+    /// change the graph.
+    pub mode: ProcedureMode,
+}
+
+/// What a procedure may do to the graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProcedureMode {
+    /// It only reads.
+    #[default]
+    Read,
+    /// It may change the graph (through [`ProcedureContext::set_property`] and the like).
+    Write,
+}
+
+impl ProcedureMode {
+    /// `READ` or `WRITE`, as `SHOW PROCEDURES` lists it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProcedureMode::Read => "READ",
+            ProcedureMode::Write => "WRITE",
+        }
+    }
 }
 
 /// A procedure parameter: its name, its type and, if it is optional, its default.
@@ -162,6 +193,7 @@ impl ProcedureSignature {
                 .collect(),
             outputs: outputs.into_iter().map(Into::into).collect(),
             description: String::new(),
+            mode: ProcedureMode::Read,
         }
     }
 
@@ -185,6 +217,12 @@ impl ProcedureSignature {
 
     pub fn description(mut self, text: &str) -> Self {
         self.description = text.to_string();
+        self
+    }
+
+    /// Marks the procedure as one that changes the graph ([`ProcedureMode::Write`]).
+    pub fn writes(mut self) -> Self {
+        self.mode = ProcedureMode::Write;
         self
     }
 
@@ -244,12 +282,56 @@ pub struct ProcedureContext<'a> {
     pub(crate) procedures: &'a Procedures,
     pub(crate) accel: Option<&'a crate::accel::Accel>,
     pub(crate) interrupt: Option<&'a crate::interrupt::Interrupt>,
+    /// The changes a [`ProcedureMode::Write`] procedure asked for; `None` for the others.
+    pub(crate) writes: Option<RefCell<Vec<ProcedureWrite>>>,
+}
+
+/// A change a write procedure asked for, made when its call returns.
+#[derive(Debug)]
+pub(crate) enum ProcedureWrite {
+    /// Sets (or with `Null` removes) a property of a node or relationship.
+    Property { target: Value, key: String, value: Value },
+    Label { node: NodeId, label: String, add: bool },
 }
 
 impl<'a> ProcedureContext<'a> {
-    /// The graph, read-only.
+    /// The graph as it was when the call started (without the call's own changes).
     pub fn store(&self) -> &'a dyn GraphStore {
         self.store
+    }
+
+    /// Sets property `key` of `target` (a node or relationship; `null` does nothing) to
+    /// `value`, or removes it if `value` is `null`. Only for [`ProcedureMode::Write`]
+    /// procedures; done when the call returns.
+    pub fn set_property(&self, target: &Value, key: &str, value: Value) -> Result<()> {
+        if !matches!(target, Value::Node(_) | Value::Rel(_) | Value::Null) {
+            return Err(Error::Type(format!("cannot set properties on a {}", target.type_name())));
+        }
+        self.write(ProcedureWrite::Property { target: target.clone(), key: key.to_string(), value })
+    }
+
+    /// Adds `label` to `node`. Only for [`ProcedureMode::Write`] procedures; done when the
+    /// call returns.
+    pub fn add_label(&self, node: NodeId, label: &str) -> Result<()> {
+        self.write(ProcedureWrite::Label { node, label: label.to_string(), add: true })
+    }
+
+    /// Removes `label` from `node`. Only for [`ProcedureMode::Write`] procedures; done
+    /// when the call returns.
+    pub fn remove_label(&self, node: NodeId, label: &str) -> Result<()> {
+        self.write(ProcedureWrite::Label { node, label: label.to_string(), add: false })
+    }
+
+    fn write(&self, change: ProcedureWrite) -> Result<()> {
+        match &self.writes {
+            Some(w) => {
+                w.borrow_mut().push(change);
+                Ok(())
+            }
+            None => Err(Error::Semantic(
+                "a read procedure cannot change the graph (register it with ProcedureSignature::writes)".into(),
+            )),
+        }
     }
 
     /// The registry the call was resolved in.
@@ -405,7 +487,26 @@ impl Procedures {
         })
     }
 
-    /// `SHOW PROCEDURES` / `dbms.procedures()` rows: name, signature, description.
+    /// Whether `query` calls a [`ProcedureMode::Write`] procedure of this registry (in
+    /// any part, `CALL { … }` subquery or `FOREACH`).
+    pub fn writes_in(&self, query: &graphbuff_cypher::ast::Query) -> bool {
+        query.parts.iter().any(|part| self.writes_in_clauses(&part.clauses))
+    }
+
+    /// [`writes_in`](Self::writes_in) for a list of clauses.
+    pub(crate) fn writes_in_clauses(&self, clauses: &[graphbuff_cypher::ast::Clause]) -> bool {
+        use graphbuff_cypher::ast::Clause;
+        clauses.iter().any(|c| match c {
+            Clause::CallProcedure { name, .. } => {
+                self.get(name).is_some_and(|x| x.signature.mode == ProcedureMode::Write)
+            }
+            Clause::CallSubquery { query, .. } => self.writes_in(query),
+            Clause::Foreach { body, .. } => self.writes_in_clauses(body),
+            _ => false,
+        })
+    }
+
+    /// `SHOW PROCEDURES` / `dbms.procedures()` rows: name, signature, description, mode.
     pub(crate) fn listing(&self) -> ProcedureRows {
         self.signatures()
             .map(|s| {
@@ -413,6 +514,7 @@ impl Procedures {
                     Value::String(s.name.clone()),
                     Value::String(s.text()),
                     Value::String(s.description.clone()),
+                    Value::String(s.mode.name().into()),
                 ]
             })
             .collect()
@@ -638,6 +740,20 @@ fn register_builtins(p: &mut Procedures) {
         |ctx, args| crate::vector::query_index(ctx, graphbuff_core::IndexEntity::Relationship, args),
     );
     add(
+        ProcedureSignature::new("db.create.setNodeVectorProperty", ["node", "key", "vector"], NONE)
+            .input_types([ProcedureType::Node, ProcedureType::String, ProcedureType::List])
+            .writes()
+            .description("Sets a property of a node to a vector (a list of numbers, checked and stored as floats)."),
+        |ctx, args| crate::vector::set_vector_property(ctx, graphbuff_core::IndexEntity::Node, args),
+    );
+    add(
+        ProcedureSignature::new("db.create.setRelationshipVectorProperty", ["relationship", "key", "vector"], NONE)
+            .input_types([ProcedureType::Relationship, ProcedureType::String, ProcedureType::List])
+            .writes()
+            .description("Sets a property of a relationship to a vector (a list of numbers, checked and stored as floats)."),
+        |ctx, args| crate::vector::set_vector_property(ctx, graphbuff_core::IndexEntity::Relationship, args),
+    );
+    add(
         ProcedureSignature::new("db.index.fulltext.queryNodes", ["indexName", "queryString"], ["node", "score"])
             .optional("options", Value::Map(BTreeMap::new()))
             .description("The nodes of a full-text index matching a query (Lucene syntax), best first, with their scores."),
@@ -673,7 +789,7 @@ fn register_builtins(p: &mut Procedures) {
         |_, _| Ok(Vec::new()),
     );
     add(
-        ProcedureSignature::new("dbms.procedures", NONE, ["name", "signature", "description"])
+        ProcedureSignature::new("dbms.procedures", NONE, ["name", "signature", "description", "mode"])
             .description("The procedures that CALL can run (as SHOW PROCEDURES)."),
         |ctx, _| Ok(ctx.procedures().listing()),
     );

@@ -1300,7 +1300,7 @@ impl Conn<'_> {
                         let mut action = None;
                         let statement = match tx {
                             Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
-                                let (needed, what) = api::authorize_query(&q);
+                                let (needed, what) = api::authorize_query(&ctx.mgr, name, &q);
                                 api::check(ctx.access_on(who, name), needed, what)?;
                                 Ok(TxStatement::Query(q))
                             }),
