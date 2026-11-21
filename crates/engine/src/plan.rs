@@ -2320,9 +2320,14 @@ fn validate_clause_order(q: &SingleQuery) -> Result<()> {
     }
     let last = &q.clauses[n - 1];
     let standalone_call = n == 1 && matches!(last, Clause::CallProcedure { .. });
-    if !matches!(last, Clause::Return(_)) && !last.is_updating() && !standalone_call {
+    // `CALL proc(…)` without YIELD (a VOID procedure, checked when it is planned).
+    let void_call = matches!(last, Clause::CallProcedure { yields: None, .. });
+    // `CALL { … }` returning nothing (its updates may be write procedure calls).
+    let unit_call = matches!(last, Clause::CallSubquery { query, .. }
+        if query.parts.iter().all(|p| !matches!(p.clauses.last(), Some(Clause::Return(_)))));
+    if !matches!(last, Clause::Return(_)) && !last.is_updating() && !standalone_call && !void_call && !unit_call {
         return Err(Error::Semantic(format!(
-            "query cannot conclude with {} (must be RETURN or an update clause)",
+            "query cannot conclude with {} (must be RETURN, an update clause or a VOID procedure call)",
             last.name()
         )));
     }
@@ -2342,7 +2347,8 @@ impl Operator {
                 | Operator::Delete { .. }
                 | Operator::Call { updating: true, .. }
                 | Operator::Foreach { .. }
-        )
+        ) || matches!(self, Operator::ProcedureCall { procedure, .. }
+                if procedure.signature.mode == crate::procedures::ProcedureMode::Write)
     }
 
     /// For a read operator: the update its read-only chain starts on (the nearest update

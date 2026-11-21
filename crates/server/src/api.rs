@@ -226,11 +226,11 @@ impl Ctx {
     ) -> Result<(), Error> {
         let (needed, what, db) = match stmt {
             Statement::Query { use_db, query } => {
-                let (needed, what) = authorize_query(query);
                 let db = match use_db {
                     Some(n) => users::resolve(n, params, "database name")?,
                     None => current.to_string(),
                 };
+                let (needed, what) = authorize_query(&self.mgr, &db, query);
                 (needed, what, db)
             }
             Statement::Use(n) => (Access::Read, "reading", users::resolve(n, params, "database name")?),
@@ -325,9 +325,11 @@ pub(crate) fn audit_action(stmt: &Statement, params: &BTreeMap<String, Value>) -
     })
 }
 
-/// The access `query` needs, and what it does.
-pub(crate) fn authorize_query(query: &Query) -> (Access, &'static str) {
-    if query.is_updating() && query.mode != QueryMode::Explain {
+/// The access `query` on database `db` needs, and what it does: it writes if it has a
+/// clause that writes or calls one of the database's write procedures.
+pub(crate) fn authorize_query(mgr: &DatabaseManager, db: &str, query: &Query) -> (Access, &'static str) {
+    let writes = query.is_updating() || mgr.database(db).is_ok_and(|d| d.writes(query));
+    if writes && query.mode != QueryMode::Explain {
         (Access::Write, "writing")
     } else {
         (Access::Read, "reading")
@@ -1077,7 +1079,7 @@ fn in_transaction(&(ctx, me): &Req, db: Option<&str>, id: &str, req: &Request) -
         Ok(q) => q,
         Err(e) => return query_error(&e),
     };
-    let (needed, what) = authorize_query(&parsed);
+    let (needed, what) = authorize_query(&ctx.mgr, &name, &parsed);
     if let Err(e) = check(ctx.access_on(me.who, &name), needed, what) {
         return query_error(&e);
     }

@@ -286,7 +286,12 @@ impl<S: GraphStore> Database<S> {
             unreachable!("position() found it");
         };
         let (before, after) = (&clauses[..at], &clauses[at + 1..]);
-        if let Some(c) = before.iter().chain(after).find(|c| c.is_updating()) {
+        let procedures = self.procedures();
+        if let Some(c) = before
+            .iter()
+            .chain(after)
+            .find(|c| c.is_updating() || procedures.writes_in_clauses(std::slice::from_ref(*c)))
+        {
             return Err(Error::Unsupported(format!(
                 "{} outside CALL {{ … }} IN TRANSACTIONS: the clauses around it may only read; \
                  move the update into the subquery",

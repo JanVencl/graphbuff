@@ -202,6 +202,16 @@ impl Executor<'_> {
                 self.exec_foreach(&frame, list, body, imports)?;
                 frame
             }
+            O::ProcedureCall {
+                input,
+                procedure,
+                args,
+                fields,
+                optional,
+            } if procedure.signature.mode == crate::procedures::ProcedureMode::Write => {
+                let frame = self.run_op(input, None)?;
+                self.exec_write_procedure(frame, procedure, args, fields, *optional)?
+            }
             _ => {
                 // A read-only chain: materialize the update it starts on (if any), then
                 // stream the rest.
@@ -291,6 +301,69 @@ impl Executor<'_> {
                 let mut out = row.clone();
                 out.extend(pos.iter().map(|&i| r[i].clone()));
                 rows.push(out);
+            }
+        }
+        Ok(Frame::new(scope, rows))
+    }
+
+    /// Runs a write procedure once per row of `frame`, in order, making the changes each
+    /// call asks for when it returns (so the next call sees them).
+    fn exec_write_procedure(
+        &mut self,
+        frame: Frame,
+        procedure: &crate::procedures::Procedure,
+        args: &[Expr],
+        fields: &[(usize, String)],
+        optional: bool,
+    ) -> Result<Frame> {
+        use crate::procedures::ProcedureWrite as W;
+        let mut scope = frame.scope.clone();
+        for (_, v) in fields {
+            scope.add(v);
+        }
+        let mut rows = Vec::new();
+        for row in frame.rows {
+            self.check_interrupt()?;
+            let env = Env::new(&frame.scope, &row);
+            let values: Vec<Value> = args.iter().map(|a| self.eval(a, &env)).collect::<Result<_>>()?;
+            let ctx = crate::procedures::ProcedureContext {
+                store: self.store(),
+                procedures: &self.procedures,
+                accel: None,
+                interrupt: self.interrupt.as_ref(),
+                writes: Some(Default::default()),
+            };
+            let out = procedure.call(&ctx, &values)?;
+            let writes = ctx.writes.expect("set above").into_inner();
+            for w in writes {
+                match w {
+                    W::Property { target, key, value } => self.set_property(&target, &key, value)?,
+                    W::Label { node, label, add: true } => {
+                        if self.store_mut()?.add_label(node, &label)? {
+                            self.stats.labels_added += 1;
+                            self.touch(node);
+                        }
+                    }
+                    W::Label { node, label, add: false } => {
+                        if self.store_mut()?.remove_label(node, &label)? {
+                            self.stats.labels_removed += 1;
+                            self.touch(node);
+                        }
+                    }
+                }
+            }
+            if procedure.signature.outputs.is_empty() {
+                rows.push(row);
+            } else if optional && out.is_empty() {
+                let mut o = row;
+                o.extend(fields.iter().map(|_| Value::Null));
+                rows.push(o);
+            } else {
+                for r in out {
+                    let mut o = row.clone();
+                    o.extend(fields.iter().map(|(i, _)| r[*i].clone()));
+                    rows.push(o);
+                }
             }
         }
         Ok(Frame::new(scope, rows))
@@ -520,7 +593,7 @@ impl Executor<'_> {
                 rows: if *user_defined { Vec::new() } else { crate::catalog::function_rows() },
             }),
             Clause::ShowProcedures => Ok(RawResult {
-                columns: ["name", "signature", "description"].map(String::from).to_vec(),
+                columns: ["name", "signature", "description", "mode"].map(String::from).to_vec(),
                 rows: self.procedures.listing(),
             }),
             Clause::ShowConstraints => Ok(RawResult {

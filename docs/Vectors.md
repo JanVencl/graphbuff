@@ -143,6 +143,4 @@ This is how an exact index works; for HNSW, see above.
 - The in-memory rows and HNSW graphs are rebuilt after a restart, on each index's first
   query; the HNSW build runs on one core.
 - Building a relationship vector index scans all relationships.
-- `db.create.setNodeVectorProperty` / `setRelationshipVectorProperty` are not available;
-  use `SET`.
 - The Neo4j 2025 `VECTOR` value type and `SEARCH` clause are not supported.

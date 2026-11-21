@@ -191,6 +191,10 @@ fn http_transactions_check_roles_and_owners() {
     let run = |auth: &str, q: &str| http(addr, "POST", &path, Some(auth), Some(&format!(r#"{{"query":"{q}"}}"#)));
     // A reader's transaction refuses writes but stays open.
     assert_eq!(run(&rita, "CREATE (n)").status, 403);
+    // Calling a write procedure is writing.
+    let set = "MATCH (n) CALL db.create.setNodeVectorProperty(n, 'v', [1])";
+    assert_eq!(run(&rita, set).status, 403);
+    assert_eq!(query(addr, &rita, set).status, 403);
     assert_eq!(run(&rita, "MATCH (n) RETURN count(n)").status, 200);
     // Another user cannot use it.
     assert_eq!(run(&ed, "MATCH (n) RETURN count(n)").status, 404);
@@ -201,6 +205,8 @@ fn http_transactions_check_roles_and_owners() {
     let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
     let r = http(addr, "POST", &path, Some(&basic("root", "rootpw")), Some(r#"{"query":"SHOW USERS"}"#));
     assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(http(addr, "DELETE", &path, Some(&basic("root", "rootpw")), None).status, 200);
+    assert_eq!(query(addr, &ed, set).status, 200);
 }
 
 #[test]

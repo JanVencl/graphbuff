@@ -7,6 +7,11 @@ the same notes.
 
 ### Added
 
+- Write procedures: `db.create.setNodeVectorProperty` and
+  `db.create.setRelationshipVectorProperty`, and procedures registered with
+  `ProcedureSignature::writes()`, which set properties and labels through their context.
+  `SHOW PROCEDURES` and `dbms.procedures()` gain a `mode` column. A query may end with a
+  call to a `VOID` procedure.
 - Point indexes: `CREATE POINT INDEX … FOR (n:L) ON (n.p)` (also on relationships).
   `MATCH` uses them to seek `point.distance(n.p, $c) < $r` and
   `point.withinBBox(n.p, $lo, $hi)` instead of filtering every candidate.
@@ -59,6 +64,11 @@ the same notes.
   Stores of the older formats still open.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
+
+### Breaking
+
+- `ProcedureSignature` has a new public field, `mode`: build signatures with
+  `ProcedureSignature::new` (and `.writes()`) rather than a struct literal.
 
 ## 0.4.0 — 2026-11-19
 

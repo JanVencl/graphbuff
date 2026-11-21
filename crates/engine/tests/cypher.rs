@@ -1721,7 +1721,7 @@ fn registered_procedures() {
     assert!(matches!(db.execute("CALL test.older('x')"), Err(Error::Type(_))));
     // Listed with the built-ins.
     let r = run(&db, "SHOW PROCEDURES");
-    assert_eq!(r.columns, ["name", "signature", "description"]);
+    assert_eq!(r.columns, ["name", "signature", "description", "mode"]);
     let listed = rows(&r);
     assert!(listed.iter().any(|l| l.starts_with("\"db.labels\", \"db.labels() :: (label)\"")), "{listed:?}");
     let sig = scalar(

@@ -109,6 +109,8 @@ pub(crate) fn build<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> 
     Ok(match (&ex.profile, op) {
         // A non-optional match is measured per step; updates are measured where they run.
         (None, _)
+        | (_, Operator::ProcedureCall { .. }) if op.is_update() => s,
+        (None, _)
         | (_, Operator::Match { optional: false, .. })
         | (
             _,
@@ -127,6 +129,12 @@ pub(crate) fn build<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> 
 fn build_op<'a>(ex: &'a Executor<'_>, op: &'a Operator, base: Frame) -> Result<BoxStream<'a>> {
     use Operator as O;
     Ok(match op {
+        // A write procedure call is an update: the base, run before.
+        O::ProcedureCall { .. } if op.is_update() => Box::new(Source {
+            scope: base.scope,
+            rows: base.rows.into(),
+            hidden: None,
+        }),
         O::Start
         | O::Create { .. }
         | O::Merge { .. }
@@ -375,6 +383,7 @@ impl<'a> Expander<'a> for ProcedureStep<'a> {
             procedures: &ex.procedures,
             accel: ex.accel.as_ref(),
             interrupt: ex.interrupt.as_ref(),
+            writes: None,
         };
         let rows = self.procedure.call(&ctx, &args)?;
         self.out = if self.procedure.signature.outputs.is_empty() {

@@ -78,7 +78,8 @@ pub use graphbuff_core::accounting;
 pub use graphbuff_cypher as cypher;
 pub use graphbuff_cypher::ast::{ExistingDatabase, QueryMode};
 pub use procedures::{
-    Procedure, ProcedureContext, ProcedureFn, ProcedureParam, ProcedureRows, ProcedureSignature, ProcedureType, Procedures,
+    Procedure, ProcedureContext, ProcedureFn, ProcedureMode, ProcedureParam, ProcedureRows, ProcedureSignature, ProcedureType,
+    Procedures,
 };
 pub use transaction::Transaction;
 pub use accel::{KernelMode, KernelStats, kernel_stats};
@@ -257,6 +258,12 @@ impl<S: GraphStore> Database<S> {
         self.read_only.store(read_only, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether `query` changes the graph: it has a clause that writes, or calls a
+    /// [`ProcedureMode::Write`] procedure of this database.
+    pub fn writes(&self, query: &cypher::ast::Query) -> bool {
+        writes_with(query, &self.procedures())
+    }
+
     /// Whether [`set_read_only`](Self::set_read_only) is in force.
     pub fn is_read_only(&self) -> bool {
         self.read_only.load(std::sync::atomic::Ordering::Relaxed)
@@ -407,7 +414,7 @@ impl<S: GraphStore> Database<S> {
         // Without a snapshot a reader holds the store's lock, which a slow consumer would
         // keep from writers: such results are collected first.
         let streams = ast.mode != QueryMode::Explain
-            && !writes(ast)
+            && !self.writes(ast)
             && batched::position(ast)?.is_none()
             && self.snapshot().is_some();
         if !streams {
@@ -437,7 +444,7 @@ impl<S: GraphStore> Database<S> {
             self.check_no_transaction()?;
             return self.run_in_transactions(ast, at, params, interrupt);
         }
-        if !writes(ast) || ast.mode == QueryMode::Explain {
+        if !self.writes(ast) || ast.mode == QueryMode::Explain {
             if self.snapshot().is_none() {
                 self.check_no_transaction()?;
             }
@@ -446,7 +453,7 @@ impl<S: GraphStore> Database<S> {
                 if ast.mode == QueryMode::Explain {
                     return explain_result(ast, &ex);
                 }
-                if writes(ast) {
+                if self.writes(ast) {
                     ex.accel = None;
                 }
                 ex.interrupt = interrupt;
@@ -493,7 +500,7 @@ impl<S: GraphStore> Database<S> {
         if batched::position(ast)?.is_some() {
             return Err(batched::in_explicit_transaction());
         }
-        let store = if writes(ast) { StoreRef::Write(store) } else { StoreRef::Read(store) };
+        let store = if self.writes(ast) { StoreRef::Write(store) } else { StoreRef::Read(store) };
         let mut ex = self.executor(store, params);
         ex.interrupt = interrupt;
         run_query(&mut ex, ast)
@@ -638,7 +645,7 @@ impl<S: GraphStore> Database<S> {
             self.check_no_transaction()?;
         }
         self.view_with_kernels(&params, |mut ex| {
-            if writes(&ast) {
+            if self.writes(&ast) {
                 ex.accel = None;
             }
             Ok(plan::QueryPlan::build(&ast, &ex)?.explain())
@@ -726,9 +733,9 @@ impl<S: GraphStore> Database<S> {
     }
 }
 
-/// Whether a query has clauses that write.
-fn writes(ast: &cypher::ast::Query) -> bool {
-    ast.parts.iter().any(|p| p.clauses.iter().any(|c| c.is_updating()))
+/// Whether a query has clauses that write, or calls a write procedure of `procedures`.
+fn writes_with(ast: &cypher::ast::Query, procedures: &Procedures) -> bool {
+    ast.parts.iter().any(|p| p.clauses.iter().any(|c| c.is_updating())) || procedures.writes_in(ast)
 }
 
 /// The result of an `EXPLAIN` query: the plan, nothing run.
