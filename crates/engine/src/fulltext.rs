@@ -450,7 +450,7 @@ fn value_terms(analyzer: Analyzer, value: &Value) -> Vec<String> {
 
 /// Calls `f` with the id of every entity `def` covers in `store` (nodes with one of its
 /// labels, or relationships of one of its types).
-fn for_each_entity(
+pub(crate) fn for_each_entity(
     store: &dyn GraphStore,
     def: &IndexDef,
     interrupt: &dyn Fn() -> Result<()>,

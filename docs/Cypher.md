@@ -79,8 +79,9 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
-  type, label or type, properties, `RANGE`, `VECTOR` or `FULLTEXT`, options), vector indexes (see
-  *Vectors* below), full-text indexes (see *Full-text* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
+  type, label or type, properties, `RANGE`, `VECTOR`, `FULLTEXT` or `POINT`, options), vector indexes (see
+  *Vectors* below), full-text indexes (see *Full-text* below), point indexes (see *Spatial
+  values* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
   `(n.a, n.b) IS UNIQUE | NODE KEY`, and property types `n.p IS :: INTEGER | FLOAT`
   (`IS TYPED`, `LIST<STRING NOT NULL>`); the older `ON … ASSERT …` form works too), the same
   on relationships `FOR ()-[r:T]-() REQUIRE r.p IS UNIQUE | NOT NULL | :: <type>` and
@@ -161,7 +162,14 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   may cross the 180th meridian. Points test equality but do not compare with `<` (null); `ORDER BY`
   sorts them after paths and before temporal values. They can be stored as properties (and in
   lists) and indexed for equality; HTTP returns them as
-  `{"$type": "point", "crs": …, "srid": …, "x": …, "y": …}`
+  `{"$type": "point", "crs": …, "srid": …, "x": …, "y": …}`. `CREATE POINT INDEX [name] [IF NOT
+  EXISTS] FOR (n:L) ON (n.p)` (also `FOR ()-[r:T]-() ON (r.p)`; ``OPTIONS {indexConfig:
+  {`spatial.cartesian.min`: [x, y], …}}`` is accepted and ignored) indexes point properties, and
+  `MATCH` starts with an index seek for `point.distance(n.p, $c) < $r` (or `<=`, either way
+  round) and `point.withinBBox(n.p, $lowerLeft, $upperRight)` in its `WHERE`. A grid per
+  coordinate system, sized to the points, is kept in memory for the last commit and updated
+  with each commit's changes; inside a transaction, and in queries that write, the query
+  scans the label instead
 * **Vectors:** a vector is a list of numbers. `vector.similarity.cosine(a, b)` and
   `vector.similarity.euclidean(a, b)` score in [0, 1] as Neo4j does (`(1 + cos) / 2`,
   `1 / (1 + d²)`). ``CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:L) ON n.p OPTIONS
@@ -211,8 +219,7 @@ recognise. Where there is another way to write it, it is given.
 
 | Missing | Error |
 |---------|-------|
-| `CREATE TEXT INDEX`, `CREATE POINT INDEX`, `CREATE LOOKUP INDEX` | `Unsupported` (range, full-text and vector indexes exist) |
-| Spatial index seeks for `point.distance` / `point.withinBBox` | none: they filter every candidate |
+| `CREATE TEXT INDEX`, `CREATE LOOKUP INDEX` | `Unsupported` (range, full-text, vector and point indexes exist) |
 | Property type constraints on `MAP`, `NODE`, `PATH`, `ANY` or nullable list elements (`LIST<INTEGER>`) | syntax error: properties cannot hold them, and lists of properties hold no nulls |
 | Quantization of vector indexes, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
 | Full-text ranges, regular expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`) | `Unsupported` |

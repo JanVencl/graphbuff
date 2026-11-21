@@ -17,13 +17,14 @@ use crate::hnsw::{Graph, Metric};
 use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
 
-/// The kind of index `CREATE [VECTOR | FULLTEXT] INDEX … OPTIONS {…}` asks for. A vector
+/// The kind of index `CREATE [VECTOR | FULLTEXT | POINT] INDEX … OPTIONS {…}` asks for. A vector
 /// index needs `indexConfig: {`vector.dimensions`: n}` and may name
 /// `vector.similarity_function` (`'cosine'`, the default, or `'euclidean'`); it is
 /// approximate (HNSW) with `vector.hnsw.enabled: true` or when `vector.hnsw.m` or
 /// `vector.hnsw.ef_construction` is given (defaults 16 and 100); a full-text
 /// index takes `fulltext.analyzer` and `fulltext.eventually_consistent` (see
-/// [`fulltext_kind`](crate::fulltext::fulltext_kind)); `indexProvider` is accepted and
+/// [`fulltext_kind`](crate::fulltext::fulltext_kind)), a point index the `spatial.*`
+/// bounds (see [`point_kind`](crate::point_index::point_kind)); `indexProvider` is accepted and
 /// ignored.
 pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<IndexKind> {
     let mut config = BTreeMap::new();
@@ -40,6 +41,9 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
     }
     if kind == IndexType::Fulltext {
         return crate::fulltext::fulltext_kind(&config);
+    }
+    if kind == IndexType::Point {
+        return crate::point_index::point_kind(&config);
     }
     if kind == IndexType::Range {
         if let Some(k) = config.keys().next() {
@@ -114,6 +118,7 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
 pub fn index_row(d: IndexDef) -> Vec<Value> {
     let options = match d.kind {
         IndexKind::Range => BTreeMap::new(),
+        IndexKind::Point => BTreeMap::from([("indexConfig".to_string(), Value::Map(BTreeMap::new()))]),
         IndexKind::Vector { dimensions, similarity, hnsw } => {
             let mut config = BTreeMap::from([
                 ("vector.dimensions".to_string(), Value::Int(i64::from(dimensions))),
@@ -231,7 +236,7 @@ fn indexed_vector(value: &Value, dimensions: u32, similarity: Similarity) -> Opt
 fn vector_params(def: &IndexDef) -> (u32, Similarity) {
     match def.kind {
         IndexKind::Vector { dimensions, similarity, .. } => (dimensions, similarity),
-        IndexKind::Range | IndexKind::Fulltext { .. } => unreachable!("a vector index"),
+        IndexKind::Range | IndexKind::Fulltext { .. } | IndexKind::Point => unreachable!("a vector index"),
     }
 }
 

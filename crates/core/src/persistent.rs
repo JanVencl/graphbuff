@@ -10,8 +10,8 @@
 //! <dir>/blobs.db   128-byte blocks holding labels and properties, chained per entity
 //! <dir>/index.db   B+tree pages: the label index and the property indexes
 //! <dir>/groups.db  fixed 64-byte relationship group records of dense nodes, at id * 64
-//! <dir>/meta       "GBMETA10", metadata (see below), CRC-32
-//! <dir>/graph.wal  "GBPWAL10", then records: len u32 | crc u32 | metadata, page images
+//! <dir>/meta       "GBMETA11", metadata (see below), CRC-32
+//! <dir>/graph.wal  "GBPWAL11", then records: len u32 | crc u32 | metadata, page images
 //! ```
 //!
 //! The metadata is small and kept in memory: id counters, entity counts, the token tables
@@ -52,7 +52,8 @@
 //! point values (another value tag), laid out the same way. Version 9 added vector index
 //! definitions at the end of the metadata (their vectors are kept in memory by the
 //! engine); older metadata reads as having none, and an older log is replaced on open.
-//! Version 10 added full-text index definitions after them, likewise.
+//! Version 10 added full-text index definitions after them, likewise, and version 11
+//! point index definitions after those.
 //!
 //! ## Index keys
 //! A single-property index entry is the value's sort key, its exact encoding (or a lossy
@@ -91,7 +92,7 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use btree::{MAX_KEY, PageAlloc};
 use pager::{
     DataFile, MAX_LOGGED_PAGES, PAGE_SIZE, PageKey, Pager, WAL_MAGIC, WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3,
-    WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8, WAL_MAGIC_V9,
+    WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8, WAL_MAGIC_V9, WAL_MAGIC_V10,
 };
 
 use crate::codec::{Decoder, Encoder, crc32};
@@ -110,7 +111,8 @@ const GROUPS: u8 = 4;
 const FILE_NAMES: [&str; 5] = ["nodes.db", "rels.db", "blobs.db", "index.db", "groups.db"];
 const META_FILE: &str = "meta";
 const META_TMP: &str = "meta.tmp";
-const META_MAGIC: &[u8; 8] = b"GBMETA10";
+const META_MAGIC: &[u8; 8] = b"GBMETA11";
+const META_MAGIC_V10: &[u8; 8] = b"GBMETA10";
 const META_MAGIC_V9: &[u8; 8] = b"GBMETAv9";
 const META_MAGIC_V8: &[u8; 8] = b"GBMETAv8";
 const META_MAGIC_V7: &[u8; 8] = b"GBMETAv7";
@@ -125,7 +127,7 @@ const META_MAGIC_V1: &[u8; 8] = b"GBMETAv1";
 /// (storage format 4). Older indexes are rebuilt when the store is opened.
 const INDEX_FORMAT: u8 = 3;
 /// The storage format this code writes.
-const FORMAT: u8 = 10;
+const FORMAT: u8 = 11;
 const WAL_FILE: &str = "graph.wal";
 const LOCK_FILE: &str = "LOCK";
 
@@ -252,8 +254,8 @@ struct Meta {
     index_format: u8,
     /// Constraint definitions (format version 5).
     constraints: Vec<ConstraintDef>,
-    /// Vector (format version 9) and full-text (10) index definitions: the engine keeps
-    /// their contents.
+    /// Vector (format version 9), full-text (10) and point (11) index definitions: the
+    /// engine keeps their contents.
     engine_indexes: Vec<IndexDef>,
 }
 
@@ -326,9 +328,12 @@ impl Meta {
         if version >= 10 {
             IndexDef::encode_fulltext_list(&self.engine_indexes, e);
         }
+        if version >= 11 {
+            IndexDef::encode_point_list(&self.engine_indexes, e);
+        }
     }
 
-    /// Decodes metadata written by storage format `version` (1 to 10).
+    /// Decodes metadata written by storage format `version` (1 to 11).
     fn decode(d: &mut Decoder, version: u8) -> Result<Meta> {
         let mut m = Meta {
             seq: d.u64()?,
@@ -405,6 +410,9 @@ impl Meta {
         }
         if version >= 10 {
             m.engine_indexes.extend(IndexDef::decode_fulltext_list(d)?);
+        }
+        if version >= 11 {
+            m.engine_indexes.extend(IndexDef::decode_point_list(d)?);
         }
         Ok(m)
     }
@@ -1982,7 +1990,7 @@ impl Tx<'_> {
         let mut existing: Vec<IndexDef> = self.m.indexes.iter().map(|ix| ix.def.clone()).collect();
         existing.extend(self.m.engine_indexes.iter().cloned());
         def.check_new(&existing)?;
-        if def.is_vector() || def.is_fulltext() {
+        if def.is_engine_kept() {
             self.m.engine_indexes.push(def);
             return Ok(());
         }
@@ -2149,7 +2157,8 @@ fn load_meta(path: &Path) -> Result<Meta> {
     };
     let what = path.display().to_string();
     let version = match bytes.get(..8) {
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => 10,
+        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => 11,
+        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V10 => 10,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V9 => 9,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V8 => 8,
         Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V7 => 7,
@@ -2286,6 +2295,7 @@ impl PersistentGraph {
         let wal_version = match bytes.get(..8) {
             None => FORMAT, // empty (or shorter than a header): a fresh log
             Some(m) if m == WAL_MAGIC => FORMAT,
+            Some(m) if m == WAL_MAGIC_V10 => 10,
             Some(m) if m == WAL_MAGIC_V9 => 9,
             Some(m) if m == WAL_MAGIC_V8 => 8,
             Some(m) if m == WAL_MAGIC_V7 => 7,

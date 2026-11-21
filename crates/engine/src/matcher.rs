@@ -69,6 +69,12 @@ pub(crate) enum SeekKind {
     Ge,
     /// `n.key STARTS WITH expr`
     StartsWith,
+    /// `point.distance(n.key, center) < radius` (or `<=`, either way round): `expr` is
+    /// `[center, radius]`. Point indexes only.
+    Near,
+    /// `point.withinBBox(n.key, lowerLeft, upperRight)`: `expr` is `[lowerLeft,
+    /// upperRight]`. Point indexes only.
+    WithinBBox,
 }
 
 impl SeekKind {
@@ -86,12 +92,20 @@ impl SeekKind {
             SeekKind::Gt => ">",
             SeekKind::Ge => ">=",
             SeekKind::StartsWith => "STARTS WITH",
+            SeekKind::Near => "point.distance <",
+            SeekKind::WithinBBox => "point.withinBBox",
         }
+    }
+
+    /// Seeks only a point index answers.
+    pub(crate) fn is_spatial(self) -> bool {
+        matches!(self, SeekKind::Near | SeekKind::WithinBBox)
     }
 }
 
 /// A `WHERE` conjunct that constrains a node or relationship property: `var.key = expr`, `var.key IN
-/// expr`, a comparison (`var.key < expr`, either way round) or `var.key STARTS WITH expr`.
+/// expr`, a comparison (`var.key < expr`, either way round), `var.key STARTS WITH expr`, or
+/// a spatial one ([`SeekKind::Near`], [`SeekKind::WithinBBox`]).
 #[derive(Debug, Clone)]
 pub(crate) struct SeekHint {
     pub var: String,
@@ -132,6 +146,9 @@ pub(crate) fn extract_hints(where_: Option<&Expr>, node_vars: &HashSet<&str>) ->
     }
     let mut hints = Vec::new();
     for c in parts {
+        if let Some(h) = spatial_hint(c, &as_prop, &refs_var) {
+            hints.push(h);
+        }
         let Expr::Binary(op, a, b) = c else { continue };
         use SeekKind as K;
         let candidates: Vec<(&Expr, &Expr, SeekKind)> = match op {
@@ -158,6 +175,56 @@ pub(crate) fn extract_hints(where_: Option<&Expr>, node_vars: &HashSet<&str>) ->
         }
     }
     hints
+}
+
+/// A spatial seek hint from conjunct `c`: `point.distance(var.key, center) < radius` (or
+/// `<=`, or `radius > …`, `>=`; the point arguments either way round) or
+/// `point.withinBBox(var.key, lowerLeft, upperRight)`, where the other arguments do not
+/// use `var`.
+fn spatial_hint(
+    c: &Expr,
+    as_prop: &dyn Fn(&Expr) -> Option<(String, String)>,
+    refs_var: &dyn Fn(&Expr, &str) -> bool,
+) -> Option<SeekHint> {
+    let call = |e: &Expr, want: &str, n: usize| -> Option<Vec<Expr>> {
+        match e {
+            Expr::Function { name, distinct: false, args } if name == want && args.len() == n => Some(args.clone()),
+            _ => None,
+        }
+    };
+    if let Some(args) = call(c, "point.withinbbox", 3) {
+        let (var, key) = as_prop(&args[0])?;
+        if refs_var(&args[1], &var) || refs_var(&args[2], &var) {
+            return None;
+        }
+        return Some(SeekHint {
+            var,
+            key,
+            kind: SeekKind::WithinBBox,
+            expr: Expr::List(vec![args[1].clone(), args[2].clone()]),
+        });
+    }
+    let Expr::Binary(op, a, b) = c else { return None };
+    let (distance, radius) = match op {
+        BinaryOp::Lt | BinaryOp::Le => (a, b),
+        BinaryOp::Gt | BinaryOp::Ge => (b, a),
+        _ => return None,
+    };
+    let args = call(distance, "point.distance", 2)?;
+    let ((var, key), center) = match (as_prop(&args[0]), as_prop(&args[1])) {
+        (Some(p), _) if !refs_var(&args[1], &p.0) => (p, &args[1]),
+        (_, Some(p)) if !refs_var(&args[0], &p.0) => (p, &args[0]),
+        _ => return None,
+    };
+    if refs_var(radius, &var) {
+        return None;
+    }
+    Some(SeekHint {
+        var,
+        key,
+        kind: SeekKind::Near,
+        expr: Expr::List(vec![center.clone(), (**radius).clone()]),
+    })
 }
 
 /// Called for each complete match; return `Ok(false)` to stop the search.

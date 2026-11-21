@@ -4,12 +4,14 @@ The binary is the one named by GRAPHBUFF_SERVER, else target/release or target/d
 (whichever was built last).
 """
 
+import collections
 import json
 import os
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import requests
@@ -113,6 +115,12 @@ class Server:
         settings.update(self.settings)
         cmd = [server_binary(), "--config", write_config(settings)]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=clean_env())
+        # Read stderr all along: the server writes an audit line per admin command, and a
+        # full pipe (4 KB on Windows) would block it mid-command, holding its locks.
+        self.stderr_tail = collections.deque(maxlen=100)
+        self._stderr_reader = threading.Thread(target=self._drain_stderr, args=(self.proc, self.stderr_tail),
+                                               daemon=True)
+        self._stderr_reader.start()
         deadline = time.time() + 20
         while True:
             try:
@@ -122,8 +130,18 @@ class Server:
                 pass
             if self.proc.poll() is not None or time.time() > deadline:
                 self.proc.kill()
-                raise RuntimeError("graphbuff-server did not start: " + self.proc.stderr.read().decode())
+                raise RuntimeError("graphbuff-server did not start: " + self._stderr_text())
             time.sleep(0.05)
+
+    @staticmethod
+    def _drain_stderr(proc, tail):
+        for line in proc.stderr:
+            tail.append(line.decode(errors="replace"))
+
+    def _stderr_text(self):
+        """The end of the server's standard error, once it has exited."""
+        self._stderr_reader.join(5)
+        return "".join(self.stderr_tail).strip()
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -132,7 +150,7 @@ class Server:
         """How the process ended, with the end of its standard error."""
         if self.proc is None or self.proc.poll() is None:
             return "server is running"
-        err = self.proc.stderr.read().decode(errors="replace").strip()
+        err = self._stderr_text()
         return f"server exited with code {self.proc.returncode}: {err[-500:]}"
 
     def restart(self):

@@ -177,6 +177,8 @@ pub(crate) struct Accel {
     pub vectors: Arc<crate::vector::VectorCache>,
     /// The full-text index postings of the same committed state.
     pub texts: Arc<crate::fulltext::TextCache>,
+    /// The point index grids of the same committed state.
+    pub points: Arc<crate::point_index::PointCache>,
     pub snapshot: Snapshot,
     pub kernels: Arc<dyn Kernels>,
     pub mode: KernelMode,
