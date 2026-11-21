@@ -788,8 +788,9 @@ impl HnswConfig {
 }
 
 /// What an index is: a property index answering seeks, a vector index answering
-/// nearest-neighbour queries over one list-of-numbers property, or a full-text index
-/// answering text queries over string properties.
+/// nearest-neighbour queries over one list-of-numbers property, a full-text index
+/// answering text queries over string properties, or a point index answering distance
+/// and bounding-box seeks over one point property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum IndexKind {
     #[default]
@@ -803,15 +804,17 @@ pub enum IndexKind {
     Fulltext {
         analyzer: Analyzer,
     },
+    Point,
 }
 
 impl IndexKind {
-    /// `RANGE`, `VECTOR` or `FULLTEXT`, as `SHOW INDEXES` lists it.
+    /// `RANGE`, `VECTOR`, `FULLTEXT` or `POINT`, as `SHOW INDEXES` lists it.
     pub fn text(self) -> &'static str {
         match self {
             IndexKind::Range => "RANGE",
             IndexKind::Vector { .. } => "VECTOR",
             IndexKind::Fulltext { .. } => "FULLTEXT",
+            IndexKind::Point => "POINT",
         }
     }
 }
@@ -901,6 +904,34 @@ impl IndexDef {
         matches!(self.kind, IndexKind::Fulltext { .. })
     }
 
+    /// A point index on one property of the nodes with `label`, or of the relationships
+    /// of a type (`entity`).
+    pub fn point(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        label: impl Into<String>,
+        property: impl Into<String>,
+    ) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            entity,
+            label: label.into(),
+            extra_labels: Vec::new(),
+            properties: vec![property.into()],
+            kind: IndexKind::Point,
+        }
+    }
+
+    pub fn is_point(&self) -> bool {
+        self.kind == IndexKind::Point
+    }
+
+    /// Whether the engine keeps the index's contents (vector, full-text and point
+    /// indexes): the store keeps only its definition.
+    pub fn is_engine_kept(&self) -> bool {
+        !matches!(self.kind, IndexKind::Range)
+    }
+
     /// The labels (or types) the index covers: [`label`](Self::label), then the
     /// [`extra_labels`](Self::extra_labels) of a full-text index.
     pub fn labels(&self) -> impl Iterator<Item = &str> {
@@ -981,6 +1012,9 @@ impl IndexDef {
                 )));
             }
         }
+        if self.is_point() && self.properties.len() != 1 {
+            return Err(Error::Semantic("a point index is on exactly one property".into()));
+        }
         if !self.extra_labels.is_empty() && !self.is_fulltext() {
             return Err(Error::Semantic("only a full-text index covers several labels or types".into()));
         }
@@ -1015,6 +1049,7 @@ impl IndexDef {
                         IndexKind::Range => "an",
                         IndexKind::Vector { .. } => "a vector",
                         IndexKind::Fulltext { .. } => "a full-text",
+                        IndexKind::Point => "a point",
                     },
                     self.target()
                 )));
@@ -1153,6 +1188,30 @@ impl IndexDef {
     pub(crate) fn decode_fulltext_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
         let n = d.len(8)?;
         (0..n).map(|_| IndexDef::decode_fulltext(d)).collect()
+    }
+
+    /// Encodes the point indexes among `defs`, each as [`encode`](Self::encode) writes it
+    /// (persistent format 11, hybrid log op 16, memory snapshot 8).
+    pub(crate) fn encode_point_list(defs: &[IndexDef], e: &mut Encoder) {
+        let points: Vec<&IndexDef> = defs.iter().filter(|d| d.is_point()).collect();
+        e.len(points.len());
+        for d in points {
+            d.encode(e);
+        }
+    }
+
+    pub(crate) fn decode_point(d: &mut Decoder) -> Result<IndexDef> {
+        let mut def = IndexDef::decode(d)?;
+        if def.properties.len() != 1 {
+            return Err(d.corrupt(format!("point index `{}` has {} properties", def.name, def.properties.len())));
+        }
+        def.kind = IndexKind::Point;
+        Ok(def)
+    }
+
+    pub(crate) fn decode_point_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
+        let n = d.len(8)?;
+        (0..n).map(|_| IndexDef::decode_point(d)).collect()
     }
 
     /// Decodes a single-property node index as older formats wrote it: name, label,

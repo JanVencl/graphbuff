@@ -827,7 +827,11 @@ impl<'a> Parser<'a> {
             if self.eat_kw("INDEX") {
                 return self.parse_create_index(IndexType::Range);
             }
-            for (kw, kind) in [("VECTOR", IndexType::Vector), ("FULLTEXT", IndexType::Fulltext)] {
+            for (kw, kind) in [
+                ("VECTOR", IndexType::Vector),
+                ("FULLTEXT", IndexType::Fulltext),
+                ("POINT", IndexType::Point),
+            ] {
                 if self.is_kw(kw) && self.kw_at(1, "INDEX") {
                     self.advance();
                     self.advance();
@@ -1214,7 +1218,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// After `CREATE INDEX`, `CREATE VECTOR INDEX` or `CREATE FULLTEXT INDEX` (`kind`).
+    /// After `CREATE INDEX`, `CREATE VECTOR INDEX`, `CREATE FULLTEXT INDEX` or `CREATE
+    /// POINT INDEX` (`kind`).
     fn parse_create_index(&mut self, kind: IndexType) -> Result<Clause> {
         let fulltext = kind == IndexType::Fulltext;
         if kind == IndexType::Range && self.eat_kw("ON") {
@@ -2776,6 +2781,15 @@ mod tests {
             &single("CREATE VECTOR INDEX FOR ()-[r:SIMILAR]-() ON r.v")[0],
             Clause::CreateIndex { kind: IndexType::Vector, entity: IndexEntity::Relationship, options: None, .. }
         ));
+        assert!(matches!(
+            &single("CREATE POINT INDEX places IF NOT EXISTS FOR (p:Place) ON (p.location)")[0],
+            Clause::CreateIndex { name: Some(n), kind: IndexType::Point, entity: IndexEntity::Node, labels, properties, if_not_exists: true, .. }
+                if n == "places" && labels == &["Place"] && properties == &["location"]
+        ));
+        assert!(matches!(
+            &single("CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint) OPTIONS {indexConfig: {}}")[0],
+            Clause::CreateIndex { kind: IndexType::Point, entity: IndexEntity::Relationship, options: Some(_), .. }
+        ));
         let c = single("CREATE FULLTEXT INDEX titles IF NOT EXISTS FOR (n:Movie|Book) ON EACH [n.title, n.tagline] OPTIONS {indexConfig: {}}");
         assert!(matches!(
             &c[0],
@@ -2794,6 +2808,9 @@ mod tests {
             "CREATE FULLTEXT INDEX FOR ()-[r]-() ON EACH [r.title]",
             "CREATE INDEX FOR (n:A|B) ON (n.title)",
             "CREATE TEXT INDEX FOR (n:Movie) ON (n.title)",
+            "CREATE POINT INDEX ON :Place(location)",
+            "CREATE POINT INDEX FOR (n:A|B) ON (n.location)",
+            "CREATE POINT INDEX FOR ()-[r:A|B]-() ON (r.location)",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

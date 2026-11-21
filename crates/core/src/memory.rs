@@ -1231,7 +1231,7 @@ impl GraphStore for MemoryGraph {
 
     fn create_index(&mut self, def: IndexDef) -> Result<()> {
         def.check_new(&self.indexes())?;
-        if def.is_vector() || def.is_fulltext() {
+        if def.is_engine_kept() {
             self.engine_indexes.push(def);
             return Ok(());
         }

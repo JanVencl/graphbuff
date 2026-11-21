@@ -193,6 +193,7 @@ pub enum IndexType {
     Range,
     Vector,
     Fulltext,
+    Point,
 }
 
 /// How `DROP INDEX` identifies its index.

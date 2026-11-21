@@ -405,6 +405,7 @@ impl Executor<'_> {
                     IndexType::Range => "index",
                     IndexType::Vector => "vector",
                     IndexType::Fulltext => "fulltext",
+                    IndexType::Point => "point",
                 };
                 let mut labels = labels.iter();
                 let label = labels.next().cloned().unwrap_or_default();

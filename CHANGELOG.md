@@ -7,6 +7,9 @@ the same notes.
 
 ### Added
 
+- Point indexes: `CREATE POINT INDEX … FOR (n:L) ON (n.p)` (also on relationships).
+  `MATCH` uses them to seek `point.distance(n.p, $c) < $r` and
+  `point.withinBBox(n.p, $lo, $hi)` instead of filtering every candidate.
 - `ALTER DATABASE … SET ACCESS READ ONLY | READ WRITE`, database aliases
   (`CREATE` / `ALTER` / `DROP ALIAS`, `SHOW ALIASES`) and `DROP DATABASE … DUMP DATA`
   (a backup in `dumps/` first). `SHOW DATABASES` gains `access` and `aliases` columns.
@@ -52,6 +55,8 @@ the same notes.
   failure after that ends the JSON with `"error"` instead of `"stats"`.
 - Aggregation keeps only its groups, not its input rows, so it needs far less memory.
 - `SHOW INDEXES` lists `vector.hnsw.enabled` for every vector index.
+- Storage formats: persistent 11, hybrid snapshot and log 8 (point index definitions).
+  Stores of the older formats still open.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
 

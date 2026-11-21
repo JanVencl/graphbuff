@@ -1703,6 +1703,12 @@ fn seek_ids(
                 continue;
             }
             (SeekKind::StartsWith, _) => continue,
+            (kind @ (SeekKind::Near | SeekKind::WithinBBox), v) => {
+                if let Some(ids) = point_seek(ex, entity, &src.label, &src.key, kind, v)? {
+                    consider(ids);
+                }
+                continue;
+            }
             (kind, v) => {
                 // Only numbers and strings have range seeks; for anything else (a date,
                 // a boolean) the filter decides, and no range is registered: an empty
@@ -1785,6 +1791,52 @@ fn seek_ids(
         }
     }
     Ok(best)
+}
+
+/// The entities a point index seek finds: `value` is `[center, radius]` (`Near`) or
+/// `[lowerLeft, upperRight]` (`WithinBBox`). `None` if the seek cannot run: no point
+/// index contents to read (inside a transaction, or while writing), or values the
+/// filter has to judge (not points and numbers); then the start falls back to a scan.
+fn point_seek(
+    ex: &Executor<'_>,
+    entity: IndexEntity,
+    label: &str,
+    key: &str,
+    kind: SeekKind,
+    value: Value,
+) -> Result<Option<Vec<u64>>> {
+    let Some(accel) = ex.accel.as_ref() else {
+        return Ok(None);
+    };
+    let Value::List(items) = value else { return Ok(None) };
+    let [a, b] = items.as_slice() else { return Ok(None) };
+    let key = [key.to_string()];
+    let Some(def) = accel
+        .snapshot
+        .indexes()
+        .into_iter()
+        .find(|d| d.is_point() && d.same_schema(entity, label, &key))
+    else {
+        return Ok(None);
+    };
+    let interrupt = || ex.check_interrupt();
+    let ids = match (kind, a, b) {
+        // A null argument makes the predicate null: nothing passes.
+        (_, Value::Null, _) | (_, _, Value::Null) => Vec::new(),
+        (SeekKind::Near, Value::Point(center), Value::Int(_) | Value::Float(_)) => {
+            let radius = match b {
+                Value::Int(n) => *n as f64,
+                Value::Float(f) => *f,
+                _ => unreachable!(),
+            };
+            accel.points.get(&accel.snapshot, &def, &interrupt)?.near(center, radius)
+        }
+        (SeekKind::WithinBBox, Value::Point(lo), Value::Point(hi)) => {
+            accel.points.get(&accel.snapshot, &def, &interrupt)?.in_bbox(lo, hi)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(ids))
 }
 
 /// Relationships found by an index seek, bound with both ends (see `Step::RelSeek`).

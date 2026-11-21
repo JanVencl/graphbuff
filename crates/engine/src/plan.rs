@@ -1626,6 +1626,10 @@ impl Estimator<'_, '_> {
 
     /// Entities an index seek is expected to find.
     fn seek(&self, entity: IndexEntity, s: &SeekSource) -> f64 {
+        if s.kind.is_spatial() {
+            // A point index keeps no statistics: a range's share of the entities.
+            return self.population(entity, &s.label) * RANGE_SELECTIVITY;
+        }
         let store = self.ex.store();
         let Some(st) = store.schema_index_stats(entity, &s.label, std::slice::from_ref(&s.key)) else {
             return self.population(entity, &s.label);
@@ -1900,13 +1904,19 @@ fn index_seeks(
         .into_iter()
         .filter(|(_, _, e)| Executor::deps_bound(e, is_bound))
         .collect();
+    let indexes = store.indexes();
     let sources = found
         .iter()
         .filter_map(|(key, kind, expr)| {
+            // Spatial seeks need a point index; the others a range index.
             let label = labels.iter().find(|l| {
-                store
-                    .schema_index_stats(entity, l, std::slice::from_ref(key))
-                    .is_some()
+                if kind.is_spatial() {
+                    indexes.iter().any(|d| d.is_point() && d.same_schema(entity, l, std::slice::from_ref(key)))
+                } else {
+                    store
+                        .schema_index_stats(entity, l, std::slice::from_ref(key))
+                        .is_some()
+                }
             })?;
             Some(SeekSource {
                 label: label.clone(),
@@ -1918,7 +1928,7 @@ fn index_seeks(
         .collect();
     let mut composite = Vec::new();
     if found.len() > 1 {
-        for ix in store.indexes() {
+        for ix in indexes {
             if ix.entity != entity || ix.kind != IndexKind::Range || ix.properties.len() < 2 || !labels.contains(&ix.label) {
                 continue;
             }
