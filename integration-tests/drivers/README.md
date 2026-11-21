@@ -30,9 +30,18 @@ mvn -B test
 mvn -B test -Dneo4j.driver.version=6.0.5
 ```
 
+## JavaScript (`javascript/`, `node:test`, Node 18+)
+
+```bash
+cd integration-tests/drivers/javascript
+npm ci
+npm test
+npm install --no-save neo4j-driver@6.3.2 && npm test
+```
+
 ## What is covered
 
-Both suites check the same things: connectivity, server info and `neo4j://` routing;
+All three suites check the same things: connectivity, server info and `neo4j://` routing;
 basic and bearer auth and a wrong password; every value type both ways (integers at the
 edges, long strings, nested lists and maps, all temporal types, points, nodes,
 relationships, paths with reversed relationships; element ids that `elementId()`
@@ -41,7 +50,9 @@ accepts); fetch sizes and partly read results; summary counters, query types,
 transactions, commit, rollback, several open results in one transaction, metadata and
 timeouts; bookmarks; concurrent sessions; syntax, constraint and runtime errors and
 recovering from them; other databases, and database commands on the `system` database.
-Java also runs the async API.
+Java also runs the async API. JavaScript also checks `Integer` and `BigInt` results,
+that a plain JS number is sent as a float, named time zones, async iteration, the
+bookmark manager and the reactive (`rxSession`) API.
 
 Python's `test_accounts.py` starts servers of its own: one with user accounts in a data
 directory (made with `graphbuff-server users --config FILE add`), checking logins, roles
@@ -54,4 +65,5 @@ cargo build -p graphbuff-server --features tls-rustcrypto
 ```
 
 Last run (2026-11-13): Python driver 5.28.2 and 6.4.1, 31 tests; Java driver 5.28.5 and
-6.0.5, 32 tests. All pass. Accounts and TLS (2026-11-13): Python 5.28.2, 38 tests, all pass.
+6.0.5, 32 tests. All pass. JavaScript (2026-11-21): driver 5.28.3 and 6.3.2, 35 tests,
+all pass. Accounts and TLS (2026-11-13): Python 5.28.2, 38 tests, all pass.
