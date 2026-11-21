@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Smoke suite: the official Neo4j JavaScript driver against graphbuff-server over Bolt.",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/"
+    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\""
   },
   "engines": {
     "node": ">=18"

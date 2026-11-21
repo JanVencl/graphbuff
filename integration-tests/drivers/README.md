@@ -39,9 +39,19 @@ npm test
 npm install --no-save neo4j-driver@6.3.2 && npm test
 ```
 
+## .NET (`dotnet/`, xUnit, .NET 8+ SDK)
+
+```bash
+cd integration-tests/drivers/dotnet
+dotnet test
+dotnet test -p:Neo4jDriverVersion=6.5.1
+```
+
+The project pins driver 5.28.4 (the 5.x LTS line).
+
 ## What is covered
 
-All three suites check the same things: connectivity, server info and `neo4j://` routing;
+All four suites check the same things: connectivity, server info and `neo4j://` routing;
 basic and bearer auth and a wrong password; every value type both ways (integers at the
 edges, long strings, nested lists and maps, all temporal types, points, nodes,
 relationships, paths with reversed relationships; element ids that `elementId()`
@@ -52,7 +62,9 @@ timeouts; bookmarks; concurrent sessions; syntax, constraint and runtime errors 
 recovering from them; other databases, and database commands on the `system` database.
 Java also runs the async API. JavaScript also checks `Integer` and `BigInt` results,
 that a plain JS number is sent as a float, named time zones, async iteration, the
-bookmark manager and the reactive (`rxSession`) API.
+bookmark manager and the reactive (`rxSession`) API. .NET also checks named time zones,
+that a C# `int` is sent as an integer, the bookmark manager and `ExecutableQuery` with
+`WithMap`.
 
 Python's `test_accounts.py` starts servers of its own: one with user accounts in a data
 directory (made with `graphbuff-server users --config FILE add`), checking logins, roles
@@ -64,6 +76,8 @@ connections. The TLS tests are skipped unless the server was built with TLS:
 cargo build -p graphbuff-server --features tls-rustcrypto
 ```
 
-Last run (2026-11-13): Python driver 5.28.2 and 6.4.1, 31 tests; Java driver 5.28.5 and
-6.0.5, 32 tests. All pass. JavaScript (2026-11-21): driver 5.28.3 and 6.3.2, 35 tests,
-all pass. Accounts and TLS (2026-11-13): Python 5.28.2, 38 tests, all pass.
+CI (`.github/workflows/drivers.yml`) runs every suite on both driver lines for each pull
+request that changes the suites or the server. Last run (2026-11-21): Python 5.28.2 and
+6.4.1 (38 passed, 4 TLS tests skipped); Java 5.28.5 and 6.0.5, 32 tests; JavaScript 5.28.3
+and 6.3.2, 35 tests; .NET 5.28.4 and 6.5.1, 33 tests. All pass.
+Accounts and TLS with a TLS build (2026-11-13): Python 5.28.2, 38 tests, all pass.

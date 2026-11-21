@@ -5,7 +5,7 @@
 | `python/` | All Python for the behave suites: hooks (`environment.py`), step definitions (`steps/`), server launcher, TCK value parser, TCK runner |
 | `cucumber/features/` | graphbuff's own scenarios (`.feature` only) |
 | `tck/` | openCypher TCK: `features/`, `graphs/`, `passing.txt` ([README](tck/README.md)) |
-| `drivers/` | Bolt driver smoke suites, Python (pytest), Java (JUnit) and JavaScript (node:test) ([README](drivers/README.md)) |
+| `drivers/` | Bolt driver smoke suites, Python (pytest), Java (JUnit), JavaScript (node:test) and .NET (xUnit) ([README](drivers/README.md)) |
 
 Both behave suites share one step registry. Hooks pick the server setup by feature path:
 TCK features share one server (fresh database per scenario), all others get a fresh server
