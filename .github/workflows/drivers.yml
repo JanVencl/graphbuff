@@ -121,7 +121,8 @@ jobs:
         run: |
           major="v${DRIVER%%.*}"
           if [ "$major" != v5 ]; then
-            sed -i "s#neo4j-go-driver/v5#neo4j-go-driver/$major#g" go.mod *.go
+            go mod edit -droprequire=github.com/neo4j/neo4j-go-driver/v5
+            sed -i "s#neo4j-go-driver/v5#neo4j-go-driver/$major#g" *.go
           fi
           go mod edit -require="github.com/neo4j/neo4j-go-driver/$major@v$DRIVER"
           go mod tidy
