@@ -76,6 +76,8 @@ connections. The TLS tests are skipped unless the server was built with TLS:
 cargo build -p graphbuff-server --features tls-rustcrypto
 ```
 
-Last run (2026-11-13): Python driver 5.28.2 and 6.4.1, 31 tests; Java driver 5.28.5 and
-6.0.5, 32 tests. All pass. JavaScript (2026-11-21): driver 5.28.3 and 6.3.2, 35 tests,
-all pass. .NET: not run yet. Accounts and TLS (2026-11-13): Python 5.28.2, 38 tests, all pass.
+CI (`.github/workflows/drivers.yml`) runs every suite on both driver lines for each pull
+request that changes the suites or the server. Last run (2026-11-21): Python 5.28.2 and
+6.4.1 (38 passed, 4 TLS tests skipped); Java 5.28.5 and 6.0.5, 32 tests; JavaScript 5.28.3
+and 6.3.2, 35 tests; .NET 5.28.4 and 6.5.1, 33 tests. All pass.
+Accounts and TLS with a TLS build (2026-11-13): Python 5.28.2, 38 tests, all pass.
