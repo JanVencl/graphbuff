@@ -1,5 +1,5 @@
 # Runs the driver smoke suites (integration-tests/drivers/README.md): the official Neo4j
-# drivers for Python, Java, JavaScript and .NET, each on the 5.x LTS line and the newest
+# drivers for Python, Java, JavaScript, .NET and Go, each on the 5.x LTS line and the newest
 # 6.x, against one graphbuff-server build. On a pull request that changes the suites or
 # the server, and on demand.
 name: drivers
@@ -59,6 +59,8 @@ jobs:
           - { suite: javascript, driver: "6.3.2" }
           - { suite: dotnet,     driver: "5.28.4" }
           - { suite: dotnet,     driver: "6.5.1" }
+          - { suite: go,         driver: "5.28.6" }
+          - { suite: go,         driver: "6.4.0" }
     defaults:
       run:
         working-directory: integration-tests/drivers/${{ matrix.suite }}
@@ -108,3 +110,22 @@ jobs:
           dotnet-version: "8.0.x"
       - if: matrix.suite == 'dotnet'
         run: dotnet test -p:Neo4jDriverVersion=${{ matrix.driver }} --logger "console;verbosity=normal"
+
+      - if: matrix.suite == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # The suite imports the v5 module; for another major version, rewrite the path.
+      - if: matrix.suite == 'go'
+        run: |
+          major="v${DRIVER%%.*}"
+          if [ "$major" != v5 ]; then
+            sed -i "s#neo4j-go-driver/v5#neo4j-go-driver/$major#g" go.mod *.go
+          fi
+          go mod edit -require="github.com/neo4j/neo4j-go-driver/$major@v$DRIVER"
+          go mod tidy
+          go vet ./...
+          go test -count=1 -v ./...
+        env:
+          DRIVER: ${{ matrix.driver }}
