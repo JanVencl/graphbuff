@@ -107,7 +107,9 @@ public sealed class DriverSmokeTest : IClassFixture<Server>, IAsyncLifetime
             Assert.Equal("02000", summary.GqlStatusObjects.First().GqlStatus);
             var e = await Fails(() => Consume(s, "RETURN 1 +"));
             Assert.Equal("Neo.ClientError.Statement.SyntaxError", e.Code);
-            Assert.Equal("42001", e.GqlStatus);
+            // Neo4jException.GqlStatus exists from driver 6.0.
+            var gqlStatus = typeof(Neo4jException).GetProperty("GqlStatus");
+            if (gqlStatus != null) Assert.Equal("42001", gqlStatus.GetValue(e));
         });
     }
 
