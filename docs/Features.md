@@ -171,7 +171,7 @@ Counters start at zero when the server starts.
 | `graphbuff_database_nodes{database}` | gauge | nodes |
 | `graphbuff_database_relationships{database}` | gauge | relationships |
 | `graphbuff_database_store_bytes{database}` | gauge | size of a durable database's files (not for in-memory databases) |
-| `graphbuff_database_cached_indexes{database}` | gauge | vector, full-text and point indexes whose contents are held in memory |
+| `graphbuff_database_cached_indexes{database}` | gauge | vector, full-text, point and text indexes whose contents are held in memory |
 | `graphbuff_memory_bytes` | gauge | memory the server process has allocated |
 
 A scrape configuration:

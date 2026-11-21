@@ -45,6 +45,12 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
     if kind == IndexType::Point {
         return crate::point_index::point_kind(&config);
     }
+    if kind == IndexType::Text {
+        return crate::text_index::text_kind(&config);
+    }
+    if kind == IndexType::Lookup {
+        return crate::text_index::lookup_kind(&config);
+    }
     if kind == IndexType::Range {
         if let Some(k) = config.keys().next() {
             return Err(Error::Semantic(format!("unknown index setting `{k}` for a range index")));
@@ -118,7 +124,9 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
 pub fn index_row(d: IndexDef) -> Vec<Value> {
     let options = match d.kind {
         IndexKind::Range => BTreeMap::new(),
-        IndexKind::Point => BTreeMap::from([("indexConfig".to_string(), Value::Map(BTreeMap::new()))]),
+        IndexKind::Point | IndexKind::Text | IndexKind::Lookup => {
+            BTreeMap::from([("indexConfig".to_string(), Value::Map(BTreeMap::new()))])
+        }
         IndexKind::Vector { dimensions, similarity, hnsw } => {
             let mut config = BTreeMap::from([
                 ("vector.dimensions".to_string(), Value::Int(i64::from(dimensions))),
@@ -139,13 +147,20 @@ pub fn index_row(d: IndexDef) -> Vec<Value> {
             ])),
         )]),
     };
-    // A full-text index on several labels shows them as `A|B`.
-    let labels = d.labels().collect::<Vec<_>>().join("|");
+    // A full-text index on several labels shows them as `A|B`; a lookup index has none.
+    let (labels, properties) = if d.is_lookup() {
+        (Value::Null, Value::Null)
+    } else {
+        (
+            Value::String(d.labels().collect::<Vec<_>>().join("|")),
+            Value::List(d.properties.into_iter().map(Value::String).collect()),
+        )
+    };
     vec![
         Value::String(d.name),
         Value::String(d.entity.text().into()),
-        Value::String(labels),
-        Value::List(d.properties.into_iter().map(Value::String).collect()),
+        labels,
+        properties,
         Value::String(d.kind.text().into()),
         Value::Map(options),
     ]
@@ -236,7 +251,9 @@ fn indexed_vector(value: &Value, dimensions: u32, similarity: Similarity) -> Opt
 fn vector_params(def: &IndexDef) -> (u32, Similarity) {
     match def.kind {
         IndexKind::Vector { dimensions, similarity, .. } => (dimensions, similarity),
-        IndexKind::Range | IndexKind::Fulltext { .. } | IndexKind::Point => unreachable!("a vector index"),
+        IndexKind::Range | IndexKind::Fulltext { .. } | IndexKind::Point | IndexKind::Text | IndexKind::Lookup => {
+            unreachable!("a vector index")
+        }
     }
 }
 

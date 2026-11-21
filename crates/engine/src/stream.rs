@@ -79,6 +79,7 @@ use crate::context::{Env, Executor, Frame, Row, Scope};
 use crate::exec::Grouping;
 use crate::exec::compare_sort_keys;
 use crate::matcher::SeekKind;
+use crate::text_index::TextMatch;
 use crate::ops::cypher_eq;
 use crate::plan::{CompositeSeek, Item, MatchPlan, Operator, SeekSource, Start, Step, profile_key};
 
@@ -1700,18 +1701,27 @@ fn seek_ids(
             (SeekKind::In, Value::List(items)) => items,
             (SeekKind::In, Value::Null) => Vec::new(),
             (SeekKind::In, _) => continue,
-            (SeekKind::StartsWith, Value::Null) => {
+            (SeekKind::StartsWith | SeekKind::EndsWith | SeekKind::Contains, Value::Null) => {
                 consider(Vec::new());
                 continue;
             }
             (SeekKind::StartsWith, Value::String(p)) => {
-                let range = ValueRange::Prefix(p);
+                let range = ValueRange::Prefix(p.clone());
                 if let Some(ids) = store.schema_index_range(entity, &src.label, &src.key, &range)? {
+                    consider(ids);
+                } else if let Some(ids) = text_seek(ex, entity, &src.label, &src.key, TextMatch::StartsWith, &p)? {
                     consider(ids);
                 }
                 continue;
             }
-            (SeekKind::StartsWith, _) => continue,
+            (kind @ (SeekKind::EndsWith | SeekKind::Contains), Value::String(p)) => {
+                let how = if kind == SeekKind::EndsWith { TextMatch::EndsWith } else { TextMatch::Contains };
+                if let Some(ids) = text_seek(ex, entity, &src.label, &src.key, how, &p)? {
+                    consider(ids);
+                }
+                continue;
+            }
+            (SeekKind::StartsWith | SeekKind::EndsWith | SeekKind::Contains, _) => continue,
             (kind @ (SeekKind::Near | SeekKind::WithinBBox), v) => {
                 if let Some(ids) = point_seek(ex, entity, &src.label, &src.key, kind, v)? {
                     consider(ids);
@@ -1846,6 +1856,32 @@ fn point_seek(
         _ => return Ok(None),
     };
     Ok(Some(ids))
+}
+
+/// The entities of the text index on `label`(`key`) whose value matches `needle` (`how`),
+/// or `None` without one (or outside a read of a committed state).
+fn text_seek(
+    ex: &Executor<'_>,
+    entity: IndexEntity,
+    label: &str,
+    key: &str,
+    how: TextMatch,
+    needle: &str,
+) -> Result<Option<Vec<u64>>> {
+    let Some(accel) = ex.accel.as_ref() else {
+        return Ok(None);
+    };
+    let key = [key.to_string()];
+    let Some(def) = accel
+        .snapshot
+        .indexes()
+        .into_iter()
+        .find(|d| d.is_text() && d.same_schema(entity, label, &key))
+    else {
+        return Ok(None);
+    };
+    let interrupt = || ex.check_interrupt();
+    Ok(Some(accel.trigrams.get(&accel.snapshot, &def, &interrupt)?.find(how, needle)))
 }
 
 /// Relationships found by an index seek, bound with both ends (see `Step::RelSeek`).

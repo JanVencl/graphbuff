@@ -86,9 +86,14 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
 * **Schema:** `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:L) ON (n.p [, n.q …])`,
   `… FOR ()-[r:T]-() ON (r.p [, r.q …])` (relationship indexes), `CREATE INDEX ON :L(p [, q …])`,
   `DROP INDEX name [IF EXISTS]`, `DROP INDEX ON :L(p [, q …])`, `SHOW INDEXES` (name, entity
-  type, label or type, properties, `RANGE`, `VECTOR`, `FULLTEXT` or `POINT`, options), vector indexes (see
-  *Vectors* below), full-text indexes (see *Full-text* below), point indexes (see *Spatial
-  values* below), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
+  type, label or type, properties, `RANGE`, `VECTOR`, `FULLTEXT`, `POINT`, `TEXT` or `LOOKUP`,
+  options), vector indexes (see *Vectors* below), full-text indexes (see *Full-text* below),
+  point indexes (see *Spatial values* below), text indexes `CREATE TEXT INDEX [name] [IF NOT
+  EXISTS] FOR (n:L) ON (n.p)` (or `FOR ()-[r:T]-() ON (r.p)`; one property; `MATCH` seeks them
+  for `n.p STARTS WITH s`, `ENDS WITH s` and `CONTAINS s`, where a range index answers only
+  `STARTS WITH`), lookup indexes `CREATE LOOKUP INDEX [name] [IF NOT EXISTS] FOR (n) ON EACH
+  labels(n)` and `FOR ()-[r]-() ON [EACH] type(r)` (one of each; listed with null labels and
+  properties, and accepted for compatibility: label and type scans need none), `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:L) REQUIRE n.p IS UNIQUE` (also `IS NOT NULL`,
   `(n.a, n.b) IS UNIQUE | NODE KEY`, and property types `n.p IS :: INTEGER | FLOAT`
   (`IS TYPED`, `LIST<STRING NOT NULL>`); the older `ON … ASSERT …` form works too), the same
   on relationships `FOR ()-[r:T]-() REQUIRE r.p IS UNIQUE | NOT NULL | :: <type>` and
@@ -226,7 +231,6 @@ recognise. Where there is another way to write it, it is given.
 
 | Missing | Error |
 |---------|-------|
-| `CREATE TEXT INDEX`, `CREATE LOOKUP INDEX` | `Unsupported` (range, full-text, vector and point indexes exist) |
 | Property type constraints on `MAP`, `NODE`, `PATH`, `ANY` or nullable list elements (`LIST<INTEGER>`) | syntax error: properties cannot hold them, and lists of properties hold no nulls |
 | Quantization of vector indexes, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
 | Full-text ranges, regular expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`) | `Unsupported` |

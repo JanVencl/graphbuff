@@ -67,8 +67,12 @@ pub(crate) enum SeekKind {
     Gt,
     /// `n.key >= expr`
     Ge,
-    /// `n.key STARTS WITH expr`
+    /// `n.key STARTS WITH expr` (a range or a text index)
     StartsWith,
+    /// `n.key ENDS WITH expr`. Text indexes only.
+    EndsWith,
+    /// `n.key CONTAINS expr`. Text indexes only.
+    Contains,
     /// `point.distance(n.key, center) < radius` (or `<=`, either way round): `expr` is
     /// `[center, radius]`. Point indexes only.
     Near,
@@ -92,6 +96,8 @@ impl SeekKind {
             SeekKind::Gt => ">",
             SeekKind::Ge => ">=",
             SeekKind::StartsWith => "STARTS WITH",
+            SeekKind::EndsWith => "ENDS WITH",
+            SeekKind::Contains => "CONTAINS",
             SeekKind::Near => "point.distance <",
             SeekKind::WithinBBox => "point.withinBBox",
         }
@@ -101,10 +107,16 @@ impl SeekKind {
     pub(crate) fn is_spatial(self) -> bool {
         matches!(self, SeekKind::Near | SeekKind::WithinBBox)
     }
+
+    /// String seeks a text index answers (`STARTS WITH` also a range index).
+    pub(crate) fn is_textual(self) -> bool {
+        matches!(self, SeekKind::StartsWith | SeekKind::EndsWith | SeekKind::Contains)
+    }
 }
 
 /// A `WHERE` conjunct that constrains a node or relationship property: `var.key = expr`, `var.key IN
-/// expr`, a comparison (`var.key < expr`, either way round), `var.key STARTS WITH expr`, or
+/// expr`, a comparison (`var.key < expr`, either way round), `var.key STARTS WITH | ENDS
+/// WITH | CONTAINS expr`, or
 /// a spatial one ([`SeekKind::Near`], [`SeekKind::WithinBBox`]).
 #[derive(Debug, Clone)]
 pub(crate) struct SeekHint {
@@ -159,6 +171,8 @@ pub(crate) fn extract_hints(where_: Option<&Expr>, node_vars: &HashSet<&str>) ->
             BinaryOp::Gt => vec![(a, b, K::Gt), (b, a, K::Lt)],
             BinaryOp::Ge => vec![(a, b, K::Ge), (b, a, K::Le)],
             BinaryOp::StartsWith => vec![(a, b, K::StartsWith)],
+            BinaryOp::EndsWith => vec![(a, b, K::EndsWith)],
+            BinaryOp::Contains => vec![(a, b, K::Contains)],
             _ => Vec::new(),
         };
         for (prop, other, kind) in candidates {

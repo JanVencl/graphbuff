@@ -831,12 +831,18 @@ impl<'a> Parser<'a> {
                 ("VECTOR", IndexType::Vector),
                 ("FULLTEXT", IndexType::Fulltext),
                 ("POINT", IndexType::Point),
+                ("TEXT", IndexType::Text),
             ] {
                 if self.is_kw(kw) && self.kw_at(1, "INDEX") {
                     self.advance();
                     self.advance();
                     return self.parse_create_index(kind);
                 }
+            }
+            if self.is_kw("LOOKUP") && self.kw_at(1, "INDEX") {
+                self.advance();
+                self.advance();
+                return self.parse_create_lookup_index();
             }
             if self.eat_kw("CONSTRAINT") {
                 return self.parse_create_constraint();
@@ -1336,6 +1342,87 @@ impl<'a> Parser<'a> {
             properties,
             if_not_exists,
             kind,
+            options,
+        })
+    }
+
+    /// After `CREATE LOOKUP INDEX`: `[name] [IF NOT EXISTS] FOR (n) ON EACH labels(n)` or
+    /// `FOR ()-[r]-() ON [EACH] type(r)`, then `[OPTIONS …]`.
+    fn parse_create_lookup_index(&mut self) -> Result<Clause> {
+        let name = if self.at_ident() && !self.is_kw("IF") && !self.is_kw("FOR") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        let if_not_exists = if self.eat_kw("IF") {
+            self.expect_kw("NOT")?;
+            self.expect_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        self.expect_kw("FOR")?;
+        self.expect(Tok::LParen, "'('")?;
+        let offset = self.offset();
+        let (entity, var, function) = if self.eat(&Tok::RParen) {
+            let rel = self.parse_rel_pattern()?;
+            self.expect(Tok::LParen, "'('")?;
+            self.expect(Tok::RParen, "')'")?;
+            match rel.var {
+                Some(var) if rel.types.is_empty() && rel.props.is_none() && rel.length.is_none() => {
+                    (IndexEntity::Relationship, var, "TYPE")
+                }
+                _ => {
+                    return Err(Error::syntax(
+                        "a relationship lookup index pattern is ()-[r]-(), with no type",
+                        offset,
+                    ));
+                }
+            }
+        } else {
+            let var = self.ident()?;
+            if !matches!(self.peek(), Tok::RParen) {
+                return Err(Error::syntax("a node lookup index pattern is (n), with no label", offset));
+            }
+            self.advance();
+            (IndexEntity::Node, var, "LABELS")
+        };
+        self.expect_kw("ON")?;
+        let each = self.eat_kw("EACH");
+        if function == "LABELS" && !each {
+            return self.err(format!("expected EACH labels({var}), found {}", self.describe()));
+        }
+        let offset = self.offset();
+        if !self.eat_kw(function) {
+            return Err(Error::syntax(
+                format!("expected {}({var})", function.to_lowercase()),
+                offset,
+            ));
+        }
+        self.expect(Tok::LParen, "'('")?;
+        let offset = self.offset();
+        if self.ident()? != var {
+            return Err(Error::syntax(format!("expected `{var}`"), offset));
+        }
+        self.expect(Tok::RParen, "')'")?;
+        let options = if self.eat_kw("OPTIONS") {
+            if !matches!(self.peek(), Tok::LBrace | Tok::Param(_)) {
+                return self.err(format!(
+                    "expected a map or a parameter after OPTIONS, found {}",
+                    self.describe()
+                ));
+            }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Clause::CreateIndex {
+            name,
+            entity,
+            labels: Vec::new(),
+            properties: Vec::new(),
+            if_not_exists,
+            kind: IndexType::Lookup,
             options,
         })
     }
@@ -2790,6 +2877,26 @@ mod tests {
             &single("CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint) OPTIONS {indexConfig: {}}")[0],
             Clause::CreateIndex { kind: IndexType::Point, entity: IndexEntity::Relationship, options: Some(_), .. }
         ));
+        assert!(matches!(
+            &single("CREATE TEXT INDEX titles IF NOT EXISTS FOR (m:Movie) ON (m.title)")[0],
+            Clause::CreateIndex { name: Some(n), kind: IndexType::Text, entity: IndexEntity::Node, labels, properties, if_not_exists: true, .. }
+                if n == "titles" && labels == &["Movie"] && properties == &["title"]
+        ));
+        assert!(matches!(
+            &single("CREATE TEXT INDEX FOR ()-[r:REVIEWED]-() ON (r.summary)")[0],
+            Clause::CreateIndex { kind: IndexType::Text, entity: IndexEntity::Relationship, .. }
+        ));
+        assert!(matches!(
+            &single("CREATE LOOKUP INDEX node_labels IF NOT EXISTS FOR (n) ON EACH labels(n)")[0],
+            Clause::CreateIndex { name: Some(n), kind: IndexType::Lookup, entity: IndexEntity::Node, labels, properties, if_not_exists: true, options: None }
+                if n == "node_labels" && labels.is_empty() && properties.is_empty()
+        ));
+        for q in ["CREATE LOOKUP INDEX FOR ()-[r]-() ON EACH type(r)", "CREATE LOOKUP INDEX FOR ()-[r]->() ON TYPE(r) OPTIONS {}"] {
+            assert!(
+                matches!(&single(q)[0], Clause::CreateIndex { kind: IndexType::Lookup, entity: IndexEntity::Relationship, .. }),
+                "{q}"
+            );
+        }
         let c = single("CREATE FULLTEXT INDEX titles IF NOT EXISTS FOR (n:Movie|Book) ON EACH [n.title, n.tagline] OPTIONS {indexConfig: {}}");
         assert!(matches!(
             &c[0],
@@ -2807,7 +2914,14 @@ mod tests {
             "CREATE FULLTEXT INDEX ON :Movie(title)",
             "CREATE FULLTEXT INDEX FOR ()-[r]-() ON EACH [r.title]",
             "CREATE INDEX FOR (n:A|B) ON (n.title)",
-            "CREATE TEXT INDEX FOR (n:Movie) ON (n.title)",
+            "CREATE TEXT INDEX FOR (n:A|B) ON (n.title)",
+            "CREATE TEXT INDEX ON :Movie(title)",
+            "CREATE LOOKUP INDEX FOR (n:Movie) ON EACH labels(n)",
+            "CREATE LOOKUP INDEX FOR (n) ON labels(n)",
+            "CREATE LOOKUP INDEX FOR (n) ON EACH labels(m)",
+            "CREATE LOOKUP INDEX FOR (n) ON EACH type(n)",
+            "CREATE LOOKUP INDEX FOR ()-[r:T]-() ON EACH type(r)",
+            "CREATE LOOKUP INDEX FOR ()-[r]-() ON EACH labels(r)",
             "CREATE POINT INDEX ON :Place(location)",
             "CREATE POINT INDEX FOR (n:A|B) ON (n.location)",
             "CREATE POINT INDEX FOR ()-[r:A|B]-() ON (r.location)",

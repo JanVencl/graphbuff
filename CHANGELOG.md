@@ -7,6 +7,11 @@ the same notes.
 
 ### Added
 
+- Text indexes: `CREATE TEXT INDEX … FOR (n:L) ON (n.p)` (also on relationships). `MATCH`
+  uses them to seek `n.p STARTS WITH $s`, `ENDS WITH $s` and `CONTAINS $s`.
+- Lookup indexes: `CREATE LOOKUP INDEX … FOR (n) ON EACH labels(n)` and
+  `FOR ()-[r]-() ON EACH type(r)`, listed by `SHOW INDEXES` (label and type scans need
+  none).
 - Write procedures: `db.create.setNodeVectorProperty` and
   `db.create.setRelationshipVectorProperty`, and procedures registered with
   `ProcedureSignature::writes()`, which set properties and labels through their context.
@@ -60,8 +65,8 @@ the same notes.
   failure after that ends the JSON with `"error"` instead of `"stats"`.
 - Aggregation keeps only its groups, not its input rows, so it needs far less memory.
 - `SHOW INDEXES` lists `vector.hnsw.enabled` for every vector index.
-- Storage formats: persistent 11, hybrid snapshot and log 8 (point index definitions).
-  Stores of the older formats still open.
+- Storage formats: persistent 12, hybrid snapshot and log 9, memory snapshot 9 (point,
+  text and lookup index definitions). Stores of the older formats still open.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
 

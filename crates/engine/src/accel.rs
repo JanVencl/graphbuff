@@ -179,6 +179,8 @@ pub(crate) struct Accel {
     pub texts: Arc<crate::fulltext::TextCache>,
     /// The point index grids of the same committed state.
     pub points: Arc<crate::point_index::PointCache>,
+    /// The text index trigrams of the same committed state.
+    pub trigrams: Arc<crate::text_index::TrigramCache>,
     pub snapshot: Snapshot,
     pub kernels: Arc<dyn Kernels>,
     pub mode: KernelMode,

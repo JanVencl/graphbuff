@@ -479,11 +479,19 @@ impl Executor<'_> {
                     IndexType::Vector => "vector",
                     IndexType::Fulltext => "fulltext",
                     IndexType::Point => "point",
+                    IndexType::Text => "text",
+                    IndexType::Lookup => "lookup",
                 };
                 let mut labels = labels.iter();
                 let label = labels.next().cloned().unwrap_or_default();
                 let def = IndexDef {
                     name: name.clone().unwrap_or_else(|| {
+                        if *kind == IndexType::Lookup {
+                            return match entity {
+                                IndexEntity::Node => "lookup_node_labels".into(),
+                                IndexEntity::Relationship => "lookup_relationship_types".into(),
+                            };
+                        }
                         let mut parts = vec![prefix.to_string(), label.clone()];
                         parts.extend(labels.clone().cloned());
                         parts.extend(properties.iter().cloned());
