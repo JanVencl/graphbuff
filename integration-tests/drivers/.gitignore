@@ -5,3 +5,4 @@ java/target/
 javascript/node_modules/
 dotnet/bin/
 dotnet/obj/
+go/go.sum
