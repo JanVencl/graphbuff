@@ -46,6 +46,7 @@ mod legacy;
 mod typecheck;
 mod plan;
 mod point_index;
+mod text_index;
 mod procedures;
 mod regex;
 mod result;
@@ -142,6 +143,8 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     text_cache: Arc<fulltext::TextCache>,
     /// The point index grids of a committed state.
     point_cache: Arc<point_index::PointCache>,
+    /// The text index trigrams of a committed state.
+    trigram_cache: Arc<text_index::TrigramCache>,
     /// The kernel backend read queries use, and when they use it.
     kernels: RwLock<(Arc<dyn Kernels>, KernelMode)>,
     /// Set by [`Database::set_read_only`]: queries that write fail.
@@ -197,7 +200,9 @@ impl<S: GraphStore> Database<S> {
         let vector_cache = Arc::<vector::VectorCache>::default();
         let text_cache = Arc::<fulltext::TextCache>::default();
         let point_cache = Arc::<point_index::PointCache>::default();
+        let trigram_cache = Arc::<text_index::TrigramCache>::default();
         if let Some(s) = &committed {
+            trigram_cache.published(s, graphbuff_core::Changes::unknown());
             vector_cache.published(s, graphbuff_core::Changes::unknown());
             text_cache.published(s, graphbuff_core::Changes::unknown());
             point_cache.published(s, graphbuff_core::Changes::unknown());
@@ -214,6 +219,7 @@ impl<S: GraphStore> Database<S> {
             vector_cache,
             text_cache,
             point_cache,
+            trigram_cache,
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
             read_only: std::sync::atomic::AtomicBool::new(false),
         }
@@ -575,6 +581,7 @@ impl<S: GraphStore> Database<S> {
         let snapshot = store.snapshot()?;
         self.text_cache.published(&snapshot, changes.clone());
         self.point_cache.published(&snapshot, changes.clone());
+        self.trigram_cache.published(&snapshot, changes.clone());
         self.vector_cache.published(&snapshot, changes);
         self.committed.write().unwrap_or_else(|e| e.into_inner()).replace(snapshot)
     }
@@ -605,6 +612,7 @@ impl<S: GraphStore> Database<S> {
                     vectors: self.vector_cache.clone(),
                     texts: self.text_cache.clone(),
                     points: self.point_cache.clone(),
+                    trigrams: self.trigram_cache.clone(),
                     snapshot: snapshot.clone(),
                     kernels,
                     mode,
@@ -713,10 +721,10 @@ impl<S: GraphStore> Database<S> {
         f(&self.store.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// The vector, full-text and point indexes whose contents are cached in memory (built by a
-    /// query on the last committed state, and kept up to date since).
+    /// The vector, full-text, point and text indexes whose contents are cached in memory
+    /// (built by a query on the last committed state, and kept up to date since).
     pub fn cached_indexes(&self) -> usize {
-        self.vector_cache.len() + self.text_cache.len() + self.point_cache.len()
+        self.vector_cache.len() + self.text_cache.len() + self.point_cache.len() + self.trigram_cache.len()
     }
 
     pub fn node_count(&self) -> usize {

@@ -194,6 +194,10 @@ pub enum IndexType {
     Vector,
     Fulltext,
     Point,
+    Text,
+    /// `CREATE LOOKUP INDEX … FOR (n) ON EACH labels(n)` (or `type(r)`): no labels or
+    /// properties.
+    Lookup,
 }
 
 /// How `DROP INDEX` identifies its index.

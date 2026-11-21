@@ -1632,6 +1632,10 @@ impl Estimator<'_, '_> {
         }
         let store = self.ex.store();
         let Some(st) = store.schema_index_stats(entity, &s.label, std::slice::from_ref(&s.key)) else {
+            // A text index keeps no statistics either.
+            if s.kind.is_textual() {
+                return self.population(entity, &s.label) * PREFIX_SELECTIVITY;
+            }
             return self.population(entity, &s.label);
         };
         let entries = st.entries as f64;
@@ -1639,7 +1643,7 @@ impl Estimator<'_, '_> {
         match s.kind {
             SeekKind::Eq => per_value,
             SeekKind::In => per_value * IN_LIST_SIZE,
-            SeekKind::StartsWith => entries * PREFIX_SELECTIVITY,
+            SeekKind::StartsWith | SeekKind::EndsWith | SeekKind::Contains => entries * PREFIX_SELECTIVITY,
             _ => entries * RANGE_SELECTIVITY,
         }
     }
@@ -1908,14 +1912,17 @@ fn index_seeks(
     let sources = found
         .iter()
         .filter_map(|(key, kind, expr)| {
-            // Spatial seeks need a point index; the others a range index.
+            // Spatial seeks need a point index, `ENDS WITH` and `CONTAINS` a text index,
+            // `STARTS WITH` a range or a text index, the others a range index.
+            let keys = std::slice::from_ref(key);
             let label = labels.iter().find(|l| {
-                if kind.is_spatial() {
-                    indexes.iter().any(|d| d.is_point() && d.same_schema(entity, l, std::slice::from_ref(key)))
-                } else {
-                    store
-                        .schema_index_stats(entity, l, std::slice::from_ref(key))
-                        .is_some()
+                let range = || store.schema_index_stats(entity, l, keys).is_some();
+                let text = || indexes.iter().any(|d| d.is_text() && d.same_schema(entity, l, keys));
+                match kind {
+                    k if k.is_spatial() => indexes.iter().any(|d| d.is_point() && d.same_schema(entity, l, keys)),
+                    SeekKind::StartsWith => range() || text(),
+                    k if k.is_textual() => text(),
+                    _ => range(),
                 }
             })?;
             Some(SeekSource {

@@ -805,16 +805,24 @@ pub enum IndexKind {
         analyzer: Analyzer,
     },
     Point,
+    /// A string index (trigrams) on one property, for `STARTS WITH`, `ENDS WITH` and
+    /// `CONTAINS`.
+    Text,
+    /// A token lookup index: the labels of all nodes, or the types of all relationships.
+    /// No label or properties.
+    Lookup,
 }
 
 impl IndexKind {
-    /// `RANGE`, `VECTOR`, `FULLTEXT` or `POINT`, as `SHOW INDEXES` lists it.
+    /// `RANGE`, `VECTOR`, `FULLTEXT`, `POINT`, `TEXT` or `LOOKUP`, as `SHOW INDEXES` lists it.
     pub fn text(self) -> &'static str {
         match self {
             IndexKind::Range => "RANGE",
             IndexKind::Vector { .. } => "VECTOR",
             IndexKind::Fulltext { .. } => "FULLTEXT",
             IndexKind::Point => "POINT",
+            IndexKind::Text => "TEXT",
+            IndexKind::Lookup => "LOOKUP",
         }
     }
 }
@@ -926,8 +934,39 @@ impl IndexDef {
         self.kind == IndexKind::Point
     }
 
-    /// Whether the engine keeps the index's contents (vector, full-text and point
-    /// indexes): the store keeps only its definition.
+    /// A text index on one property of the nodes with `label`, or of the relationships
+    /// of a type (`entity`).
+    pub fn text(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        label: impl Into<String>,
+        property: impl Into<String>,
+    ) -> IndexDef {
+        IndexDef { kind: IndexKind::Text, ..IndexDef::point(name, entity, label, property) }
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.kind == IndexKind::Text
+    }
+
+    /// The token lookup index of the nodes' labels or the relationships' types.
+    pub fn lookup(name: impl Into<String>, entity: IndexEntity) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            entity,
+            label: String::new(),
+            extra_labels: Vec::new(),
+            properties: Vec::new(),
+            kind: IndexKind::Lookup,
+        }
+    }
+
+    pub fn is_lookup(&self) -> bool {
+        self.kind == IndexKind::Lookup
+    }
+
+    /// Whether the engine keeps the index's contents (vector, full-text, point and text
+    /// indexes; a lookup index has none of its own): the store keeps only its definition.
     pub fn is_engine_kept(&self) -> bool {
         !matches!(self.kind, IndexKind::Range)
     }
@@ -982,6 +1021,12 @@ impl IndexDef {
     /// The indexed schema in Cypher style: `:Label(a, b)` or `[:TYPE](a)` (`:A|B(a)` for a
     /// full-text index on several labels).
     pub fn target(&self) -> String {
+        if self.is_lookup() {
+            return match self.entity {
+                IndexEntity::Node => "labels(n)".into(),
+                IndexEntity::Relationship => "type(r)".into(),
+            };
+        }
         let props = self.properties.join(", ");
         let labels = self.labels().collect::<Vec<_>>().join("|");
         match self.entity {
@@ -992,7 +1037,11 @@ impl IndexDef {
 
     /// Checks that `self` is well formed and does not clash with `existing`.
     pub fn check_new(&self, existing: &[IndexDef]) -> Result<()> {
-        if self.properties.is_empty() {
+        if self.is_lookup() {
+            if !self.label.is_empty() || !self.properties.is_empty() {
+                return Err(Error::Semantic("a lookup index has no label, type or properties".into()));
+            }
+        } else if self.properties.is_empty() {
             return Err(Error::Semantic("an index needs at least one property".into()));
         }
         if let IndexKind::Vector { dimensions, hnsw, .. } = self.kind {
@@ -1012,8 +1061,8 @@ impl IndexDef {
                 )));
             }
         }
-        if self.is_point() && self.properties.len() != 1 {
-            return Err(Error::Semantic("a point index is on exactly one property".into()));
+        if (self.is_point() || self.is_text()) && self.properties.len() != 1 {
+            return Err(Error::Semantic(format!("a {} index is on exactly one property", self.kind.text().to_lowercase())));
         }
         if !self.extra_labels.is_empty() && !self.is_fulltext() {
             return Err(Error::Semantic("only a full-text index covers several labels or types".into()));
@@ -1050,6 +1099,8 @@ impl IndexDef {
                         IndexKind::Vector { .. } => "a vector",
                         IndexKind::Fulltext { .. } => "a full-text",
                         IndexKind::Point => "a point",
+                        IndexKind::Text => "a text",
+                        IndexKind::Lookup => "a lookup",
                     },
                     self.target()
                 )));
@@ -1212,6 +1263,57 @@ impl IndexDef {
     pub(crate) fn decode_point_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
         let n = d.len(8)?;
         (0..n).map(|_| IndexDef::decode_point(d)).collect()
+    }
+
+    /// Encodes the text and lookup indexes among `defs`, each as a kind tag (1 text,
+    /// 2 lookup) and the definition's name, entity, label and properties (persistent
+    /// format 12, hybrid log op 17, memory snapshot 9). Later kinds take further tags.
+    pub(crate) fn encode_tagged_list(defs: &[IndexDef], e: &mut Encoder) {
+        let tagged: Vec<&IndexDef> = defs.iter().filter(|d| d.is_text() || d.is_lookup()).collect();
+        e.len(tagged.len());
+        for d in tagged {
+            d.encode_tagged(e);
+        }
+    }
+
+    /// One definition of [`encode_tagged_list`](Self::encode_tagged_list).
+    pub(crate) fn encode_tagged(&self, e: &mut Encoder) {
+        e.u8(match self.kind {
+            IndexKind::Text => 1,
+            IndexKind::Lookup => 2,
+            _ => unreachable!("encode_tagged of a {} index", self.kind.text()),
+        });
+        e.str(&self.name);
+        e.u8(match self.entity {
+            IndexEntity::Node => 1,
+            IndexEntity::Relationship => 2,
+        });
+        e.str(&self.label);
+        e.strings(&self.properties);
+    }
+
+    pub(crate) fn decode_tagged(d: &mut Decoder) -> Result<IndexDef> {
+        let tag = d.u8()?;
+        let name = d.str()?;
+        let entity = match d.u8()? {
+            1 => IndexEntity::Node,
+            2 => IndexEntity::Relationship,
+            t => return Err(d.corrupt(format!("unknown index entity {t}"))),
+        };
+        let label = d.str()?;
+        let properties = d.strings()?;
+        let def = match tag {
+            1 if properties.len() == 1 => IndexDef::text(name, entity, label, properties[0].clone()),
+            2 if properties.is_empty() && label.is_empty() => IndexDef::lookup(name, entity),
+            1 | 2 => return Err(d.corrupt(format!("bad index `{name}`"))),
+            t => return Err(d.corrupt(format!("unknown index kind {t}"))),
+        };
+        Ok(def)
+    }
+
+    pub(crate) fn decode_tagged_list(d: &mut Decoder) -> Result<Vec<IndexDef>> {
+        let n = d.len(8)?;
+        (0..n).map(|_| IndexDef::decode_tagged(d)).collect()
     }
 
     /// Decodes a single-property node index as older formats wrote it: name, label,
