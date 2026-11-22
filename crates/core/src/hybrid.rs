@@ -14,15 +14,8 @@
 //! <dir>/graph.wal       "GBWAL_v9", then records: len u32 | crc u32 | seq u64, ops…
 //! ```
 //!
-//! Version 2 added constraint definitions (to the snapshot, and as log operations).
-//! Version 3 added full index definitions (relationship and composite indexes).
-//! Version 4 added temporal property values (a new value tag), version 5 points (another),
-//! version 6 vector index definitions (and log operation 14 creates one), version 7
-//! full-text index definitions (operation 15), version 8 point index definitions
-//! (operation 16), version 9 text and lookup index definitions (operation 17).
-//! Older files are read; an older log is replayed, then the store writes a current
-//! snapshot and starts a current log, so older software rejects the upgraded store
-//! instead of misreading it.
+//! Only the current format (version 9) is read: a snapshot or log written by an older
+//! version is rejected on open.
 //!
 //! A record that was only partly written when the process died fails its length or
 //! checksum check and is cut off on the next open, so the store always recovers to the
@@ -35,28 +28,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::codec::{Decoder, Encoder, crc32};
-use crate::memory::SNAPSHOT_VERSION;
+use crate::persistent::older_format;
 use crate::store::{Adjacency, ConstraintDef, Direction, GraphStore, IndexDef, Scan, Snapshot};
 use crate::{Error, MemoryGraph, NodeId, RelId, Result, Value};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"GBSNAPv9";
-const SNAPSHOT_MAGIC_V8: &[u8; 8] = b"GBSNAPv8";
-const SNAPSHOT_MAGIC_V7: &[u8; 8] = b"GBSNAPv7";
-const SNAPSHOT_MAGIC_V6: &[u8; 8] = b"GBSNAPv6";
-const SNAPSHOT_MAGIC_V5: &[u8; 8] = b"GBSNAPv5";
-const SNAPSHOT_MAGIC_V4: &[u8; 8] = b"GBSNAPv4";
-const SNAPSHOT_MAGIC_V3: &[u8; 8] = b"GBSNAPv3";
-const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"GBSNAPv2";
-const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"GBSNAPv1";
 const WAL_MAGIC: &[u8; 8] = b"GBWAL_v9";
-const WAL_MAGIC_V8: &[u8; 8] = b"GBWAL_v8";
-const WAL_MAGIC_V7: &[u8; 8] = b"GBWAL_v7";
-const WAL_MAGIC_V6: &[u8; 8] = b"GBWAL_v6";
-const WAL_MAGIC_V5: &[u8; 8] = b"GBWAL_v5";
-const WAL_MAGIC_V4: &[u8; 8] = b"GBWAL_v4";
-const WAL_MAGIC_V3: &[u8; 8] = b"GBWAL_v3";
-const WAL_MAGIC_V2: &[u8; 8] = b"GBWAL_v2";
-const WAL_MAGIC_V1: &[u8; 8] = b"GBWAL_v1";
 const SNAPSHOT_FILE: &str = "graph.snapshot";
 const SNAPSHOT_TMP: &str = "graph.snapshot.tmp";
 const WAL_FILE: &str = "graph.wal";
@@ -276,7 +253,6 @@ impl Op {
                 id: NodeId(d.u64()?),
                 label: d.str()?,
             },
-            9 => Op::CreateIndex(IndexDef::decode_v1(d)?),
             13 => Op::CreateIndex(IndexDef::decode(d)?),
             14 => Op::CreateIndex(IndexDef::decode_vector(d)?),
             15 => Op::CreateIndex(IndexDef::decode_fulltext(d)?),
@@ -411,7 +387,6 @@ impl HybridGraph {
         wal.read_to_end(&mut bytes)
             .map_err(io(&wal_path, "reading"))?;
 
-        let mut upgrade = false;
         let wal_len = if bytes.len() < WAL_MAGIC.len() {
             // Empty, or the header itself was torn: start a fresh log.
             wal.set_len(0).map_err(io(&wal_path, "truncating"))?;
@@ -421,9 +396,10 @@ impl HybridGraph {
                 .map_err(io(&wal_path, "initializing"))?;
             WAL_MAGIC.len() as u64
         } else {
-            if [WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3, WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8].contains(&&bytes[..8].try_into().unwrap()) {
-                upgrade = true;
-            } else if &bytes[..8] != WAL_MAGIC {
+            if bytes[..8].starts_with(b"GBWAL_") && &bytes[..8] != WAL_MAGIC {
+                return Err(older_format(&wal_path.display().to_string()));
+            }
+            if &bytes[..8] != WAL_MAGIC {
                 return Err(Error::Storage(format!(
                     "{} is not a graphbuff write-ahead log",
                     wal_path.display()
@@ -439,7 +415,7 @@ impl HybridGraph {
             valid as u64
         };
 
-        let mut g = HybridGraph {
+        Ok(HybridGraph {
             mem,
             pending: None,
             opts,
@@ -448,19 +424,7 @@ impl HybridGraph {
             seq,
             poisoned: None,
             _lock: lock,
-        };
-        if upgrade {
-            // The snapshot now covers the older log, which is replaced.
-            g.write_snapshot()?;
-            g.wal
-                .set_len(0)
-                .and_then(|_| g.wal.seek(SeekFrom::Start(0)))
-                .and_then(|_| g.wal.write_all(WAL_MAGIC))
-                .and_then(|_| g.wal.sync_all())
-                .map_err(io(&wal_path, "replacing"))?;
-            g.wal_len = WAL_MAGIC.len() as u64;
-        }
-        Ok(g)
+        })
     }
 
     fn load_snapshot(path: &Path) -> Result<(MemoryGraph, u64)> {
@@ -472,22 +436,15 @@ impl HybridGraph {
             Err(e) => return Err(io(path, "reading")(e)),
         };
         let what = path.display().to_string();
-        let version = match bytes.get(..8) {
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC => SNAPSHOT_VERSION,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V8 => 8,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V7 => 7,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V6 => 6,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V5 => 5,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V4 => 4,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V3 => 3,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V2 => 2,
-            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC_V1 => 1,
+        match bytes.get(..8) {
+            Some(m) if bytes.len() >= 8 + 8 + 4 && m == SNAPSHOT_MAGIC => {}
+            Some(m) if m.starts_with(b"GBSNAP") => return Err(older_format(&what)),
             _ => {
                 return Err(Error::Storage(format!(
                     "{what} is not a graphbuff snapshot"
                 )));
             }
-        };
+        }
         let (body, tail) = bytes.split_at(bytes.len() - 4);
         if crc32(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
             return Err(Error::Storage(format!(
@@ -496,7 +453,7 @@ impl HybridGraph {
         }
         let mut d = Decoder::new(&body[8..], &what);
         let seq = d.u64()?;
-        let g = MemoryGraph::decode_snapshot(&mut d, version)?;
+        let g = MemoryGraph::decode_snapshot(&mut d)?;
         if !d.is_empty() {
             return Err(d.corrupt("trailing data"));
         }
@@ -1050,62 +1007,36 @@ mod tests {
         assert_eq!(names, ["k1", "k3"]);
     }
 
-    /// Rewrites the snapshot and log of a closed store as version 1, which had no
-    /// constraint (nor vector index) definitions.
-    fn downgrade_to_v1(dir: &Path) {
-        let path = dir.join(SNAPSHOT_FILE);
-        let bytes = fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], SNAPSHOT_MAGIC);
-        // The body ends with the (empty) constraint, vector, full-text, point and tagged
-        // index lists: five u64 lengths of 0.
-        let body = &bytes[8..bytes.len() - 4];
-        assert_eq!(&body[body.len() - 40..], &[0u8; 40]);
-        let mut out = SNAPSHOT_MAGIC_V1.to_vec();
-        out.extend_from_slice(&body[..body.len() - 40]);
-        let crc = crc32(&out);
-        out.extend(crc.to_le_bytes());
-        fs::write(&path, out).unwrap();
-        let wal = dir.join(WAL_FILE);
-        let mut log = fs::read(&wal).unwrap();
-        assert_eq!(&log[..8], WAL_MAGIC);
-        log[..8].copy_from_slice(WAL_MAGIC_V1);
-        fs::write(&wal, log).unwrap();
-    }
-
     #[test]
-    fn opens_and_upgrades_a_version_1_store() {
-        let dir = Dir::new("v1");
-        let mut props = BTreeMap::new();
-        props.insert("a".to_string(), Value::Int(1));
+    fn rejects_an_older_format() {
+        let dir = Dir::new("older-format");
         {
             let mut g = HybridGraph::open(HybridOptions::new(&dir.0)).unwrap();
-            g.create_node(&["P".into()], props.clone()).unwrap();
+            g.create_node(&[], BTreeMap::new()).unwrap();
             g.checkpoint().unwrap();
-            g.create_node(&["P".into()], props.clone()).unwrap(); // stays in the log
         }
-        downgrade_to_v1(&dir.0);
-        {
-            let mut g = HybridGraph::open(HybridOptions::new(&dir.0)).unwrap();
-            assert_eq!(g.node_count(), 2);
-            assert!(g.constraints().is_empty());
-            assert_eq!(&fs::read(dir.0.join(SNAPSHOT_FILE)).unwrap()[..8], SNAPSHOT_MAGIC);
-            assert_eq!(fs::read(dir.0.join(WAL_FILE)).unwrap(), WAL_MAGIC);
-            g.create_constraint(key("k")).unwrap();
-        }
-        let g = HybridGraph::open(HybridOptions::new(&dir.0)).unwrap();
-        assert_eq!(g.node_count(), 2);
-        assert_eq!(g.constraints(), vec![key("k")]);
+        let wal = dir.0.join(WAL_FILE);
+        fs::write(&wal, b"GBWAL_v8").unwrap();
+        let e = HybridGraph::open(HybridOptions::new(&dir.0)).err().expect("rejected");
+        assert!(e.to_string().contains("no longer supported"), "{e}");
+
+        fs::write(&wal, WAL_MAGIC).unwrap();
+        let path = dir.0.join(SNAPSHOT_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[..8].copy_from_slice(b"GBSNAPv8");
+        fs::write(&path, bytes).unwrap();
+        let e = HybridGraph::open(HybridOptions::new(&dir.0)).err().expect("rejected");
+        assert!(e.to_string().contains("no longer supported"), "{e}");
     }
 }
 
-/// A snapshot body (the first byte picks the format version) (see [`crate::fuzzing`]).
+/// A snapshot body (see [`crate::fuzzing`]).
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_snapshot(bytes: &[u8]) {
-    let Some((&v, body)) = bytes.split_first() else { return };
-    let mut d = Decoder::new(body, "snapshot");
+    let mut d = Decoder::new(bytes, "snapshot");
     if d.u64().is_ok() {
         // Up to 2^16 slots: larger counts are allocated as asked (see decode_snapshot_limited).
-        let _ = MemoryGraph::decode_snapshot_limited(&mut d, 1 + v % SNAPSHOT_VERSION, 1 << 16);
+        let _ = MemoryGraph::decode_snapshot_limited(&mut d, 1 << 16);
     }
 }
 

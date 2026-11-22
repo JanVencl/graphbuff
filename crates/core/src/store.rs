@@ -1315,14 +1315,6 @@ impl IndexDef {
         let n = d.len(8)?;
         (0..n).map(|_| IndexDef::decode_tagged(d)).collect()
     }
-
-    /// Decodes a single-property node index as older formats wrote it: name, label,
-    /// property.
-    pub(crate) fn decode_v1(d: &mut Decoder) -> Result<IndexDef> {
-        let name = d.str()?;
-        let label = d.str()?;
-        Ok(IndexDef::node(name, label, d.str()?))
-    }
 }
 
 /// A schema constraint on the nodes with a label or the relationships of a type.
