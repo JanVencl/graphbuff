@@ -6,6 +6,8 @@
 [![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-blue?logo=rust)](https://www.rust-lang.org)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fjanvencl%2Fgraphbuff-blue?logo=docker)](https://github.com/JanVencl/graphbuff/pkgs/container/graphbuff)
 [![Website](https://img.shields.io/badge/web-graphbuff.com-informational)](https://graphbuff.com)
+# GraphBuff
+
 ## Graph database engine written in Rust and queried with **Cypher**.
 
 * high performance, low memory footprint database
@@ -31,7 +33,8 @@ docker run --rm -p 127.0.0.1:7475:7475 -p 127.0.0.1:7687:7687 \
 ```
 Starts HTTP/JSON server on `http://127.0.0.1:7475` and Bolt server on `bolt://127.0.0.1:7687`.
 Login with `admin` and the password `change-me`;
-```
+
+```bash
 curl -s -u admin:change-me http://127.0.0.1:7475/query -H 'Content-Type: application/json' \
      -d '{"query": "CREATE (:Person {name: \"Ann\"}) RETURN 1"}'
 ```
