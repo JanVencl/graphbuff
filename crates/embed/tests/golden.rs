@@ -202,3 +202,20 @@ fn a_batch_is_charged_to_the_query_thread_while_it_runs() {
     assert!(charged.iter().any(|&b| b >= 4 * 2 * 3 * (6 * 32 + 2 * 64)), "{charged:?}");
     assert!(graphbuff::accounting::thread_bytes() - before < 4096, "the charge ends with the batch");
 }
+
+/// The GPU (wgpu) gives the same vectors, to float noise. Needs a GPU, so not run by default.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "needs a GPU: cargo test -p graphbuff-embed --features gpu -- --ignored gpu"]
+fn gpu_matches_transformers() {
+    let reference = Reference::read(&fixture().join("reference.json"));
+    let texts = reference.texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let spec = ModelSpec::read("tiny-bert", &fixture()).unwrap();
+    let config = EmbedderConfig { device: graphbuff_embed::DeviceKind::Gpu, ..Default::default() };
+    let e = LocalEmbedder::new(Registry::from_specs([spec]), config).unwrap();
+    let got = e.embed(None, &refs, &EmbedOptions::default(), &no_interrupt).unwrap();
+    for (i, (g, w)) in got.iter().zip(reference.vectors("mean")).enumerate() {
+        assert_close(&format!("gpu {i}"), g, &w, 1e-4);
+    }
+}
