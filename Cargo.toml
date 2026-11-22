@@ -22,6 +22,40 @@ graphbuff = { path = "crates/engine" }
 graphbuff-gpu = { path = "crates/gpu" }
 graphbuff-embed = { path = "crates/embed" }
 
+# cubecl and pliron register their IR interfaces in linker sections (linkme). With
+# several codegen units, the GNU linker on Windows drops the object files that only hold
+# those registrations, and the GPU kernels then fail ("Expected type ... to implement
+# dyn SizedType"). One codegen unit keeps each crate's registrations with its code.
+[profile.dev.package.cubecl-core]
+codegen-units = 1
+
+[profile.dev.package.cubecl-ir]
+codegen-units = 1
+
+[profile.dev.package.cubecl-opt]
+codegen-units = 1
+
+[profile.dev.package.cubecl-wgpu]
+codegen-units = 1
+
+[profile.dev.package.pliron]
+codegen-units = 1
+
+[profile.release.package.cubecl-core]
+codegen-units = 1
+
+[profile.release.package.cubecl-ir]
+codegen-units = 1
+
+[profile.release.package.cubecl-opt]
+codegen-units = 1
+
+[profile.release.package.cubecl-wgpu]
+codegen-units = 1
+
+[profile.release.package.pliron]
+codegen-units = 1
+
 # Password hashing (Argon2id, 64 MiB) is many times slower unoptimized; debug builds and
 # tests optimize the crates that do it.
 [profile.dev.package.argon2]
