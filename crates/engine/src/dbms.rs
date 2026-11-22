@@ -187,6 +187,8 @@ pub struct DatabaseManager {
     procedures: RwLock<Arc<crate::Procedures>>,
     /// The kernel backend of every database, when not the default.
     kernels: RwLock<Option<Arc<dyn crate::Kernels>>>,
+    /// The embedder of every database, when set.
+    embedder: RwLock<Option<Arc<dyn crate::Embedder>>>,
     /// The system database; `None` without the `system-db` feature.
     system: Option<Db>,
     _lock: Option<File>,
@@ -449,6 +451,7 @@ impl DatabaseManager {
             csv_urls: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
+            embedder: RwLock::new(None),
             system: system_in_memory(),
             _lock: None,
         }
@@ -534,6 +537,7 @@ impl DatabaseManager {
             csv_urls: RwLock::new(None),
             procedures: RwLock::new(crate::Procedures::builtin()),
             kernels: RwLock::new(None),
+            embedder: RwLock::new(None),
             system,
             _lock: Some(lock),
         };
@@ -605,7 +609,25 @@ impl DatabaseManager {
         }
     }
 
-    fn apply_kernels(&self, db: &Database<BoxedStore>) {
+    /// Sets the embedder of every database, now and as they are created or opened (see
+    /// [`Database::set_embedder`]).
+    pub fn set_embedder(&self, embedder: Arc<dyn crate::Embedder>) {
+        let cat = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        *self.embedder.write().unwrap_or_else(|e| e.into_inner()) = Some(embedder.clone());
+        for entry in cat.dbs.values() {
+            entry.db.set_embedder(embedder.clone());
+        }
+    }
+
+    /// The embedder set with [`DatabaseManager::set_embedder`].
+    pub fn embedder(&self) -> Option<Arc<dyn crate::Embedder>> {
+        self.embedder.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn apply_backends(&self, db: &Database<BoxedStore>) {
+        if let Some(e) = self.embedder.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            db.set_embedder(e);
+        }
         if let Some(k) = self.kernels.read().unwrap_or_else(|e| e.into_inner()).clone() {
             db.set_kernels(k);
         }
@@ -914,7 +936,7 @@ impl DatabaseManager {
         db.set_import_dir(self.import_dir());
         db.set_csv_urls(self.csv_urls());
         db.set_procedures(self.procedures());
-        self.apply_kernels(&db);
+        self.apply_backends(&db);
         cat.dbs.insert(name.to_string(), Entry { storage, db });
         self.save(&cat)
     }
@@ -952,7 +974,7 @@ impl DatabaseManager {
         db.set_import_dir(self.import_dir());
         db.set_csv_urls(self.csv_urls());
         db.set_procedures(self.procedures());
-        self.apply_kernels(&db);
+        self.apply_backends(&db);
         cat.dbs.insert(name.clone(), Entry { storage, db });
         if let Err(e) = self.save(&cat) {
             cat.dbs.remove(&name);
@@ -1120,7 +1142,7 @@ impl DatabaseManager {
                 db.set_import_dir(self.import_dir());
         db.set_csv_urls(self.csv_urls());
                 db.set_procedures(self.procedures());
-        self.apply_kernels(&db);
+        self.apply_backends(&db);
                 cat.dbs.insert(
                     name.to_string(),
                     Entry {

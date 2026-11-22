@@ -143,6 +143,7 @@ pub(crate) const FUNCTIONS: &[Entry] = &[
     ("point.distance", "Spatial", "point.distance(from :: POINT, to :: POINT) :: FLOAT", "The distance between two points of the same CRS (meters for WGS-84)."),
     ("point.withinBBox", "Spatial", "point.withinBBox(point :: POINT, lowerLeft :: POINT, upperRight :: POINT) :: BOOLEAN", "Whether a point lies within a box."),
     // ---- vectors ----
+    ("vector.embed", "Vector", "vector.embed(text :: STRING, model = null :: STRING, options = null :: MAP) :: LIST<FLOAT>", "The embedding of a text, by an installed model (the default one if none is named)."),
     ("vector.similarity.cosine", "Vector", "vector.similarity.cosine(a :: LIST<INTEGER | FLOAT>, b :: LIST<INTEGER | FLOAT>) :: FLOAT", "The cosine similarity of two vectors, scaled to [0, 1]."),
     ("vector.similarity.euclidean", "Vector", "vector.similarity.euclidean(a :: LIST<INTEGER | FLOAT>, b :: LIST<INTEGER | FLOAT>) :: FLOAT", "The Euclidean similarity of two vectors, 1 / (1 + d²)."),
     // ---- APOC subset ----

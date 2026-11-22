@@ -1,0 +1,24 @@
+[package]
+name = "graphbuff-embed"
+description = "Local text embedding models (Burn) for the graphbuff graph database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Runs BERT-family sentence encoders on the CPU (Burn's pure-Rust `flex` backend) or, with
+# `gpu`, through wgpu. Weights come straight from Hugging Face safetensors files. Not in
+# the default build: `graphbuff-server` uses it with its `embed` feature.
+
+[dependencies]
+graphbuff.workspace = true
+# Pinned: Burn's API changes between releases (0.22 made tensors backend-free).
+burn = { version = "=0.22.1", default-features = false, features = ["std", "flex", "rayon"] }
+# Pure Rust: no onig / esaxx (C, C++).
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+safetensors = "0.8"
+rayon = "1"
+
+[features]
+# `device = "gpu"`: run the models through wgpu (Vulkan, Direct3D 12 or Metal).
+gpu = ["burn/wgpu"]

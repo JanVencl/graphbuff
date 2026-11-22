@@ -74,3 +74,16 @@ dir = "-"
 level = "info"
 # Log queries that take at least this long to query.log.
 # slow_query_ms = 1000
+
+[embedding]
+# Text embedding models for vector.embed(): one sub-folder per model (mount them with
+# `-v ./model:/models:ro`; see packaging/model/README.md).
+model_dir = "/models"
+# The model used when a query names none. Default: the only installed model.
+# default_model = "minilm"
+# Texts per forward pass.
+batch_size = 32
+# Threads that run the models (0: half the cores).
+threads = 0
+# Models kept in memory at once; the least recently used one is unloaded.
+max_loaded_models = 2

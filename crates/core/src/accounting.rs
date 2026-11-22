@@ -111,6 +111,37 @@ pub fn exempt<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Counts `bytes` as held by this thread until the returned guard is dropped: for memory
+/// a query uses on other threads (a thread pool's work buffers), which its own thread's
+/// count does not see.
+///
+/// ```
+/// use graphbuff_core::accounting;
+///
+/// let before = accounting::thread_bytes();
+/// let guard = accounting::charge(1 << 20);
+/// assert_eq!(accounting::thread_bytes() - before, 1 << 20);
+/// drop(guard);
+/// assert_eq!(accounting::thread_bytes(), before);
+/// ```
+pub fn charge(bytes: usize) -> Charge {
+    let n = i64::try_from(bytes).unwrap_or(i64::MAX);
+    add(n);
+    Charge(n, std::marker::PhantomData)
+}
+
+/// What [`charge`] counted; uncounted when dropped. It stays on the thread that made it
+/// (it is not `Send`).
+#[must_use = "the charge ends when the guard is dropped"]
+#[derive(Debug)]
+pub struct Charge(i64, std::marker::PhantomData<*const ()>);
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        add(-self.0);
+    }
+}
+
 /// The memory of this computer, or of the container it runs in when that is less: the
 /// cgroup limit or physical memory on Linux, physical memory on Windows and macOS.
 /// `None` if it cannot be found.

@@ -23,6 +23,11 @@
 #   docker run --rm -it -v graphbuff-data:/data --entrypoint graphbuff-server graphbuff \
 #     admin reset-password admin
 #
+# Embedding models for vector.embed() go in /models, one sub-folder per model (see
+# packaging/model/README.md); mount a folder of them read-only:
+#
+#   docker run ... -v ./model:/models:ro graphbuff
+#
 # The client runs inside the server's container (the server's own address and login):
 #
 #   docker exec -it CONTAINER graphbuff-cli -u admin
@@ -53,8 +58,8 @@ COPY examples/movies.cypher examples/movies.cypher
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=graphbuff-target-$TARGETARCH \
     cargo build --release --locked --target "$(cat /target-triple)" -p graphbuff-server -p graphbuff-cli \
-       --features graphbuff-server/tls,graphbuff-cli/tls \
- && mkdir -p /out/bin /out/data \
+       --features graphbuff-server/tls,graphbuff-server/embed,graphbuff-cli/tls \
+ && mkdir -p /out/bin /out/data /out/models \
  && cp "target/$(cat /target-triple)/release/graphbuff-server" \
        "target/$(cat /target-triple)/release/graphbuff-cli" /out/bin/
 
@@ -67,6 +72,7 @@ LABEL org.opencontainers.image.title="graphbuff" \
 COPY --from=build /out/bin/ /usr/local/bin/
 COPY packaging/docker/graphbuff.toml /etc/graphbuff/graphbuff.toml
 COPY --from=build --chown=65532:65532 /out/data /data
+COPY --from=build /out/models /models
 USER nonroot
 WORKDIR /data
 VOLUME /data

@@ -104,6 +104,10 @@ In your own config file, `slow_query_ms = 500` in `[logs]` logs queries that tak
 or more, `mode = "memory"` in `[storage]` (without `data`) makes a throwaway server, and
 `dir = "/data/logs"` in `[logs]` writes log files into the volume.
 
+Text embedding models (`vector.embed`, see [Text embeddings](Embeddings.md)) are read
+from `/models`, one sub-folder per model: mount a folder of them with
+`-v ./model:/models:ro`.
+
 Build the image yourself with `docker build -t graphbuff .`.
 
 ## Prebuilt binaries
@@ -116,6 +120,7 @@ graphbuff-VERSION-PLATFORM/
   graphbuff-server            the server (graphbuff-server.exe on Windows)
   graphbuff-cli               the command-line client (graphbuff-cli.exe on Windows)
   config/graphbuff.toml       its settings: edit, then restart the server
+  config/model/               text embedding models, and fetch-model.py to get one
   README.md
   data/                       created on the first start: databases, accounts, logs
 ```

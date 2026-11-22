@@ -2,7 +2,8 @@
 
 graphbuff stores embeddings as ordinary list properties and finds the nearest ones with
 a vector index. The Cypher surface is the one Neo4j 5 uses, so existing queries and
-drivers work unchanged.
+drivers work unchanged. The server can also compute the embeddings itself with local
+models (`vector.embed`): see [Text embeddings](Embeddings.md).
 
 - [Similarity functions](#similarity-functions)
 - [Vector indexes](#vector-indexes)

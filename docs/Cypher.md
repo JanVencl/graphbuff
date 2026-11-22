@@ -48,7 +48,9 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   come from the parameters of the same names). Built in: `db.labels()`,
   `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
   `db.awaitIndexes()`, `dbms.procedures()`, `dbms.functions()`, `dbms.components()`, the
-  vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`), and
+  vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`), the
+  embedding procedures `vector.embedBatch(texts, model?, options?)` and `vector.models()`
+  ([Text embeddings](Embeddings.md)), and
   the writing `db.create.setNodeVectorProperty(node, key, vector)` and
   `db.create.setRelationshipVectorProperty(relationship, key, vector)` (the vector checked:
   1 to 4096 finite numbers, stored as floats); `SHOW PROCEDURES` lists them, with their
@@ -182,6 +184,8 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   coordinate system, sized to the points, is kept in memory for the last commit and updated
   with each commit's changes; inside a transaction, and in queries that write, the query
   scans the label instead
+* **Text embeddings:** `vector.embed(text, model?, options?)` returns the embedding of a text
+  by a local model, in a server with models installed ([Text embeddings](Embeddings.md)).
 * **Vectors:** a vector is a list of numbers. `vector.similarity.cosine(a, b)` and
   `vector.similarity.euclidean(a, b)` score in [0, 1] as Neo4j does (`(1 + cos) / 2`,
   `1 / (1 + d²)`). ``CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:L) ON n.p OPTIONS

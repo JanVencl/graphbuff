@@ -154,6 +154,8 @@ pub(crate) struct Executor<'s> {
     /// Kernels for a read query on a committed state ([`crate::accel`]); `None` runs
     /// everything on rows.
     pub accel: Option<crate::accel::Accel>,
+    /// What `vector.embed` runs; `None`: it fails.
+    pub embedder: Option<std::sync::Arc<dyn crate::embed::Embedder>>,
     /// Nodes this query deleted, and the relationships it deleted with their types:
     /// reading their properties or labels afterwards fails, `type(r)` still answers.
     pub deleted_nodes: std::collections::HashSet<NodeId>,
@@ -194,6 +196,7 @@ impl<'s> Executor<'s> {
             procedures: crate::procedures::Procedures::builtin(),
             interrupt: None,
             accel: None,
+            embedder: None,
             deleted_nodes: Default::default(),
             deleted_rels: HashMap::new(),
             read_only: false,

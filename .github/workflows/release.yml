@@ -1,5 +1,6 @@
 # Pushing a tag `vX.Y.Z` publishes a release:
-#   * archives of `graphbuff-server` and `graphbuff-cli` (both with TLS) for Linux
+#   * archives of `graphbuff-server` (with TLS and embedding models) and `graphbuff-cli`
+#     (with TLS) for Linux
 #     (x86-64 and ARM64), macOS and Windows, plus SHA256SUMS, attached to the GitHub release of the tag;
 #   * the image ghcr.io/janvencl/graphbuff, tagged X.Y.Z and latest (amd64 and arm64).
 name: release
@@ -58,14 +59,16 @@ jobs:
       - name: Build
         run: >-
           cargo build --release --locked --target ${{ matrix.target }}
-          -p graphbuff-server -p graphbuff-cli --features graphbuff-server/tls,graphbuff-cli/tls
+          -p graphbuff-server -p graphbuff-cli --features graphbuff-server/tls,graphbuff-server/embed,graphbuff-cli/tls
       - name: Package
         shell: bash
         run: |
           dir=graphbuff-${GITHUB_REF_NAME#v}-${{ matrix.name }}
-          mkdir -p "$dir/config" dist
+          mkdir -p "$dir/config/model" dist
           cp README.md "$dir/"
           cp packaging/config/graphbuff.toml "$dir/config/"
+          # The embedding model folder ([embedding] model_dir): empty but for how to fill it.
+          cp packaging/model/README.md scripts/fetch-model.py "$dir/config/model/"
           bin=target/${{ matrix.target }}/release
           if [ "${{ runner.os }}" = Windows ]; then
             cp "$bin/graphbuff-server.exe" "$bin/graphbuff-cli.exe" "$dir/"

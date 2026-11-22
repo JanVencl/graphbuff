@@ -282,6 +282,7 @@ pub struct ProcedureContext<'a> {
     pub(crate) procedures: &'a Procedures,
     pub(crate) accel: Option<&'a crate::accel::Accel>,
     pub(crate) interrupt: Option<&'a crate::interrupt::Interrupt>,
+    pub(crate) embedder: Option<&'a Arc<dyn crate::embed::Embedder>>,
     /// The changes a [`ProcedureMode::Write`] procedure asked for; `None` for the others.
     pub(crate) writes: Option<RefCell<Vec<ProcedureWrite>>>,
 }
@@ -366,6 +367,11 @@ impl<'a> ProcedureContext<'a> {
     /// (not inside a transaction).
     pub(crate) fn texts(&self) -> Option<(&'a crate::fulltext::TextCache, &'a graphbuff_core::Snapshot)> {
         self.accel.map(|a| (&*a.texts, &a.snapshot))
+    }
+
+    /// The database's [`crate::Embedder`]; `Unsupported` if none is set.
+    pub fn embedder(&self) -> Result<&'a dyn crate::embed::Embedder> {
+        self.embedder.map(|e| e.as_ref()).ok_or_else(crate::embed::not_available)
     }
 
     /// Fails if the query ran out of time or was cancelled; long procedures call it
@@ -738,6 +744,19 @@ fn register_builtins(p: &mut Procedures) {
         )
         .description("The relationships of a vector index most similar to a vector, best first, with their scores."),
         |ctx, args| crate::vector::query_index(ctx, graphbuff_core::IndexEntity::Relationship, args),
+    );
+    add(
+        ProcedureSignature::new("vector.embedBatch", ["texts"], ["index", "text", "vector"])
+            .optional("model", Value::Null)
+            .optional("options", Value::Null)
+            .input_types([ProcedureType::List, ProcedureType::String, ProcedureType::Map])
+            .description("Embeds a list of texts in one pass: one row per text, in order, with its vector (null for a null text)."),
+        crate::embed::embed_batch,
+    );
+    add(
+        ProcedureSignature::new("vector.models", NONE, ["name", "dimensions", "maxTokens", "loaded"])
+            .description("The installed embedding models."),
+        crate::embed::models,
     );
     add(
         ProcedureSignature::new("db.create.setNodeVectorProperty", ["node", "key", "vector"], NONE)
