@@ -175,6 +175,15 @@ impl LocalEmbedder {
         self
     }
 
+    /// Runs `f` on the embedding threads. A panic in it (a backend that fails inside, for
+    /// one) becomes an error, so it fails the query instead of the thread that called.
+    fn on_pool<T>(&self, f: impl FnOnce() -> std::result::Result<T, String> + Send) -> std::result::Result<T, String>
+    where
+        T: Send,
+    {
+        guarded(|| self.pool.install(f))
+    }
+
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
@@ -215,7 +224,7 @@ impl LocalEmbedder {
                 let weights = spec.dir.join(registry::WEIGHTS);
                 let model = accounting::exempt(|| -> std::result::Result<LoadedModel, String> {
                     let tokenizer = TextTokenizer::load(&spec.dir.join(registry::TOKENIZER), spec.max_tokens())?;
-                    let bert = self.pool.install(|| Bert::load(&weights, &spec.config, &self.device))?;
+                    let bert = self.on_pool(|| Bert::load(&weights, &spec.config, &self.device))?;
                     Ok(LoadedModel { tokenizer, bert })
                 })?;
                 let took = started.elapsed();
@@ -238,6 +247,18 @@ impl LocalEmbedder {
         let mut t = m.tokenizer.encode(&[&text], options.truncate).map_err(Error::Semantic)?;
         Ok(t.pop().map(|t| t.ids).unwrap_or_default())
     }
+}
+
+/// `f`, with a panic turned into an error that carries its message.
+fn guarded<T>(f: impl FnOnce() -> std::result::Result<T, String>) -> std::result::Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".into());
+        Err(format!("the model backend failed: {msg}"))
+    })
 }
 
 fn with_prefix(spec: &ModelSpec, text: &str, task: EmbedTask) -> String {
@@ -290,7 +311,7 @@ impl Embedder for LocalEmbedder {
         let texts: Vec<String> = texts.iter().map(|t| with_prefix(spec, t, options.task)).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let tokens: Vec<Tokens> =
-            self.pool.install(|| m.tokenizer.encode(&refs, options.truncate)).map_err(Error::Semantic)?;
+            self.on_pool(|| m.tokenizer.encode(&refs, options.truncate)).map_err(Error::Semantic)?;
         // Batches of similar lengths pad less: sort by length, embed, put back in order.
         let mut order: Vec<usize> = (0..tokens.len()).collect();
         order.sort_by_key(|&i| tokens[i].ids.len());
@@ -302,8 +323,7 @@ impl Embedder for LocalEmbedder {
             let _charge = accounting::charge(m.bert.activation_bytes(padded.rows, padded.width));
             interrupt()?;
             let vectors = self
-                .pool
-                .install(|| m.bert.embed(&padded, spec.manifest.pooling, spec.manifest.normalize))
+                .on_pool(|| m.bert.embed(&padded, spec.manifest.pooling, spec.manifest.normalize))
                 .map_err(|e| Error::Runtime(format!("embedding model '{}': {e}", spec.name)))?;
             for (&i, v) in chunk.iter().zip(vectors) {
                 out[i] = v;
@@ -315,5 +335,19 @@ impl Embedder for LocalEmbedder {
         c.tokens.fetch_add(tokens.iter().map(|t| t.ids.len() as u64).sum(), Ordering::Relaxed);
         c.nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded;
+
+    #[test]
+    fn a_panic_becomes_an_error() {
+        assert_eq!(guarded(|| Ok::<_, String>(1)), Ok(1));
+        let e = guarded::<()>(|| panic!("kernel {} broke", 7)).unwrap_err();
+        assert_eq!(e, "the model backend failed: kernel 7 broke");
+        let e = guarded::<()>(|| panic!("static")).unwrap_err();
+        assert!(e.ends_with("static"));
     }
 }

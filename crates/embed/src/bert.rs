@@ -1,13 +1,14 @@
 //! A BERT encoder in Burn, with weights read straight from a Hugging Face
 //! `model.safetensors` (`BertModel` key names, with or without a `bert.` prefix).
 //!
-//! embeddings (word + position + token type, LayerNorm) → N × (self-attention, add &
+//! embeddings (word + position + token type, gathered on the host; LayerNorm) → N ×
+//! (self-attention, add &
 //! norm, GELU feed-forward, add & norm) → pooling (mean over the mask, or `[CLS]`) →
 //! optional L2 normalization. Matches `transformers` to about 1e-6 (tests/golden.rs).
 
 use std::path::Path;
 
-use burn::tensor::{Device, Int, Tensor, TensorData, activation};
+use burn::tensor::{Device, Tensor, TensorData, activation};
 
 use crate::manifest::Pooling;
 use crate::registry::BertConfig;
@@ -57,9 +58,12 @@ struct Layer {
 pub struct Bert {
     config: BertConfig,
     device: Device,
-    word: Tensor<2>,
-    pos: Tensor<2>,
-    typ: Tensor<2>,
+    /// The embedding tables, row-major `[rows, hidden]`, on the host: a batch's rows are
+    /// gathered and summed here and uploaded once. (The wgpu backend's `select` fails in
+    /// Burn 0.22.1, and the gather is a copy either way.)
+    word: Vec<f32>,
+    pos: Vec<f32>,
+    typ: Vec<f32>,
     emb_norm: LayerNorm,
     layers: Vec<Layer>,
 }
@@ -71,6 +75,11 @@ struct Weights<'a> {
 
 impl Weights<'_> {
     fn tensor<const D: usize>(&self, name: &str, shape: [usize; D]) -> Result<Tensor<D>, String> {
+        Ok(Tensor::from_data(TensorData::new(self.host(name, shape)?, shape.to_vec()), self.device))
+    }
+
+    /// The weights `name`, checked to have `shape`, as host floats.
+    fn host<const D: usize>(&self, name: &str, shape: [usize; D]) -> Result<Vec<f32>, String> {
         let view = self
             .st
             .tensor(name)
@@ -82,9 +91,7 @@ impl Weights<'_> {
         if view.shape() != shape {
             return Err(format!("`{name}` has shape {:?}, expected {shape:?}", view.shape()));
         }
-        let vals: Vec<f32> =
-            view.data().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-        Ok(Tensor::from_data(TensorData::new(vals, shape.to_vec()), self.device))
+        Ok(view.data().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
     }
 
     fn linear(&self, prefix: &str, input: usize, output: usize) -> Result<Linear, String> {
@@ -126,9 +133,9 @@ impl Bert {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Bert {
-            word: w.tensor("embeddings.word_embeddings.weight", [config.vocab_size, h])?,
-            pos: w.tensor("embeddings.position_embeddings.weight", [config.max_position_embeddings, h])?,
-            typ: w.tensor("embeddings.token_type_embeddings.weight", [config.type_vocab_size, h])?,
+            word: w.host("embeddings.word_embeddings.weight", [config.vocab_size, h])?,
+            pos: w.host("embeddings.position_embeddings.weight", [config.max_position_embeddings, h])?,
+            typ: w.host("embeddings.token_type_embeddings.weight", [config.type_vocab_size, h])?,
             emb_norm: w.norm("embeddings.LayerNorm", h, eps)?,
             layers,
             config: config.clone(),
@@ -161,12 +168,16 @@ impl Bert {
         let dev = &self.device;
         let heads = self.config.num_attention_heads;
         let hd = h / heads;
-        let ids = Tensor::<1, Int>::from_data(TensorData::new(batch.ids.clone(), [b * t]), dev);
-        let types = Tensor::<1, Int>::from_data(TensorData::new(batch.type_ids.clone(), [b * t]), dev);
-        let pos = self.pos.clone().select(0, Tensor::<1, Int>::arange(0..t as i64, dev)).unsqueeze::<3>();
-        let x = self.word.clone().select(0, ids).reshape([b, t, h])
-            + self.typ.clone().select(0, types).reshape([b, t, h])
-            + pos;
+        // word + token type + position, in that order (as transformers adds them).
+        let mut x = vec![0f32; b * t * h];
+        for (n, out) in x.chunks_exact_mut(h).enumerate() {
+            let (id, ty, p) = (batch.ids[n] as usize, batch.type_ids[n] as usize, n % t);
+            let (word, typ, pos) = (&self.word[id * h..][..h], &self.typ[ty * h..][..h], &self.pos[p * h..][..h]);
+            for k in 0..h {
+                out[k] = word[k] + typ[k] + pos[k];
+            }
+        }
+        let x = Tensor::<3>::from_data(TensorData::new(x, [b, t, h]), dev);
         let mut x = self.emb_norm.forward(x);
 
         let mask = Tensor::<2>::from_data(TensorData::new(batch.mask.clone(), [b, t]), dev);
