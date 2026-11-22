@@ -16,8 +16,6 @@
 mod cow;
 mod snapshot;
 
-pub(crate) use snapshot::SNAPSHOT_VERSION;
-
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;

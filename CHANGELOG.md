@@ -66,7 +66,8 @@ the same notes.
 - Aggregation keeps only its groups, not its input rows, so it needs far less memory.
 - `SHOW INDEXES` lists `vector.hnsw.enabled` for every vector index.
 - Storage formats: persistent 12, hybrid snapshot and log 9, memory snapshot 9 (point,
-  text and lookup index definitions). Stores of the older formats still open.
+  text and lookup index definitions). Stores written in older formats are no longer
+  read: opening one fails with an error saying its format is no longer supported.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
 

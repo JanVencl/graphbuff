@@ -13,13 +13,6 @@ use super::{Interner, MemoryGraph, NodeRecord, Props, RelRecord, Token};
 use crate::codec::{Decoder, Encoder};
 use crate::{ConstraintDef, GraphStore, IndexDef, NodeId, RelId, Result};
 
-/// Snapshot layout version written by [`MemoryGraph::encode_snapshot`]: 2 added the
-/// constraint definitions at the end, 3 full index definitions (relationship and
-/// composite indexes), 4 temporal property values (laid out as 3), 5 points (likewise),
-/// 6 vector index definitions at the end, 7 full-text index definitions after them, 8
-/// point index definitions after those, 9 text and lookup index definitions after those.
-pub(crate) const SNAPSHOT_VERSION: u8 = 9;
-
 impl Interner {
     pub(crate) fn from_names(names: Vec<String>, d: &Decoder) -> Result<Self> {
         let mut ids = HashMap::with_capacity(names.len());
@@ -115,10 +108,9 @@ impl MemoryGraph {
         IndexDef::encode_tagged_list(&self.engine_indexes, e);
     }
 
-    /// Rebuilds a graph from data written by [`encode_snapshot`](Self::encode_snapshot),
-    /// in layout `version` (1 to [`SNAPSHOT_VERSION`]).
-    pub(crate) fn decode_snapshot(d: &mut Decoder, version: u8) -> Result<MemoryGraph> {
-        Self::decode_snapshot_limited(d, version, usize::MAX)
+    /// Rebuilds a graph from data written by [`encode_snapshot`](Self::encode_snapshot).
+    pub(crate) fn decode_snapshot(d: &mut Decoder) -> Result<MemoryGraph> {
+        Self::decode_snapshot_limited(d, usize::MAX)
     }
 
     /// [`decode_snapshot`](Self::decode_snapshot), failing when the snapshot asks for
@@ -127,7 +119,7 @@ impl MemoryGraph {
     /// The slot counts come from the file and are allocated before the records are read
     /// (deleted ids keep their slots), so a corrupt count must fail as an error, not abort
     /// the process on an allocation it cannot make.
-    pub(crate) fn decode_snapshot_limited(d: &mut Decoder, version: u8, max_slots: usize) -> Result<MemoryGraph> {
+    pub(crate) fn decode_snapshot_limited(d: &mut Decoder, max_slots: usize) -> Result<MemoryGraph> {
         let labels = Interner::from_names(d.strings()?, d)?;
         let rel_types = Interner::from_names(d.strings()?, d)?;
         let keys = Interner::from_names(d.strings()?, d)?;
@@ -214,38 +206,21 @@ impl MemoryGraph {
 
         let n = d.len(8 + 4 + 4)?;
         for _ in 0..n {
-            let def = if version >= 3 {
-                IndexDef::decode(d)?
-            } else {
-                let name = d.str()?;
-                let label = decode_token(d, &g.labels, "label")?;
-                let key = decode_token(d, &g.keys, "property key")?;
-                IndexDef::node(name, g.labels.name(label), g.keys.name(key))
-            };
+            let def = IndexDef::decode(d)?;
             let existing: Vec<IndexDef> = g.indexes.iter().map(|ix| ix.def.clone()).collect();
             def.check_new(&existing)
                 .map_err(|e| d.corrupt(format!("bad index definition: {e}")))?;
             let ix = g.build_index(def);
             g.indexes.push(ix);
         }
-        if version >= 2 {
-            g.constraints = ConstraintDef::decode_list(d)?;
-        }
-        if version >= 6 {
-            let mut defs = IndexDef::decode_vector_list(d)?;
-            if version >= 7 {
-                defs.extend(IndexDef::decode_fulltext_list(d)?);
-            }
-            if version >= 8 {
-                defs.extend(IndexDef::decode_point_list(d)?);
-            }
-            if version >= 9 {
-                defs.extend(IndexDef::decode_tagged_list(d)?);
-            }
-            for def in defs {
-                def.check_new(&g.indexes()).map_err(|e| d.corrupt(format!("bad index definition: {e}")))?;
-                g.engine_indexes.push(def);
-            }
+        g.constraints = ConstraintDef::decode_list(d)?;
+        let mut defs = IndexDef::decode_vector_list(d)?;
+        defs.extend(IndexDef::decode_fulltext_list(d)?);
+        defs.extend(IndexDef::decode_point_list(d)?);
+        defs.extend(IndexDef::decode_tagged_list(d)?);
+        for def in defs {
+            def.check_new(&g.indexes()).map_err(|e| d.corrupt(format!("bad index definition: {e}")))?;
+            g.engine_indexes.push(def);
         }
         Ok(g)
     }
@@ -299,7 +274,7 @@ mod tests {
         let mut e = Encoder::new();
         g.encode_snapshot(&mut e);
         let mut d = Decoder::new(&e.buf, "snapshot");
-        let mut h = MemoryGraph::decode_snapshot(&mut d, SNAPSHOT_VERSION).unwrap();
+        let mut h = MemoryGraph::decode_snapshot(&mut d).unwrap();
         assert!(d.is_empty());
 
         assert_eq!(h.node_count(), 2);
@@ -330,7 +305,7 @@ mod tests {
         let body = [0x02, 0x09, 0x05, 0x00, 0x01, 0x18, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x08, 0xb3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut d = Decoder::new(&body, "snapshot");
         d.u64().unwrap();
-        let e = MemoryGraph::decode_snapshot(&mut d, SNAPSHOT_VERSION).err().expect("an error");
+        let e = MemoryGraph::decode_snapshot(&mut d).err().expect("an error");
         assert!(e.to_string().contains("slots do not fit"), "{e}");
     }
 }

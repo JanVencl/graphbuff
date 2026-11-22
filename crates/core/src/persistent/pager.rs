@@ -39,29 +39,6 @@ pub(crate) const PAGE_SIZE: usize = 8192;
 /// its image plus a 9-byte key. 1 MiB is left for the record's metadata header.
 pub(crate) const MAX_LOGGED_PAGES: usize = ((u32::MAX as usize) - (1 << 20)) / (PAGE_SIZE + 9);
 pub(crate) const WAL_MAGIC: &[u8; 8] = b"GBPWAL12";
-/// Log written by format version 11 (metadata without text and lookup indexes).
-pub(crate) const WAL_MAGIC_V11: &[u8; 8] = b"GBPWAL11";
-/// Log written by format version 10 (metadata without point indexes).
-pub(crate) const WAL_MAGIC_V10: &[u8; 8] = b"GBPWAL10";
-/// Log written by format version 9 (metadata without full-text indexes).
-pub(crate) const WAL_MAGIC_V9: &[u8; 8] = b"GBPWALv9";
-/// Log written by format version 8 (metadata without vector indexes).
-pub(crate) const WAL_MAGIC_V8: &[u8; 8] = b"GBPWALv8";
-/// Log written by format version 7 (no point property values).
-pub(crate) const WAL_MAGIC_V7: &[u8; 8] = b"GBPWALv7";
-/// Log written by format version 6 (no temporal property values).
-pub(crate) const WAL_MAGIC_V6: &[u8; 8] = b"GBPWALv6";
-/// Log written by format version 5 (metadata with single-property node indexes only).
-pub(crate) const WAL_MAGIC_V5: &[u8; 8] = b"GBPWALv5";
-/// Log written by format version 4 (metadata without constraints).
-pub(crate) const WAL_MAGIC_V4: &[u8; 8] = b"GBPWALv4";
-/// Log written by format version 3 (metadata without index counts).
-pub(crate) const WAL_MAGIC_V3: &[u8; 8] = b"GBPWALv3";
-/// Log written by format version 2 (metadata without the index key format).
-pub(crate) const WAL_MAGIC_V2: &[u8; 8] = b"GBPWALv2";
-/// Log written by format version 1 (metadata without the group allocator). It is still
-/// replayed on open, then replaced by a version 2 log.
-pub(crate) const WAL_MAGIC_V1: &[u8; 8] = b"GBPWALv1";
 
 /// A page of one data file.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

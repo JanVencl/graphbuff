@@ -35,26 +35,9 @@
 //! then walks only the matching groups, and every degree is read from group records.
 //! A node never becomes sparse again.
 //!
-//! ## Format versions
-//! Version 2 added dense nodes (`groups.db`, a dense flag in node records, the group
-//! allocator in the metadata). A version 1 store opens as a version 2 store without dense
-//! nodes; its log is replayed and replaced, and the next checkpoint writes `GBMETAv2`.
-//! Nodes become dense on their next new relationship. Version 1 software rejects the
-//! upgraded files.
-//!
-//! Version 3 sorted the index keys and version 4 added index counts; older indexes are
-//! rebuilt on open. Version 5 added constraint definitions to the metadata. Older
-//! metadata reads as having none, and the log is replaced on open as above. Version 6
-//! added relationship and composite indexes: an index definition names its entity and
-//! lists its properties. Older definitions read as single-property node indexes, whose
-//! keys are unchanged. Version 7 added temporal property values (a new value tag); its
-//! metadata is laid out as in version 6, and older stores open unchanged. Version 8 added
-//! point values (another value tag), laid out the same way. Version 9 added vector index
-//! definitions at the end of the metadata (their vectors are kept in memory by the
-//! engine); older metadata reads as having none, and an older log is replaced on open.
-//! Version 10 added full-text index definitions after them, likewise, version 11
-//! point index definitions after those, and version 12 text and lookup index
-//! definitions (kind-tagged) after those.
+//! ## Format version
+//! Only the current storage format (12: `GBMETA12` and `GBPWAL12`) is read: a store
+//! written by an older version is rejected on open.
 //!
 //! ## Index keys
 //! A single-property index entry is the value's sort key, its exact encoding (or a lossy
@@ -91,11 +74,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 
 use btree::{MAX_KEY, PageAlloc};
-use pager::{
-    DataFile, MAX_LOGGED_PAGES, PAGE_SIZE, PageKey, Pager, WAL_MAGIC, WAL_MAGIC_V1, WAL_MAGIC_V2, WAL_MAGIC_V3,
-    WAL_MAGIC_V4, WAL_MAGIC_V5, WAL_MAGIC_V6, WAL_MAGIC_V7, WAL_MAGIC_V8, WAL_MAGIC_V9, WAL_MAGIC_V10,
-    WAL_MAGIC_V11,
-};
+use pager::{DataFile, MAX_LOGGED_PAGES, PAGE_SIZE, PageKey, Pager, WAL_MAGIC};
 
 use crate::codec::{Decoder, Encoder, crc32};
 use crate::hybrid::SyncPolicy;
@@ -114,23 +93,9 @@ const FILE_NAMES: [&str; 5] = ["nodes.db", "rels.db", "blobs.db", "index.db", "g
 const META_FILE: &str = "meta";
 const META_TMP: &str = "meta.tmp";
 const META_MAGIC: &[u8; 8] = b"GBMETA12";
-const META_MAGIC_V11: &[u8; 8] = b"GBMETA11";
-const META_MAGIC_V10: &[u8; 8] = b"GBMETA10";
-const META_MAGIC_V9: &[u8; 8] = b"GBMETAv9";
-const META_MAGIC_V8: &[u8; 8] = b"GBMETAv8";
-const META_MAGIC_V7: &[u8; 8] = b"GBMETAv7";
-const META_MAGIC_V6: &[u8; 8] = b"GBMETAv6";
-const META_MAGIC_V5: &[u8; 8] = b"GBMETAv5";
-const META_MAGIC_V4: &[u8; 8] = b"GBMETAv4";
-const META_MAGIC_V3: &[u8; 8] = b"GBMETAv3";
-const META_MAGIC_V2: &[u8; 8] = b"GBMETAv2";
-const META_MAGIC_V1: &[u8; 8] = b"GBMETAv1";
-/// Version of the property indexes: 1 = unsorted keys (before storage format 3), 2 =
-/// sorted keys (see [`value_key`]), 3 = sorted keys plus entry and distinct-value counts
-/// (storage format 4). Older indexes are rebuilt when the store is opened.
+/// Key layout of the property indexes (sorted keys, see [`value_key`], plus entry and
+/// distinct-value counts), recorded in the metadata; any other layout is rejected.
 const INDEX_FORMAT: u8 = 3;
-/// The storage format this code writes.
-const FORMAT: u8 = 12;
 const WAL_FILE: &str = "graph.wal";
 const LOCK_FILE: &str = "LOCK";
 
@@ -251,25 +216,19 @@ struct Meta {
     /// Root of the label index (`label u32 BE | node u64 BE`).
     label_tree: u64,
     indexes: Vec<IndexMeta>,
-    /// Record allocator of `groups.db` (format version 2).
+    /// Record allocator of `groups.db`.
     groups: PageAlloc,
-    /// Key layout of the property indexes ([`INDEX_FORMAT`] once rebuilt).
+    /// Key layout of the property indexes (always [`INDEX_FORMAT`]).
     index_format: u8,
-    /// Constraint definitions (format version 5).
+    /// Constraint definitions.
     constraints: Vec<ConstraintDef>,
-    /// Vector (format version 9), full-text (10), point (11), text and lookup (12) index definitions: the
-    /// engine keeps their contents.
+    /// Vector, full-text, point, text and lookup index definitions: the engine keeps
+    /// their contents.
     engine_indexes: Vec<IndexDef>,
 }
 
 impl Meta {
     fn encode(&self, e: &mut Encoder) {
-        self.encode_version(e, FORMAT);
-    }
-
-    /// Encodes the metadata as storage format `version` writes it (older versions for
-    /// upgrade tests).
-    fn encode_version(&self, e: &mut Encoder, version: u8) {
         for v in [
             self.seq,
             self.next_node,
@@ -295,52 +254,28 @@ impl Meta {
         e.u64(self.label_tree);
         e.len(self.indexes.len());
         for ix in &self.indexes {
-            if version >= 6 {
-                ix.def.encode(e);
-                e.u32(ix.label);
-                e.len(ix.keys.len());
-                for &k in &ix.keys {
-                    e.u32(k);
-                }
-            } else {
-                e.str(&ix.def.name);
-                e.str(&ix.def.label);
-                e.str(&ix.def.properties[0]);
-                e.u32(ix.label);
-                e.u32(ix.keys[0]);
+            ix.def.encode(e);
+            e.u32(ix.label);
+            e.len(ix.keys.len());
+            for &k in &ix.keys {
+                e.u32(k);
             }
             e.u64(ix.root);
-            if version >= 4 {
-                e.u64(ix.entries);
-                e.u64(ix.distinct);
-            }
+            e.u64(ix.entries);
+            e.u64(ix.distinct);
         }
-        if version >= 2 {
-            e.u64(self.groups.next);
-            e.u64(self.groups.free);
-        }
-        if version >= 3 {
-            e.u8(self.index_format);
-        }
-        if version >= 5 {
-            ConstraintDef::encode_list(&self.constraints, e);
-        }
-        if version >= 9 {
-            IndexDef::encode_vector_list(&self.engine_indexes, e);
-        }
-        if version >= 10 {
-            IndexDef::encode_fulltext_list(&self.engine_indexes, e);
-        }
-        if version >= 11 {
-            IndexDef::encode_point_list(&self.engine_indexes, e);
-        }
-        if version >= 12 {
-            IndexDef::encode_tagged_list(&self.engine_indexes, e);
-        }
+        e.u64(self.groups.next);
+        e.u64(self.groups.free);
+        e.u8(self.index_format);
+        ConstraintDef::encode_list(&self.constraints, e);
+        IndexDef::encode_vector_list(&self.engine_indexes, e);
+        IndexDef::encode_fulltext_list(&self.engine_indexes, e);
+        IndexDef::encode_point_list(&self.engine_indexes, e);
+        IndexDef::encode_tagged_list(&self.engine_indexes, e);
     }
 
-    /// Decodes metadata written by storage format `version` (1 to 12).
-    fn decode(d: &mut Decoder, version: u8) -> Result<Meta> {
+    /// Decodes metadata written by [`encode`](Self::encode).
+    fn decode(d: &mut Decoder) -> Result<Meta> {
         let mut m = Meta {
             seq: d.u64()?,
             next_node: d.u64()?,
@@ -368,17 +303,10 @@ impl Meta {
         m.label_tree = d.u64()?;
         let n = d.len(32)?;
         for _ in 0..n {
-            let (def, label, keys) = if version >= 6 {
-                let def = IndexDef::decode(d)?;
-                let label = d.u32()?;
-                let n = d.len(4)?;
-                let keys: Vec<Token> = (0..n).map(|_| d.u32()).collect::<Result<_>>()?;
-                (def, label, keys)
-            } else {
-                let def = IndexDef::decode_v1(d)?;
-                let label = d.u32()?;
-                (def, label, vec![d.u32()?])
-            };
+            let def = IndexDef::decode(d)?;
+            let label = d.u32()?;
+            let n = d.len(4)?;
+            let keys: Vec<Token> = (0..n).map(|_| d.u32()).collect::<Result<_>>()?;
             let labels = match def.entity {
                 IndexEntity::Node => &m.labels,
                 IndexEntity::Relationship => &m.rel_types,
@@ -390,7 +318,7 @@ impl Meta {
                 return Err(d.corrupt("index token out of range"));
             }
             let root = d.u64()?;
-            let (entries, distinct) = if version >= 4 { (d.u64()?, d.u64()?) } else { (0, 0) };
+            let (entries, distinct) = (d.u64()?, d.u64()?);
             m.indexes.push(IndexMeta {
                 def,
                 label,
@@ -400,29 +328,20 @@ impl Meta {
                 distinct,
             });
         }
-        if version >= 2 {
-            m.groups.next = d.u64()?;
-            m.groups.free = d.u64()?;
-            if m.groups.next == 0 || m.groups.free >= m.groups.next {
-                return Err(d.corrupt("group allocator out of range"));
-            }
+        m.groups.next = d.u64()?;
+        m.groups.free = d.u64()?;
+        if m.groups.next == 0 || m.groups.free >= m.groups.next {
+            return Err(d.corrupt("group allocator out of range"));
         }
-        m.index_format = if version >= 3 { d.u8()? } else { 1 };
-        if version >= 5 {
-            m.constraints = ConstraintDef::decode_list(d)?;
+        m.index_format = d.u8()?;
+        if m.index_format != INDEX_FORMAT {
+            return Err(d.corrupt(format!("unsupported index key format {}", m.index_format)));
         }
-        if version >= 9 {
-            m.engine_indexes = IndexDef::decode_vector_list(d)?;
-        }
-        if version >= 10 {
-            m.engine_indexes.extend(IndexDef::decode_fulltext_list(d)?);
-        }
-        if version >= 11 {
-            m.engine_indexes.extend(IndexDef::decode_point_list(d)?);
-        }
-        if version >= 12 {
-            m.engine_indexes.extend(IndexDef::decode_tagged_list(d)?);
-        }
+        m.constraints = ConstraintDef::decode_list(d)?;
+        m.engine_indexes = IndexDef::decode_vector_list(d)?;
+        m.engine_indexes.extend(IndexDef::decode_fulltext_list(d)?);
+        m.engine_indexes.extend(IndexDef::decode_point_list(d)?);
+        m.engine_indexes.extend(IndexDef::decode_tagged_list(d)?);
         Ok(m)
     }
 
@@ -2165,31 +2084,28 @@ fn load_meta(path: &Path) -> Result<Meta> {
         Err(e) => return Err(io(path, "reading")(e)),
     };
     let what = path.display().to_string();
-    let version = match bytes.get(..8) {
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => 12,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V11 => 11,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V10 => 10,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V9 => 9,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V8 => 8,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V7 => 7,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V6 => 6,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V5 => 5,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V4 => 4,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V3 => 3,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V2 => 2,
-        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC_V1 => 1,
+    match bytes.get(..8) {
+        Some(m) if bytes.len() >= 8 + 4 && m == META_MAGIC => {}
+        Some(m) if m.starts_with(b"GBMETA") => return Err(older_format(&what)),
         _ => return Err(Error::Storage(format!("{what} is not a graphbuff metadata file"))),
-    };
+    }
     let (body, tail) = bytes.split_at(bytes.len() - 4);
     if crc32(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
         return Err(Error::Storage(format!("{what} is corrupt: checksum mismatch")));
     }
     let mut d = Decoder::new(&body[8..], &what);
-    let m = Meta::decode(&mut d, version)?;
+    let m = Meta::decode(&mut d)?;
     if !d.is_empty() {
         return Err(d.corrupt("trailing data"));
     }
     Ok(m)
+}
+
+/// The error for a file written in an older, unsupported storage format.
+pub(crate) fn older_format(what: &str) -> Error {
+    Error::Storage(format!(
+        "{what} was written by an older graphbuff version; its storage format is no longer supported"
+    ))
 }
 
 fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
@@ -2211,7 +2127,7 @@ fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
 
 /// Re-applies the log records newer than `meta` to the data files. Stops at the first
 /// torn or corrupt record.
-fn replay(bytes: &[u8], pager: &mut Pager, meta: &mut Meta, version: u8) -> Result<()> {
+fn replay(bytes: &[u8], pager: &mut Pager, meta: &mut Meta) -> Result<()> {
     let mut pos = WAL_MAGIC.len();
     while bytes.len() - pos >= 8 {
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -2224,10 +2140,7 @@ fn replay(bytes: &[u8], pager: &mut Pager, meta: &mut Meta, version: u8) -> Resu
         }
         let what = format!("redo log record at byte {pos}");
         let mut d = Decoder::new(payload, &what);
-        let mut m = Meta::decode(&mut d, version)?;
-        if version < 2 {
-            m.groups = meta.groups;
-        }
+        let m = Meta::decode(&mut d)?;
         if m.seq > meta.seq {
             if m.seq != meta.seq + 1 {
                 return Err(Error::Storage(format!(
@@ -2302,42 +2215,33 @@ impl PersistentGraph {
         let mut bytes = Vec::new();
         wal.read_to_end(&mut bytes)
             .map_err(io(&wal_path, "reading"))?;
-        let wal_version = match bytes.get(..8) {
-            None => FORMAT, // empty (or shorter than a header): a fresh log
-            Some(m) if m == WAL_MAGIC => FORMAT,
-            Some(m) if m == WAL_MAGIC_V11 => 11,
-            Some(m) if m == WAL_MAGIC_V10 => 10,
-            Some(m) if m == WAL_MAGIC_V9 => 9,
-            Some(m) if m == WAL_MAGIC_V8 => 8,
-            Some(m) if m == WAL_MAGIC_V7 => 7,
-            Some(m) if m == WAL_MAGIC_V6 => 6,
-            Some(m) if m == WAL_MAGIC_V5 => 5,
-            Some(m) if m == WAL_MAGIC_V4 => 4,
-            Some(m) if m == WAL_MAGIC_V3 => 3,
-            Some(m) if m == WAL_MAGIC_V2 => 2,
-            Some(m) if m == WAL_MAGIC_V1 => 1,
+        match bytes.get(..8) {
+            None => {} // empty (or shorter than a header): a fresh log
+            Some(m) if m == WAL_MAGIC => {}
+            Some(m) if m.starts_with(b"GBPWAL") => {
+                return Err(older_format(&wal_path.display().to_string()));
+            }
             Some(_) => {
                 return Err(Error::Storage(format!(
                     "{} is not a graphbuff redo log",
                     wal_path.display()
                 )));
             }
-        };
+        }
 
         let mut pager = Pager::new(files, wal, wal_path, 0, opts.cache_bytes, opts.max_tx_pages());
         if bytes.len() > WAL_MAGIC.len() {
-            replay(&bytes, &mut pager, &mut meta, wal_version)?;
+            replay(&bytes, &mut pager, &mut meta)?;
             pager.sync_files()?;
             write_meta(&dir, &meta)?;
         }
-        // An older log is replaced even when empty: records are appended to it.
-        if bytes.len() != WAL_MAGIC.len() || wal_version < FORMAT {
+        if bytes.len() != WAL_MAGIC.len() {
             pager.reset_wal()?;
         } else {
             pager.set_wal_len(bytes.len() as u64);
         }
 
-        let mut g = PersistentGraph {
+        let g = PersistentGraph {
             opts,
             meta,
             saved: None,
@@ -2349,39 +2253,7 @@ impl PersistentGraph {
             changes: Default::default(),
             _lock: lock,
         };
-        if g.meta.index_format < INDEX_FORMAT {
-            g.rebuild_indexes()?;
-        }
         Ok(g)
-    }
-
-    /// Rebuilds every property index in the current key layout, in one transaction (a
-    /// crash in between leaves the old indexes, and the next open tries again).
-    fn rebuild_indexes(&mut self) -> Result<()> {
-        let defs: Vec<IndexDef> = self.meta.indexes.iter().map(|ix| ix.def.clone()).collect();
-        // Not the user's transaction: only the log record limits it.
-        self.pager_mut().max_tx_pages = MAX_LOGGED_PAGES;
-        let restore = self.opts.max_tx_pages();
-        self.begin()?;
-        let mut rebuild = || -> Result<()> {
-            for d in &defs {
-                self.drop_index(&d.name)?;
-            }
-            for d in &defs {
-                self.create_index(d.clone())?;
-            }
-            self.meta.index_format = INDEX_FORMAT;
-            Ok(())
-        };
-        let done = match rebuild() {
-            Ok(()) => self.commit(),
-            Err(e) => {
-                self.rollback();
-                Err(e)
-            }
-        };
-        self.pager_mut().max_tx_pages = restore;
-        done
     }
 
     /// A snapshot of the last committed state.
@@ -3276,91 +3148,6 @@ mod tests {
         assert_eq!(degrees(&g, h, &[]), [8, 5, 11]);
     }
 
-    /// Rewrites a closed store's metadata and log in format version 1.
-    fn downgrade_to_v1(dir: &Path) {
-        let v1_meta = |m: &Meta| {
-            assert_eq!(m.groups, PageAlloc::default(), "v1 stores have no groups");
-            let mut e = Encoder::new();
-            m.encode_version(&mut e, 1);
-            e.buf
-        };
-        let meta_path = dir.join(META_FILE);
-        if let Ok(bytes) = fs::read(&meta_path) {
-            let body = &bytes[8..bytes.len() - 4];
-            let m = Meta::decode(&mut Decoder::new(body, "meta"), 2).unwrap();
-            let mut out = META_MAGIC_V1.to_vec();
-            out.extend(v1_meta(&m));
-            let crc = crc32(&out);
-            out.extend(crc.to_le_bytes());
-            fs::write(&meta_path, out).unwrap();
-        }
-        let wal = fs::read(dir.join(WAL_FILE)).unwrap();
-        assert_eq!(&wal[..8], WAL_MAGIC);
-        let mut out = WAL_MAGIC_V1.to_vec();
-        let mut pos = 8;
-        while pos < wal.len() {
-            let len = u32::from_le_bytes(wal[pos..pos + 4].try_into().unwrap()) as usize;
-            let payload = &wal[pos + 8..pos + 8 + len];
-            let m = Meta::decode(&mut Decoder::new(payload, "record"), 2).unwrap();
-            let mut e = Encoder::new();
-            m.encode(&mut e);
-            let mut new = v1_meta(&m);
-            new.extend_from_slice(&payload[e.buf.len()..]);
-            out.extend((new.len() as u32).to_le_bytes());
-            out.extend(crc32(&new).to_le_bytes());
-            out.extend(new);
-            pos += 8 + len;
-        }
-        fs::write(dir.join(WAL_FILE), out).unwrap();
-        let _ = fs::remove_file(dir.join(FILE_NAMES[GROUPS as usize]));
-    }
-
-    #[test]
-    fn opens_a_clean_version_1_store() {
-        let dir = Dir::new("v1-clean");
-        let sparse = PersistentOptions::new(&dir.0).dense_threshold(1000);
-        let (h, expected) = {
-            let mut g = PersistentGraph::open(sparse).unwrap();
-            let h = hub(&mut g);
-            (h, sorted_expand(&g, h, Direction::Both, &[]))
-        }; // closing checkpoints
-        downgrade_to_v1(&dir.0);
-        {
-            let mut g =
-                PersistentGraph::open(PersistentOptions::new(&dir.0).dense_threshold(3)).unwrap();
-            assert_eq!(&fs::read(dir.0.join(WAL_FILE)).unwrap()[..8], WAL_MAGIC);
-            assert!(!is_dense(&g, h), "nodes stay sparse until written");
-            assert_eq!(sorted_expand(&g, h, Direction::Both, &[]), expected);
-            assert_eq!(degrees(&g, h, &[]), [8, 5, 11]);
-            let leaf = g.create_node(&[], none()).unwrap();
-            g.create_relationship(h, leaf, "B", none()).unwrap();
-            assert!(is_dense(&g, h), "a new relationship densifies");
-            assert_eq!(degrees(&g, h, &[]), [9, 5, 12]);
-        }
-        assert_eq!(&fs::read(dir.0.join(META_FILE)).unwrap()[..8], META_MAGIC);
-    }
-
-    #[test]
-    fn replays_a_version_1_log() {
-        let dir = Dir::new("v1-crash");
-        let sparse = PersistentOptions::new(&dir.0).dense_threshold(1000);
-        let (h, expected) = {
-            let mut g = PersistentGraph::open(sparse).unwrap();
-            g.create_node(&[], none()).unwrap();
-            g.checkpoint().unwrap();
-            let h = hub(&mut g);
-            let e = sorted_expand(&g, h, Direction::Both, &[]);
-            g.abandon();
-            (h, e)
-        };
-        downgrade_to_v1(&dir.0);
-        let g = PersistentGraph::open(PersistentOptions::new(&dir.0).dense_threshold(3)).unwrap();
-        assert_eq!(g.node_count(), 11);
-        assert_eq!(sorted_expand(&g, h, Direction::Both, &[]), expected);
-        assert_eq!(&fs::read(dir.0.join(WAL_FILE)).unwrap()[..8], WAL_MAGIC);
-        assert_eq!(&fs::read(dir.0.join(META_FILE)).unwrap()[..8], META_MAGIC);
-    }
-
     fn props(k: &str, v: Value) -> BTreeMap<String, Value> {
         BTreeMap::from([(k.to_string(), v)])
     }
@@ -3397,36 +3184,6 @@ mod tests {
             assert!(g.drop_constraint("c").unwrap());
             assert!(!g.drop_constraint("c").unwrap());
         } // closing checkpoints
-        let g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-        assert_eq!(g.constraints(), vec![unique("a", "P", "x")]);
-    }
-
-    #[test]
-    fn opens_a_version_4_store() {
-        let dir = Dir::new("v4");
-        {
-            let mut g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-            g.create_node(&["P".into()], props("x", Value::Int(1))).unwrap();
-        }
-        let meta_path = dir.0.join(META_FILE);
-        let bytes = fs::read(&meta_path).unwrap();
-        let m = Meta::decode(&mut Decoder::new(&bytes[8..bytes.len() - 4], "meta"), FORMAT).unwrap();
-        let mut e = Encoder::new();
-        m.encode_version(&mut e, 4);
-        let mut out = META_MAGIC_V4.to_vec();
-        out.extend(e.buf);
-        let crc = crc32(&out);
-        out.extend(crc.to_le_bytes());
-        fs::write(&meta_path, out).unwrap();
-        fs::write(dir.0.join(WAL_FILE), WAL_MAGIC_V4).unwrap();
-        {
-            let mut g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-            assert_eq!(&fs::read(dir.0.join(WAL_FILE)).unwrap()[..8], WAL_MAGIC);
-            assert!(g.constraints().is_empty());
-            assert_eq!(g.node_count(), 1);
-            g.create_constraint(unique("a", "P", "x")).unwrap();
-        }
-        assert_eq!(&fs::read(&meta_path).unwrap()[..8], META_MAGIC);
         let g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
         assert_eq!(g.constraints(), vec![unique("a", "P", "x")]);
     }
@@ -3483,78 +3240,24 @@ mod tests {
     }
 
     #[test]
-    fn opens_a_version_2_store_and_rebuilds_its_indexes() {
-        upgrades_indexes_from(2, META_MAGIC_V2, WAL_MAGIC_V2);
-    }
-
-    #[test]
-    fn opens_a_version_3_store_and_counts_its_indexes() {
-        upgrades_indexes_from(3, META_MAGIC_V3, WAL_MAGIC_V3);
-    }
-
-    /// Rewrites a closed store as storage format `version` and checks that opening it
-    /// rebuilds the indexes: seeks, range seeks and counts work.
-    fn upgrades_indexes_from(version: u8, meta_magic: &[u8; 8], wal_magic: &[u8; 8]) {
-        let dir = Dir::new(&format!("v{version}-index"));
-        let names = ["Ann", "Bob", "Cat", "Dan"];
+    fn rejects_an_older_format() {
+        let dir = Dir::new("older-format");
         {
             let mut g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-            for (i, n) in names.iter().enumerate() {
-                g.create_node(&["P".into()], props("name", Value::from(*n))).unwrap();
-                g.create_node(&["P".into()], props("age", Value::Int(20 + i as i64))).unwrap();
-            }
-            for (name, prop) in [("by_name", "name"), ("by_age", "age")] {
-                g.create_index(IndexDef::node(name, "P", prop))
-                .unwrap();
-            }
+            g.create_node(&[], none()).unwrap();
         } // closing checkpoints
-        // Rewrite the metadata and the log header in the old format.
         let meta_path = dir.0.join(META_FILE);
-        let bytes = fs::read(&meta_path).unwrap();
-        let mut m = Meta::decode(&mut Decoder::new(&bytes[8..bytes.len() - 4], "meta"), FORMAT).unwrap();
-        m.index_format = version - 1; // format 3 wrote index format 2
-        let mut e = Encoder::new();
-        m.encode_version(&mut e, version);
-        let mut out = meta_magic.to_vec();
-        out.extend(e.buf);
-        let crc = crc32(&out);
-        out.extend(crc.to_le_bytes());
-        fs::write(&meta_path, out).unwrap();
-        fs::write(dir.0.join(WAL_FILE), wal_magic).unwrap();
+        let mut bytes = fs::read(&meta_path).unwrap();
+        bytes[..8].copy_from_slice(b"GBMETA11");
+        fs::write(&meta_path, &bytes).unwrap();
+        let e = PersistentGraph::open(PersistentOptions::new(&dir.0)).err().expect("rejected");
+        assert!(e.to_string().contains("no longer supported"), "{e}");
 
-        {
-            let g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-            assert_eq!(g.meta.index_format, INDEX_FORMAT);
-            let names_of = |ids: Vec<NodeId>| -> Vec<Value> {
-                ids.into_iter()
-                    .map(|n| g.node_property(n, "name").unwrap().unwrap())
-                    .collect()
-            };
-            let between = ValueRange::Between {
-                lower: Bound::Included(Value::from("B")),
-                upper: Bound::Excluded(Value::from("D")),
-            };
-            let got = g.index_range("P", "name", &between).unwrap().unwrap();
-            assert_eq!(names_of(got), vec![Value::from("Bob"), Value::from("Cat")]);
-            let ages = ValueRange::Between {
-                lower: Bound::Included(Value::Int(22)),
-                upper: Bound::Unbounded,
-            };
-            assert_eq!(g.index_range("P", "age", &ages).unwrap().unwrap().len(), 2);
-            assert_eq!(g.index_seek("P", "name", &Value::from("Dan")).unwrap().unwrap().len(), 1);
-            let mut defs: Vec<String> = g.indexes().into_iter().map(|d| d.name).collect();
-            defs.sort();
-            assert_eq!(defs, vec!["by_age", "by_name"]);
-            let counts = IndexStats {
-                entries: 4,
-                distinct: 4,
-            };
-            assert_eq!(g.index_stats("P", "name"), Some(counts));
-            assert_eq!(g.index_stats("P", "age"), Some(counts));
-        }
-        assert_eq!(&fs::read(&meta_path).unwrap()[..8], META_MAGIC);
-        let g = PersistentGraph::open(PersistentOptions::new(&dir.0)).unwrap();
-        assert_eq!(g.meta.index_format, INDEX_FORMAT);
+        bytes[..8].copy_from_slice(META_MAGIC);
+        fs::write(&meta_path, &bytes).unwrap();
+        fs::write(dir.0.join(WAL_FILE), b"GBPWALv9").unwrap();
+        let e = PersistentGraph::open(PersistentOptions::new(&dir.0)).err().expect("rejected");
+        assert!(e.to_string().contains("no longer supported"), "{e}");
     }
 
     #[test]
@@ -3639,11 +3342,10 @@ mod tests {
     }
 }
 
-/// Metadata (the first byte picks the format version) (see [`crate::fuzzing`]).
+/// Metadata (see [`crate::fuzzing`]).
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_meta(bytes: &[u8]) {
-    let Some((&v, body)) = bytes.split_first() else { return };
-    let _ = Meta::decode(&mut Decoder::new(body, "meta"), 1 + v % FORMAT);
+    let _ = Meta::decode(&mut Decoder::new(bytes, "meta"));
 }
 
 /// A node, relationship or group record (zero-padded to its size, as the pager hands it
