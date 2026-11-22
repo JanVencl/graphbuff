@@ -22,6 +22,9 @@ python -m venv .venv
 `requirements.txt` pins driver 5.28 (the 5.x LTS line). To try another driver, install it
 into the venv (`pip install neo4j==6.4.1`) and run again.
 
+`test_embeddings.py` embeds, indexes and searches text over HTTP and Bolt with the tiny
+test model; it needs a server built with `--features embed` and is skipped otherwise.
+
 ## Java (`java/`, Maven + JUnit 5, Java 17+)
 
 ```bash

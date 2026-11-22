@@ -234,7 +234,30 @@ pub(crate) fn render(ctx: &Ctx) -> String {
         family(&mut out, "graphbuff_memory_bytes", "gauge", "Memory the process has allocated.");
         let _ = writeln!(out, "graphbuff_memory_bytes {bytes}");
     }
+    if let Some(e) = ctx.mgr.embedder() {
+        embedding(&mut out, e.as_ref());
+    }
     out
+}
+
+/// The `graphbuff_embed_*` metrics, when embedding models are set up.
+fn embedding(out: &mut String, e: &dyn graphbuff::Embedder) {
+    let s = e.stats();
+    for (name, kind, help, value) in [
+        ("graphbuff_embed_calls_total", "counter", "Embedding calls (vector.embed rows and vector.embedBatch calls) that succeeded.", s.calls as f64),
+        ("graphbuff_embed_texts_total", "counter", "Texts embedded.", s.texts as f64),
+        ("graphbuff_embed_tokens_total", "counter", "Tokens embedded (padding not counted).", s.tokens as f64),
+        ("graphbuff_embed_seconds_total", "counter", "Time spent embedding.", s.seconds),
+        ("graphbuff_embed_model_loads_total", "counter", "Embedding models loaded into memory.", s.model_loads as f64),
+        ("graphbuff_embed_model_load_seconds_total", "counter", "Time spent loading embedding models.", s.load_seconds),
+    ] {
+        family(out, name, kind, help);
+        let _ = writeln!(out, "{name} {value}");
+    }
+    family(out, "graphbuff_embed_model_loaded", "gauge", "Whether an installed embedding model is in memory now, by model.");
+    for m in e.models() {
+        let _ = writeln!(out, "graphbuff_embed_model_loaded{{model={}}} {}", label(&m.name), u8::from(m.loaded));
+    }
 }
 
 #[cfg(test)]

@@ -31,6 +31,7 @@ mod gzip;
 mod context;
 mod csv;
 mod dbms;
+mod embed;
 mod demo;
 mod eval;
 mod exec;
@@ -83,6 +84,7 @@ pub use procedures::{
     Procedures,
 };
 pub use transaction::Transaction;
+pub use embed::{EmbedOptions, EmbedStats, EmbedTask, Embedder, HashEmbedder, ModelInfo};
 pub use accel::{KernelMode, KernelStats, kernel_stats};
 #[cfg(feature = "gpu")]
 pub use graphbuff_gpu::WgpuKernels;
@@ -147,6 +149,8 @@ pub struct Database<S: GraphStore = MemoryGraph> {
     trigram_cache: Arc<text_index::TrigramCache>,
     /// The kernel backend read queries use, and when they use it.
     kernels: RwLock<(Arc<dyn Kernels>, KernelMode)>,
+    /// What `vector.embed` and `vector.embedBatch` run; `None`: they fail.
+    embedder: RwLock<Option<Arc<dyn Embedder>>>,
     /// Set by [`Database::set_read_only`]: queries that write fail.
     read_only: std::sync::atomic::AtomicBool,
 }
@@ -221,6 +225,7 @@ impl<S: GraphStore> Database<S> {
             point_cache,
             trigram_cache,
             kernels: RwLock::new((Arc::new(CpuKernels::new()), KernelMode::Auto)),
+            embedder: RwLock::new(None),
             read_only: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -255,6 +260,7 @@ impl<S: GraphStore> Database<S> {
         ex.csv_urls = self.csv_urls();
         ex.procedures = self.procedures();
         ex.read_only = self.is_read_only();
+        ex.embedder = self.embedder();
         ex
     }
 
@@ -632,6 +638,17 @@ impl<S: GraphStore> Database<S> {
 
     pub fn kernel_mode(&self) -> KernelMode {
         self.kernels.read().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// Sets what `vector.embed`, `vector.embedBatch` and `vector.models` run (see
+    /// [`Embedder`]); without one they fail with `Unsupported`.
+    pub fn set_embedder(&self, embedder: Arc<dyn Embedder>) {
+        *self.embedder.write().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
+    }
+
+    /// The embedder set with [`Database::set_embedder`].
+    pub fn embedder(&self) -> Option<Arc<dyn Embedder>> {
+        self.embedder.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The kernel backend read queries use ([`CpuKernels`] by default).

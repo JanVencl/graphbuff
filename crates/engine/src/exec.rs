@@ -331,6 +331,7 @@ impl Executor<'_> {
                 procedures: &self.procedures,
                 accel: None,
                 interrupt: self.interrupt.as_ref(),
+                embedder: self.embedder.as_ref(),
                 writes: Some(Default::default()),
             };
             let out = procedure.call(&ctx, &values)?;

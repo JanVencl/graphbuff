@@ -20,7 +20,7 @@
 * **persistent storage** ([storage modes](./docs/Storage.md))
 * **durable transactions**
 * **bulk CSV import** ([details](./docs/Import.md))
-* **vector search** ([details](./docs/Vectors.md))
+* **vector search** ([details](./docs/Vectors.md)) and **text embeddings** with local models ([details](./docs/Embeddings.md))
 * **full-text search** ([details](./docs/FullText.md))
 * [More features](./docs/Features.md)
 
@@ -149,6 +149,7 @@ More in [Command-line client](./docs/CLI.md).
 | [Bolt](./docs/Bolt.md) | Neo4j drivers |
 | [Users and TLS](./docs/Users.md) | accounts, roles, HTTPS and Bolt over TLS |
 | [Vector search](./docs/Vectors.md) | similarity functions and vector indexes |
+| [Text embeddings](./docs/Embeddings.md) | `vector.embed` with local models, the model folder |
 | [Full-text search](./docs/FullText.md) | full-text indexes, query syntax, analyzers |
 | [Supported Cypher](./docs/Cypher.md) | clauses, functions, procedures, what is missing |
 | [Layout](./docs/Architecture.md) | crates, storage internals, concurrency, execution |

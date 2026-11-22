@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/cli", "crates/core", "crates/cypher", "crates/engine", "crates/gpu", "crates/server", "crates/wasm"]
+members = ["crates/cli", "crates/core", "crates/cypher", "crates/embed", "crates/engine", "crates/gpu", "crates/server", "crates/wasm"]
 # The GPU backend pulls in wgpu (and, on Windows with the GNU toolchain, needs extra tools to
 # link; see the README), so a plain `cargo build` / `cargo test` leaves it out. Build it with
 # `-p graphbuff-gpu` or the `gpu` feature of `graphbuff` or `graphbuff-server`.
+# The embedding models (`crates/embed`) pull in Burn and the tokenizers (a long first
+# build), so they are left out too: `-p graphbuff-embed` or the `embed` feature of the server.
 # The browser build (`crates/wasm`) is for the wasm32-unknown-unknown target; see its README.
 default-members = ["crates/cli", "crates/core", "crates/cypher", "crates/engine", "crates/server"]
 
@@ -18,6 +20,7 @@ graphbuff-core = { path = "crates/core" }
 graphbuff-cypher = { path = "crates/cypher" }
 graphbuff = { path = "crates/engine" }
 graphbuff-gpu = { path = "crates/gpu" }
+graphbuff-embed = { path = "crates/embed" }
 
 # Password hashing (Argon2id, 64 MiB) is many times slower unoptimized; debug builds and
 # tests optimize the crates that do it.

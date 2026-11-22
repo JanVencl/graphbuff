@@ -7,6 +7,13 @@ the same notes.
 
 ### Added
 
+- Text embeddings with local models: `vector.embed(text, model?, options?)`,
+  `CALL vector.embedBatch(texts, …)` and `CALL vector.models()`. They use BERT-family
+  sentence encoders (MiniLM, BGE, E5, GTE) from Hugging Face files, run on the CPU or the
+  GPU. Models go in the model folder (`[embedding]` in `graphbuff.toml`; `config/model/`
+  in the release archives, `/models` in the Docker image), and `fetch-model.py` downloads
+  a known one. Server feature `embed`, on in the release builds; `graphbuff_embed_*`
+  metrics. See [Text embeddings](docs/Embeddings.md).
 - Text indexes: `CREATE TEXT INDEX … FOR (n:L) ON (n.p)` (also on relationships). `MATCH`
   uses them to seek `n.p STARTS WITH $s`, `ENDS WITH $s` and `CONTAINS $s`.
 - Lookup indexes: `CREATE LOOKUP INDEX … FOR (n) ON EACH labels(n)` and

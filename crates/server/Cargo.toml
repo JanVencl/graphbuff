@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 graphbuff = { workspace = true, features = ["system-db"] }
+# `vector.embed()` with local models (`[embedding]` in the config file); see the `embed` feature.
+graphbuff-embed = { workspace = true, optional = true }
 # Argon2id password hashes. Only the hash function: the server writes and reads the PHC
 # strings and makes the salts itself.
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
@@ -23,7 +25,10 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 tls = ["dep:rustls", "rustls/ring"]
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
 # `gpu = true` in [queries] of the config file: run graph kernels on the GPU (wgpu).
-gpu = ["graphbuff/gpu"]
+gpu = ["graphbuff/gpu", "graphbuff-embed?/gpu"]
+# Text embedding models run in the server (`vector.embed`, `[embedding]` in the config
+# file): Burn and the Hugging Face tokenizers, pure Rust, about 15-25 MB more binary.
+embed = ["dep:graphbuff-embed"]
 # Entry points for the fuzz targets in `fuzz/` (`graphbuff_server::fuzzing`); not for other use.
 fuzzing = []
 

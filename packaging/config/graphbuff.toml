@@ -77,3 +77,19 @@ gpu = false
 level = "info"
 # Log queries that take at least this long to query.log.
 # slow_query_ms = 1000
+
+[embedding]
+# Text embedding models for vector.embed() (needs a build with the `embed` feature): one
+# sub-folder per model, named after it, with model.toml, config.json, tokenizer.json and
+# model.safetensors. Default: the `model` folder next to this file.
+# model_dir = "model"
+# The model used when a query names none. Default: the only installed model.
+# default_model = "minilm"
+# Texts per forward pass.
+batch_size = 32
+# Threads that run the models (0: half the cores).
+threads = 0
+# Models kept in memory at once; the least recently used one is unloaded.
+max_loaded_models = 2
+# cpu, or gpu (needs a build with the `gpu` feature too).
+device = "cpu"

@@ -58,6 +58,43 @@ pub struct Config {
     pub log_dir: LogDir,
     pub log_level: Level,
     pub slow_query: Option<Duration>,
+    // [embedding]
+    pub embedding: Embedding,
+}
+
+/// `[embedding]`: the local embedding models (`vector.embed`), in a build with `embed`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Embedding {
+    /// The model folder; `None`: `model` next to the config file.
+    pub model_dir: Option<PathBuf>,
+    /// `None`: the only installed model, if there is one.
+    pub default_model: Option<String>,
+    pub batch_size: usize,
+    /// 0: half the cores.
+    pub threads: usize,
+    pub max_loaded_models: usize,
+    pub device: EmbedDevice,
+}
+
+impl Default for Embedding {
+    fn default() -> Self {
+        Embedding { model_dir: None, default_model: None, batch_size: 32, threads: 0, max_loaded_models: 2, device: EmbedDevice::Cpu }
+    }
+}
+
+/// `embedding.device`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedDevice {
+    Cpu,
+    Gpu,
+}
+
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+impl Embedding {
+    /// The model folder: `model_dir`, else `model` next to `config_file`.
+    pub fn model_dir(&self, config_file: Option<&Path>) -> Option<PathBuf> {
+        self.model_dir.clone().or_else(|| config_file.map(|f| f.parent().unwrap_or(Path::new("")).join("model")))
+    }
 }
 
 impl Default for Config {
@@ -90,6 +127,7 @@ impl Default for Config {
             log_dir: LogDir::Default,
             log_level: Level::Info,
             slow_query: None,
+            embedding: Embedding::default(),
         }
     }
 }
@@ -197,6 +235,22 @@ gpu = false
 level = "info"
 # Log queries that take at least this long to query.log.
 # slow_query_ms = 1000
+
+[embedding]
+# Text embedding models for vector.embed() (needs a build with the `embed` feature): one
+# sub-folder per model, named after it, with model.toml, config.json, tokenizer.json and
+# model.safetensors. Default: the `model` folder next to this file.
+# model_dir = "model"
+# The model used when a query names none. Default: the only installed model.
+# default_model = "minilm"
+# Texts per forward pass.
+batch_size = 32
+# Threads that run the models (0: half the cores).
+threads = 0
+# Models kept in memory at once; the least recently used one is unloaded.
+max_loaded_models = 2
+# cpu, or gpu (needs a build with the `gpu` feature too).
+device = "cpu"
 "#;
 
 /// The `data` line of [`TEMPLATE`] for a config file next to the program.
@@ -281,6 +335,17 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("dir", Kind::Str, "Folder of the logs; \"-\" for standard error."),
             ("level", Kind::Str, "error, warn, info or debug."),
             ("slow_query_ms", Kind::Count, "Log queries that take at least this long to query.log."),
+        ],
+    ),
+    (
+        "embedding",
+        &[
+            ("model_dir", Kind::Path, "Folder of the embedding models, one sub-folder per model."),
+            ("default_model", Kind::Str, "The embedding model used when a query names none."),
+            ("batch_size", Kind::Positive, "Texts per forward pass."),
+            ("threads", Kind::Count, "Threads that run the models (0: half the cores)."),
+            ("max_loaded_models", Kind::Positive, "Embedding models kept in memory at once."),
+            ("device", Kind::Str, "Where the models run: cpu or gpu."),
         ],
     ),
 ];
@@ -376,6 +441,18 @@ impl Config {
                     })?;
                 }
                 ("logs", "slow_query_ms") => c.slow_query = Some(Duration::from_millis(int_of(value))),
+                ("embedding", "model_dir") => c.embedding.model_dir = Some(path_of(value)),
+                ("embedding", "default_model") => c.embedding.default_model = Some(str_of(value)).filter(|m| !m.is_empty()),
+                ("embedding", "batch_size") => c.embedding.batch_size = int_of(value) as usize,
+                ("embedding", "threads") => c.embedding.threads = int_of(value) as usize,
+                ("embedding", "max_loaded_models") => c.embedding.max_loaded_models = int_of(value) as usize,
+                ("embedding", "device") => {
+                    c.embedding.device = match str_of(value).as_str() {
+                        "cpu" => EmbedDevice::Cpu,
+                        "gpu" => EmbedDevice::Gpu,
+                        other => return Err(format!("{}: embedding.device is \"cpu\" or \"gpu\", not \"{other}\"", at())),
+                    }
+                }
                 _ => unreachable!("checked by read_toml"),
             }
         }
@@ -445,6 +522,18 @@ impl Config {
             },
             ("logs", "level") => Some(format!("{:?}", self.log_level).to_ascii_lowercase()),
             ("logs", "slow_query_ms") => millis(&self.slow_query),
+            ("embedding", "model_dir") => path(&self.embedding.model_dir),
+            ("embedding", "default_model") => self.embedding.default_model.clone(),
+            ("embedding", "batch_size") => Some(self.embedding.batch_size.to_string()),
+            ("embedding", "threads") => Some(self.embedding.threads.to_string()),
+            ("embedding", "max_loaded_models") => Some(self.embedding.max_loaded_models.to_string()),
+            ("embedding", "device") => Some(
+                match self.embedding.device {
+                    EmbedDevice::Cpu => "cpu",
+                    EmbedDevice::Gpu => "gpu",
+                }
+                .into(),
+            ),
             _ => return Err(()),
         })
     }
@@ -738,6 +827,34 @@ max_memory_mb = 512").unwrap();
     }
 
     #[test]
+    fn embedding_section() {
+        let c = parse(
+            "[embedding]\nmodel_dir = \"models\"\ndefault_model = \"minilm\"\nbatch_size = 8\nthreads = 3\n\
+             max_loaded_models = 1\ndevice = \"gpu\"\n",
+        )
+        .unwrap();
+        let e = &c.embedding;
+        assert_eq!(e.model_dir, Some(Path::new("conf").join("models")));
+        assert_eq!(e.default_model.as_deref(), Some("minilm"));
+        assert_eq!((e.batch_size, e.threads, e.max_loaded_models, e.device), (8, 3, 1, EmbedDevice::Gpu));
+        let file = Path::new("conf").join("graphbuff.toml");
+        assert_eq!(e.model_dir(Some(&file)), Some(Path::new("conf").join("models")));
+        let d = Embedding::default();
+        assert_eq!(d.model_dir(Some(&file)), Some(Path::new("conf").join("model")));
+        assert_eq!(d.model_dir(None), None);
+        assert_eq!(parse("[embedding]\ndefault_model = \"\"").unwrap().embedding.default_model, None);
+        let err = |t: &str| parse(t).unwrap_err();
+        assert!(err("[embedding]\ndevice = \"tpu\"").contains("embedding.device"));
+        assert!(err("[embedding]\nbatch_size = 0").contains("greater than 0"));
+        assert!(err("[embedding]\nmax_loaded_models = 0").contains("greater than 0"));
+        let list = c.listing();
+        let get = |n: &str| list.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n}"));
+        assert_eq!(get("embedding.device").value.as_deref(), Some("gpu"));
+        assert_eq!(get("embedding.device").default.as_deref(), Some("cpu"));
+        assert_eq!(get("embedding.batch_size").default.as_deref(), Some("32"));
+    }
+
+    #[test]
     fn errors_name_the_line() {
         let e = |text: &str| parse(text).unwrap_err();
         assert!(e("[server]\nbnd = \"x\"").contains("graphbuff.toml:2: unknown setting `bnd` in [server]"), "{}", e("[server]\nbnd = \"x\""));
@@ -805,5 +922,6 @@ max_memory_mb = 512").unwrap();
         assert_eq!(docker.bolt.as_deref(), Some("0.0.0.0:7687"));
         assert_eq!(docker.data, Some(PathBuf::from("/data")));
         assert_eq!(docker.log_dir, LogDir::StandardError);
+        assert_eq!(docker.embedding.model_dir, Some(PathBuf::from("/models")));
     }
 }

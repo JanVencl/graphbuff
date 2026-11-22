@@ -89,6 +89,10 @@ impl Executor<'_> {
         if let Some(v) = spatial_function(name, &args)? {
             return Ok(v);
         }
+        if name == "vector.embed" {
+            let interrupt = || self.interrupt.as_ref().map_or(Ok(()), |i| i.check_now());
+            return crate::embed::embed_function(self.embedder.as_ref(), &args, &interrupt);
+        }
         if let Some(v) = crate::vector::vector_function(name, &args)? {
             return Ok(v);
         }

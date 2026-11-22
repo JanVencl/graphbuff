@@ -384,6 +384,7 @@ impl<'a> Expander<'a> for ProcedureStep<'a> {
             procedures: &ex.procedures,
             accel: ex.accel.as_ref(),
             interrupt: ex.interrupt.as_ref(),
+            embedder: ex.embedder.as_ref(),
             writes: None,
         };
         let rows = self.procedure.call(&ctx, &args)?;

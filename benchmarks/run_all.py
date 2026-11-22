@@ -6,7 +6,11 @@
     python benchmarks/run_all.py --no-gpu        skip gpubench and vecbench (need --features gpu)
     python benchmarks/run_all.py --list          list the benchmarks
 
-The benchmarks are the release-built examples in crates/engine/examples. Each one's output
+embedbench measures the model in GRAPHBUFF_EMBED_BENCH_MODEL (a model folder, see
+docs/Embeddings.md); without it, the tiny test model (overhead only).
+
+The benchmarks are the release-built examples in crates/engine/examples (embedbench: in
+crates/embed/examples). Each one's output
 is printed live and written to benchmarks/results/<timestamp>/<name>.txt. Exits 1 if one fails.
 """
 
@@ -33,11 +37,22 @@ BENCHMARKS = {
                  [], ["--people", "50000", "--reps", "3"]),
     "vecbench": ("vector index queries vs ORDER BY similarity, CPU and GPU", ["gpu"],
                  [], ["--docs", "20000", "--dims", "128", "--reps", "3"]),
+    "embedbench": ("text embedding throughput by batch size and length (CPU)", [],
+                   [], ["--quick", "--reps", "1"]),
 }
+
+# The crate of each benchmark that is not in crates/engine.
+PACKAGES = {"embedbench": "graphbuff-embed"}
+
+
+def extra_args(name):
+    if name == "embedbench" and os.environ.get("GRAPHBUFF_EMBED_BENCH_MODEL"):
+        return ["--model", os.environ["GRAPHBUFF_EMBED_BENCH_MODEL"]]
+    return []
 
 
 def cargo(name, features, args):
-    cmd = ["cargo", "run", "--release", "--quiet", "-p", "graphbuff", "--example", name]
+    cmd = ["cargo", "run", "--release", "--quiet", "-p", PACKAGES.get(name, "graphbuff"), "--example", name]
     if features:
         cmd += ["--features", ",".join(features)]
     return cmd + (["--", *args] if args else [])
@@ -79,7 +94,7 @@ def main():
     summary = []
     for name in names:
         desc, features, default_args, quick_args = BENCHMARKS[name]
-        cmd = cargo(name, features, quick_args if args.quick else default_args)
+        cmd = cargo(name, features, (quick_args if args.quick else default_args) + extra_args(name))
         print(f"\n===== {name}: {desc}\n$ {' '.join(cmd)}\n", flush=True)
         start = time.time()
         code = run(name, cmd, os.path.join(out_dir, f"{name}.txt"))

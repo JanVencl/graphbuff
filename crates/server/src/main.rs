@@ -38,7 +38,8 @@ Settings:
   folder cannot be written, the per-user one) with every setting and its default. The
   file describes each setting; sections: [server] (addresses, connections), [storage]
   (mode, data folder, fsync, import and backup folders), [security] (token, TLS),
-  [queries] (timeouts, GPU), [logs]. Relative paths are relative to the file's folder.
+  [queries] (timeouts, GPU), [logs], [embedding] (text embedding models, in a build
+  with the `embed` feature). Relative paths are relative to the file's folder.
   Env GRAPHBUFF_TOKEN overrides security.token.
 
   Without storage.data, databases are kept in:
@@ -446,6 +447,90 @@ fn first_admin() -> Result<Option<(String, String)>, String> {
 /// An offline command (`users`, `admin`) on its arguments.
 type OfflineCommand = fn(std::iter::Skip<std::env::Args>) -> Result<(), String>;
 
+/// Sets up the models of `[embedding]` (`vector.embed`). Without a model folder or models
+/// there is nothing to do; bad models are skipped with a warning.
+#[cfg(feature = "embed")]
+fn start_embedding(
+    mgr: &DatabaseManager,
+    e: &settings::Embedding,
+    config_file: Option<&std::path::Path>,
+    log: &Arc<Log>,
+    warn: &dyn Fn(&str),
+) -> Result<(), String> {
+    use graphbuff_embed::{DeviceKind, EmbedderConfig, LocalEmbedder, Registry};
+
+    let Some(dir) = e.model_dir(config_file) else {
+        log.info("embedding: no model folder (no config file, no embedding.model_dir); vector.embed() is off");
+        return Ok(());
+    };
+    let registry = match Registry::scan(&dir) {
+        Ok(r) => r,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if e.model_dir.is_some() {
+                return Err(format!("the model folder {} does not exist (embedding.model_dir)", dir.display()));
+            }
+            log.info(format_args!("embedding: no model folder {}; vector.embed() is off", dir.display()));
+            return Ok(());
+        }
+        Err(err) => return Err(format!("cannot read the model folder {}: {err}", dir.display())),
+    };
+    for s in registry.skipped() {
+        warn(&format!("embedding model `{}` in {} is skipped: {}", s.name, dir.display(), s.reason));
+    }
+    if registry.is_empty() {
+        if let Some(m) = &e.default_model {
+            return Err(format!("embedding.default_model `{m}` is not installed in {}", dir.display()));
+        }
+        log.info(format_args!("embedding: no models in {}; vector.embed() is off", dir.display()));
+        return Ok(());
+    }
+    let config = EmbedderConfig {
+        default_model: e.default_model.clone(),
+        batch_size: e.batch_size,
+        threads: e.threads,
+        max_loaded_models: e.max_loaded_models,
+        device: match e.device {
+            settings::EmbedDevice::Cpu => DeviceKind::Cpu,
+            settings::EmbedDevice::Gpu => DeviceKind::Gpu,
+        },
+    };
+    let names: Vec<String> = registry.models().map(|m| format!("{} ({} dimensions)", m.name, m.manifest.dimensions)).collect();
+    let load_log = Arc::clone(log);
+    let embedder = LocalEmbedder::new(registry, config)?.on_load(move |m| {
+        load_log.info(format_args!(
+            "loaded embedding model `{}` ({} dimensions, {:.1} MiB of weights) in {} ms",
+            m.name,
+            m.dimensions,
+            m.bytes as f64 / (1 << 20) as f64,
+            m.took.as_millis()
+        ));
+    });
+    log.info(format_args!(
+        "embedding models in {}: {}; default: {}; device: {}",
+        dir.display(),
+        names.join(", "),
+        embedder.default_model().unwrap_or("none (queries name the model)"),
+        if e.device == settings::EmbedDevice::Gpu { "gpu" } else { "cpu" }
+    ));
+    mgr.set_embedder(Arc::new(embedder));
+    Ok(())
+}
+
+/// Without the `embed` feature: `[embedding]` settings have no effect, so say so.
+#[cfg(not(feature = "embed"))]
+fn start_embedding(
+    _mgr: &DatabaseManager,
+    e: &settings::Embedding,
+    _config_file: Option<&std::path::Path>,
+    _log: &Arc<Log>,
+    warn: &dyn Fn(&str),
+) -> Result<(), String> {
+    if *e != settings::Embedding::default() {
+        warn("[embedding] is set, but this build has no embedding models (build with the `embed` feature)");
+    }
+    Ok(())
+}
+
 fn main() {
     let offline: Option<OfflineCommand> =
         match std::env::args().nth(1).as_deref() {
@@ -625,6 +710,9 @@ fn main() {
             Ok(k) => mgr.set_kernels(k),
             Err(e) => fatal(&format!("queries.gpu: {e}")),
         }
+    }
+    if let Err(e) = start_embedding(&mgr, &settings.embedding, config_file.as_deref(), &log, &warn) {
+        fatal(&format!("embedding: {e}"));
     }
     let server = match Server::start(Arc::clone(&mgr), config.clone()) {
         Ok(s) => s,
