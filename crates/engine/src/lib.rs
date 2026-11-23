@@ -35,6 +35,8 @@ mod embed;
 mod demo;
 mod eval;
 mod exec;
+// Only the tests filter searches so far.
+#[cfg_attr(not(test), allow(dead_code))]
 mod filter_column;
 mod fulltext;
 mod hnsw;

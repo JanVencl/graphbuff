@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use graphbuff_core::{
     Changes, Error, GraphStore, HnswConfig, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId,
-    RelId, Result, Value, VectorRows, VectorSimilarity as Similarity,
+    RelId, Result, Value, VectorRows, VectorScores, VectorSimilarity as Similarity, vector_row_score,
 };
 use graphbuff_cypher::ast::IndexType;
 
-use crate::filter_column::{FilterColumn, filter_value};
+use crate::filter_column::{FilterColumn, Predicate, Selection, filter_value};
 use crate::hnsw::{Graph, Metric};
 use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
@@ -320,19 +320,21 @@ impl Entry {
     fn read(store: &dyn GraphStore, def: &IndexDef, id: u64, value: &Value) -> Result<Option<Entry>> {
         let (dimensions, similarity) = vector_params(def);
         let Some(row) = matrix_row(value, dimensions, similarity) else { return Ok(None) };
-        let filters = def
-            .filter_properties()
-            .iter()
-            .map(|key| {
-                let v = match def.entity {
-                    IndexEntity::Node => store.node_property(NodeId(id), key)?,
-                    IndexEntity::Relationship => store.relationship_property(RelId(id), key)?,
-                };
-                Ok(filter_value(v))
-            })
-            .collect::<Result<_>>()?;
-        Ok(Some(Entry { row, filters }))
+        Ok(Some(Entry { row, filters: read_filters(store, def, id)? }))
     }
+}
+
+/// Property `key` of entity `id` of `def`.
+fn property(store: &dyn GraphStore, def: &IndexDef, id: u64, key: &str) -> Result<Option<Value>> {
+    match def.entity {
+        IndexEntity::Node => store.node_property(NodeId(id), key),
+        IndexEntity::Relationship => store.relationship_property(RelId(id), key),
+    }
+}
+
+/// The values entity `id` has for the filter properties of `def`.
+fn read_filters(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Vec<Value>> {
+    def.filter_properties().iter().map(|key| Ok(filter_value(property(store, def, id, key)?))).collect()
 }
 
 /// The entries of every entity `def` covers in `store`, in id order.
@@ -546,22 +548,61 @@ impl Matrix {
     /// stored vector. Rows not in use are scored too; [`Matrix::ids`] tells them apart.
     fn approximate(&self, q: &[f64], kernels: &dyn Kernels) -> (Vec<f64>, f64) {
         let (_, similarity) = vector_params(&self.def);
-        let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let query = RowQuery::new(similarity, q);
+        let s = kernels.vector_scores(&self.rows, &query.vector, similarity);
+        let bound = s.error_bound(similarity, self.rows.max_norm(), query.norm);
+        (s.values.iter().map(|&v| query.score(v)).collect(), bound)
+    }
+}
+
+/// A query vector as rows are compared with it (unit length for cosine).
+struct RowQuery {
+    similarity: Similarity,
+    vector: Vec<f64>,
+    /// The norm of `vector`.
+    norm: f64,
+}
+
+impl RowQuery {
+    fn new(similarity: Similarity, q: &[f64]) -> RowQuery {
+        let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         match similarity {
-            Similarity::Cosine => {
-                let unit: Vec<f64> = q.iter().map(|x| x / qn).collect();
-                let s = kernels.vector_scores(&self.rows, &unit, similarity);
-                // The score is (1 + dot) / 2: it moves by half as much as the dot product.
-                let bound = s.error_bound(similarity, 1.0, 1.0);
-                (s.values.iter().map(|dot| (1.0 + dot.clamp(-1.0, 1.0)) / 2.0).collect(), bound)
-            }
-            Similarity::Euclidean => {
-                let s = kernels.vector_scores(&self.rows, q, similarity);
-                // 1 / (1 + d²) moves by at most as much as d².
-                let bound = s.error_bound(similarity, self.rows.max_norm(), qn);
-                (s.values.iter().map(|d2| 1.0 / (1.0 + d2.max(0.0))).collect(), bound)
-            }
+            Similarity::Cosine => RowQuery { similarity, vector: q.iter().map(|x| x / norm).collect(), norm: 1.0 },
+            Similarity::Euclidean => RowQuery { similarity, vector: q.to_vec(), norm },
         }
+    }
+
+    /// The score of a row for which the kernels computed `v`. For cosine, `(1 + dot) / 2`
+    /// moves by half as much as the dot product; for euclidean, `1 / (1 + d²)` moves by at
+    /// most as much as d².
+    fn score(&self, v: f64) -> f64 {
+        match self.similarity {
+            Similarity::Cosine => (1.0 + v.clamp(-1.0, 1.0)) / 2.0,
+            Similarity::Euclidean => 1.0 / (1.0 + v.max(0.0)),
+        }
+    }
+
+    /// Approximate scores of `rows` (with their entities), and a bound on how far one may
+    /// be from the exact score of the stored vector.
+    fn scores<'a>(
+        &self,
+        rows: impl Iterator<Item = (u64, &'a [f32])>,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<(f64, u64)>, f64)> {
+        let mut out = Vec::new();
+        let mut max_norm = 1.0f64;
+        for (n, (id, row)) in rows.enumerate() {
+            if n % 4096 == 4095 {
+                interrupt()?;
+            }
+            let v = vector_row_score(row, &self.vector, self.similarity);
+            if self.similarity == Similarity::Euclidean {
+                max_norm = max_norm.max(self.norm + v.max(0.0).sqrt());
+            }
+            out.push((self.score(v), id));
+        }
+        let bound = VectorScores { values: Vec::new(), f32_terms: 0 }.error_bound(self.similarity, max_norm, self.norm);
+        Ok((out, bound))
     }
 }
 
@@ -668,17 +709,51 @@ impl Approximate {
         Ok(())
     }
 
-    /// The entities of the (up to) `n` vectors the graph finds closest to `q`.
-    fn candidates(&self, q: &[f64], n: usize) -> Vec<u64> {
+    /// The query vector as the graph's vectors are kept (unit length for cosine).
+    fn query(&self, q: &[f64]) -> Vec<f32> {
         let (_, similarity) = vector_params(&self.def);
         let scale = match similarity {
             Similarity::Cosine => 1.0 / q.iter().map(|x| x * x).sum::<f64>().sqrt(),
             Similarity::Euclidean => 1.0,
         };
-        let q: Vec<f32> = q.iter().map(|x| (x * scale) as f32).collect();
-        self.graph.search(&q, n, n).into_iter().map(|(_, slot)| self.ids[slot as usize]).collect()
+        q.iter().map(|x| (x * scale) as f32).collect()
+    }
+
+    /// The entities of the (up to) `n` vectors the graph finds closest to `q`.
+    fn candidates(&self, q: &[f64], n: usize) -> Vec<u64> {
+        self.graph.search(&self.query(q), n, n).into_iter().map(|(_, slot)| self.ids[slot as usize]).collect()
+    }
+
+    /// The entities of the (up to) `n` selected vectors the graph finds closest to `q`, at
+    /// least `min(k, selected.count())`; `None` if scoring all the selected ones takes
+    /// less work, or the search turned out to take as much or to find too few.
+    fn candidates_where(&self, q: &[f64], k: usize, n: usize, selected: &Selection) -> Option<Vec<u64>> {
+        let matches = selected.count();
+        if matches <= n || filtered_search_cost(n, self.graph.slots(), matches) >= matches as f64 {
+            return None;
+        }
+        let found = self.graph.search_where(&self.query(q), n, n, |slot| selected.contains(slot), matches)?;
+        (found.len() >= k.min(matches)).then(|| found.into_iter().map(|(_, slot)| self.ids[slot as usize]).collect())
     }
 }
+
+/// About how many distances a graph search that keeps `ef` candidates measures when
+/// `matches` of the `slots` vectors pass its filter: it looks at all vectors around the
+/// query to find the ones that pass.
+fn filtered_search_cost(ef: usize, slots: usize, matches: usize) -> f64 {
+    FILTERED_SEARCH_FACTOR * ef as f64 * slots as f64 / matches.max(1) as f64
+}
+
+/// The distances a graph search measures per candidate it keeps (`filtered_search_cost_measured`):
+/// about 4 to 5 on clustered vectors, whatever share of them passes, and 10 to 16 on
+/// uniformly random ones when a quarter or more pass.
+const FILTERED_SEARCH_FACTOR: f64 = 8.0;
+
+/// An exact index scores only the selected rows, on the calling thread, if they are at
+/// most this many or at most one in [`SUBSET_SHARE`]: otherwise all rows, with the
+/// database's kernels.
+const SUBSET_ROWS: usize = 1024;
+const SUBSET_SHARE: usize = 8;
 
 /// The in-memory contents of a vector index of one committed state.
 #[derive(Clone)]
@@ -810,78 +885,7 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
     if similarity == Similarity::Cosine && q.iter().all(|x| *x == 0.0) {
         return Err(Error::Semantic(format!("{procedure}: a zero vector has no cosine similarity")));
     }
-    let interrupt = || ctx.check_interrupt();
-    let store = ctx.store();
-    let exact = |value: &Value| indexed_vector(value, dimensions, similarity).and_then(|v| similarity.score(&v, &q));
-
-    let best: Vec<(f64, u64)> = match ctx.vectors() {
-        // A committed state: the cached matrix, then exact scores near the cut.
-        Some((cache, snapshot)) => {
-            let index = cache.get(snapshot, &def, &interrupt)?;
-            let m = match &*index {
-                VectorIndex::Flat(m) => m,
-                VectorIndex::Approximate(a) => {
-                    let mut out = Vec::new();
-                    for id in a.candidates(&q, search_width(k)) {
-                        let value = match entity {
-                            IndexEntity::Node => store.node_property(NodeId(id), &def.properties[0])?,
-                            IndexEntity::Relationship => store.relationship_property(RelId(id), &def.properties[0])?,
-                        };
-                        if let Some(score) = value.as_ref().and_then(exact) {
-                            out.push((score, id));
-                        }
-                    }
-                    return Ok(rows(out, k, entity));
-                }
-            };
-            let (all, tolerance) = m.approximate(&q, &*ctx.kernels());
-            let approx: Vec<(f64, u64)> =
-                all.into_iter().zip(&m.ids).filter(|(_, id)| **id != FREE).map(|(s, id)| (s, *id)).collect();
-            if approx.is_empty() {
-                return Ok(Vec::new());
-            }
-            let cut = if approx.len() <= k {
-                f64::NEG_INFINITY
-            } else {
-                let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
-                let i = sorted.len() - k;
-                *sorted.select_nth_unstable_by(i, f64::total_cmp).1 - tolerance
-            };
-            let mut out = Vec::new();
-            for &(s, id) in &approx {
-                if s < cut {
-                    continue;
-                }
-                let value = match entity {
-                    IndexEntity::Node => store.node_property(NodeId(id), &def.properties[0])?,
-                    IndexEntity::Relationship => store.relationship_property(RelId(id), &def.properties[0])?,
-                };
-                if let Some(score) = value.as_ref().and_then(exact) {
-                    out.push((score, id));
-                }
-            }
-            out
-        }
-        // Inside a transaction (or writing): every entity, as the query sees it.
-        None => {
-            let mut out = Vec::new();
-            for_each_entity(store, &def, &interrupt, |id, value| {
-                if let Some(score) = exact(&value) {
-                    out.push((score, id));
-                }
-                Ok(())
-            })?;
-            out
-        }
-    };
-    Ok(rows(best, k, entity))
-}
-
-/// The best `k` of `scored`, as `[entity, score]` rows, best first (ties by id).
-fn rows(mut scored: Vec<(f64, u64)>, k: usize, entity: IndexEntity) -> ProcedureRows {
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.truncate(k);
-    scored
+    Ok(nearest(ctx, &def, &q, k, &[])?
         .into_iter()
         .map(|(score, id)| {
             let e = match entity {
@@ -890,7 +894,103 @@ fn rows(mut scored: Vec<(f64, u64)>, k: usize, entity: IndexEntity) -> Procedure
             };
             vec![e, Value::Float(score)]
         })
-        .collect()
+        .collect())
+}
+
+/// The `k` entities of vector index `def` most similar to `q` (of the index's dimensions,
+/// not zero for cosine) among those whose filter properties pass every predicate of
+/// `filter`: their scores and ids, best first (ties by id). All that pass, if they are
+/// fewer. Exact, except for an approximate index on a committed state when its graph is
+/// searched; even then the scores are exact and `k` entities are returned if as many pass
+/// a (non-empty) filter.
+pub(crate) fn nearest(
+    ctx: &ProcedureContext<'_>,
+    def: &IndexDef,
+    q: &[f64],
+    k: usize,
+    filter: &[Predicate],
+) -> Result<Vec<(f64, u64)>> {
+    let (dimensions, similarity) = vector_params(def);
+    let interrupt = || ctx.check_interrupt();
+    let store = ctx.store();
+    let exact = |value: &Value| indexed_vector(value, dimensions, similarity).and_then(|v| similarity.score(&v, q));
+    // The exact scores of `ids`, from the stored vectors.
+    let rescore = |ids: &mut dyn Iterator<Item = u64>| -> Result<Vec<(f64, u64)>> {
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(score) = property(store, def, id, &def.properties[0])?.as_ref().and_then(exact) {
+                out.push((score, id));
+            }
+        }
+        Ok(out)
+    };
+    // The exact scores of those of `approx` that may be among the best `k`, when each of
+    // its scores is within `tolerance` of the exact one.
+    let near_the_cut = |(approx, tolerance): (Vec<(f64, u64)>, f64)| -> Result<Vec<(f64, u64)>> {
+        let cut = if approx.len() <= k || k == 0 {
+            f64::NEG_INFINITY
+        } else {
+            let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
+            let i = sorted.len() - k;
+            *sorted.select_nth_unstable_by(i, f64::total_cmp).1 - tolerance
+        };
+        rescore(&mut approx.iter().filter(|(s, _)| *s >= cut).map(|(_, id)| *id))
+    };
+
+    let mut best: Vec<(f64, u64)> = match ctx.vectors() {
+        _ if k == 0 => Vec::new(),
+        // A committed state: the cached index, then exact scores near the cut.
+        Some((cache, snapshot)) => {
+            let index = cache.get(snapshot, def, &interrupt)?;
+            let columns = match &*index {
+                VectorIndex::Flat(m) => &m.filters,
+                VectorIndex::Approximate(a) => &a.filters,
+            };
+            let selected = match filter {
+                [] => None,
+                filter => Some(Selection::new(columns, filter, &interrupt)?),
+            };
+            let query = RowQuery::new(similarity, q);
+            match (&*index, selected) {
+                (VectorIndex::Flat(m), Some(s)) if s.count() <= SUBSET_ROWS.max(m.ids.len() / SUBSET_SHARE) => {
+                    near_the_cut(query.scores(s.iter().map(|r| (m.ids[r as usize], m.row(r))), &interrupt)?)?
+                }
+                (VectorIndex::Flat(m), selected) => {
+                    let (all, tolerance) = m.approximate(q, &*ctx.kernels());
+                    let in_use = |r: usize| match &selected {
+                        Some(s) => s.contains(r as u32),
+                        None => m.ids[r] != FREE,
+                    };
+                    let approx = all.into_iter().enumerate().filter(|(r, _)| in_use(*r)).map(|(r, s)| (s, m.ids[r]));
+                    near_the_cut((approx.collect(), tolerance))?
+                }
+                (VectorIndex::Approximate(a), None) => rescore(&mut a.candidates(q, search_width(k)).into_iter())?,
+                (VectorIndex::Approximate(a), Some(s)) => match a.candidates_where(q, k, search_width(k), &s) {
+                    Some(ids) => rescore(&mut ids.into_iter())?,
+                    None => near_the_cut(
+                        query.scores(s.iter().map(|r| (a.ids[r as usize], a.graph.vector(r))), &interrupt)?,
+                    )?,
+                },
+            }
+        }
+        // Inside a transaction (or writing): every entity, as the query sees it.
+        None => {
+            let mut out = Vec::new();
+            for_each_entity(store, def, &interrupt, |id, value| {
+                if let Some(score) = exact(&value) {
+                    let values = if filter.is_empty() { Vec::new() } else { read_filters(store, def, id)? };
+                    if filter.iter().all(|p| p.passes(&values[p.column])) {
+                        out.push((score, id));
+                    }
+                }
+                Ok(())
+            })?;
+            out
+        }
+    };
+    best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    best.truncate(k);
+    Ok(best)
 }
 
 #[cfg(test)]
@@ -1010,6 +1110,245 @@ mod tests {
         db.execute("MATCH ()-[r:NEAR]->() SET r.since = coalesce(r.since, 1) + 1").unwrap();
         db.execute(q).unwrap();
         assert_eq!(values(&db), ["2", "2"]);
+    }
+
+    /// `test.nearest(index, k, q, filter)`: a filtered search, where `filter` is a list of
+    /// `[filter property's number, operator, value]`.
+    fn with_filtered_search() -> crate::Database {
+        use crate::filter_column::Compare;
+        let db = crate::Database::in_memory();
+        db.register_procedure(
+            crate::ProcedureSignature::new("test.nearest", ["index", "k", "q", "filter"], ["id", "score"]),
+            |ctx, args| {
+                let [Value::String(name), Value::Int(k), q, Value::List(filter)] = args else { panic!("{args:?}") };
+                let def = ctx.store().indexes().into_iter().find(|d| d.name == *name).expect("an index");
+                let filter: Vec<Predicate> = filter
+                    .iter()
+                    .map(|p| {
+                        let Value::List(p) = p else { panic!("{p:?}") };
+                        let [Value::Int(column), Value::String(op), v] = &p[..] else { panic!("{p:?}") };
+                        let (c, v) = (*column as usize, v.clone());
+                        match (op.as_str(), v) {
+                            ("=", v) => Predicate::equal(c, v),
+                            ("IN", Value::List(list)) => Predicate::one_of(c, list),
+                            ("<", v) => Predicate::compare(c, Compare::Lt, v),
+                            ("<=", v) => Predicate::compare(c, Compare::Le, v),
+                            (">", v) => Predicate::compare(c, Compare::Gt, v),
+                            (">=", v) => Predicate::compare(c, Compare::Ge, v),
+                            (op, v) => panic!("{op} {v:?}"),
+                        }
+                    })
+                    .collect();
+                let q = vector_arg("test", q)?.expect("a vector");
+                Ok(nearest(ctx, &def, &q, *k as usize, &filter)?
+                    .into_iter()
+                    .map(|(score, id)| vec![Value::Int(id as i64), Value::Float(score)])
+                    .collect())
+            },
+        )
+        .unwrap();
+        db
+    }
+
+    fn shown(r: crate::QueryResult) -> Vec<String> {
+        r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")).collect()
+    }
+
+    /// The queries of a filtered search, through the index and as a scan of the graph.
+    fn filtered(index: &str, function: &str, k: usize, q: &str, filter: &[(usize, &str, &str)]) -> (String, String) {
+        let names = ["tenant", "year"];
+        let list: Vec<String> = filter.iter().map(|(c, op, v)| format!("[{c}, '{op}', {v}]")).collect();
+        let conditions: Vec<String> = filter.iter().map(|(c, op, v)| format!("n.{} {op} {v}", names[*c])).collect();
+        (
+            format!("CALL test.nearest('{index}', {k}, {q}, [{}]) YIELD id, score RETURN id, score", list.join(", ")),
+            format!(
+                "MATCH (n:V) WHERE {} WITH n, vector.similarity.{function}(n.e, {q}) AS score \
+                 RETURN id(n), score ORDER BY score DESC, id(n) LIMIT {k}",
+                conditions.join(" AND ")
+            ),
+        )
+    }
+
+    const FILTERS: [&[(usize, &str, &str)]; 11] = [
+        &[(0, "=", "3")],
+        &[(0, "=", "3.0")],
+        &[(0, "=", "'none'")],
+        &[(0, "=", "null")],
+        &[(0, "IN", "[1, 2, null, 'x']")],
+        &[(0, "IN", "[]")],
+        &[(1, ">=", "date('2020-06-01')")],
+        &[(1, ">", "date('2000-01-01')"), (1, "<=", "date('2021-01-01')")],
+        &[(0, "<", "2"), (1, "<", "date('2019-01-01')")],
+        &[(1, "<", "2020")],
+        &[(0, ">=", "0")],
+    ];
+
+    #[test]
+    fn filtered_exact_search() {
+        for function in ["cosine", "euclidean"] {
+            let db = with_filtered_search();
+            db.execute(&format!(
+                "CREATE VECTOR INDEX v FOR (n:V) ON n.e WITH [n.tenant, n.year] OPTIONS {{indexConfig: \
+                 {{`vector.dimensions`: 3, `vector.similarity_function`: '{function}'}}}}"
+            ))
+            .unwrap();
+            // Coarse coordinates, so that many scores are equal.
+            db.execute(
+                "UNWIND range(1, 4000) AS i CREATE (n:V {e: [i * 7 % 5 - 2, i * 13 % 7 - 3.0, i * 31 % 3 + 1]}) \
+                 SET n.tenant = CASE i % 11 WHEN 0 THEN null WHEN 1 THEN 'x' WHEN 2 THEN 1.0 ELSE i % 5 END, \
+                 n.year = CASE i % 9 WHEN 0 THEN i ELSE date({year: 2015 + i % 8, month: 1 + i % 12}) END",
+            )
+            .unwrap();
+            let check = |what: &str| {
+                for filter in FILTERS {
+                    for k in [1, 10, 300, 5000] {
+                        let (search, scan) = filtered("v", function, k, "[1, 0.5, -2]", filter);
+                        assert_eq!(shown(db.execute(&search).unwrap()), shown(db.execute(&scan).unwrap()), "{what}: {search}");
+                    }
+                }
+            };
+            check("built");
+            db.execute("MATCH (n:V) WHERE id(n) % 3 = 0 SET n.tenant = 3, n.year = date('2020-07-01')").unwrap();
+            db.execute("MATCH (n:V) WHERE id(n) % 10 = 0 DETACH DELETE n").unwrap();
+            check("after commits");
+            // Inside a transaction, its own writes count.
+            let mut tx = db.begin().unwrap();
+            tx.execute("MATCH (n:V) WHERE id(n) % 4 = 1 SET n.tenant = 1").unwrap();
+            for filter in FILTERS {
+                let (search, scan) = filtered("v", function, 10, "[1, 0.5, -2]", filter);
+                assert_eq!(shown(tx.execute(&search).unwrap()), shown(tx.execute(&scan).unwrap()), "in a transaction: {search}");
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_approximate_search() {
+        let db = with_filtered_search();
+        let dims = 16;
+        db.execute(&format!(
+            "CREATE VECTOR INDEX v FOR (n:V) ON n.e WITH [n.tenant, n.year] OPTIONS {{indexConfig: \
+             {{`vector.dimensions`: {dims}, `vector.hnsw.enabled`: true}}}}"
+        ))
+        .unwrap();
+        let mut seed = 7u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f64 / (1u64 << 24) as f64 * 2.0 - 1.0
+        };
+        // Forty clusters. `tenant` is independent of the vectors, `year` is the cluster: a
+        // filter on it selects vectors far from (or only near) the query.
+        let n = 6000;
+        let centers: Vec<Vec<f64>> = (0..40).map(|_| (0..dims).map(|_| next()).collect()).collect();
+        let mut vector = |c: usize| -> Vec<String> { centers[c].iter().map(|x| format!("{:.4}", x + 0.3 * next())).collect() };
+        let values: Vec<String> =
+            (0..n).map(|i| format!("{{e: [{}], tenant: {}, year: {}}}", vector(i % 40).join(", "), i / 40 % 100, i % 40)).collect();
+        db.execute(&format!("UNWIND [{}] AS p CREATE (n:V) SET n = p", values.join(", "))).unwrap();
+        let queries: Vec<String> = (0..10).map(|c| format!("[{}]", vector(c).join(", "))).collect();
+
+        let mut through_graph = 0;
+        for (filter, least) in [
+            (&[(0, "=", "5")][..], 0.95),
+            (&[(0, "<", "10")], 0.95),
+            (&[(0, "<", "50")], 0.95),
+            (&[(0, "<", "90")], 0.95),
+            (&[(1, "=", "3")], 0.95),
+            (&[(1, "=", "39")], 0.95),
+            (&[(1, "<", "20")], 0.95),
+            (&[(1, ">=", "20")], 0.95),
+            (&[(1, ">=", "4"), (0, "<", "95")], 0.95),
+            (&[(0, "=", "1000")], 1.0),
+        ] {
+            for k in [1, 10, 100] {
+                let (mut hits, mut total) = (0, 0);
+                for q in &queries {
+                    let (search, scan) = filtered("v", "cosine", k, q, filter);
+                    let (got, want) = (shown(db.execute(&search).unwrap()), shown(db.execute(&scan).unwrap()));
+                    assert_eq!(got.len(), want.len(), "{filter:?}, k = {k}");
+                    total += want.len();
+                    // Entity and score: the scores are exact.
+                    hits += got.iter().filter(|r| want.contains(r)).count();
+                }
+                assert!(hits as f64 >= least * total as f64, "{filter:?}, k = {k}: {hits} of {total}");
+            }
+            let entry = db.vector_cache.entry("v").unwrap();
+            let VectorIndex::Approximate(a) = &*entry else { panic!("an approximate index") };
+            let predicates: Vec<Predicate> = filter
+                .iter()
+                .map(|(c, op, v)| {
+                    use crate::filter_column::Compare;
+                    let v = Value::Int(v.parse().unwrap());
+                    match *op {
+                        "=" => Predicate::equal(*c, v),
+                        "<" => Predicate::compare(*c, Compare::Lt, v),
+                        _ => Predicate::compare(*c, Compare::Ge, v),
+                    }
+                })
+                .collect();
+            let s = Selection::new(&a.filters, &predicates, &|| Ok(())).unwrap();
+            let q: Vec<f64> = queries[0].trim_matches(['[', ']']).split(", ").map(|x| x.parse().unwrap()).collect();
+            // Few matches are always scored one by one.
+            let graph = a.candidates_where(&q, 10, search_width(10), &s).is_some();
+            assert!(!graph || s.count() * 4 > n, "{filter:?}");
+            through_graph += usize::from(graph);
+        }
+        assert!(through_graph >= 2, "the graph was searched for {through_graph} filters");
+
+        // A graph search that reaches fewer than `k` of the matches does not answer.
+        let entry = db.vector_cache.entry("v").unwrap();
+        let VectorIndex::Approximate(a) = &*entry else { panic!("an approximate index") };
+        let mut a = a.clone();
+        let all = Selection::new(&a.filters, &[Predicate::one_of(0, (0..100).map(Value::Int).collect())], &|| Ok(())).unwrap();
+        let q = vec![1.0; dims];
+        assert_eq!(a.candidates_where(&q, 150, 600, &all).map(|c| c.len()), Some(600));
+        a.graph.cut_off(100);
+        assert!(a.candidates_where(&q, 150, 600, &all).is_none());
+        assert!(a.candidates_where(&q, 1, 600, &all).is_some_and(|c| (1..=100).contains(&c.len())));
+    }
+
+    /// How the distances a filtered graph search measures grow: see
+    /// [`FILTERED_SEARCH_FACTOR`].
+    #[test]
+    #[ignore = "prints measurements"]
+    fn filtered_search_cost_measured() {
+        for (n, dims, clusters) in [(20_000, 32, 0), (20_000, 32, 200), (50_000, 64, 500)] {
+            let mut seed = 11u64;
+            let mut next = move || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            };
+            let centers: Vec<Vec<f32>> = (0..clusters).map(|_| (0..dims).map(|_| next()).collect()).collect();
+            let mut vector = |i: usize| -> Vec<f32> {
+                let spread = if clusters == 0 { 1.0 } else { 0.3 };
+                let v: Vec<f32> = (0..dims)
+                    .map(|d| centers.get(i % clusters.max(1)).map_or(0.0, |c| c[d]) + spread * next())
+                    .collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter().map(|x| x / norm).collect()
+            };
+            let mut g = Graph::new(dims, Metric::Cosine, 16, 100);
+            for i in 0..n {
+                let v = vector(i);
+                g.insert(&v);
+            }
+            let queries: Vec<Vec<f32>> = (0..10).map(&mut vector).collect();
+            for every in [1u32, 2, 4, 10, 30, 100] {
+                let mut factors: Vec<f64> = queries
+                    .iter()
+                    .map(|q| {
+                        let (mut lo, mut hi) = (0, 2 * n);
+                        while hi - lo > 1 {
+                            let mid = (lo + hi) / 2;
+                            // Slots in a scrambled order, so that clusters do not line up.
+                            let passes = |s: u32| (s.wrapping_mul(2_654_435_761) >> 8).is_multiple_of(every);
+                            if g.search_where(q, 10, 200, passes, mid).is_some() { hi = mid } else { lo = mid }
+                        }
+                        hi as f64 / (200.0 * f64::from(every))
+                    })
+                    .collect();
+                factors.sort_by(f64::total_cmp);
+                println!("{n} x {dims}, {clusters} clusters, 1 in {every}: factor {:.1} to {:.1}, median {:.1}", factors[0], factors[9], factors[5]);
+            }
+        }
     }
 
     #[test]

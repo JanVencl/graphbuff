@@ -41,7 +41,7 @@ pub use csr::{Csr, CsrAdjacency};
 pub use error::{Error, Result};
 pub use kernels::{
     Aggregates, Bits, CmpOp, Column, CpuKernels, ExpandBatch, Hop, Kernels, Mask, Num, VectorRows, VectorScores,
-    label_mask,
+    label_mask, vector_row_score,
 };
 pub use hybrid::{HybridGraph, HybridOptions, SyncPolicy};
 pub use maintenance::{BackupInfo, CheckReport};

@@ -178,16 +178,25 @@ impl Graph {
         }
     }
 
-    /// The (up to) `ef` nodes of `layer` closest to `q` found from `entries`, closest
-    /// first. With `live`, deleted nodes are explored but not returned.
-    fn search_layer(&self, q: &[f32], entries: &[Near], ef: usize, layer: usize, live: bool) -> Vec<Near> {
+    /// The (up to) `ef` nodes of `layer` that pass `accept` and are closest to `q`, found
+    /// from `entries`, closest first. The others are explored but not returned. Gives up
+    /// (`None`) after measuring `budget` distances.
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entries: &[Near],
+        ef: usize,
+        layer: usize,
+        accept: impl Fn(u32) -> bool,
+        mut budget: usize,
+    ) -> Option<Vec<Near>> {
         let mut visited = Visited::new(self.slots());
         let mut candidates: BinaryHeap<Reverse<Near>> = BinaryHeap::new();
         let mut found: BinaryHeap<Near> = BinaryHeap::new();
         for &e in entries {
             if visited.insert(e.1) {
                 candidates.push(Reverse(e));
-                if !(live && self.deleted[e.1 as usize]) {
+                if accept(e.1) {
                     found.push(e);
                 }
             }
@@ -203,10 +212,11 @@ impl Graph {
                 if !visited.insert(n) {
                     continue;
                 }
+                budget = budget.checked_sub(1)?;
                 let d = self.to(q, n);
                 if found.len() < ef || found.peek().is_some_and(|f| d < f.0) {
                     candidates.push(Reverse(Near(d, n)));
-                    if !(live && self.deleted[n as usize]) {
+                    if accept(n) {
                         found.push(Near(d, n));
                         if found.len() > ef {
                             found.pop();
@@ -215,7 +225,7 @@ impl Graph {
                 }
             }
         }
-        found.into_sorted_vec()
+        Some(found.into_sorted_vec())
     }
 
     /// Up to `m` of `candidates` (closest first) as neighbours: each one kept is closer to
@@ -253,7 +263,9 @@ impl Graph {
         }
         let mut entries = vec![from];
         for l in (0..=layer.min(self.top)).rev() {
-            let found = self.search_layer(v, &entries, self.ef_construction, l, false);
+            let found = self
+                .search_layer(v, &entries, self.ef_construction, l, |_| true, usize::MAX)
+                .expect("no budget");
             let neighbours = self.select(&found, self.m);
             let max = if l == 0 { 2 * self.m } else { self.m };
             for &n in &neighbours {
@@ -292,14 +304,39 @@ impl Graph {
     /// The (up to) `k` live slots closest to `q` that a search keeping `ef` candidates
     /// finds, closest first, with their distances.
     pub fn search(&self, q: &[f32], k: usize, ef: usize) -> Vec<(f32, u32)> {
-        let Some(entry) = self.entry else { return Vec::new() };
+        self.search_where(q, k, ef, |_| true, usize::MAX).expect("no budget")
+    }
+
+    /// As [`search`](Self::search), but only of the slots that pass `accept`: the others
+    /// still lead the search on. The fewer pass, the further it goes; it gives up (`None`)
+    /// after measuring about `budget` distances.
+    pub fn search_where(
+        &self,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        accept: impl Fn(u32) -> bool,
+        budget: usize,
+    ) -> Option<Vec<(f32, u32)>> {
+        let Some(entry) = self.entry else { return Some(Vec::new()) };
         let mut from = Near(self.to(q, entry), entry);
         for l in (1..=self.top).rev() {
             from = self.greedy(q, from, l);
         }
-        let mut found = self.search_layer(q, &[from], ef.max(k), 0, true);
+        let accept = |slot: u32| !self.deleted[slot as usize] && accept(slot);
+        let mut found = self.search_layer(q, &[from], ef.max(k), 0, accept, budget)?;
         found.truncate(k);
-        found.into_iter().map(|n| (n.0, n.1)).collect()
+        Some(found.into_iter().map(|n| (n.0, n.1)).collect())
+    }
+}
+
+#[cfg(test)]
+impl Graph {
+    /// Leaves only the first `keep` slots reachable.
+    pub fn cut_off(&mut self, keep: u32) {
+        self.links.iter_mut().flatten().for_each(|links| links.retain(|&n| n < keep));
+        self.entry = Some(0);
+        self.top = 0;
     }
 }
 
@@ -375,6 +412,37 @@ mod tests {
         assert!(r >= 0.9, "recall {r}");
         // A deleted vector itself is not returned, though it is the closest.
         assert!(g.search(&data[0], 5, 50).iter().all(|(_, s)| *s != 0));
+    }
+
+    #[test]
+    fn filtered_search() {
+        let data = points(3000, 16, 5);
+        let mut g = Graph::new(16, Metric::Euclidean, 16, 100);
+        for v in &data {
+            g.insert(v);
+        }
+        for i in (0..data.len()).step_by(11) {
+            g.remove(i as u32);
+        }
+        let queries = points(20, 16, 23);
+        for every in [2, 5, 20] {
+            let passes = |s: u32| s.is_multiple_of(every);
+            let live: Vec<bool> = (0..data.len()).map(|i| i % 11 != 0 && passes(i as u32)).collect();
+            let mut hits = 0;
+            for q in &queries {
+                let mut exact: Vec<(f32, u32)> =
+                    (0..data.len()).filter(|&i| live[i]).map(|i| (g.distance(q, &data[i]), i as u32)).collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let got = g.search_where(q, 10, 100, passes, usize::MAX).expect("no budget");
+                assert_eq!(got.len(), 10);
+                assert!(got.iter().all(|(_, s)| live[*s as usize]));
+                hits += got.iter().filter(|(_, s)| exact[..10].iter().any(|e| e.1 == *s)).count();
+            }
+            assert!(hits >= 190, "1 in {every}: {hits} of 200");
+        }
+        // It gives up when it takes too long, and finds nothing if nothing passes.
+        assert!(g.search_where(&queries[0], 10, 100, |_| true, 50).is_none());
+        assert_eq!(g.search_where(&queries[0], 10, 100, |_| false, usize::MAX), Some(vec![]));
     }
 
     #[test]
