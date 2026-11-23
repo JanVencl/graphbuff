@@ -460,10 +460,14 @@ impl Executor<'_> {
                 entity,
                 labels,
                 properties,
+                filters,
                 if_not_exists,
                 kind,
                 options,
             } => {
+                if *kind == IndexType::Vector && properties.len() != 1 {
+                    return Err(Error::Semantic("a vector index is on exactly one property".into()));
+                }
                 let options = match options {
                     Some(e) => {
                         let scope = Scope::default();
@@ -501,7 +505,7 @@ impl Executor<'_> {
                     entity: *entity,
                     label,
                     extra_labels: labels.cloned().collect(),
-                    properties: properties.clone(),
+                    properties: properties.iter().chain(filters).cloned().collect(),
                     kind: crate::vector::index_kind(*kind, &options)?,
                 };
                 let existing = self.store().indexes();

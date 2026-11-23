@@ -1235,6 +1235,7 @@ impl<'a> Parser<'a> {
                 entity: IndexEntity::Node,
                 labels: vec![label],
                 properties,
+                filters: Vec::new(),
                 if_not_exists: false,
                 kind,
                 options: None,
@@ -1306,16 +1307,7 @@ impl<'a> Parser<'a> {
         }
         let mut properties = Vec::new();
         loop {
-            let offset = self.offset();
-            let owner = self.ident()?;
-            if owner != var {
-                return Err(Error::syntax(
-                    format!("expected `{var}.<property>`, found `{owner}`"),
-                    offset,
-                ));
-            }
-            self.expect(Tok::Dot, "'.'")?;
-            properties.push(self.ident()?);
+            properties.push(self.parse_index_property(&var)?);
             if !parens || !self.eat(&Tok::Comma) {
                 break;
             }
@@ -1323,6 +1315,17 @@ impl<'a> Parser<'a> {
         if parens {
             let what = if fulltext { "']'" } else { "')'" };
             self.expect(close, what)?;
+        }
+        let mut filters = Vec::new();
+        if kind == IndexType::Vector && self.eat_kw("WITH") {
+            self.expect(Tok::LBracket, "'['")?;
+            loop {
+                filters.push(self.parse_index_property(&var)?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket, "']'")?;
         }
         let options = if self.eat_kw("OPTIONS") {
             if !matches!(self.peek(), Tok::LBrace | Tok::Param(_)) {
@@ -1340,10 +1343,25 @@ impl<'a> Parser<'a> {
             entity,
             labels,
             properties,
+            filters,
             if_not_exists,
             kind,
             options,
         })
+    }
+
+    /// `var.property` in an index definition.
+    fn parse_index_property(&mut self, var: &str) -> Result<String> {
+        let offset = self.offset();
+        let owner = self.ident()?;
+        if owner != var {
+            return Err(Error::syntax(
+                format!("expected `{var}.<property>`, found `{owner}`"),
+                offset,
+            ));
+        }
+        self.expect(Tok::Dot, "'.'")?;
+        self.ident()
     }
 
     /// After `CREATE LOOKUP INDEX`: `[name] [IF NOT EXISTS] FOR (n) ON EACH labels(n)` or
@@ -1421,6 +1439,7 @@ impl<'a> Parser<'a> {
             entity,
             labels: Vec::new(),
             properties: Vec::new(),
+            filters: Vec::new(),
             if_not_exists,
             kind: IndexType::Lookup,
             options,
@@ -2800,6 +2819,7 @@ mod tests {
                 entity: IndexEntity::Node,
                 labels: vec!["Person".into()],
                 properties: vec!["name".into()],
+                filters: vec![],
                 if_not_exists: true,
                 kind: IndexType::Range,
                 options: None,
@@ -2816,6 +2836,7 @@ mod tests {
                 entity: IndexEntity::Node,
                 labels: vec!["Person".into()],
                 properties: vec!["first".into(), "last".into()],
+                filters: vec![],
                 if_not_exists: false,
                 kind: IndexType::Range,
                 options: None,
@@ -2833,6 +2854,7 @@ mod tests {
                     entity: IndexEntity::Relationship,
                     labels: vec!["KNOWS".into()],
                     properties: vec!["since".into()],
+                    filters: vec![],
                     if_not_exists: false,
                     kind: IndexType::Range,
                     options: None,
@@ -2868,6 +2890,27 @@ mod tests {
             &single("CREATE VECTOR INDEX FOR ()-[r:SIMILAR]-() ON r.v")[0],
             Clause::CreateIndex { kind: IndexType::Vector, entity: IndexEntity::Relationship, options: None, .. }
         ));
+        for (q, want) in [
+            ("CREATE VECTOR INDEX FOR (d:Doc) ON d.e WITH [d.tenant] OPTIONS {}", vec!["tenant"]),
+            ("CREATE VECTOR INDEX FOR (d:Doc) ON (d.e) WITH [d.tenant, d.`the year`] OPTIONS $o", vec!["tenant", "the year"]),
+            ("CREATE VECTOR INDEX FOR ()-[r:SIMILAR]-() ON (r.v) WITH [r.since]", vec!["since"]),
+        ] {
+            assert!(
+                matches!(&single(q)[0], Clause::CreateIndex { properties, filters, .. } if properties.len() == 1 && *filters == want),
+                "{q}"
+            );
+        }
+        for bad in [
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.e WITH []",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.e WITH [x.tenant]",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.e WITH d.tenant",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.e WITH [d.tenant",
+            "CREATE VECTOR INDEX FOR (d:Doc) ON d.e OPTIONS {} WITH [d.tenant]",
+            "CREATE INDEX FOR (d:Doc) ON (d.e) WITH [d.tenant]",
+            "CREATE FULLTEXT INDEX FOR (d:Doc) ON EACH [d.e] WITH [d.tenant]",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         assert!(matches!(
             &single("CREATE POINT INDEX places IF NOT EXISTS FOR (p:Place) ON (p.location)")[0],
             Clause::CreateIndex { name: Some(n), kind: IndexType::Point, entity: IndexEntity::Node, labels, properties, if_not_exists: true, .. }
@@ -2888,7 +2931,7 @@ mod tests {
         ));
         assert!(matches!(
             &single("CREATE LOOKUP INDEX node_labels IF NOT EXISTS FOR (n) ON EACH labels(n)")[0],
-            Clause::CreateIndex { name: Some(n), kind: IndexType::Lookup, entity: IndexEntity::Node, labels, properties, if_not_exists: true, options: None }
+            Clause::CreateIndex { name: Some(n), kind: IndexType::Lookup, entity: IndexEntity::Node, labels, properties, if_not_exists: true, options: None, .. }
                 if n == "node_labels" && labels.is_empty() && properties.is_empty()
         ));
         for q in ["CREATE LOOKUP INDEX FOR ()-[r]-() ON EACH type(r)", "CREATE LOOKUP INDEX FOR ()-[r]->() ON TYPE(r) OPTIONS {}"] {
@@ -2900,7 +2943,7 @@ mod tests {
         let c = single("CREATE FULLTEXT INDEX titles IF NOT EXISTS FOR (n:Movie|Book) ON EACH [n.title, n.tagline] OPTIONS {indexConfig: {}}");
         assert!(matches!(
             &c[0],
-            Clause::CreateIndex { name: Some(n), entity: IndexEntity::Node, labels, properties, if_not_exists: true, kind: IndexType::Fulltext, options: Some(_) }
+            Clause::CreateIndex { name: Some(n), entity: IndexEntity::Node, labels, properties, if_not_exists: true, kind: IndexType::Fulltext, options: Some(_), .. }
                 if n == "titles" && labels == &["Movie", "Book"] && properties == &["title", "tagline"]
         ));
         assert!(matches!(

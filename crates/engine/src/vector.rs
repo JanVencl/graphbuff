@@ -13,6 +13,7 @@ use graphbuff_core::{
 };
 use graphbuff_cypher::ast::IndexType;
 
+use crate::filter_column::{FilterColumn, filter_value};
 use crate::hnsw::{Graph, Metric};
 use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
@@ -263,7 +264,7 @@ fn for_each_entity(
     store: &dyn GraphStore,
     def: &IndexDef,
     interrupt: &dyn Fn() -> Result<()>,
-    mut f: impl FnMut(u64, Value),
+    mut f: impl FnMut(u64, Value) -> Result<()>,
 ) -> Result<()> {
     let key = &def.properties[0];
     let mut n = 0u32;
@@ -277,7 +278,7 @@ fn for_each_entity(
                 let id = id?;
                 tick()?;
                 if let Some(v) = store.node_property(id, key)? {
-                    f(id.0, v);
+                    f(id.0, v)?;
                 }
             }
         }
@@ -288,7 +289,7 @@ fn for_each_entity(
                 if store.relationship_type(id)?.as_deref() == Some(def.label.as_str())
                     && let Some(v) = store.relationship_property(id, key)?
                 {
-                    f(id.0, v);
+                    f(id.0, v)?;
                 }
             }
         }
@@ -307,10 +308,58 @@ fn matrix_row(value: &Value, dimensions: u32, similarity: Similarity) -> Option<
     Some(v.iter().map(|x| (x * scale) as f32).collect())
 }
 
-/// The row entity `id` has in `store` for index `def`, or `None` if the index skips it
+/// What a vector index keeps of an entity: its row, and its value of each filter property.
+struct Entry {
+    row: Vec<f32>,
+    filters: Vec<Value>,
+}
+
+impl Entry {
+    /// The entry of entity `id`, whose vector property is `value`, or `None` if the index
+    /// skips it.
+    fn read(store: &dyn GraphStore, def: &IndexDef, id: u64, value: &Value) -> Result<Option<Entry>> {
+        let (dimensions, similarity) = vector_params(def);
+        let Some(row) = matrix_row(value, dimensions, similarity) else { return Ok(None) };
+        let filters = def
+            .filter_properties()
+            .iter()
+            .map(|key| {
+                let v = match def.entity {
+                    IndexEntity::Node => store.node_property(NodeId(id), key)?,
+                    IndexEntity::Relationship => store.relationship_property(RelId(id), key)?,
+                };
+                Ok(filter_value(v))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(Entry { row, filters }))
+    }
+}
+
+/// The entries of every entity `def` covers in `store`, in id order.
+fn entries(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Vec<(u64, Entry)>> {
+    let mut out = Vec::new();
+    for_each_entity(store, def, interrupt, |id, value| {
+        if let Some(e) = Entry::read(store, def, id, &value)? {
+            out.push((id, e));
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Empty columns for the filter properties of `def`.
+fn filter_columns(def: &IndexDef) -> Vec<FilterColumn> {
+    def.filter_properties().iter().map(|_| FilterColumn::new()).collect()
+}
+
+/// The values of `row` in `columns`.
+fn filters_at(columns: &[FilterColumn], row: u32) -> Vec<Value> {
+    columns.iter().map(|c| c.get(row).clone()).collect()
+}
+
+/// The entry entity `id` has in `store` for index `def`, or `None` if the index skips it
 /// (or it is gone).
-fn current_row(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Option<Vec<f32>>> {
-    let (dimensions, similarity) = vector_params(def);
+fn current_entry(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Option<Entry>> {
     let key = &def.properties[0];
     let value = match def.entity {
         IndexEntity::Node => {
@@ -330,7 +379,10 @@ fn current_row(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Option
             }
         }
     };
-    Ok(value.and_then(|v| matrix_row(&v, dimensions, similarity)))
+    match value {
+        Some(v) => Entry::read(store, def, id, &v),
+        None => Ok(None),
+    }
 }
 
 /// [`Matrix::ids`] of a row not in use.
@@ -350,22 +402,17 @@ pub(crate) struct Matrix {
     /// The rows not in use.
     free: Vec<u32>,
     rows: VectorRows,
+    /// The filter properties' values by row (`null` for a row not in use).
+    filters: Vec<FilterColumn>,
 }
 
 impl Matrix {
     fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Matrix> {
-        let (dimensions, similarity) = vector_params(def);
-        let mut entries = Vec::new();
-        for_each_entity(store, def, interrupt, |id, value| {
-            if let Some(row) = matrix_row(&value, dimensions, similarity) {
-                entries.push((id, row));
-            }
-        })?;
-        Ok(Matrix::layout(def, entries))
+        Ok(Matrix::layout(def, entries(store, def, interrupt)?))
     }
 
     /// The rows of `entries`, then rows not in use (an eighth more, at least 16).
-    fn layout(def: &IndexDef, entries: Vec<(u64, Vec<f32>)>) -> Matrix {
+    fn layout(def: &IndexDef, entries: Vec<(u64, Entry)>) -> Matrix {
         let (dimensions, _) = vector_params(def);
         let d = dimensions as usize;
         let n = entries.len();
@@ -373,30 +420,47 @@ impl Matrix {
         let mut ids = Vec::with_capacity(capacity);
         let mut row_of = HashMap::with_capacity(n);
         let mut data = Vec::with_capacity(capacity * d);
-        for (i, (id, row)) in entries.into_iter().enumerate() {
+        let mut filters = filter_columns(def);
+        for (i, (id, entry)) in entries.into_iter().enumerate() {
             ids.push(id);
             row_of.insert(id, i as u32);
-            data.extend(row);
+            data.extend(entry.row);
+            for (column, value) in filters.iter_mut().zip(&entry.filters) {
+                column.push(value);
+            }
         }
         ids.resize(capacity, FREE);
         data.resize(capacity * d, 0.0);
+        for column in &mut filters {
+            column.pad(capacity);
+        }
         Matrix {
             def: def.clone(),
             ids,
             row_of,
             free: (n as u32..capacity as u32).rev().collect(),
             rows: VectorRows::new(d, data),
+            filters,
         }
     }
 
-    /// The row entity `id` has in `store`, or `None` if the index skips it (or it is gone).
-    fn current(&self, store: &dyn GraphStore, id: u64) -> Result<Option<Vec<f32>>> {
-        current_row(store, &self.def, id)
+    /// The vector of row `r`.
+    fn row(&self, r: u32) -> &[f32] {
+        let (d, r) = (self.rows.dims(), r as usize);
+        &self.rows.data()[r * d..(r + 1) * d]
+    }
+
+    /// Sets the filter values of row `r`.
+    fn set_filters(&mut self, r: u32, values: &[Value]) {
+        for (column, value) in self.filters.iter_mut().zip(values) {
+            column.set(r, value);
+        }
     }
 
     /// Brings the matrix to `store`, a later committed state, given (a superset of) the
     /// entities changed since: their rows are rewritten, freed or taken from the free
-    /// ones. Laid out anew when the free rows run out or most rows are free.
+    /// ones; the row of an unchanged vector stays, whatever its filter values. Laid out
+    /// anew when the free rows run out or most rows are free.
     fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
         let changed = match self.def.entity {
             IndexEntity::Node => &changes.nodes,
@@ -407,9 +471,9 @@ impl Matrix {
             if n % 4096 == 4095 {
                 interrupt()?;
             }
-            let row = self.current(store, id)?;
-            if row.is_some() || self.row_of.contains_key(&id) {
-                updates.push((id, row));
+            let entry = current_entry(store, &self.def, id)?;
+            if entry.is_some() || self.row_of.contains_key(&id) {
+                updates.push((id, entry));
             }
         }
         if updates.is_empty() {
@@ -425,17 +489,20 @@ impl Matrix {
         let d = self.rows.dims();
         let mut writes: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
         // Free rows first, so that new entities can take them.
-        for (id, row) in &updates {
-            if row.is_none()
+        for (id, entry) in &updates {
+            if entry.is_none()
                 && let Some(r) = self.row_of.remove(id)
             {
                 self.ids[r as usize] = FREE;
                 self.free.push(r);
                 writes.insert(r, vec![0.0; d]);
+                for column in &mut self.filters {
+                    column.set(r, &Value::Null);
+                }
             }
         }
-        for (id, row) in updates {
-            let Some(row) = row else { continue };
+        for (id, entry) in updates {
+            let Some(Entry { row, filters }) = entry else { continue };
             let r = match self.row_of.get(&id) {
                 Some(&r) => r,
                 None => {
@@ -445,7 +512,13 @@ impl Matrix {
                     r
                 }
             };
-            writes.insert(r, row);
+            self.set_filters(r, &filters);
+            if writes.contains_key(&r) || self.row(r) != row {
+                writes.insert(r, row);
+            }
+        }
+        if writes.is_empty() {
+            return Ok(());
         }
         let at: Vec<u32> = writes.keys().copied().collect();
         let data: Vec<f32> = writes.into_values().flatten().collect();
@@ -454,16 +527,16 @@ impl Matrix {
     }
 
     /// Lays the matrix out anew with `updates` applied.
-    fn relayout(&mut self, updates: Vec<(u64, Option<Vec<f32>>)>) {
-        let d = self.rows.dims();
-        let updated: HashMap<u64, Option<Vec<f32>>> = updates.into_iter().collect();
-        let mut entries: Vec<(u64, Vec<f32>)> = Vec::with_capacity(self.row_of.len() + updated.len());
+    fn relayout(&mut self, updates: Vec<(u64, Option<Entry>)>) {
+        let updated: HashMap<u64, Option<Entry>> = updates.into_iter().collect();
+        let mut entries: Vec<(u64, Entry)> = Vec::with_capacity(self.row_of.len() + updated.len());
         for (i, &id) in self.ids.iter().enumerate() {
             if id != FREE && !updated.contains_key(&id) {
-                entries.push((id, self.rows.data()[i * d..(i + 1) * d].to_vec()));
+                let r = i as u32;
+                entries.push((id, Entry { row: self.row(r).to_vec(), filters: filters_at(&self.filters, r) }));
             }
         }
-        entries.extend(updated.into_iter().filter_map(|(id, row)| row.map(|r| (id, r))));
+        entries.extend(updated.into_iter().filter_map(|(id, entry)| entry.map(|e| (id, e))));
         entries.sort_unstable_by_key(|e| e.0);
         *self = Matrix::layout(&self.def, entries);
     }
@@ -504,6 +577,8 @@ pub(crate) struct Approximate {
     ids: Vec<u64>,
     /// The live slot of each entity.
     slot_of: HashMap<u64, u32>,
+    /// The filter properties' values by slot (`null` for a deleted one).
+    filters: Vec<FilterColumn>,
 }
 
 impl Approximate {
@@ -519,37 +594,34 @@ impl Approximate {
             graph: Graph::new(dimensions as usize, metric, usize::from(h.m), usize::from(h.ef_construction)),
             ids: Vec::new(),
             slot_of: HashMap::new(),
+            filters: filter_columns(def),
         }
     }
 
     /// The graph of `entries`, inserted in order.
-    fn with(def: &IndexDef, entries: Vec<(u64, Vec<f32>)>, interrupt: &dyn Fn() -> Result<()>) -> Result<Approximate> {
+    fn with(def: &IndexDef, entries: Vec<(u64, Entry)>, interrupt: &dyn Fn() -> Result<()>) -> Result<Approximate> {
         let mut a = Approximate::new(def);
-        for (n, (id, row)) in entries.into_iter().enumerate() {
+        for (n, (id, entry)) in entries.into_iter().enumerate() {
             if n % 256 == 255 {
                 interrupt()?;
             }
-            a.insert(id, &row);
+            a.insert(id, &entry);
         }
         Ok(a)
     }
 
-    fn insert(&mut self, id: u64, row: &[f32]) {
-        let slot = self.graph.insert(row);
+    fn insert(&mut self, id: u64, entry: &Entry) {
+        let slot = self.graph.insert(&entry.row);
         debug_assert_eq!(slot as usize, self.ids.len());
         self.ids.push(id);
         self.slot_of.insert(id, slot);
+        for (column, value) in self.filters.iter_mut().zip(&entry.filters) {
+            column.push(value);
+        }
     }
 
     fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<Approximate> {
-        let (dimensions, similarity) = vector_params(def);
-        let mut entries = Vec::new();
-        for_each_entity(store, def, interrupt, |id, value| {
-            if let Some(row) = matrix_row(&value, dimensions, similarity) {
-                entries.push((id, row));
-            }
-        })?;
-        Approximate::with(def, entries, interrupt)
+        Approximate::with(def, entries(store, def, interrupt)?, interrupt)
     }
 
     fn apply(&mut self, store: &dyn GraphStore, changes: &Changes, interrupt: &dyn Fn() -> Result<()>) -> Result<()> {
@@ -561,21 +633,35 @@ impl Approximate {
             if n % 256 == 255 {
                 interrupt()?;
             }
-            let row = current_row(store, &self.def, id)?;
+            let entry = current_entry(store, &self.def, id)?;
             if let Some(slot) = self.slot_of.get(&id).copied() {
-                if row.as_deref() == Some(self.graph.vector(slot)) {
+                if let Some(e) = &entry
+                    && e.row == self.graph.vector(slot)
+                {
+                    // The same vector: at most its filter values changed.
+                    for (column, value) in self.filters.iter_mut().zip(&e.filters) {
+                        column.set(slot, value);
+                    }
                     continue;
                 }
                 self.graph.remove(slot);
                 self.slot_of.remove(&id);
+                for column in &mut self.filters {
+                    column.set(slot, &Value::Null);
+                }
             }
-            if let Some(row) = row {
-                self.insert(id, &row);
+            if let Some(entry) = entry {
+                self.insert(id, &entry);
             }
         }
         if self.graph.removed() > 64 && self.graph.removed() > self.graph.live() {
-            let mut entries: Vec<(u64, Vec<f32>)> =
-                self.slot_of.iter().map(|(&id, &slot)| (id, self.graph.vector(slot).to_vec())).collect();
+            let mut entries: Vec<(u64, Entry)> = self
+                .slot_of
+                .iter()
+                .map(|(&id, &slot)| {
+                    (id, Entry { row: self.graph.vector(slot).to_vec(), filters: filters_at(&self.filters, slot) })
+                })
+                .collect();
             entries.sort_unstable_by_key(|e| e.0);
             *self = Approximate::with(&self.def, entries, interrupt)?;
         }
@@ -783,6 +869,7 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
                 if let Some(score) = exact(&value) {
                     out.push((score, id));
                 }
+                Ok(())
             })?;
             out
         }
@@ -819,6 +906,110 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-12
+    }
+
+    /// The filter values of every entity index `name` holds, by id (as text), and the index.
+    fn filters_by_id(db: &crate::Database, name: &str) -> (BTreeMap<u64, String>, std::sync::Arc<VectorIndex>) {
+        let e = db.vector_cache.entry(name).expect("built");
+        let (rows, columns) = match &*e {
+            VectorIndex::Flat(m) => (&m.row_of, &m.filters),
+            VectorIndex::Approximate(a) => (&a.slot_of, &a.filters),
+        };
+        let shown = rows
+            .iter()
+            .map(|(&id, &r)| {
+                let values: Vec<String> = filters_at(columns, r).iter().map(|v| v.to_string()).collect();
+                (id, values.join(" "))
+            })
+            .collect();
+        (shown, e)
+    }
+
+    /// What the index `name` should hold, read from the graph.
+    fn expected_filters(db: &crate::Database) -> BTreeMap<u64, String> {
+        let r = db
+            .execute("MATCH (n:V) WHERE size(n.e) = 2 RETURN id(n), n.tenant, n.year")
+            .unwrap();
+        r.rows
+            .iter()
+            .map(|row| {
+                let shown = |v: &crate::ResultValue| match v.to_string() {
+                    s if s.starts_with('[') => "null".to_string(),
+                    s => s,
+                };
+                (row[0].to_string().parse().unwrap(), format!("{} {}", shown(&row[1]), shown(&row[2])))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filter_columns_follow_commits() {
+        for hnsw in [false, true] {
+            let db = crate::Database::in_memory();
+            let q = "CALL db.index.vector.queryNodes('v', 1, [1, 0]) YIELD node RETURN node.k";
+            db.execute(&format!(
+                "CREATE VECTOR INDEX v FOR (n:V) ON n.e WITH [n.tenant, n.year] \
+                 OPTIONS {{indexConfig: {{`vector.dimensions`: 2, `vector.hnsw.enabled`: {hnsw}}}}}"
+            ))
+            .unwrap();
+            db.execute(
+                "UNWIND range(1, 100) AS i CREATE (:V {k: i, e: [0.1 * i, 1], tenant: 't' + toString(i % 7), year: 2000 + i % 5})",
+            )
+            .unwrap();
+            let check = |what: &str| {
+                db.execute(q).unwrap();
+                let (got, e) = filters_by_id(&db, "v");
+                assert_eq!(got, expected_filters(&db), "hnsw {hnsw}: {what}");
+                e
+            };
+            let built = check("built");
+
+            // Only filter values change: neither the rows nor the graph do.
+            db.execute("MATCH (n:V) WHERE n.k <= 30 SET n.tenant = 'moved', n.year = null").unwrap();
+            let after = check("filter values changed");
+            match (&*built, &*after) {
+                (VectorIndex::Flat(a), VectorIndex::Flat(b)) => assert_eq!(a.rows.id(), b.rows.id()),
+                (VectorIndex::Approximate(a), VectorIndex::Approximate(b)) => {
+                    assert_eq!((a.graph.slots(), b.graph.slots(), b.graph.removed()), (100, 100, 0));
+                }
+                _ => panic!("the kind of index changed"),
+            }
+            drop((built, after));
+
+            for (what, change) in [
+                ("values that are not kept", "MATCH (n:V) WHERE n.k = 50 SET n.tenant = [1, 2]"),
+                ("vector and filters", "MATCH (n:V) WHERE n.k = 51 SET n.e = [9, 9], n.year = 1.5"),
+                ("entities gone", "MATCH (n:V) WHERE n.k % 10 = 0 DETACH DELETE n"),
+                ("entities that left the index", "MATCH (n:V) WHERE n.k % 10 = 1 REMOVE n:V"),
+                ("vectors no longer indexed", "MATCH (n:V) WHERE n.k % 10 = 2 SET n.e = [1]"),
+                ("a few new ones", "UNWIND range(101, 110) AS i CREATE (:V {k: i, e: [1, i], tenant: date('2026-01-01')})"),
+                ("many new ones", "UNWIND range(200, 400) AS i CREATE (:V {k: i, e: [i, 1], year: i % 2 = 0})"),
+                ("most vectors replaced", "MATCH (n:V) WHERE size(n.e) = 2 SET n.e = [n.e[1], n.e[0] + 1]"),
+                ("again", "MATCH (n:V) WHERE size(n.e) = 2 SET n.e = [n.e[1], n.e[0] + 1], n.tenant = n.k"),
+                ("most gone", "MATCH (n:V) WHERE n.k > 120 DETACH DELETE n"),
+            ] {
+                db.execute(change).unwrap_or_else(|e| panic!("{change}: {e}"));
+                check(what);
+            }
+        }
+    }
+
+    #[test]
+    fn relationship_filter_columns() {
+        let db = crate::Database::in_memory();
+        db.execute(
+            "CREATE VECTOR INDEX v FOR ()-[r:NEAR]-() ON r.e WITH [r.since] OPTIONS {indexConfig: {`vector.dimensions`: 2}}",
+        )
+        .unwrap();
+        db.execute("CREATE (a)-[:NEAR {e: [1, 0], since: 1}]->(b), (b)-[:NEAR {e: [0, 1]}]->(a), (a)-[:FAR {e: [0, 1], since: 3}]->(b)")
+            .unwrap();
+        let q = "CALL db.index.vector.queryRelationships('v', 1, [1, 0]) YIELD score RETURN score";
+        db.execute(q).unwrap();
+        let values = |db: &crate::Database| filters_by_id(db, "v").0.into_values().collect::<Vec<_>>();
+        assert_eq!(values(&db), ["1", "null"]);
+        db.execute("MATCH ()-[r:NEAR]->() SET r.since = coalesce(r.since, 1) + 1").unwrap();
+        db.execute(q).unwrap();
+        assert_eq!(values(&db), ["2", "2"]);
     }
 
     #[test]

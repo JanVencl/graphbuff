@@ -145,9 +145,60 @@ fn vector_index_definitions() {
 }
 
 #[test]
+fn filter_properties() {
+    on_every_store(|store, db, reopen| {
+        run(
+            &db,
+            "CREATE VECTOR INDEX docs FOR (d:Doc) ON d.emb WITH [d.tenant, d.year] OPTIONS {indexConfig: {`vector.dimensions`: 2}}",
+        );
+        run(
+            &db,
+            "CREATE VECTOR INDEX FOR ()-[r:NEAR]-() ON (r.v) WITH [r.since] OPTIONS {indexConfig: {`vector.dimensions`: 2, `vector.hnsw.enabled`: true}}",
+        );
+        run(&db, "CREATE (:Doc {t: 'a', emb: [1, 0], tenant: 1})-[:NEAR {v: [1, 0], since: 2}]->(:Doc {t: 'b', emb: [0, 1]})");
+        let db = reopen(db);
+        assert_eq!(
+            rows(&db, "CALL db.indexes() YIELD name, labelOrType, properties RETURN name, labelOrType, properties ORDER BY name"),
+            [
+                "\"docs\", \"Doc\", [\"emb\", \"tenant\", \"year\"]",
+                // Named after the vector property, as without filter properties.
+                "\"vector_NEAR_v\", \"NEAR\", [\"v\", \"since\"]",
+            ],
+            "{store}"
+        );
+        // An entity without the filter properties is indexed too.
+        let q = "CALL db.index.vector.queryNodes('docs', 5, [0, 1]) YIELD node RETURN node.t";
+        assert_eq!(rows(&db, q), ["\"b\"", "\"a\""], "{store}");
+        // Another vector index on the same property is refused, whatever its filters.
+        let again = "CREATE VECTOR INDEX other FOR (d:Doc) ON d.emb WITH [d.lang] OPTIONS {indexConfig: {`vector.dimensions`: 2}}";
+        let err = db.execute(again).unwrap_err().to_string();
+        assert!(err.contains("a vector index on :Doc(emb) already exists"), "{store}: {err}");
+        let r = run(&db, &again.replace("other FOR", "other IF NOT EXISTS FOR"));
+        assert_eq!(r.stats.indexes_added, 0, "{store}");
+        // The filter properties answer no seeks, and a range index may be on them.
+        run(&db, "CREATE INDEX FOR (d:Doc) ON (d.tenant)");
+        assert_eq!(rows(&db, "MATCH (d:Doc {tenant: 1}) RETURN d.t"), ["\"a\""], "{store}");
+        run(&db, "DROP INDEX docs");
+        let db = reopen(db);
+        assert_eq!(rows(&db, "SHOW INDEXES").len(), 2, "{store}");
+    });
+}
+
+#[test]
 fn bad_vector_index_options() {
     let db = mem();
     for (q, want) in [
+        ("CREATE VECTOR INDEX v FOR (d:Doc) ON (d.e, d.f) OPTIONS {indexConfig: {`vector.dimensions`: 3}}", "exactly one property"),
+        ("CREATE VECTOR INDEX v FOR (d:Doc) ON d.e WITH [d.e] OPTIONS {indexConfig: {`vector.dimensions`: 3}}", "`e` is repeated"),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e WITH [d.a, d.b, d.a] OPTIONS {indexConfig: {`vector.dimensions`: 3}}",
+            "`a` is repeated",
+        ),
+        (
+            "CREATE VECTOR INDEX v FOR (d:Doc) ON d.e WITH [d.p1, d.p2, d.p3, d.p4, d.p5, d.p6, d.p7, d.p8, d.p9, d.p10, d.p11, d.p12, \
+             d.p13, d.p14, d.p15, d.p16] OPTIONS {indexConfig: {`vector.dimensions`: 3}}",
+            "at most 16 properties",
+        ),
         ("CREATE VECTOR INDEX v FOR (d:Doc) ON d.e", "needs OPTIONS"),
         ("CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 0}}", "from 1 to 4096"),
         ("CREATE VECTOR INDEX v FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 4097}}", "from 1 to 4096"),
