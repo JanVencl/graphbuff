@@ -226,7 +226,7 @@ Levels: `error`, `warn`, `info` (default), `debug`. Each file rotates to `.1`, `
 `graphbuff_server::Log` and `ServerConfig::log`.
 
 ```text
-2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.4.0 listening on http://127.0.0.1:7475 (data in /home/ann/.local/share/graphbuff)
+2026-11-15T18:00:00.123Z INFO  graphbuff-server 0.5.0 listening on http://127.0.0.1:7475 (data in /home/ann/.local/share/graphbuff)
 2026-11-15T18:00:05.004Z WARN  failed login (bolt) from 10.0.0.7:51234 as `admin`
 2026-11-15T18:00:09.871Z SLOW  1532 ms bolt movies alice MATCH (a)-[*..6]->(b) RETURN count(b)
 2026-11-15T18:01:00.000Z AUDIT bolt 10.0.0.7:51234 admin GRANT ROLE editor ON DATABASE movies TO alice: ok

@@ -3,7 +3,7 @@
 Notable changes per release. Releases are also tagged (`vX.Y.Z`); the tag messages carry
 the same notes.
 
-## Unreleased
+## 0.5.0 — 2026-11-23
 
 ### Added
 
@@ -72,14 +72,15 @@ the same notes.
   failure after that ends the JSON with `"error"` instead of `"stats"`.
 - Aggregation keeps only its groups, not its input rows, so it needs far less memory.
 - `SHOW INDEXES` lists `vector.hnsw.enabled` for every vector index.
-- Storage formats: persistent 12, hybrid snapshot and log 9, memory snapshot 9 (point,
-  text and lookup index definitions). Stores written in older formats are no longer
-  read: opening one fails with an error saying its format is no longer supported.
 - The documentation removed from the README is back as `docs/` pages; vector search is
   documented.
 
 ### Breaking
 
+- Storage formats: persistent 12, hybrid snapshot and log 9, memory snapshot 9 (point,
+  text and lookup index definitions). Stores written in older formats, including those of
+  0.4, are no longer read: opening one fails with an error saying its format is no longer
+  supported.
 - `ProcedureSignature` has a new public field, `mode`: build signatures with
   `ProcedureSignature::new` (and `.writes()`) rather than a struct literal.
 
