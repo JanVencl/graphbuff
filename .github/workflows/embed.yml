@@ -1,0 +1,81 @@
+# Builds and tests the text embeddings (docs/Embeddings.md), which the default build leaves
+# out: the engine and graphbuff-embed tests, graphbuff-server with the `embed` feature, and
+# the embedding suite of the Python driver over HTTP and Bolt. All with the tiny test model
+# (crates/embed/tests/fixtures/tiny-bert), so nothing is downloaded. The GPU build is only
+# type-checked: the runner has no GPU. On a pull request that changes the code involved,
+# and on demand.
+name: embed
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/embed.yml"
+      - "crates/embed/**"
+      - "crates/engine/**"
+      - "crates/server/**"
+      - "crates/core/src/**"
+      - "crates/cypher/src/**"
+      - "integration-tests/drivers/python/**"
+      - "integration-tests/python/graphbuff_server.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine tests
+        run: cargo test --locked -p graphbuff --test embeddings
+      - name: graphbuff-embed tests
+        run: cargo test --locked -p graphbuff-embed
+      - name: Server tests
+        run: cargo test --locked -p graphbuff-server --features embed --bins --test embedding
+      - name: Build the server
+        run: cargo build --locked -p graphbuff-server --features embed
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The suite skips itself when the server has no models; here that is a failure.
+      - name: Driver tests
+        shell: bash
+        working-directory: integration-tests/drivers/python
+        env:
+          GRAPHBUFF_SERVER: ${{ github.workspace }}/target/debug/graphbuff-server
+        run: |
+          pip install -r requirements.txt
+          python -m pytest -q -rs test_embeddings.py | tee "$RUNNER_TEMP/pytest.log"
+          if grep -q skipped "$RUNNER_TEMP/pytest.log"; then
+            echo "::error::the embedding suite was skipped"
+            exit 1
+          fi
+
+  gpu-check:
+    name: type-check the GPU build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check graphbuff-embed
+        run: cargo check --locked -p graphbuff-embed --features gpu --all-targets
+      - name: Check the server
+        run: cargo check --locked -p graphbuff-server --features embed,gpu
