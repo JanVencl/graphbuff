@@ -8,7 +8,7 @@ cargo run --release -p graphbuff-server     # settings from target/release/confi
 ```
 
 What it serves, where it keeps its data and who may log in is set in its config file (see
-[Configuration](../README.md#configuration)): for example `mode = "persistent"` (disk-resident) or
+[Configuration](Configuration.md)): for example `mode = "persistent"` (disk-resident) or
 `mode = "memory"` (nothing written to disk) in `[storage]`, `bind = "0.0.0.0:7475"` in
 `[server]`, `token = "s3cret"` in `[security]`, `demo = "movies"` in `[storage]` to start
 with the movies demo graph.
