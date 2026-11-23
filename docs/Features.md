@@ -2,7 +2,7 @@
 
 How `graphbuff-server` behaves over HTTP/JSON: transactions, timeouts, values, errors,
 security, where it keeps data and logs, and how it stops. Settings are named as
-`section.setting` in `graphbuff.toml` (see [Configuration](../README.md#configuration)).
+`section.setting` in `graphbuff.toml` (see [Configuration](Configuration.md)).
 
 - [Transactions](#transactions)
 - [Timeouts](#timeouts)
