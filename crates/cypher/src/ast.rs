@@ -117,6 +117,7 @@ pub enum Clause {
     ShowFunctions { user_defined: bool },
     /// `CREATE [RANGE | VECTOR] INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, …)
     /// [OPTIONS {…}]`, `… FOR ()-[r:TYPE]-() ON (r.a, …)` or `CREATE INDEX ON :Label(a, …)`;
+    /// a vector index takes `WITH [n.b, …]` (its filter properties) before `OPTIONS`;
     /// `CREATE FULLTEXT INDEX [name] [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.a, …]
     /// [OPTIONS {…}]` (or `FOR ()-[r:A|B]-()`).
     CreateIndex {
@@ -125,6 +126,8 @@ pub enum Clause {
         /// The label, or the relationship type (several for a full-text index).
         labels: Vec<String>,
         properties: Vec<String>,
+        /// The filter properties of a vector index (`WITH [n.a, …]`).
+        filters: Vec<String>,
         if_not_exists: bool,
         kind: IndexType,
         /// The `OPTIONS` map (or parameter).

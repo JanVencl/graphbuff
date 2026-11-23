@@ -838,7 +838,8 @@ pub struct IndexDef {
     pub label: String,
     /// Further labels or types of a full-text index; empty for other indexes.
     pub extra_labels: Vec<String>,
-    /// One property, or several for a composite index (in order).
+    /// One property, or several for a composite index (in order). A vector index has its
+    /// vector property first, then its filter properties.
     pub properties: Vec<String>,
     pub kind: IndexKind,
 }
@@ -882,6 +883,24 @@ impl IndexDef {
             *h = Some(hnsw);
         }
         self
+    }
+
+    /// The same vector index with `filters` as its filter properties.
+    pub fn with_filters(mut self, filters: impl IntoIterator<Item = String>) -> IndexDef {
+        self.properties.extend(filters);
+        self
+    }
+
+    /// The filter properties of a vector index: kept next to its vectors, for filters
+    /// applied during a search. Empty for other indexes.
+    pub fn filter_properties(&self) -> &[String] {
+        if self.is_vector() { self.properties.get(1..).unwrap_or_default() } else { &[] }
+    }
+
+    /// The properties that tell indexes of one kind apart: all but the filter properties
+    /// of a vector index.
+    fn key_properties(&self) -> &[String] {
+        &self.properties[..self.properties.len() - self.filter_properties().len()]
     }
 
     /// A full-text index on `properties` of the nodes with any of `labels`, or of the
@@ -979,7 +998,7 @@ impl IndexDef {
 
     /// Whether `self` and `other` are indexes of the same kind (range, vector or
     /// full-text) on the same labels or types and properties: one makes the other
-    /// redundant.
+    /// redundant. The filter properties of vector indexes do not count.
     pub fn same_index(&self, other: &IndexDef) -> bool {
         let mut a: Vec<&str> = self.labels().collect();
         let mut b: Vec<&str> = other.labels().collect();
@@ -988,7 +1007,7 @@ impl IndexDef {
         std::mem::discriminant(&self.kind) == std::mem::discriminant(&other.kind)
             && self.entity == other.entity
             && a == b
-            && self.properties == other.properties
+            && self.key_properties() == other.key_properties()
     }
 
     /// A single-property relationship index.
@@ -1019,7 +1038,7 @@ impl IndexDef {
     }
 
     /// The indexed schema in Cypher style: `:Label(a, b)` or `[:TYPE](a)` (`:A|B(a)` for a
-    /// full-text index on several labels).
+    /// full-text index on several labels), without the filter properties of a vector index.
     pub fn target(&self) -> String {
         if self.is_lookup() {
             return match self.entity {
@@ -1027,7 +1046,7 @@ impl IndexDef {
                 IndexEntity::Relationship => "type(r)".into(),
             };
         }
-        let props = self.properties.join(", ");
+        let props = self.key_properties().join(", ");
         let labels = self.labels().collect::<Vec<_>>().join("|");
         match self.entity {
             IndexEntity::Node => format!(":{labels}({props})"),
@@ -1051,9 +1070,6 @@ impl IndexDef {
                     HnswConfig::MAX_M,
                     HnswConfig::MAX_EF_CONSTRUCTION
                 )));
-            }
-            if self.properties.len() != 1 {
-                return Err(Error::Semantic("a vector index is on exactly one property".into()));
             }
             if dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
                 return Err(Error::Semantic(format!(
@@ -1145,7 +1161,8 @@ impl IndexDef {
     /// Encodes a vector index: the definition as [`encode`](Self::encode) writes it, then
     /// its dimensions and similarity (persistent format 9, hybrid log op 14, memory
     /// snapshot 6). An approximate index sets [`HNSW_FLAG`] in the similarity byte and
-    /// follows it with `m` and `ef_construction`.
+    /// follows it with `m` and `ef_construction`. Filter properties follow the vector
+    /// property in the definition's properties; 0.5 and older refuse such an index.
     pub(crate) fn encode_vector(&self, e: &mut Encoder) {
         let IndexKind::Vector { dimensions, similarity, hnsw } = self.kind else {
             unreachable!("encode_vector of a range index")
@@ -1185,7 +1202,7 @@ impl IndexDef {
         } else {
             None
         };
-        if def.properties.len() != 1 || dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
+        if dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
             return Err(d.corrupt(format!("bad vector index `{}`", def.name)));
         }
         def.kind = IndexKind::Vector { dimensions, similarity, hnsw };

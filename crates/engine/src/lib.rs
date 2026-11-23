@@ -35,6 +35,7 @@ mod embed;
 mod demo;
 mod eval;
 mod exec;
+mod filter_column;
 mod fulltext;
 mod hnsw;
 mod functions;
