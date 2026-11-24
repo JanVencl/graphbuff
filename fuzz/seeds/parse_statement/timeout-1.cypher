@@ -1,0 +1,1 @@
+RETURN reduce(s =s + ({x: A + ({x: 0, y: (E OR REuce(s =s + ({x: A + ({x: 0, y: (E OR REPe{x:  + ({x: 0, y: (s =s + ({x:  + ({x: 0, y:noE OR REPe(E OR REP + ({x:  + ({x: 0, y: ({x:  + ({x:(REs =s + ({x:  + (Pe{x:  + ({x: 0, y: (s =s + ({x:  + ({x: 0, y:noE OR REPe(E OR REP + ({x:  + ({x: 0, y: ({x:  + ({x:(REs =s + ({x:  + ({x T
