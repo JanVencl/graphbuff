@@ -43,6 +43,7 @@ use crate::result::{PlanDescription, PlanLine};
 use crate::matcher::{SeekKind, extract_hints};
 use crate::procedures::Procedure;
 use crate::typecheck::{self, Ty, TyEnv};
+use crate::vector_search::VectorSearch;
 
 /// The plan of a whole query.
 #[derive(Debug, Clone)]
@@ -678,6 +679,16 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
     // patterns. Imported variables could hold anything.
     let mut kinds: HashMap<String, VarKind> = imported.iter().map(|v| (v.clone(), VarKind::Unknown)).collect();
     for clause in &q.clauses {
+        // Planned before the match adds its variables: the search does not see them.
+        let search = match clause {
+            Clause::Match { patterns, search: Some(s), .. } => {
+                Some(VectorSearch::plan(ex, s, patterns, &ty_env(&kinds))?)
+            }
+            _ => None,
+        };
+        if let Some(score) = search.as_ref().and_then(|s| s.score.as_ref()) {
+            kinds.insert(score.clone(), VarKind::Value);
+        }
         match clause {
             Clause::Match { patterns, .. } => check_pattern_vars(patterns, &mut kinds, false)?,
             Clause::Create { patterns } => check_pattern_vars(patterns, &mut kinds, true)?,
@@ -696,10 +707,11 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
                 optional,
                 patterns,
                 where_,
+                ..
             } => Operator::Match {
                 input,
                 optional: *optional,
-                plan: plan_match(ex, patterns, where_.as_ref(), &bound)?,
+                plan: plan_match(ex, patterns, search, where_.as_ref(), &bound)?,
             },
             Clause::Create { patterns } if patterns.iter().any(|p| p.shortest.is_some()) => {
                 return Err(Error::Semantic("shortestPath(...) cannot be used in CREATE".into()));
@@ -863,7 +875,15 @@ fn plan_part(q: &SingleQuery, ex: &Executor, imported: &[String]) -> Result<(Par
             }
         };
         match clause {
-            Clause::Match { patterns, .. } | Clause::Create { patterns } => {
+            Clause::Match { patterns, search, .. } => {
+                for v in patterns.iter().flat_map(PatternPart::variables) {
+                    add(&mut bound, v);
+                }
+                if let Some(score) = search.as_ref().and_then(|s| s.score.as_ref()) {
+                    add(&mut bound, score);
+                }
+            }
+            Clause::Create { patterns } => {
                 for v in patterns.iter().flat_map(PatternPart::variables) {
                     add(&mut bound, v);
                 }
@@ -1317,6 +1337,8 @@ pub(crate) enum Step {
         used: Vec<String>,
         predicates: Vec<Expr>,
     },
+    /// `SEARCH`: binds its variables to each entity a search of a vector index finds.
+    VectorSearch(Box<VectorSearch>),
     /// The `WHERE` of the `MATCH`.
     Filter(Expr),
 }
@@ -1334,13 +1356,20 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('\u{0}')
 }
 
-fn plan_match(ex: &Executor, patterns: &[PatternPart], where_: Option<&Expr>, bound: &[String]) -> Result<MatchPlan> {
+fn plan_match(
+    ex: &Executor,
+    patterns: &[PatternPart],
+    search: Option<VectorSearch>,
+    where_: Option<&Expr>,
+    bound: &[String],
+) -> Result<MatchPlan> {
     let mut named: Vec<String> = Vec::new();
     for v in patterns.iter().flat_map(PatternPart::variables) {
         if !bound.iter().any(|b| b == v) && !named.iter().any(|n| n == v) {
             named.push(v.to_string());
         }
     }
+    named.extend(search.iter().filter_map(|s| s.score.clone()));
     // Variables whose properties index seeks may constrain: nodes, and single relationships.
     let mut seek_vars: HashSet<&str> = patterns
         .iter()
@@ -1356,6 +1385,10 @@ fn plan_match(ex: &Executor, patterns: &[PatternPart], where_: Option<&Expr>, bo
     );
     let hints = extract_hints(where_, &seek_vars);
     let mut placed: HashSet<String> = bound.iter().cloned().collect();
+    // A search binds its variable before the pattern, which then starts from it (or, for a
+    // relationship, says no more than the search checks).
+    placed.extend(search.iter().flat_map(VectorSearch::binds).map(str::to_string));
+    let patterns = if search.as_ref().is_some_and(|s| s.rel.is_some()) { &[] } else { patterns };
     let mut hidden: Vec<String> = Vec::new();
     // Per part: its steps, what was bound before it, its relationship columns, and
     // whether it is independent of everything before it (a join candidate).
@@ -1450,7 +1483,7 @@ fn plan_match(ex: &Executor, patterns: &[PatternPart], where_: Option<&Expr>, bo
         }
         pending = rest;
     }
-    let mut steps = Vec::new();
+    let mut steps: Vec<Step> = search.map(|s| Step::VectorSearch(Box::new(s))).into_iter().collect();
     let mut left_rels: Vec<String> = Vec::new();
     for (part_steps, before, rels, independent) in parts {
         if !independent {
@@ -1717,6 +1750,7 @@ impl Estimator<'_, '_> {
                     paths * target
                 }
                 Step::BuildPath { .. } => 1.0,
+                Step::VectorSearch(s) => s.estimate(),
                 Step::ShortestPath { all, .. } => {
                     if *all { 2.0 } else { 1.0 }
                 }
@@ -2053,7 +2087,7 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
 /// Every variable name `e` mentions, including inside pattern predicates. Names bound
 /// locally (list comprehensions, quantifiers) are included too, which can only place a
 /// filter later than necessary, never too early.
-fn expr_vars(e: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn expr_vars(e: &Expr, out: &mut HashSet<String>) {
     e.walk(&mut |x| match x {
         Expr::Var(v) => {
             out.insert(v.clone());
@@ -2081,6 +2115,7 @@ impl Step {
             Step::RelSeek { rel, left, right, .. } => vec![rel, left, right],
             Step::Expand { rel, to, .. } => vec![rel, to],
             Step::BuildPath { var, .. } => vec![var],
+            Step::VectorSearch(s) => s.binds(),
             Step::ShortestPath { rel, path, .. } => {
                 let mut v = vec![rel.as_str()];
                 v.extend(path.as_deref());
@@ -2141,6 +2176,7 @@ impl Step {
                 }
             }
             Step::BuildPath { .. } => {}
+            Step::VectorSearch(s) => s.exprs().for_each(|e| expr_vars(e, out)),
             Step::ShortestPath { pattern, predicates, .. } => {
                 if let Some(p) = &pattern.props {
                     expr_vars(p, out);
@@ -2692,13 +2728,14 @@ impl Step {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Step::VectorSearch(s) => s.describe(),
             Step::Filter(_) => "Filter".into(),
         }
     }
 }
 
 /// A short rendering of an expression: names, literals and parameters; `…` otherwise.
-fn expr_text(e: &Expr) -> String {
+pub(crate) fn expr_text(e: &Expr) -> String {
     match e {
         Expr::Literal(v) => v.to_string(),
         Expr::Param(p) => format!("${p}"),

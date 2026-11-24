@@ -35,8 +35,6 @@ mod embed;
 mod demo;
 mod eval;
 mod exec;
-// Only the tests filter searches so far.
-#[cfg_attr(not(test), allow(dead_code))]
 mod filter_column;
 mod fulltext;
 mod hnsw;
@@ -59,6 +57,7 @@ mod transaction;
 mod interrupt;
 mod unicode;
 mod vector;
+mod vector_search;
 pub mod json;
 
 use std::collections::BTreeMap;

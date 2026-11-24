@@ -1226,6 +1226,18 @@ fn build_steps<'a>(
                     },
                 ))
             }
+            Step::VectorSearch(search) => Box::new(Expanding::new(
+                s,
+                scope.clone(),
+                VectorSearchStep {
+                    scope: scope.clone(),
+                    search,
+                    var: slot(&search.var),
+                    score: search.score.as_deref().map(slot),
+                    row: Vec::new(),
+                    found: Vec::new().into_iter(),
+                },
+            )),
             Step::Filter(w) => Box::new(FilterStream {
                 input: s,
                 predicate: w,
@@ -1604,6 +1616,45 @@ fn is_used(row: &[Value], used: &[usize], rel: RelId) -> bool {
         Value::List(items) => items.contains(&Value::Rel(rel)),
         _ => false,
     })
+}
+
+/// `SEARCH`: the entities a vector index finds for the input row, best first.
+struct VectorSearchStep<'a> {
+    scope: Scope,
+    search: &'a crate::vector_search::VectorSearch,
+    var: usize,
+    score: Option<usize>,
+    row: Row,
+    found: std::vec::IntoIter<(Value, f64)>,
+}
+
+impl<'a> Expander<'a> for VectorSearchStep<'a> {
+    fn begin(&mut self, ex: &'a Executor<'_>, row: Row) -> Result<()> {
+        self.found = self.search.run(ex, &self.scope, &row)?.into_iter();
+        self.row = row;
+        Ok(())
+    }
+
+    fn next_row(&mut self, ex: &'a Executor<'_>) -> Result<Option<Row>> {
+        for (entity, score) in &mut self.found {
+            ex.check_interrupt()?;
+            // A relationship has no other step to check the rest of its pattern.
+            if let (Some(pattern), Value::Rel(id)) = (&self.search.rel, &entity) {
+                let t = ex.store().relationship_type(*id)?;
+                let type_ok = pattern.types.is_empty() || t.is_some_and(|t| pattern.types.contains(&t));
+                if !type_ok || !rel_ok(ex, *id, pattern, &self.scope, &self.row)? {
+                    continue;
+                }
+            }
+            let mut r = self.row.clone();
+            r[self.var] = entity;
+            if let Some(s) = self.score {
+                r[s] = Value::Float(score);
+            }
+            return Ok(Some(r));
+        }
+        Ok(None)
+    }
 }
 
 struct NodeStartStep<'a> {

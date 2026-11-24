@@ -1218,6 +1218,7 @@ impl<'a> Parser<'a> {
                     clauses: vec![Clause::Match {
                         optional: false,
                         patterns,
+                        search: None,
                         where_,
                     }],
                 }],
@@ -1718,16 +1719,58 @@ impl<'a> Parser<'a> {
 
     fn parse_match(&mut self, optional: bool) -> Result<Clause> {
         let patterns = self.parse_pattern_list()?;
+        // `SEARCH` comes before or after `WHERE`. It is a keyword only here, where no name
+        // can stand.
+        let mut search = self.parse_search()?;
         let where_ = if self.eat_kw("WHERE") {
             Some(self.parse_expr()?)
         } else {
             None
         };
+        if search.is_none() {
+            search = self.parse_search()?;
+        }
         Ok(Clause::Match {
             optional,
             patterns,
+            search: search.map(Box::new),
             where_,
         })
+    }
+
+    /// `SEARCH var IN (VECTOR INDEX name FOR expr [WHERE expr] LIMIT expr) [SCORE AS name]`,
+    /// if one comes next.
+    fn parse_search(&mut self) -> Result<Option<Search>> {
+        if !self.eat_kw("SEARCH") {
+            return Ok(None);
+        }
+        let var = self.ident()?;
+        self.expect_kw("IN")?;
+        self.expect(Tok::LParen, "'('")?;
+        if self.is_kw("FULLTEXT") {
+            return Err(Error::Unsupported(
+                "SEARCH on a full-text index is not supported; call db.index.fulltext.queryNodes or queryRelationships".into(),
+            ));
+        }
+        self.expect_kw("VECTOR")?;
+        self.expect_kw("INDEX")?;
+        if matches!(self.peek(), Tok::Param(_)) {
+            return self.err("the index of a SEARCH is a name, not a parameter");
+        }
+        let index = self.ident()?;
+        self.expect_kw("FOR")?;
+        let query = self.parse_expr()?;
+        let filter = if self.eat_kw("WHERE") { Some(self.parse_expr()?) } else { None };
+        self.expect_kw("LIMIT")?;
+        let limit = self.parse_expr()?;
+        self.expect(Tok::RParen, "')' to close the SEARCH")?;
+        let score = if self.eat_kw("SCORE") {
+            self.expect_kw("AS")?;
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        Ok(Some(Search { var, index, query, filter, limit, score }))
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {
@@ -2600,6 +2643,7 @@ impl<'a> Parser<'a> {
                     Clause::Match {
                         optional: false,
                         patterns: vec![part],
+                        search: None,
                         where_,
                     },
                     Clause::Return(Projection {
@@ -2737,6 +2781,7 @@ mod tests {
         let Clause::Match {
             patterns,
             where_,
+            search: None,
             optional,
         } = &c[0]
         else {
@@ -2783,6 +2828,53 @@ mod tests {
         };
         assert!(matches!(*l, Expr::Binary(BinaryOp::Eq, _, _)));
         assert!(matches!(*r, Expr::Unary(UnaryOp::Not, _)));
+    }
+
+    #[test]
+    fn search_clause() {
+        let search = |src: &str| match single(src).remove(0) {
+            Clause::Match { search, where_, optional, .. } => (*search.unwrap_or_else(|| panic!("{src}")), where_, optional),
+            c => panic!("{src}: {c:?}"),
+        };
+        let (s, where_, optional) = search(
+            "MATCH (d:Doc) SEARCH d IN (VECTOR INDEX `my docs` FOR $q WHERE d.a = 1 AND d.b IN [2] LIMIT 5 + 5) \
+             SCORE AS score WHERE score > 0.5 RETURN d",
+        );
+        assert_eq!((s.var.as_str(), s.index.as_str(), s.score.as_deref()), ("d", "my docs", Some("score")));
+        assert_eq!(s.query, Expr::Param("q".into()));
+        assert!(matches!(s.filter, Some(Expr::Binary(BinaryOp::And, _, _))));
+        assert!(matches!(s.limit, Expr::Binary(BinaryOp::Add, _, _)));
+        assert!(where_.is_some() && !optional);
+        // After the WHERE, in an OPTIONAL MATCH, in a subquery, without a filter or a score.
+        let (s, where_, optional) = search(
+            "OPTIONAL MATCH ()-[r:NEAR]->() WHERE r.x = 1 search r in (vector index v for [1, 2] limit 3) RETURN r",
+        );
+        assert!(s.filter.is_none() && s.score.is_none() && where_.is_some() && optional);
+        parse("RETURN EXISTS { MATCH (d) SEARCH d IN (VECTOR INDEX v FOR [1] LIMIT 1) }").unwrap();
+        // The words are still names everywhere else.
+        for ok in [
+            "MATCH (search:Search {score: 1})-[vector:SEARCH]->(score) WHERE search.index = score.vector RETURN search AS score",
+            "WITH 1 AS search RETURN search",
+            "MATCH (search) SEARCH search IN (VECTOR INDEX search FOR [1] LIMIT 1) SCORE AS score RETURN score",
+        ] {
+            parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v FOR $q) RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v LIMIT 3) RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX $v FOR $q LIMIT 3) RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v FOR $q LIMIT 3 WHERE d.a = 1) RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v FOR $q SKIP 1 LIMIT 3) RETURN d",
+            "MATCH (d) SEARCH d IN (INDEX v FOR $q LIMIT 3) RETURN d",
+            "MATCH (d) SEARCH d IN VECTOR INDEX v FOR $q LIMIT 3 RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v FOR $q LIMIT 3) SCORE score RETURN d",
+            "MATCH (d) SEARCH d IN (VECTOR INDEX v FOR $q LIMIT 3) SEARCH d IN (VECTOR INDEX v FOR $q LIMIT 3) RETURN d",
+            "SEARCH d IN (VECTOR INDEX v FOR $q LIMIT 3) RETURN d",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let err = parse("MATCH (d) SEARCH d IN (FULLTEXT INDEX v FOR 'x' LIMIT 3) RETURN d").unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
     }
 
     #[test]

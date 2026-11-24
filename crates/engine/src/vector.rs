@@ -873,18 +873,8 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
             def.entity.text().to_lowercase()
         )));
     }
-    let (dimensions, similarity) = vector_params(&def);
-    let q = vector_arg(procedure, &args[2])?
+    let q = query_vector(procedure, &def, &args[2])?
         .ok_or_else(|| Error::Type(format!("{procedure}: the query vector is null")))?;
-    if q.len() != dimensions as usize {
-        return Err(Error::Semantic(format!(
-            "{procedure}: index `{name}` has {dimensions} dimensions, the query vector {}",
-            q.len()
-        )));
-    }
-    if similarity == Similarity::Cosine && q.iter().all(|x| *x == 0.0) {
-        return Err(Error::Semantic(format!("{procedure}: a zero vector has no cosine similarity")));
-    }
     Ok(nearest(ctx, &def, &q, k, &[])?
         .into_iter()
         .map(|(score, id)| {
@@ -895,6 +885,24 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
             vec![e, Value::Float(score)]
         })
         .collect())
+}
+
+/// The vector `value` to search index `def` with (`None` for null): of the index's
+/// dimensions, and not zero for cosine. `what` searches, for errors.
+pub(crate) fn query_vector(what: &str, def: &IndexDef, value: &Value) -> Result<Option<Vec<f64>>> {
+    let (dimensions, similarity) = vector_params(def);
+    let Some(q) = vector_arg(what, value)? else { return Ok(None) };
+    if q.len() != dimensions as usize {
+        return Err(Error::Semantic(format!(
+            "{what}: index `{}` has {dimensions} dimensions, the query vector {}",
+            def.name,
+            q.len()
+        )));
+    }
+    if similarity == Similarity::Cosine && q.iter().all(|x| *x == 0.0) {
+        return Err(Error::Semantic(format!("{what}: a zero vector has no cosine similarity")));
+    }
+    Ok(Some(q))
 }
 
 /// The `k` entities of vector index `def` most similar to `q` (of the index's dimensions,
