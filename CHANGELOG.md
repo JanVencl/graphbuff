@@ -3,6 +3,17 @@
 Notable changes per release. Releases are also tagged (`vX.Y.Z`); the tag messages carry
 the same notes.
 
+## Unreleased
+
+### Added
+
+- Filtered vector search: `MATCH (d:Doc) SEARCH d IN (VECTOR INDEX name FOR $vector WHERE
+  d.tenant = 5 LIMIT 10) SCORE AS score` finds the nearest entities that match a filter, on
+  exact and HNSW indexes, for nodes and relationships. The properties to filter on are
+  declared with the index: `CREATE VECTOR INDEX … ON d.embedding WITH [d.tenant, d.year]`.
+  The syntax is Neo4j's (Cypher 25). See [Filtered search](docs/Vectors.md#filtered-search).
+  Existing stores open as they are; 0.5 and older cannot open a store with such an index.
+
 ## 0.5.0 — 2026-11-23
 
 ### Added
