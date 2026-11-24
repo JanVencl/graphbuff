@@ -57,6 +57,8 @@ mod transaction;
 mod interrupt;
 mod unicode;
 mod vector;
+#[cfg(test)]
+mod vector_file_tests;
 mod vector_search;
 pub mod json;
 
@@ -203,7 +205,8 @@ impl<S: GraphStore> Database<S> {
         // What was written before is in the first snapshot.
         drop(store.take_changes());
         let committed = store.snapshot();
-        let vector_cache = Arc::<vector::VectorCache>::default();
+        let vector_cache = Arc::new(vector::VectorCache::in_dir(store.data_dir()));
+        vector_cache.remove_stale_files(&store.indexes(), vector::is_graph_file);
         let text_cache = Arc::<fulltext::TextCache>::default();
         let point_cache = Arc::<point_index::PointCache>::default();
         let trigram_cache = Arc::<text_index::TrigramCache>::default();
@@ -714,13 +717,16 @@ impl<S: GraphStore> Database<S> {
         self.kernel_cache.csr(&snapshot)
     }
 
-    /// Compacts durable storage (snapshot + empty log). A no-op for in-memory storage.
+    /// Compacts durable storage (snapshot + empty log), and saves the graphs of HNSW vector
+    /// indexes. A no-op for in-memory storage.
     pub fn checkpoint(&self) -> Result<()> {
         self.check_no_transaction()?;
         self.store
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .checkpoint()
+            .checkpoint()?;
+        self.vector_cache.save();
+        Ok(())
     }
 
     /// A short description of the storage backend.

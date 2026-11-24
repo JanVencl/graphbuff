@@ -2753,6 +2753,10 @@ impl GraphStore for PersistentGraph {
         self.changes.take()
     }
 
+    fn data_dir(&self) -> Option<&Path> {
+        Some(&self.opts.dir)
+    }
+
     fn checkpoint(&mut self) -> Result<()> {
         if self.saved.is_some() {
             return Err(Error::Runtime(

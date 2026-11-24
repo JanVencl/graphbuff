@@ -15,6 +15,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
+mod file;
+
+pub(crate) use file::Loaded;
+
 /// How distances are measured: lower is closer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Metric {
@@ -294,6 +298,11 @@ impl Graph {
         self.links[n as usize][layer] = kept;
     }
 
+    /// Whether `slot` is not deleted.
+    pub fn is_live(&self, slot: u32) -> bool {
+        !self.deleted[slot as usize]
+    }
+
     /// Marks `slot` deleted.
     pub fn remove(&mut self, slot: u32) {
         if !std::mem::replace(&mut self.deleted[slot as usize], true) {
@@ -344,7 +353,7 @@ impl Graph {
 mod tests {
     use super::*;
 
-    fn points(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
+    pub(super) fn points(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
         let mut s = seed;
         let mut next = || {
             s ^= s << 13;
@@ -355,7 +364,7 @@ mod tests {
         (0..n).map(|_| (0..dims).map(|_| next()).collect()).collect()
     }
 
-    fn unit(v: &[f32]) -> Vec<f32> {
+    pub(super) fn unit(v: &[f32]) -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / n).collect()
     }

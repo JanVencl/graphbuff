@@ -171,11 +171,21 @@ OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.hnsw.enabled`: true}}
   per query against 12 ms for the exact index.
 - The graph is built in memory on the index's first query (about 5 seconds for those
   100,000 vectors, on one core; uniformly random vectors, the worst case, take several
-  times longer), and again after a restart. Commits keep it current: a changed vector is
+  times longer), and saved to a file in the database's directory (below). Commits keep it current: a changed vector is
   inserted anew and its old node is marked deleted; once deleted nodes outnumber live
   ones, the graph is built again.
 - Inside an explicit transaction, the index is searched exactly, as the transaction sees
   the data.
+- **After a restart** of a hybrid or persistent database, the first query loads the saved
+  graph instead of building it: for 100,000 clustered 128-dimension vectors, 0.6 s (hybrid)
+  or 1 s (persistent) instead of 17 s, from a file of 8.5 MiB (`hnsw-<hash>.graph`).
+  - The file holds the links of the graph, not the vectors, which are read from the store.
+    Vectors that are not as they were when it was saved are taken out of the graph or put
+    into it, so a crash, or a backup in the place of the store, does not matter. If more
+    than one in eight of its vectors are not, or the file is damaged, the graph is built.
+  - It is saved when it was built, by the query that finds a tenth of it changed, at a
+    checkpoint and when the database is closed. Graphs of fewer than 1,000 vectors are not.
+  - The file can be deleted at any time (with the database closed). Backups do not have it.
 - Memory: the vectors as for an exact index, plus about `2 × m` links of 4 bytes per vector.
 
 ## What gets indexed
@@ -209,8 +219,8 @@ This is how an exact index works; for HNSW, see above.
 - An exact search scores all vectors, so its cost grows linearly with their number; an
   HNSW index does not, but is approximate. There is no quantization.
 - The filter of a `SEARCH` has no `OR`, `<>`, `IS NULL` or string predicates.
-- The in-memory rows and HNSW graphs are rebuilt after a restart, on each index's first
-  query; the HNSW build runs on one core.
+- The in-memory rows of exact indexes are built again after a restart, on each index's
+  first query. The HNSW build runs on one core.
 - Building a relationship vector index scans all relationships.
 - The Neo4j 2025 `VECTOR` value type, vector indexes on several labels, and `SEARCH` on
   full-text indexes are not supported.
