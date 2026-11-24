@@ -255,13 +255,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn temporal(&mut self) -> Result<Temporal> {
-        use crate::temporal::{Duration, MAX_YEAR, NANOS_PER_DAY, NANOS_PER_SECOND, civil_from_days};
+        use crate::temporal::{Duration, MAX_YEAR, NANOS_PER_DAY, NANOS_PER_SECOND, days_from_civil};
+        // Compared as ranges: arithmetic on an unchecked value may overflow.
         let days = |d: &Self, v: u64| -> Result<i64> {
             let v = v as i64;
-            if civil_from_days(v).0.abs() > MAX_YEAR {
-                return Err(d.corrupt(format!("date out of range ({v} days)")));
+            if (days_from_civil(-MAX_YEAR, 1, 1)..=days_from_civil(MAX_YEAR, 12, 31)).contains(&v) {
+                Ok(v)
+            } else {
+                Err(d.corrupt(format!("date out of range ({v} days)")))
             }
-            Ok(v)
         };
         let nanos = |d: &Self, v: u64| -> Result<i64> {
             let v = v as i64;
@@ -273,7 +275,7 @@ impl<'a> Decoder<'a> {
         };
         let offset = |d: &Self, v: u32| -> Result<i32> {
             let o = v as i32;
-            if o.abs() <= 18 * 3600 {
+            if (-18 * 3600..=18 * 3600).contains(&o) {
                 Ok(o)
             } else {
                 Err(d.corrupt(format!("UTC offset out of range ({o} s)")))
@@ -453,5 +455,30 @@ mod tests {
         e.str("hello");
         let mut d = Decoder::new(&e.buf[..6], "test");
         assert!(matches!(d.str(), Err(Error::Storage(_))));
+    }
+
+    /// Found by the `storage` fuzz target: a UTC offset of `i32::MIN` overflowed the check
+    /// of its range.
+    #[test]
+    fn temporal_values_are_range_checked() {
+        use crate::temporal::{MAX_YEAR, days_from_civil};
+        let datetime = |days: i64, offset: i32| {
+            let mut e = Encoder::new();
+            e.value(&Value::Temporal(Temporal::DateTime { days, nanos: 0, offset, zone: None }));
+            Decoder::new(&e.buf, "test").value()
+        };
+        for offset in [-18 * 3600, 0, 18 * 3600] {
+            assert!(datetime(0, offset).is_ok(), "{offset}");
+        }
+        for offset in [i32::MIN, -18 * 3600 - 1, 18 * 3600 + 1, i32::MAX] {
+            assert!(matches!(datetime(0, offset), Err(Error::Storage(_))), "{offset}");
+        }
+        let (first, last) = (days_from_civil(-MAX_YEAR, 1, 1), days_from_civil(MAX_YEAR, 12, 31));
+        for days in [first, 0, last] {
+            assert!(datetime(days, 0).is_ok(), "{days}");
+        }
+        for days in [i64::MIN, first - 1, last + 1, i64::MAX] {
+            assert!(matches!(datetime(days, 0), Err(Error::Storage(_))), "{days}");
+        }
     }
 }

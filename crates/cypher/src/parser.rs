@@ -5,6 +5,8 @@
 //! string/list/null predicates (`IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `IS [NOT] NULL`) <
 //! `+ -` < `* / %` < `^` < unary `- +` < postfix (`.prop`, `[i]`, `[a..b]`, `:Label`) < atoms.
 
+use std::collections::HashSet;
+
 use graphbuff_core::{Error, Result, Value};
 
 use crate::ast::*;
@@ -66,6 +68,20 @@ struct Parser<'a> {
     /// In the `WHERE` of a list or pattern comprehension, where `|` starts the mapping
     /// expression: `x:A|B` there stops before the `|` (parenthesize to use it).
     pipe_ends_where: bool,
+    /// Attempts given up, with the token they started at and `pipe_ends_where` there: they
+    /// would fail again. Attempts nest (a pattern's properties hold expressions), and a
+    /// failed one's tokens are parsed again as something else, so repeating the attempts
+    /// inside it would take time exponential in the nesting depth.
+    given_up: HashSet<(Attempt, usize, bool)>,
+}
+
+/// What [`Parser`] parses tentatively, going back to its start if it is something else.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Attempt {
+    /// `(`: a pattern predicate, or else a parenthesized expression.
+    PatternPredicate,
+    /// `[`: a pattern comprehension, or else a list.
+    PatternComprehension,
 }
 
 impl<'a> Parser<'a> {
@@ -75,6 +91,7 @@ impl<'a> Parser<'a> {
             toks: tokenize(src)?,
             pos: 0,
             pipe_ends_where: false,
+            given_up: HashSet::new(),
         })
     }
 
@@ -2334,13 +2351,10 @@ impl<'a> Parser<'a> {
             Tok::LBrace => self.parse_map_literal(),
             Tok::LParen => {
                 // Either a pattern predicate `(a)-->(b)` or a parenthesized expression.
-                let save = self.pos;
-                if let Ok(part) = self.parse_pattern_part()
-                    && !part.chain.is_empty()
-                {
+                let pattern = |_: &Self, part: &PatternPart| !part.chain.is_empty();
+                if let Some(part) = self.try_pattern_part(Attempt::PatternPredicate, pattern) {
                     return Ok(Expr::PatternPredicate(Box::new(part)));
                 }
-                self.pos = save;
                 self.advance();
                 let outer = std::mem::replace(&mut self.pipe_ends_where, false);
                 let e = self.parse_expr();
@@ -2527,6 +2541,26 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// A pattern that `accept` takes (called after the pattern), or `None`, back at its start.
+    fn try_pattern_part(
+        &mut self,
+        attempt: Attempt,
+        accept: impl Fn(&Self, &PatternPart) -> bool,
+    ) -> Option<PatternPart> {
+        let key = (attempt, self.pos, self.pipe_ends_where);
+        if self.given_up.contains(&key) {
+            return None;
+        }
+        match self.parse_pattern_part() {
+            Ok(part) if accept(self, &part) => Some(part),
+            _ => {
+                self.pos = key.1;
+                self.given_up.insert(key);
+                None
+            }
+        }
+    }
+
     /// After `[`: a pattern comprehension `[p = (a)-->(b) WHERE … | expr]`, if one starts
     /// here. It runs as `COLLECT { MATCH p = (a)-->(b) WHERE … RETURN expr }`.
     fn try_pattern_comprehension(&mut self) -> Result<Option<Expr>> {
@@ -2535,12 +2569,11 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         let start = self.pos;
-        let part = match self.parse_pattern_part() {
-            Ok(p) if !p.chain.is_empty() && (self.is_kw("WHERE") || *self.peek() == Tok::Pipe) => p,
-            _ => {
-                self.pos = start;
-                return Ok(None);
-            }
+        let pattern = |p: &Self, part: &PatternPart| {
+            !part.chain.is_empty() && (p.is_kw("WHERE") || *p.peek() == Tok::Pipe)
+        };
+        let Some(part) = self.try_pattern_part(Attempt::PatternComprehension, pattern) else {
+            return Ok(None);
         };
         let where_ = if self.eat_kw("WHERE") {
             let outer = std::mem::replace(&mut self.pipe_ends_where, true);
@@ -2772,6 +2805,49 @@ mod tests {
             parse_expression("(a.x + 1)").unwrap(),
             Expr::Binary(BinaryOp::Add, _, _)
         ));
+    }
+
+    /// Found by the `parse_statement` fuzz target: every `(` and `[` is tried as a pattern
+    /// first, and repeating that at each level made these take time exponential in the
+    /// nesting depth.
+    #[test]
+    fn nested_attempts_take_reasonable_time() {
+        let start = std::time::Instant::now();
+        for src in [
+            include_str!("../../../fuzz/seeds/parse_statement/timeout-0.cypher"),
+            include_str!("../../../fuzz/seeds/parse_statement/timeout-1.cypher"),
+            include_str!("../../../fuzz/seeds/parse_statement/timeout-2.cypher"),
+        ] {
+            assert!(matches!(parse_statement(src), Err(Error::Syntax { .. })), "{src}");
+        }
+        for (open, atom, close) in [
+            ("({x: ", "1", "})"),
+            ("({x: ", "1", "}) - 1"),
+            ("[({x: ", "1", "})]"),
+            ("[({x: ", "1", "})-->()]"),
+            ("[p = ({x: ", "1", "})-->() | 1]"),
+            ("[y IN z WHERE ({x: ", "1", "}) | 1]"),
+            ("[()-->() WHERE ({x: ", "1", "}) | 1]"),
+        ] {
+            let src = format!("{}{atom}{}", open.repeat(24), close.repeat(24));
+            assert!(parse_expression(&src).is_ok(), "{src}");
+            // The same cut off, so that every attempt fails.
+            assert!(parse_expression(&format!("{}{atom}", open.repeat(24))).is_err());
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+    }
+
+    /// Going back from an attempt gives the same expression as parsing it directly.
+    #[test]
+    fn nested_attempts_parse_the_same() {
+        let e = parse_expression("[({x: [(a)-->(b) | 1]}), ({x: (c)-->(d)})]").unwrap();
+        let Expr::List(items) = e else { panic!("{e:?}") };
+        let x = |e: &Expr| match e {
+            Expr::Map(m) => m[0].1.clone(),
+            e => panic!("{e:?}"),
+        };
+        assert!(matches!(x(&items[0]), Expr::Subquery { kind: SubqueryKind::Collect, .. }));
+        assert!(matches!(x(&items[1]), Expr::PatternPredicate(_)));
     }
 
     #[test]
