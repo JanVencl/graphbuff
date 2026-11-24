@@ -745,8 +745,10 @@ fn filtered_search_cost(ef: usize, slots: usize, matches: usize) -> f64 {
 }
 
 /// The distances a graph search measures per candidate it keeps (`filtered_search_cost_measured`):
-/// about 4 to 5 on clustered vectors, whatever share of them passes, and 10 to 16 on
-/// uniformly random ones when a quarter or more pass.
+/// about 4 to 6 on clustered vectors and 10 to 26 on uniformly random ones, when a quarter
+/// or more pass. With 8, the search chosen was the faster one, or close to it, for every
+/// size and share measured (graph and scan take the same time near one in ten of 100,000
+/// clustered 128-dimension vectors).
 const FILTERED_SEARCH_FACTOR: f64 = 8.0;
 
 /// An exact index scores only the selected rows, on the calling thread, if they are at
@@ -1318,7 +1320,7 @@ mod tests {
     #[test]
     #[ignore = "prints measurements"]
     fn filtered_search_cost_measured() {
-        for (n, dims, clusters) in [(20_000, 32, 0), (20_000, 32, 200), (50_000, 64, 500)] {
+        for (n, dims, clusters) in [(20_000, 32, 0), (20_000, 32, 200), (50_000, 64, 500), (100_000, 128, 1000), (50_000, 384, 500), (50_000, 384, 0)] {
             let mut seed = 11u64;
             let mut next = move || {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1354,7 +1356,28 @@ mod tests {
                     })
                     .collect();
                 factors.sort_by(f64::total_cmp);
-                println!("{n} x {dims}, {clusters} clusters, 1 in {every}: factor {:.1} to {:.1}, median {:.1}", factors[0], factors[9], factors[5]);
+                // The time of the graph search, and of scoring every vector that passes.
+                let passes = |s: u32| (s.wrapping_mul(2_654_435_761) >> 8).is_multiple_of(every);
+                let t = std::time::Instant::now();
+                for q in &queries {
+                    g.search_where(q, 10, 200, passes, usize::MAX);
+                }
+                let graph = t.elapsed().as_secs_f64() * 1e5;
+                let t = std::time::Instant::now();
+                for q in &queries {
+                    let q: Vec<f64> = q.iter().map(|x| f64::from(*x)).collect();
+                    let rows = (0..n as u32).filter(|s| passes(*s)).map(|s| (u64::from(s), g.vector(s)));
+                    RowQuery::new(Similarity::Cosine, &q).scores(rows, &|| Ok(())).unwrap();
+                }
+                let scan = t.elapsed().as_secs_f64() * 1e5;
+                let matches = n as f64 / f64::from(every);
+                println!(
+                    "{n} x {dims}, {clusters} clusters, 1 in {every}: factor {:.1} to {:.1}, median {:.1}; graph {graph:.0} us, scan {scan:.0} us, {}",
+                    factors[0],
+                    factors[9],
+                    factors[5],
+                    if filtered_search_cost(200, n, matches as usize) >= matches { "scan chosen" } else { "graph chosen" },
+                );
             }
         }
     }

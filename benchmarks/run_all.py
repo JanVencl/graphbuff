@@ -36,7 +36,8 @@ BENCHMARKS = {
     "gpubench": ("GPU kernels vs CPU kernels", ["gpu"],
                  [], ["--people", "50000", "--reps", "3"]),
     "vecbench": ("vector index queries vs ORDER BY similarity, CPU and GPU", ["gpu"],
-                 [], ["--docs", "20000", "--dims", "128", "--reps", "3"]),
+                 ["--hnsw", "1", "--clusters", "1000"],
+                 ["--docs", "20000", "--dims", "128", "--reps", "3", "--hnsw", "1", "--clusters", "200"]),
     "embedbench": ("text embedding throughput by batch size and length (CPU)", [],
                    [], ["--quick", "--reps", "1"]),
 }

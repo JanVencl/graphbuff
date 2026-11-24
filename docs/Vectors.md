@@ -8,6 +8,7 @@ models (`vector.embed`): see [Text embeddings](Embeddings.md).
 - [Similarity functions](#similarity-functions)
 - [Vector indexes](#vector-indexes)
 - [Querying an index](#querying-an-index)
+- [Filtered search](#filtered-search)
 - [What gets indexed](#what-gets-indexed)
 - [How it works](#how-it-works)
 - [Limits](#limits)
@@ -67,7 +68,7 @@ RETURN node.title, score
   cosine, not be all zeros). An unknown index, or a node index queried for
   relationships (or the other way round), is an error.
 - Filter after the call with `WHERE`; the filter runs on the `k` results, so ask for
-  more than you need when it is selective.
+  more than you need when it is selective, or use a [filtered search](#filtered-search).
 - Inside a transaction that has written, the query sees those writes.
 
 The results of an index without `vector.hnsw` options are **exact**. When every `Doc` has a
@@ -78,6 +79,73 @@ MATCH (d:Doc)
 RETURN d, vector.similarity.cosine(d.embedding, $embedding) AS score
 ORDER BY score DESC, id(d) LIMIT 10
 ```
+
+## Filtered search
+
+`SEARCH` finds the `k` nearest entities **that match a filter**. It is part of a `MATCH`,
+as in Neo4j's Cypher 25. The properties to filter on are declared with the index:
+
+```cypher
+CREATE VECTOR INDEX doc_embedding FOR (d:Doc) ON d.embedding
+WITH [d.tenant, d.year]
+OPTIONS {indexConfig: {`vector.dimensions`: 384}}
+```
+
+```cypher
+MATCH (d:Doc)
+SEARCH d IN (
+  VECTOR INDEX doc_embedding
+  FOR $embedding
+  WHERE d.tenant = 5 AND d.year >= 2024
+  LIMIT 10
+) SCORE AS score
+RETURN d.title, score
+```
+
+- **The filter** (the `WHERE` inside) is applied during the search: there are `k` results
+  whenever `k` entities match.
+  - It compares filter properties with `=`, `<`, `<=`, `>`, `>=` or `IN`, joined by `AND`.
+    A boolean property can stand alone: `d.open`, `NOT d.open`.
+  - The other side is any expression without the searched variable.
+  - Anything else there is an error.
+- **The rest of the `MATCH`** (labels, types and properties in the pattern, and its own
+  `WHERE`, before or after the `SEARCH`) filters the results, so there can be fewer than `k`.
+- **The pattern** is a node, or one relationship, and names only the searched variable,
+  which must be new. Only that variable can have labels, types or properties. A
+  relationship index is searched with a direction: `MATCH ()-[r:NEAR]->() SEARCH r IN (…)`.
+- **The vector, the limit and the filter's values** may use parameters and the variables
+  bound before, so one query can search for many vectors. A `null` vector finds nothing.
+- `LIMIT` is required. `SCORE AS` is optional; its variable can be used in the `WHERE` of the
+  `MATCH`. Results come best first.
+- `OPTIONAL MATCH … SEARCH` gives a row of nulls when there are no results.
+- `EXPLAIN` and `PROFILE` show it as `VectorSearch`.
+
+**Filter properties** can be numbers, strings, booleans and temporal values. Anything else
+counts as `null`, and so does a missing property: the entity is still indexed, but passes no
+condition on it. There can be up to 15. Their values are kept in memory next to the vectors
+(4 bytes per entity and property, plus each distinct value) and follow every commit.
+`SHOW INDEXES` lists them after the vector property. To change them, drop the index and
+create it again.
+
+**How it runs.** The filter is tested once per distinct value, which tells exactly which
+entities match. An exact index scores just those when they are few, and otherwise all
+vectors, as without a filter. An HNSW index searches its graph, where entities that do not
+match only lead the search on, or scores the ones that match when that takes less work.
+Scores are exact in every case, and so are the results, except when an HNSW graph is searched.
+
+100,000 clustered 128-dimension vectors, 10 nearest, by the share that passes the filter
+(4 CPU threads, an RX 5700 XT; `vecbench`):
+
+| Share | `MATCH … WHERE … ORDER BY` | exact, CPU | exact, GPU | HNSW |
+|------:|------:|------:|------:|------:|
+| 1 % | 58 ms | 0.34 ms | 0.33 ms | 0.34 ms |
+| 10 % | 140 ms | 2.3 ms | 2.4 ms | 2.3 ms |
+| 50 % | 540 ms | 6.3 ms | 2.5 ms | 1.8 ms |
+| 100 % | 890 ms | 6.7 ms | 3.0 ms | 1.1 ms |
+
+HNSW found all of the true 10 nearest in every case.
+
+A store with an index that has filter properties cannot be opened by graphbuff 0.5 or older.
 
 ## Approximate indexes (HNSW)
 
@@ -139,9 +207,10 @@ This is how an exact index works; for HNSW, see above.
 ## Limits
 
 - An exact search scores all vectors, so its cost grows linearly with their number; an
-  HNSW index does not, but is approximate. There is no quantization, and no filtered
-  search (a `WHERE` runs on the `k` results).
+  HNSW index does not, but is approximate. There is no quantization.
+- The filter of a `SEARCH` has no `OR`, `<>`, `IS NULL` or string predicates.
 - The in-memory rows and HNSW graphs are rebuilt after a restart, on each index's first
   query; the HNSW build runs on one core.
 - Building a relationship vector index scans all relationships.
-- The Neo4j 2025 `VECTOR` value type and `SEARCH` clause are not supported.
+- The Neo4j 2025 `VECTOR` value type, vector indexes on several labels, and `SEARCH` on
+  full-text indexes are not supported.

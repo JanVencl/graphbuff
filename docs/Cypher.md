@@ -201,7 +201,9 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   the scores are computed on the GPU (the vectors stay on the device between queries), then the
   rows near the cut are re-scored exactly, so the results do not change: on an RX 5700 XT,
   200,000 768-dimensional vectors answer in about 6 ms against 43 ms on 4 CPU threads
-  (`vecbench`). More in [Vector search](Vectors.md).
+  (`vecbench`). `MATCH (d:L) SEARCH d IN (VECTOR INDEX name FOR $vector [WHERE filter] LIMIT k)
+  [SCORE AS s]` finds the k most similar that pass a filter on the properties the index
+  declares (`… ON n.p WITH [n.a, n.b]`). More in [Vector search](Vectors.md).
 * **Full-text:** ``CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.p, n.q]
   [OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}]`` (also `FOR ()-[r:A|B]-()`)
   indexes STRING and LIST<STRING> properties. `CALL db.index.fulltext.queryNodes('name',
@@ -230,13 +232,14 @@ recognise. Where there is another way to write it, it is given.
 | Dynamic labels and types: `n:$(expr)`, `[:$(expr)]` | none yet |
 | Type predicates: `x IS :: STRING` | `valueType(x) = 'STRING NOT NULL'` |
 | `USE graph.byName(…)` | `USE name` |
+| `SEARCH` on a full-text index (`Unsupported`) | `db.index.fulltext.queryNodes` / `queryRelationships` |
 
 **Schema:**
 
 | Missing | Error |
 |---------|-------|
 | Property type constraints on `MAP`, `NODE`, `PATH`, `ANY` or nullable list elements (`LIST<INTEGER>`) | syntax error: properties cannot hold them, and lists of properties hold no nulls |
-| Quantization of vector indexes, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
+| Quantization of vector indexes, vector indexes on several labels, the `VECTOR` value type and `vector()` | vectors are lists of numbers; approximate search is `vector.hnsw.enabled` ([Vector search](Vectors.md)) |
 | Full-text ranges, regular expressions and phrase slop (`[a TO b]`, `/re/`, `"a b"~2`) | `Unsupported` |
 | Index or constraint settings graphbuff does not know | `Unsupported` |
 
