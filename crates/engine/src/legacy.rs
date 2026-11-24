@@ -112,9 +112,13 @@ impl Executor<'_> {
             let mut frame = Frame::new(Scope::default(), vec![Vec::new()]);
             for (clause, cap) in part.clauses.iter().zip(caps) {
                 frame = match clause {
+                    Clause::Match { search: Some(_), .. } => {
+                        return Err(Error::Unsupported("SEARCH".into()));
+                    }
                     Clause::Match {
                         optional,
                         patterns,
+                        search: None,
                         where_,
                     } => self.exec_match(*optional, patterns, where_.as_ref(), frame, cap)?,
                     Clause::Unwind { expr, var } => self.exec_unwind(expr, var, frame, cap)?,

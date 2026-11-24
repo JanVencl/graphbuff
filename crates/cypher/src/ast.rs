@@ -44,11 +44,24 @@ pub struct SingleQuery {
     pub clauses: Vec<Clause>,
 }
 
+/// `SEARCH var IN (VECTOR INDEX index FOR query [WHERE filter] LIMIT limit) [SCORE AS score]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct Search {
+    pub var: String,
+    pub index: String,
+    pub query: Expr,
+    pub filter: Option<Expr>,
+    pub limit: Expr,
+    pub score: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
     Match {
         optional: bool,
         patterns: Vec<PatternPart>,
+        /// `SEARCH …`: finds the pattern's candidates in a vector index.
+        search: Option<Box<Search>>,
         where_: Option<Expr>,
     },
     Create {

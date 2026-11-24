@@ -402,7 +402,7 @@ fn kernel_cost(accel: &Accel, store: &dyn GraphStore, op: &KernelOp) -> Option<f
 
 /// The kernel form of query part `q`, if it has one. `op` is its row plan.
 fn recognize(q: &SingleQuery, op: &Operator) -> Option<KernelOp> {
-    let [Clause::Match { optional: false, patterns, where_ }, Clause::Return(ret)] = q.clauses.as_slice() else {
+    let [Clause::Match { optional: false, patterns, search: None, where_ }, Clause::Return(ret)] = q.clauses.as_slice() else {
         return None;
     };
     let [part] = patterns.as_slice() else { return None };
