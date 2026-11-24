@@ -707,15 +707,20 @@ impl VectorScores {
     }
 }
 
+/// What [`Kernels::vector_scores`] computes for one row, with `f64` sums.
+pub fn vector_row_score(row: &[f32], query: &[f64], similarity: VectorSimilarity) -> f64 {
+    match similarity {
+        VectorSimilarity::Cosine => row.iter().zip(query).map(|(r, q)| f64::from(*r) * q).sum(),
+        VectorSimilarity::Euclidean => row.iter().zip(query).map(|(r, q)| (f64::from(*r) - q).powi(2)).sum(),
+    }
+}
+
 /// [`Kernels::vector_scores`] on the CPU over the rows in `range`, with `f64` sums.
 fn vector_scores_cpu(rows: &VectorRows, query: &[f64], similarity: VectorSimilarity, range: Range<usize>) -> Vec<f64> {
     let d = rows.dims;
     rows.data[range.start * d..range.end * d]
         .chunks_exact(d)
-        .map(|row| match similarity {
-            VectorSimilarity::Cosine => row.iter().zip(query).map(|(r, q)| f64::from(*r) * q).sum(),
-            VectorSimilarity::Euclidean => row.iter().zip(query).map(|(r, q)| (f64::from(*r) - q).powi(2)).sum(),
-        })
+        .map(|row| vector_row_score(row, query, similarity))
         .collect()
 }
 
