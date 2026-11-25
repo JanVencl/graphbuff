@@ -344,7 +344,7 @@ impl QueryPlan {
                     .and_then(|k| profile.map(|p| p.get(&k).copied().unwrap_or_default()));
                 PlanLine {
                     depth,
-                    operator,
+                    operator: operator + &measured.map_or_else(String::new, |m| crate::vector::methods_text(m.searches)),
                     estimated_rows,
                     rows: measured.map(|m| m.rows),
                     time: measured.map(|m| m.time),

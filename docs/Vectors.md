@@ -118,7 +118,9 @@ RETURN d.title, score
 - `LIMIT` is required. `SCORE AS` is optional; its variable can be used in the `WHERE` of the
   `MATCH`. Results come best first.
 - `OPTIONAL MATCH … SEARCH` gives a row of nulls when there are no results.
-- `EXPLAIN` and `PROFILE` show it as `VectorSearch`.
+- `EXPLAIN` and `PROFILE` show it as `VectorSearch`; `PROFILE` also says how the results were
+  found: `by HNSW graph`, `by matching vectors` (each that passes the filter was scored),
+  `by all vectors`, or `by scan of the store` (inside a transaction).
 
 **Filter properties** can be numbers, strings, booleans and temporal values. Anything else
 counts as `null`, and so does a missing property: the entity is still indexed, but passes no

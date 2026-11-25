@@ -17,6 +17,11 @@ the same notes.
   databases, so that the first query after a restart does not build them again. See
   [Approximate indexes](docs/Vectors.md#approximate-indexes-hnsw).
 
+### Fixed
+
+- A search of an HNSW vector index stops at the query's timeout or when it is cancelled;
+  before, only once it was done.
+
 ## 0.5.0 — 2026-11-23
 
 ### Added

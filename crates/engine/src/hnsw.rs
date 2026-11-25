@@ -12,6 +12,7 @@
 //! Removal marks a slot deleted: it still routes searches but is never a result. The
 //! owner rebuilds the graph once deleted slots outnumber live ones.
 
+use graphbuff_core::Result;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
@@ -65,6 +66,21 @@ impl PartialOrd for Near {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// What stops a search early.
+#[derive(Clone, Copy)]
+pub(crate) struct Bounds<'a> {
+    /// It gives up after measuring about this many distances.
+    pub budget: usize,
+    /// Called every [`CHECK_EVERY`] distances; the search fails with its error.
+    pub interrupt: &'a dyn Fn() -> Result<()>,
+}
+
+const CHECK_EVERY: usize = 256;
+
+impl Bounds<'_> {
+    const NONE: Bounds<'static> = Bounds { budget: usize::MAX, interrupt: &|| Ok(()) };
 }
 
 /// The slots seen by one search.
@@ -183,8 +199,8 @@ impl Graph {
     }
 
     /// The (up to) `ef` nodes of `layer` that pass `accept` and are closest to `q`, found
-    /// from `entries`, closest first. The others are explored but not returned. Gives up
-    /// (`None`) after measuring `budget` distances.
+    /// from `entries`, closest first. The others are explored but not returned. `None` if
+    /// it gave up.
     fn search_layer(
         &self,
         q: &[f32],
@@ -192,8 +208,9 @@ impl Graph {
         ef: usize,
         layer: usize,
         accept: impl Fn(u32) -> bool,
-        mut budget: usize,
-    ) -> Option<Vec<Near>> {
+        bounds: Bounds<'_>,
+    ) -> Result<Option<Vec<Near>>> {
+        let mut measured = 0usize;
         let mut visited = Visited::new(self.slots());
         let mut candidates: BinaryHeap<Reverse<Near>> = BinaryHeap::new();
         let mut found: BinaryHeap<Near> = BinaryHeap::new();
@@ -216,7 +233,13 @@ impl Graph {
                 if !visited.insert(n) {
                     continue;
                 }
-                budget = budget.checked_sub(1)?;
+                if measured == bounds.budget {
+                    return Ok(None);
+                }
+                measured += 1;
+                if measured.is_multiple_of(CHECK_EVERY) {
+                    (bounds.interrupt)()?;
+                }
                 let d = self.to(q, n);
                 if found.len() < ef || found.peek().is_some_and(|f| d < f.0) {
                     candidates.push(Reverse(Near(d, n)));
@@ -229,7 +252,7 @@ impl Graph {
                 }
             }
         }
-        Some(found.into_sorted_vec())
+        Ok(Some(found.into_sorted_vec()))
     }
 
     /// Up to `m` of `candidates` (closest first) as neighbours: each one kept is closer to
@@ -268,8 +291,10 @@ impl Graph {
         let mut entries = vec![from];
         for l in (0..=layer.min(self.top)).rev() {
             let found = self
-                .search_layer(v, &entries, self.ef_construction, l, |_| true, usize::MAX)
-                .expect("no budget");
+                .search_layer(v, &entries, self.ef_construction, l, |_| true, Bounds::NONE)
+                .ok()
+                .flatten()
+                .expect("nothing stops it");
             let neighbours = self.select(&found, self.m);
             let max = if l == 0 { 2 * self.m } else { self.m };
             for &n in &neighbours {
@@ -312,30 +337,32 @@ impl Graph {
 
     /// The (up to) `k` live slots closest to `q` that a search keeping `ef` candidates
     /// finds, closest first, with their distances.
+    #[cfg(test)]
     pub fn search(&self, q: &[f32], k: usize, ef: usize) -> Vec<(f32, u32)> {
-        self.search_where(q, k, ef, |_| true, usize::MAX).expect("no budget")
+        self.search_where(q, k, ef, |_| true, Bounds::NONE).unwrap().expect("no budget")
     }
 
     /// As [`search`](Self::search), but only of the slots that pass `accept`: the others
-    /// still lead the search on. The fewer pass, the further it goes; it gives up (`None`)
-    /// after measuring about `budget` distances.
+    /// still lead the search on. The fewer pass, the further it goes; `None` if it gave up.
     pub fn search_where(
         &self,
         q: &[f32],
         k: usize,
         ef: usize,
         accept: impl Fn(u32) -> bool,
-        budget: usize,
-    ) -> Option<Vec<(f32, u32)>> {
-        let Some(entry) = self.entry else { return Some(Vec::new()) };
+        bounds: Bounds<'_>,
+    ) -> Result<Option<Vec<(f32, u32)>>> {
+        let Some(entry) = self.entry else { return Ok(Some(Vec::new())) };
         let mut from = Near(self.to(q, entry), entry);
         for l in (1..=self.top).rev() {
             from = self.greedy(q, from, l);
         }
         let accept = |slot: u32| !self.deleted[slot as usize] && accept(slot);
-        let mut found = self.search_layer(q, &[from], ef.max(k), 0, accept, budget)?;
-        found.truncate(k);
-        Some(found.into_iter().map(|n| (n.0, n.1)).collect())
+        let found = self.search_layer(q, &[from], ef.max(k), 0, accept, bounds)?;
+        Ok(found.map(|mut found| {
+            found.truncate(k);
+            found.into_iter().map(|n| (n.0, n.1)).collect()
+        }))
     }
 }
 
@@ -442,7 +469,7 @@ mod tests {
                 let mut exact: Vec<(f32, u32)> =
                     (0..data.len()).filter(|&i| live[i]).map(|i| (g.distance(q, &data[i]), i as u32)).collect();
                 exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let got = g.search_where(q, 10, 100, passes, usize::MAX).expect("no budget");
+                let got = g.search_where(q, 10, 100, passes, Bounds::NONE).unwrap().expect("no budget");
                 assert_eq!(got.len(), 10);
                 assert!(got.iter().all(|(_, s)| live[*s as usize]));
                 hits += got.iter().filter(|(_, s)| exact[..10].iter().any(|e| e.1 == *s)).count();
@@ -450,8 +477,17 @@ mod tests {
             assert!(hits >= 190, "1 in {every}: {hits} of 200");
         }
         // It gives up when it takes too long, and finds nothing if nothing passes.
-        assert!(g.search_where(&queries[0], 10, 100, |_| true, 50).is_none());
-        assert_eq!(g.search_where(&queries[0], 10, 100, |_| false, usize::MAX), Some(vec![]));
+        assert!(g.search_where(&queries[0], 10, 100, |_| true, Bounds { budget: 50, ..Bounds::NONE }).unwrap().is_none());
+        assert_eq!(g.search_where(&queries[0], 10, 100, |_| false, Bounds::NONE).unwrap(), Some(vec![]));
+        // It can be interrupted on the way: this one looks at all 3000.
+        let calls = std::cell::Cell::new(0);
+        let interrupt = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 { Err(graphbuff_core::Error::Cancelled("stopped".into())) } else { Ok(()) }
+        };
+        let stopped = g.search_where(&queries[0], 10, 100, |_| false, Bounds { interrupt: &interrupt, ..Bounds::NONE });
+        assert!(stopped.is_err());
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
