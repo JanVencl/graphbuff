@@ -29,7 +29,8 @@ passes. After a change that makes more scenarios pass, record them with
 `python python/run_tck.py --save-baseline`. Each run writes every scenario's outcome to
 `results/results.tsv` (git-ignored).
 
-The `tck` workflow runs the suite on pull requests that change the code involved, and on demand.
+The `tck` workflow runs the suite every night, on pull requests that change the code involved,
+and on demand.
 
 ## How scenarios run
 

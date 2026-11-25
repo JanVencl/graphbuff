@@ -1,10 +1,12 @@
 # Runs the openCypher TCK (integration-tests/tck/README.md) against graphbuff-server: every
 # scenario, with the pass rate per feature group in the run's summary. Fails if a scenario in
-# integration-tests/tck/passing.txt no longer passes. On a pull request that changes the code
-# involved or the suite, and on demand.
+# integration-tests/tck/passing.txt no longer passes. Every night, on a pull request that
+# changes the code involved or the suite, and on demand.
 name: tck
 
 on:
+  schedule:
+    - cron: "47 2 * * *"
   workflow_dispatch:
   pull_request:
     paths:
