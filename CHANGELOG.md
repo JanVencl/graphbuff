@@ -13,6 +13,9 @@ the same notes.
   declared with the index: `CREATE VECTOR INDEX … ON d.embedding WITH [d.tenant, d.year]`.
   The syntax is Neo4j's (Cypher 25). See [Filtered search](docs/Vectors.md#filtered-search).
   Existing stores open as they are; 0.5 and older cannot open a store with such an index.
+- The graphs of HNSW vector indexes are saved in the directories of hybrid and persistent
+  databases, so that the first query after a restart does not build them again. See
+  [Approximate indexes](docs/Vectors.md#approximate-indexes-hnsw).
 
 ## 0.5.0 — 2026-11-23
 

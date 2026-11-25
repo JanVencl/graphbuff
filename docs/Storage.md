@@ -59,6 +59,10 @@ the store refuses further writes until it is reopened.
 <dir>/graph.wal  redo log
 ```
 
+Directories of hybrid and persistent stores also hold the saved graphs of HNSW vector
+indexes, `hnsw-<hash>.graph` ([Vector search](Vectors.md#approximate-indexes-hnsw)), which
+the stores themselves do not use.
+
 All page access goes through an LRU **page cache** (`persistent/pager.rs`). Pages changed
 by the open transaction are pinned and their before-images kept, so rollback is exact and
 uncommitted data never reaches a data file. Read queries run on a **snapshot** that shares

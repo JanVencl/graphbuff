@@ -942,6 +942,10 @@ impl GraphStore for HybridGraph {
         self.wal.sync_all().map_err(io(&wal_path, "syncing"))
     }
 
+    fn data_dir(&self) -> Option<&Path> {
+        Some(&self.opts.dir)
+    }
+
     fn describe(&self) -> String {
         let sync = match self.opts.sync {
             SyncPolicy::EveryCommit => "fsync per commit",

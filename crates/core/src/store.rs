@@ -312,6 +312,12 @@ pub trait GraphStore {
         "in-memory".into()
     }
 
+    /// The directory of the store's files, if it has any. The engine keeps files of its own
+    /// there (saved HNSW graphs), which the store ignores and which can be deleted.
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     // ---- maintenance ------------------------------------------------------------------
 
     /// Writes a copy of the last committed state into `dest`, a new or empty directory,
@@ -618,6 +624,9 @@ impl<T: GraphStore + ?Sized> GraphStore for Box<T> {
     }
     fn describe(&self) -> String {
         (**self).describe()
+    }
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        (**self).data_dir()
     }
     fn backup(&self, dest: &std::path::Path) -> Result<crate::BackupInfo> {
         (**self).backup(dest)

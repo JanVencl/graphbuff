@@ -6,6 +6,8 @@
 //! similar.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io;
+use std::path::Path;
 
 use graphbuff_core::{
     Changes, Error, GraphStore, HnswConfig, IndexDef, IndexEntity, IndexKind, Kernels, MAX_VECTOR_DIMENSIONS, NodeId,
@@ -14,7 +16,7 @@ use graphbuff_core::{
 use graphbuff_cypher::ast::IndexType;
 
 use crate::filter_column::{FilterColumn, Predicate, Selection, filter_value};
-use crate::hnsw::{Graph, Metric};
+use crate::hnsw::{Graph, Loaded, Metric};
 use crate::index_cache::{Cached, IndexCache};
 use crate::procedures::{ProcedureContext, ProcedureRows};
 
@@ -620,6 +622,8 @@ pub(crate) struct Approximate {
     slot_of: HashMap<u64, u32>,
     /// The filter properties' values by slot (`null` for a deleted one).
     filters: Vec<FilterColumn>,
+    /// Vectors inserted into and taken out of the graph, since it was loaded if it was.
+    edits: u64,
 }
 
 impl Approximate {
@@ -636,6 +640,7 @@ impl Approximate {
             ids: Vec::new(),
             slot_of: HashMap::new(),
             filters: filter_columns(def),
+            edits: 0,
         }
     }
 
@@ -653,6 +658,7 @@ impl Approximate {
 
     fn insert(&mut self, id: u64, entry: &Entry) {
         let slot = self.graph.insert(&entry.row);
+        self.edits += 1;
         debug_assert_eq!(slot as usize, self.ids.len());
         self.ids.push(id);
         self.slot_of.insert(id, slot);
@@ -686,6 +692,7 @@ impl Approximate {
                     continue;
                 }
                 self.graph.remove(slot);
+                self.edits += 1;
                 self.slot_of.remove(&id);
                 for column in &mut self.filters {
                     column.set(slot, &Value::Null);
@@ -704,9 +711,71 @@ impl Approximate {
                 })
                 .collect();
             entries.sort_unstable_by_key(|e| e.0);
+            let edits = self.edits;
             *self = Approximate::with(&self.def, entries, interrupt)?;
+            self.edits += edits;
         }
         Ok(())
+    }
+
+    /// What a saved graph of index `def` must be of. The filter properties are not part of
+    /// it: their values are read from the store.
+    fn key(def: &IndexDef) -> Vec<u8> {
+        let (dimensions, similarity) = vector_params(def);
+        let IndexKind::Vector { hnsw: Some(h), .. } = def.kind else { unreachable!("an approximate index") };
+        let mut key = format!("{}|{dimensions}|{}|{}|{}", def.entity.text(), similarity.name(), h.m, h.ef_construction);
+        for s in [&def.name, &def.label, &def.properties[0]] {
+            key += &format!("|{}:{s}", s.len());
+        }
+        key.into_bytes()
+    }
+
+    /// The contents of index `def` in `store`, with the graph saved in `file`: vectors it
+    /// does not have are inserted. `None` if there is no graph of the index, or too much
+    /// of it is not of this state.
+    fn load(
+        file: &Path,
+        store: &dyn GraphStore,
+        def: &IndexDef,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<Approximate>> {
+        if !file.is_file() {
+            return Ok(None);
+        }
+        let entries = entries(store, def, interrupt)?;
+        let at: HashMap<u64, usize> = entries.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+        let mut a = Approximate::new(def);
+        let empty = std::mem::replace(&mut a.graph, Graph::new(1, Metric::Cosine, 2, 1));
+        let row = |id: u64| at.get(&id).map(|&i| &entries[i].1.row[..]);
+        let Some(Loaded { graph, ids, dropped }) = Graph::load(file, &Approximate::key(def), empty, row) else {
+            return Ok(None);
+        };
+        if dropped > 64 && dropped > graph.live() / LOAD_DROPPED_SHARE || graph.removed() > 64 && graph.removed() > graph.live() {
+            return Ok(None);
+        }
+        a.graph = graph;
+        a.edits = dropped as u64;
+        for (slot, id) in ids.iter().enumerate() {
+            let values = if a.graph.is_live(slot as u32) {
+                a.slot_of.insert(*id, slot as u32);
+                Some(&entries[at[id]].1.filters)
+            } else {
+                None
+            };
+            for (i, column) in a.filters.iter_mut().enumerate() {
+                column.push(values.map_or(&Value::Null, |v| &v[i]));
+            }
+        }
+        a.ids = ids;
+        for (n, (id, entry)) in entries.iter().enumerate() {
+            if n % 256 == 255 {
+                interrupt()?;
+            }
+            if !a.slot_of.contains_key(id) {
+                a.insert(*id, entry);
+            }
+        }
+        Ok(Some(a))
     }
 
     /// The query vector as the graph's vectors are kept (unit length for cosine).
@@ -757,6 +826,27 @@ const FILTERED_SEARCH_FACTOR: f64 = 8.0;
 const SUBSET_ROWS: usize = 1024;
 const SUBSET_SHARE: usize = 8;
 
+/// A saved graph is not used if more than one in this many of its vectors are no longer
+/// those of their entities: the search of a graph suffers from taking out many.
+const LOAD_DROPPED_SHARE: usize = 8;
+
+/// Graphs of fewer vectors are not saved: building one takes a fraction of a second.
+const MIN_SAVED: usize = 1000;
+
+/// A graph is saved while queries run once this many of its vectors (and one in
+/// [`SAVE_SHARE`]) were inserted or taken out since.
+const SAVE_EDITS: u64 = 1000;
+const SAVE_SHARE: u64 = 10;
+
+/// Whether `name` is a file that graphs are saved in, or written to before.
+pub(crate) fn is_graph_file(name: &str) -> bool {
+    name.strip_prefix("hnsw-").is_some_and(|rest| {
+        rest.strip_suffix(".graph").or(rest.strip_suffix(".tmp")).is_some_and(|hash| {
+            hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    })
+}
+
 /// The in-memory contents of a vector index of one committed state.
 #[derive(Clone)]
 pub(crate) enum VectorIndex {
@@ -784,6 +874,51 @@ impl Cached for VectorIndex {
         match self {
             VectorIndex::Flat(m) => m.apply(store, changes, interrupt),
             VectorIndex::Approximate(a) => a.apply(store, changes, interrupt),
+        }
+    }
+
+    /// `hnsw-<hash of the index's name>.graph` for an approximate index.
+    fn file_name(def: &IndexDef) -> Option<String> {
+        let IndexKind::Vector { hnsw: Some(_), .. } = def.kind else { return None };
+        // FNV-1a. (Another index with the same hash would only make both graphs be built:
+        // the file says which index it is of.)
+        let hash = def.name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3));
+        Some(format!("hnsw-{hash:016x}.graph"))
+    }
+
+    fn load(
+        file: &Path,
+        store: &dyn GraphStore,
+        def: &IndexDef,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<VectorIndex>> {
+        Ok(Approximate::load(file, store, def, interrupt)?.map(VectorIndex::Approximate))
+    }
+
+    fn save(&self, file: &Path) -> io::Result<()> {
+        match self {
+            VectorIndex::Approximate(a) if a.graph.live() >= MIN_SAVED => {
+                a.graph.save(file, &Approximate::key(&a.def), &a.ids)
+            }
+            VectorIndex::Approximate(_) => match std::fs::remove_file(file) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+            VectorIndex::Flat(_) => Ok(()),
+        }
+    }
+
+    fn edits(&self) -> u64 {
+        match self {
+            VectorIndex::Flat(_) => 0,
+            VectorIndex::Approximate(a) => a.edits,
+        }
+    }
+
+    fn save_due(&self, unsaved: u64) -> bool {
+        match self {
+            VectorIndex::Flat(_) => false,
+            VectorIndex::Approximate(a) => unsaved >= SAVE_EDITS.max(a.graph.live() as u64 / SAVE_SHARE),
         }
     }
 }
