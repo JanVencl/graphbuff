@@ -15,13 +15,18 @@ use std::time::{Duration, Instant};
 use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
 use settings::{Config, LogDir, Storage};
-use graphbuff_server::{Log, LogConfig, LoginLimits, Role, Server, ServerConfig, TlsConfig, Users};
+use graphbuff_server::{
+    DEFAULT_TOKEN_LIFETIME, Log, LogConfig, LoginLimits, Role, Server, ServerConfig, TlsConfig, TokenAccess, Users,
+};
 
 const USAGE: &str = "\
 usage: graphbuff-server [--config FILE]
        graphbuff-server users [--config FILE]
                         (list | add NAME [ROLE...] | password NAME
                          | grant NAME ROLE... | revoke NAME ROLE... | remove NAME)
+       graphbuff-server tokens [--config FILE]
+                        (list [USER] | add USER NAME [--write] [--database DB]...
+                         [--days N | --never] | remove USER NAME)
        graphbuff-server admin [--config FILE] (init [NAME] | reset-password NAME)
 
 Settings:
@@ -80,6 +85,15 @@ User accounts:
   directory (the same config file as the server, or --config FILE), only while
   no server uses it. New passwords come from env GRAPHBUFF_PASSWORD, else are asked for
   without echo on a terminal, else read from the first line of standard input.
+
+  API tokens, for programs: a user's token logs in as `Authorization: Bearer gbt_...`
+  (Bolt: bearer), and may do what its user may, up to its own cap: only reading, unless it
+  was made with ACCESS WRITE (--write); on every database, unless it names some; never
+  administration. It expires after 90 days unless made otherwise. Make them with Cypher
+  (CREATE TOKEN laptop [ACCESS WRITE] [ON DATABASE movies] [EXPIRES IN 30 DAYS], SHOW
+  TOKENS, DROP TOKEN laptop; admins also FOR USER alice), or offline with
+  `graphbuff-server tokens ...`, which prints the new token on standard output. The token
+  is shown only once.
 
   The first administrator, at start-up: when no user has the admin role, the server
   creates GRAPHBUFF_ADMIN_USER (default: admin) with the admin role and the password in
@@ -318,6 +332,76 @@ fn users_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
+/// `graphbuff-server tokens [--config FILE] …`: manages the API tokens in the system
+/// database of the data directory, while no server uses it.
+fn tokens_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let (mgr, users, command, rest) = offline_users("tokens", "list, add or remove", args)?;
+    let err = |e: graphbuff::Error| e.to_string();
+    match command.as_str() {
+        "list" => {
+            let user = match rest.as_slice() {
+                [] => None,
+                [user] => Some(user.as_str()),
+                _ => return Err("tokens list takes at most a USER".into()),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            for t in users.tokens(user) {
+                let databases: Vec<&str> = t.databases.iter().map(String::as_str).collect();
+                let databases = if databases.is_empty() { "*".to_string() } else { databases.join(",") };
+                let expires = match t.expires {
+                    None => "never expires".to_string(),
+                    Some(e) if e <= now => "expired".to_string(),
+                    Some(e) => format!("expires in {} h", (e - now) / 3_600_000),
+                };
+                println!("{}\t{}\t{}\t{databases}\t{expires}", t.user, t.name, t.access.name());
+            }
+        }
+        "add" => {
+            let (mut names, mut access, mut databases) = (Vec::new(), TokenAccess::Read, Vec::new());
+            let mut lifetime = Some(DEFAULT_TOKEN_LIFETIME);
+            let mut it = rest.into_iter();
+            while let Some(arg) = it.next() {
+                let mut value = || it.next().ok_or(format!("{arg} needs a value"));
+                match arg.as_str() {
+                    "--write" => access = TokenAccess::Write,
+                    "--never" => lifetime = None,
+                    "--days" => {
+                        let days = value()?.parse().ok().filter(|d| (1..=3650).contains(d));
+                        let days: u64 = days.ok_or("--days needs a number from 1 to 3650")?;
+                        lifetime = Some(Duration::from_secs(days * 24 * 3600));
+                    }
+                    "--database" => {
+                        let db = value()?;
+                        mgr.database(&db).map_err(err)?;
+                        databases.push(mgr.resolve_name(&db));
+                    }
+                    option if option.starts_with("--") => return Err(format!("unknown tokens add option {option}")),
+                    _ => names.push(arg),
+                }
+            }
+            let [user, name] = names.as_slice() else {
+                return Err("tokens add needs a USER and a NAME".into());
+            };
+            let (token, _) = users.create_token(user, name, access, &databases, lifetime).map_err(err)?;
+            eprintln!("added token {name} of {user} ({}); it is not shown again", access.name());
+            println!("{token}");
+        }
+        "remove" => {
+            let [user, name] = rest.as_slice() else {
+                return Err("tokens remove needs a USER and a NAME".into());
+            };
+            if !users.drop_token(user, name).map_err(err)? {
+                return Err(format!("user `{user}` has no token `{name}`"));
+            }
+            println!("removed token {name} of {user}");
+        }
+        other => return Err(format!("unknown tokens command `{other}`")),
+    }
+    Ok(())
+}
+
 /// The names of the users with the admin role.
 fn admins(users: &Users) -> Vec<String> {
     users.list().into_iter().filter(|(_, roles)| roles.contains(&Role::Admin)).map(|(n, _)| n).collect()
@@ -535,6 +619,7 @@ fn main() {
     let offline: Option<OfflineCommand> =
         match std::env::args().nth(1).as_deref() {
             Some("users") => Some(users_command),
+            Some("tokens") => Some(tokens_command),
             Some("admin") => Some(admin_command),
             _ => None,
         };

@@ -97,7 +97,7 @@ pub use log::{Level, Log, LogConfig};
 pub use http::Cors;
 pub use net::TlsConfig;
 pub use throttle::{LoginLimits, MAX_LOCKOUT};
-pub use users::{HashParams, MIN_PASSWORD_LENGTH, Role, Users};
+pub use users::{DEFAULT_TOKEN_LIFETIME, HashParams, MIN_PASSWORD_LENGTH, Role, TokenAccess, TokenInfo, Users};
 
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};

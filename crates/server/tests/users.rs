@@ -11,7 +11,7 @@ use graphbuff::DatabaseManager;
 use graphbuff::cypher::ast::ExistingDatabase;
 use graphbuff_server::json::{self, Json};
 use graphbuff_server::packstream::{self, PackValue};
-use graphbuff_server::{HashParams, LoginLimits, Role, Server, ServerConfig, Users};
+use graphbuff_server::{HashParams, LoginLimits, Role, Server, ServerConfig, TokenAccess, Users};
 
 fn users() -> Arc<Users> {
     let u = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
@@ -827,4 +827,201 @@ fn roles_on_one_database() {
     // A role held everywhere still counts on every database.
     ok(&root, "GRANT ROLE reader TO m");
     assert_eq!(query(addr, &m, "MATCH (n) RETURN count(n)").status, 200);
+}
+
+// ---- API tokens -----------------------------------------------------------------------------
+
+/// Makes an API token with `q` as `auth` and returns its `Authorization` header.
+fn make_token(addr: SocketAddr, auth: &str, q: &str) -> String {
+    let r = query(addr, auth, q);
+    assert_eq!(r.status, 200, "{q}: {}", r.body);
+    let Json::Array(row) = r.rows().remove(0) else { panic!("{}", r.body) };
+    let Some(Json::String(token)) = row.last() else { panic!("{}", r.body) };
+    assert!(token.starts_with("gbt_"), "{token}");
+    format!("Bearer {token}")
+}
+
+#[test]
+fn api_tokens_over_http() {
+    let server = start(users(), Some("tok"));
+    let addr = server.local_addr();
+    let (root, ed, rita, nobody) =
+        (basic("root", "rootpw"), basic("ed", "edpw"), basic("rita", "ritapw"), basic("nobody", "nopw"));
+    for q in ["CREATE DATABASE movies", "CREATE DATABASE other", "CREATE ALIAS films FOR DATABASE movies"] {
+        assert_eq!(query(addr, &root, q).status, 200, "{q}");
+    }
+
+    let admin_write = make_token(addr, &root, "CREATE TOKEN w ACCESS WRITE");
+    let admin_read = make_token(addr, &root, "CREATE TOKEN r");
+    let ed_write = make_token(addr, &ed, "CREATE TOKEN w ACCESS WRITE");
+    let ed_read = make_token(addr, &ed, "CREATE TOKEN r ACCESS READ EXPIRES NEVER");
+    let rita_write = make_token(addr, &rita, "CREATE TOKEN w ACCESS WRITE");
+    let nobody_write = make_token(addr, &nobody, "CREATE TOKEN w ACCESS WRITE");
+    let movies = make_token(addr, &root, "CREATE TOKEN m ACCESS WRITE ON DATABASE Films");
+    let given = make_token(addr, "Bearer tok", "CREATE TOKEN given FOR USER ed ACCESS WRITE");
+    assert_eq!(query(addr, &root, "CREATE TOKEN x ON DATABASE nope").status, 400);
+    // Without a role, and for tokens, the answer does not tell which databases exist.
+    for auth in [&nobody, &admin_write] {
+        for db in ["movies", "nope"] {
+            assert_eq!(query(addr, auth, &format!("CREATE TOKEN x ON DATABASE {db}")).status, 403, "{db}");
+        }
+    }
+
+    // What each may do: (statement, its status with each token).
+    let all = [&admin_write, &admin_read, &ed_write, &ed_read, &rita_write, &nobody_write, &movies, &given];
+    let cases: [(&str, [u16; 8]); 20] = [
+        ("MATCH (n) RETURN count(n)", [200, 200, 200, 200, 200, 403, 403, 200]),
+        ("EXPLAIN CREATE (:P)", [200, 200, 200, 200, 200, 403, 403, 200]),
+        ("PROFILE CREATE (:P)", [200, 403, 200, 403, 403, 403, 403, 200]),
+        ("CREATE (:P {n: 1})", [200, 403, 200, 403, 403, 403, 403, 200]),
+        ("MATCH (p:P) CALL db.create.setNodeVectorProperty(p, 'v', [1.0])", [200, 403, 200, 403, 403, 403, 403, 200]),
+        ("CREATE INDEX i IF NOT EXISTS FOR (p:P) ON (p.n)", [200, 403, 200, 403, 403, 403, 403, 200]),
+        ("USE movies MATCH (n) RETURN count(n)", [200, 200, 200, 200, 200, 403, 200, 200]),
+        ("USE films CREATE (:M)", [200, 403, 200, 403, 403, 403, 200, 200]),
+        ("USE other CREATE (:M)", [200, 403, 200, 403, 403, 403, 403, 200]),
+        ("SHOW DATABASES", [200, 200, 200, 200, 200, 403, 200, 200]),
+        ("CREATE DATABASE nope", [403; 8]),
+        ("DROP DATABASE other", [403; 8]),
+        ("ALTER DATABASE other SET ACCESS READ ONLY", [403; 8]),
+        ("SHOW USERS", [403; 8]),
+        ("CREATE USER evil SET PASSWORD 'evilpw'", [403; 8]),
+        ("GRANT ROLE admin TO nobody", [403; 8]),
+        ("CREATE TOKEN more ACCESS WRITE EXPIRES NEVER", [403; 8]),
+        ("SHOW TOKENS", [403; 8]),
+        ("SHOW SETTINGS", [403; 8]),
+        ("SHOW CURRENT USER", [200; 8]),
+    ];
+    for (q, want) in cases {
+        let got: Vec<u16> = all.iter().map(|t| query(addr, t, q).status).collect();
+        assert_eq!(got, want, "{q}");
+    }
+    for t in all {
+        assert_eq!(query(addr, t, "ALTER CURRENT USER SET PASSWORD FROM 'rootpw' TO 'x'").status, 403);
+        assert_eq!(http(addr, "GET", "/metrics", Some(t), None).status, 403);
+        for path in ["/db/movies/backup", "/db/movies/restore", "/db/movies/check"] {
+            assert_eq!(http(addr, "POST", path, Some(t), Some(r#"{"backup":"b"}"#)).status, 403, "{path}");
+        }
+    }
+    assert!(query(addr, &root, "SHOW CURRENT USER").body.contains("root"));
+    let refused = query(addr, &admin_read, "CREATE (:P)").body;
+    assert!(refused.contains("editor role (or a stronger one), or an API token whose"), "{refused}");
+    assert!(!query(addr, &rita, "CREATE (:P)").body.contains("API token"));
+
+    // Explicit transactions belong to the token.
+    assert_eq!(http(addr, "POST", "/db/other/tx", Some(&movies), Some("")).status, 403);
+    let begin = http(addr, "POST", "/db/movies/tx", Some(&movies), Some(""));
+    assert_eq!(begin.status, 201, "{}", begin.body);
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    let body = Some(r#"{"query":"CREATE (:M)"}"#);
+    assert_eq!(http(addr, "POST", &path, Some(&movies), body).status, 200);
+    for other in [&root, &admin_write, &ed_write] {
+        assert_eq!(http(addr, "POST", &path, Some(other), body).status, 404);
+    }
+    assert_eq!(http(addr, "POST", &format!("{path}/commit"), Some(&movies), Some("")).status, 200);
+    let begin = http(addr, "POST", "/db/movies/tx", Some(&admin_read), Some(""));
+    let path = begin.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).unwrap().1.clone();
+    assert_eq!(http(addr, "POST", &path, Some(&admin_read), body).status, 403);
+    assert_eq!(http(addr, "DELETE", &path, Some(&admin_read), None).status, 200);
+
+    // Dropped, or its user gone: no login.
+    assert_eq!(query(addr, &ed, "DROP TOKEN w").status, 200);
+    assert_eq!(query(addr, &ed_write, "RETURN 1").status, 401);
+    assert_eq!(query(addr, &root, "REVOKE ROLE editor FROM ed").status, 200);
+    assert_eq!(query(addr, &given, "RETURN 1").status, 403);
+    assert_eq!(query(addr, &root, "DROP USER ed").status, 200);
+    assert_eq!(query(addr, &given, "RETURN 1").status, 401);
+    // A token is not a password.
+    let token = admin_write.strip_prefix("Bearer ").unwrap();
+    assert_eq!(query(addr, &basic("root", token), "RETURN 1").status, 401);
+}
+
+#[test]
+fn api_tokens_over_bolt() {
+    let users = users();
+    let (token, _) = users.create_token("root", "t", TokenAccess::Read, &[], None).unwrap();
+    let (expired, _) = users.create_token("root", "old", TokenAccess::Read, &[], Some(Duration::ZERO)).unwrap();
+    let server = start(Arc::clone(&users), None);
+    let logon = |credentials: &str| {
+        let mut b = Bolt::connect(server.bolt_addr().unwrap());
+        let auth = PackValue::map([("scheme", s("bearer")), ("credentials", s(credentials))]);
+        b.send(LOGON, vec![auth]);
+        let reply = b.recv();
+        (b, reply)
+    };
+    let (mut b, reply) = logon(&token);
+    assert_eq!(reply.0, SUCCESS, "{reply:?}");
+    assert_eq!(b.run("RETURN 1", None).unwrap().len(), 1);
+    assert_eq!(b.run("CREATE (n)", None).unwrap_err(), FORBIDDEN);
+    assert_eq!(b.run("SHOW USERS", Some("system")).unwrap_err(), FORBIDDEN);
+    assert_eq!(b.run("CREATE TOKEN more", Some("system")).unwrap_err(), FORBIDDEN);
+    assert_eq!(b.run("CREATE DATABASE nope", Some("system")).unwrap_err(), FORBIDDEN);
+    b.send(BEGIN, vec![PackValue::Map(BTreeMap::new())]);
+    assert_eq!(b.recv().0, SUCCESS);
+    b.send(RUN, vec![s("CREATE (n)"), PackValue::Map(BTreeMap::new()), PackValue::Map(BTreeMap::new())]);
+    let (tag, fields) = b.recv();
+    assert_eq!((tag, failure_code(&fields)), (FAILURE, FORBIDDEN.to_string()));
+    b.send(RESET, vec![]);
+    assert_eq!(b.recv().0, SUCCESS);
+    // Dropping it applies to open connections.
+    users.drop_token("root", "t").unwrap();
+    assert_eq!(b.run("RETURN 1", None).unwrap_err(), "Neo.ClientError.Security.Unauthorized");
+    for bad in [&token, &expired] {
+        let (_, (tag, fields)) = logon(bad);
+        assert_eq!((tag, failure_code(&fields)), (FAILURE, "Neo.ClientError.Security.Unauthorized".to_string()));
+    }
+}
+
+#[test]
+fn expired_tokens_do_not_lock_out_and_wrong_ones_do() {
+    let users = users();
+    let (good, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let (expired, _) = users.create_token("rita", "old", TokenAccess::Read, &[], Some(Duration::ZERO)).unwrap();
+    let server = Server::start(
+        Arc::new(DatabaseManager::in_memory()),
+        ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            users: Some(users),
+            login_limits: LoginLimits { max_failures: 3, lockout: Duration::from_secs(60) },
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr();
+    let status = |token: &str| query(addr, &format!("Bearer {token}"), "RETURN 1").status;
+    for _ in 0..20 {
+        assert_eq!(status(&expired), 401);
+    }
+    assert_eq!(status(&good), 200);
+    // Guessing the secret of one token locks out that token from this address, not others.
+    let wrong = format!("{}{}", &good[..21], "0".repeat(64));
+    for _ in 0..3 {
+        assert_eq!(status(&wrong), 401);
+    }
+    assert_eq!(status(&good), 429);
+    assert_eq!(status(&expired), 401);
+    assert_eq!(query(addr, &basic("rita", "ritapw"), "RETURN 1").status, 200);
+}
+
+#[test]
+fn users_see_the_queries_of_their_tokens() {
+    let users = users();
+    let (a, _) = users.create_token("rita", "a", TokenAccess::Read, &[], None).unwrap();
+    let (b, _) = users.create_token("rita", "b", TokenAccess::Read, &[], None).unwrap();
+    let server = start(users, None);
+    let addr = server.local_addr();
+    let (a, b) = (format!("Bearer {a}"), format!("Bearer {b}"));
+    let runner = a.clone();
+    let running = std::thread::spawn(move || query(addr, &runner, ENDLESS).status);
+    let show = "SHOW TRANSACTIONS YIELD transactionId, username, currentQuery WHERE currentQuery CONTAINS 'endless'";
+    // The user sees what the token runs, under their name; their other tokens do not.
+    let rows = wait_for(addr, &basic("rita", "ritapw"), show);
+    assert!(rows[0].contains(r#""rita""#), "{rows:?}");
+    assert!(rows_of(addr, &b, show).is_empty());
+    assert!(rows_of(addr, &basic("ed", "edpw"), show).is_empty());
+    let id = first_string(&rows[0]);
+    let ended = rows_of(addr, &b, &format!("TERMINATE TRANSACTIONS '{id}'"));
+    assert!(ended[0].contains("not found"), "{ended:?}");
+    let ended = rows_of(addr, &basic("rita", "ritapw"), &format!("TERMINATE TRANSACTIONS '{id}'"));
+    assert!(ended[0].contains("terminated"), "{ended:?}");
+    assert_eq!(running.join().unwrap(), 409);
 }

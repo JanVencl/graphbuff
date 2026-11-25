@@ -74,12 +74,7 @@ impl Ctx {
     ) {
         self.metrics.query(protocol, elapsed, error);
         let Some(log) = &self.log else { return };
-        let user = match who {
-            Principal::Open => "-",
-            Principal::Token => "token",
-            Principal::User(name) => name,
-        };
-        log.query(elapsed, protocol, database, user, text);
+        log.query(elapsed, protocol, database, audit_user(&who.label()), text);
         if let Some(e @ Error::Storage(_)) = error {
             log.error(format_args!("{protocol} query on database {database} failed: {e}"));
         }
@@ -105,7 +100,7 @@ impl Ctx {
         failure: Option<&dyn std::fmt::Display>,
     ) {
         let Some(log) = &self.log else { return };
-        let name = crate::running::username(who);
+        let name = who.label();
         let user = audit_user(&name);
         match failure {
             None => log.security(format_args!("{protocol} {peer} {user} {action}: ok")),
@@ -189,11 +184,22 @@ impl Ctx {
         }
     }
 
-    /// What `who` may do now on every database; `None` if the account no longer exists.
+    /// Who the bearer credential `token` belongs to: the holder of the server token, or an
+    /// API token.
+    pub(crate) fn bearer_login(&self, token: &str) -> Option<Principal> {
+        match &self.token {
+            Some(t) if same_secret(token, t) => Some(Principal::Token),
+            _ => self.users.as_ref()?.authenticate_token(token),
+        }
+    }
+
+    /// What `who` may do now on every database; `None` if the account or API token no
+    /// longer exists, or the token has expired.
     pub(crate) fn access(&self, who: &Principal) -> Option<Access> {
         match who {
             Principal::Open | Principal::Token => Some(Access::Admin),
             Principal::User(name) => self.users.as_ref()?.access(name),
+            Principal::ApiToken { id, .. } => self.users.as_ref()?.token_access(id),
         }
     }
 
@@ -202,6 +208,9 @@ impl Ctx {
         match who {
             Principal::Open | Principal::Token => Access::Admin,
             Principal::User(name) => self.users.as_ref().and_then(|u| u.access_on(name, db)).unwrap_or(Access::None),
+            Principal::ApiToken { id, .. } => {
+                self.users.as_ref().and_then(|u| u.token_access_on(id, db)).unwrap_or(Access::None)
+            }
         }
     }
 
@@ -210,6 +219,9 @@ impl Ctx {
         match who {
             Principal::Open | Principal::Token => Access::Admin,
             Principal::User(name) => self.users.as_ref().and_then(|u| u.best_access(name)).unwrap_or(Access::None),
+            Principal::ApiToken { id, .. } => {
+                self.users.as_ref().and_then(|u| u.token_best_access(id)).unwrap_or(Access::None)
+            }
         }
     }
 
@@ -243,7 +255,7 @@ impl Ctx {
             Statement::User(_) | Statement::Transaction(_) | Statement::Settings(_) => return Ok(()),
         };
         // Roles are granted on databases, not on the aliases that name them.
-        check(self.access_on(who, &self.mgr.resolve_name(&db)), needed, what)
+        check_as(who, self.access_on(who, &self.mgr.resolve_name(&db)), needed, what)
     }
 
     /// Runs a user command for `who`.
@@ -267,6 +279,22 @@ impl Ctx {
         {
             let db = users::resolve(db, params, "database name")?;
             self.mgr.database(&db)?;
+        }
+        // A token is limited to databases that exist, by their names rather than aliases.
+        if let UserCommand::CreateToken { name, user, write, databases, expires } = cmd
+            && !databases.is_empty()
+            && !matches!(who, Principal::ApiToken { .. })
+        {
+            // Like listing databases: which ones exist is not for everyone.
+            check(self.best_access(who), Access::Read, "CREATE TOKEN ON DATABASE")?;
+            let resolve = |db: &DbName| {
+                let db = users::resolve(db, params, "database name")?;
+                self.mgr.database(&db)?;
+                Ok(DbName::Name(self.mgr.resolve_name(&db)))
+            };
+            let databases = databases.iter().map(resolve).collect::<Result<Vec<_>, Error>>()?;
+            let cmd = UserCommand::CreateToken { name: name.clone(), user: user.clone(), write: *write, databases, expires: *expires };
+            return users::run(users, who, access, &cmd, params);
         }
         users::run(users, who, access, cmd, params)
     }
@@ -315,6 +343,15 @@ pub(crate) fn audit_action(stmt: &Statement, params: &BTreeMap<String, Value>) -
             UserCommand::Revoke { roles, database, users } => {
                 format!("REVOKE ROLE {}{} FROM {}", names(roles), on(database), names(users))
             }
+            UserCommand::CreateToken { name: n, user, write, databases, .. } => {
+                let of = user.as_ref().map_or_else(String::new, |u| format!(" FOR USER {}", name(u)));
+                let on = if databases.is_empty() { String::new() } else { format!(" ON DATABASE {}", names(databases)) };
+                format!("CREATE TOKEN {}{of} ACCESS {}{on}", name(n), if *write { "WRITE" } else { "READ" })
+            }
+            UserCommand::DropToken { name: n, user, .. } => {
+                let of = user.as_ref().map_or_else(String::new, |u| format!(" FOR USER {}", name(u)));
+                format!("DROP TOKEN {}{of}", name(n))
+            }
             _ => cmd.name().to_string(),
         },
         Statement::Transaction(cmd) if cmd.terminate => match crate::running::ids(&cmd.ids, params) {
@@ -348,6 +385,16 @@ pub(crate) fn check(access: Access, needed: Access, what: &str) -> Result<(), Er
     Err(Error::Forbidden(format!("{what} needs the {role} role (or a stronger one)")))
 }
 
+/// As [`check`] for `who`; says so if an API token's own limits may be why it is refused.
+pub(crate) fn check_as(who: &Principal, access: Access, needed: Access, what: &str) -> Result<(), Error> {
+    check(access, needed, what).map_err(|e| match (who, e) {
+        (Principal::ApiToken { .. }, Error::Forbidden(m)) => {
+            Error::Forbidden(format!("{m}, or an API token whose access and databases allow it"))
+        }
+        (_, e) => e,
+    })
+}
+
 pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str, out: &mut Out<'_>) -> Response {
     let segments: Vec<String> = req
         .path
@@ -361,7 +408,7 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str, out: &mut Out<'_>) ->
     let who = if segments.as_slice() == ["health"] {
         Principal::Open
     } else {
-        let user = basic_user(req).unwrap_or_default();
+        let user = login_name(req).unwrap_or_default();
         let sent = req.header("authorization").is_some();
         match ctx.throttled_login("http", peer, &user, sent, || authenticate(ctx, req)) {
             Ok(who) => who,
@@ -380,9 +427,9 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str, out: &mut Out<'_>) ->
             }
         }
     };
-    // The account may have been dropped since this connection logged in.
+    // An expired API token logs in, but has no access: it is not a guess to lock out.
     let Some(access) = ctx.access(&who) else {
-        return error(401, "Unauthorized", "the user no longer exists");
+        return error(401, "Unauthorized", no_access(&who));
     };
     let me = Client { who: &who, access, peer };
     let ctx = &(ctx, me);
@@ -446,7 +493,7 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, peer: &str, out: &mut Out<'_>) ->
     }
 }
 
-/// Who sent `req`: `Authorization: Bearer <token>` or `Basic <base64 user:password>`.
+/// Who sent `req`: `Authorization: Bearer <server or API token>` or `Basic <base64 user:password>`.
 fn authenticate(ctx: &Ctx, req: &Request) -> Option<Principal> {
     if !ctx.auth_required() {
         return Some(Principal::Open);
@@ -455,10 +502,7 @@ fn authenticate(ctx: &Ctx, req: &Request) -> Option<Principal> {
     let (scheme, value) = header.split_once(' ')?;
     let value = value.trim();
     if scheme.eq_ignore_ascii_case("bearer") {
-        return match &ctx.token {
-            Some(t) if same_secret(value, t) => Some(Principal::Token),
-            _ => None,
-        };
+        return ctx.bearer_login(value);
     }
     if scheme.eq_ignore_ascii_case("basic") {
         let decoded = String::from_utf8(crypto::base64_decode(value)?).ok()?;
@@ -468,9 +512,21 @@ fn authenticate(ctx: &Ctx, req: &Request) -> Option<Principal> {
     None
 }
 
-/// The user name of `Authorization: Basic …`, for the log.
-fn basic_user(req: &Request) -> Option<String> {
+/// Why a principal without access is refused.
+pub(crate) fn no_access(who: &Principal) -> &'static str {
+    match who {
+        Principal::ApiToken { .. } => "the API token has expired or was dropped",
+        _ => "the user no longer exists",
+    }
+}
+
+/// The user name of `Authorization: Basic …`, or the public part of an API token, to log
+/// and count failed logins.
+fn login_name(req: &Request) -> Option<String> {
     let (scheme, value) = req.header("authorization")?.trim().split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        return Some(users::bearer_name(value.trim()));
+    }
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
@@ -1014,7 +1070,7 @@ fn tx_path(db: &str, id: &str) -> String {
 
 /// `POST /db/{name}/tx`: begins a transaction. The body may be empty or `{}`.
 fn begin(&(ctx, me): &Req, db: Option<&str>, req: &Request) -> Response {
-    if let Err(e) = check(ctx.access_on(me.who, &tx_database(ctx, db)), Access::Read, "a transaction") {
+    if let Err(e) = check_as(me.who, ctx.access_on(me.who, &tx_database(ctx, db)), Access::Read, "a transaction") {
         return query_error(&e);
     }
     let text = match json_body(req) {
@@ -1080,7 +1136,7 @@ fn in_transaction(&(ctx, me): &Req, db: Option<&str>, id: &str, req: &Request) -
         Err(e) => return query_error(&e),
     };
     let (needed, what) = authorize_query(&ctx.mgr, &name, &parsed);
-    if let Err(e) = check(ctx.access_on(me.who, &name), needed, what) {
+    if let Err(e) = check_as(me.who, ctx.access_on(me.who, &name), needed, what) {
         return query_error(&e);
     }
     let started = Instant::now();

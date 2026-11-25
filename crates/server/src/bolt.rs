@@ -757,20 +757,26 @@ impl Conn<'_> {
             _ => "",
         };
         let scheme = text("scheme");
-        let user = if scheme == "basic" { text("principal") } else { "" };
+        let user = match scheme {
+            "basic" => text("principal").to_string(),
+            "bearer" => crate::users::bearer_name(text("credentials")),
+            _ => String::new(),
+        };
         let counts = matches!(scheme, "basic" | "bearer");
         let attempt = || match scheme {
             "basic" => ctx.login(text("principal"), text("credentials")),
-            "bearer" => match &ctx.token {
-                Some(t) if api::same_secret(text("credentials"), t) => Some(Principal::Token),
-                _ => None,
-            },
+            "bearer" => ctx.bearer_login(text("credentials")),
             _ => None,
         };
-        ctx.throttled_login("bolt", &self.peer, user, counts, attempt).map_err(|e| match e {
+        let who = ctx.throttled_login("bolt", &self.peer, &user, counts, attempt).map_err(|e| match e {
             api::LoginError::Wrong => Failure::new(UNAUTHORIZED, "wrong or missing credentials"),
             api::LoginError::Locked(wait) => Failure::new(RATE_LIMIT, api::LoginError::locked_message(wait)),
-        })
+        })?;
+        // An expired API token.
+        match ctx.access(&who) {
+            Some(_) => Ok(who),
+            None => Err(Failure::new(UNAUTHORIZED, api::no_access(&who))),
+        }
     }
 
     /// What the logged-in client may do now.
@@ -778,7 +784,7 @@ impl Conn<'_> {
         let who = self.who.as_ref().ok_or_else(|| Failure::new(UNAUTHORIZED, "not logged in"))?;
         match self.shared.ctx.access(who) {
             Some(a) => Ok((who, a)),
-            None => Err(Failure::new(UNAUTHORIZED, "the user no longer exists")),
+            None => Err(Failure::new(UNAUTHORIZED, api::no_access(who))),
         }
     }
 
@@ -1169,7 +1175,7 @@ impl Conn<'_> {
             let (who, _) = self.access()?;
             let ctx = &self.shared.ctx;
             let access = if self.is_system(&name) { ctx.best_access(who) } else { ctx.access_on(who, &name) };
-            api::check(access, Access::Read, "a transaction").map_err(|e| Failure::from_error(&e))?;
+            api::check_as(who, access, Access::Read, "a transaction").map_err(|e| Failure::from_error(&e))?;
             let limit = self.time_limit(&extra)?;
             if self.is_system(&name) {
                 return Ok((name, limit, None));
@@ -1301,7 +1307,7 @@ impl Conn<'_> {
                         let statement = match tx {
                             Some(_) => api::transaction_query(name, &text, &params).and_then(|q| {
                                 let (needed, what) = api::authorize_query(&ctx.mgr, name, &q);
-                                api::check(ctx.access_on(who, name), needed, what)?;
+                                api::check_as(who, ctx.access_on(who, name), needed, what)?;
                                 Ok(TxStatement::Query(q))
                             }),
                             None => graphbuff::cypher::parse_statement(&text).and_then(|s| {

@@ -36,7 +36,8 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   dates, times, date-times with offsets or named time zones, durations and points, in both
   directions. Byte arrays are refused.
 * **Authentication:** `basic` with a user's name and password; with `security.token`, also
-  `basic` with the token as the password (any user name) or `bearer` with the token.
+  `basic` with the token as the password (any user name) or `bearer` with the token. A
+  user's [API token](Users.md) logs in with `bearer`.
 * **Transactions and limits** behave as over HTTP: an explicit transaction holds its
   database's write lock until it ends, and is rolled back after
   `queries.transaction_timeout_seconds` without a message or when its connection closes;

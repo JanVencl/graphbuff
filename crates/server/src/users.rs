@@ -32,13 +32,24 @@
 //!
 //! New passwords need at least [`MIN_PASSWORD_LENGTH`] characters and must differ from
 //! the user name.
+//!
+//! A user may also have API tokens, for programs: `gbt_<id>_<secret>`, where the secret is
+//! 256 random bits, stored as a SHA-256 hash (a random secret needs no slow hash). A token
+//! may do what its user may, but only up to its own cap (reading, or also writing) and
+//! only on its databases, if it names some; it never administers, nor manages tokens or
+//! passwords. In the system database each token is a node
+//! `(:ApiToken {id, hash, name, user, accountId, access, databases, created, expires,
+//! lastUsed})`. It belongs to the account whose random `accountId` it has, not to whoever
+//! has the name: a user who is dropped or replaced loses their tokens. Tokens are not
+//! connected to the `User` nodes, so that versions without tokens can still delete those.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use graphbuff::{BoxedStore, Database, Error, QueryResult, QueryStats, Result, ResultValue, Value};
-use graphbuff::cypher::ast::{DbName, ExistingDatabase, Secret, UserCommand};
+use graphbuff::{BoxedStore, Database, Error, QueryResult, QueryStats, Result, ResultValue, Temporal, Value};
+use graphbuff::cypher::ast::{DbName, ExistingDatabase, Secret, TokenExpiry, UserCommand};
 
 use crate::crypto::{self, Sha256};
 
@@ -207,8 +218,102 @@ impl PasswordHash {
     }
 }
 
+/// How long an API token works unless it is made with another expiry.
+pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(90 * 24 * 3600);
+
+/// The most API tokens one user may have.
+pub const MAX_TOKENS: usize = 100;
+
+/// How often the time a token was last used is saved, in milliseconds.
+const SAVE_LAST_USED: i64 = 3_600_000;
+
+const TOKEN_PREFIX: &str = "gbt_";
+
+/// What an API token may do at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenAccess {
+    Read,
+    /// Also write data, indexes and constraints.
+    Write,
+}
+
+impl TokenAccess {
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenAccess::Read => "read",
+            TokenAccess::Write => "write",
+        }
+    }
+
+    /// Parses `read` or `write` (case-insensitive).
+    pub fn parse(name: &str) -> Result<TokenAccess> {
+        [TokenAccess::Read, TokenAccess::Write]
+            .into_iter()
+            .find(|a| a.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::Runtime(format!("a token's access is read or write, not `{name}`")))
+    }
+
+    fn access(self) -> Access {
+        match self {
+            TokenAccess::Read => Access::Read,
+            TokenAccess::Write => Access::Write,
+        }
+    }
+}
+
+/// An API token of a user, without its secret. Times are milliseconds since 1970.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenInfo {
+    /// The public part: the token reads `gbt_<id>_<secret>`.
+    pub id: String,
+    pub name: String,
+    pub user: String,
+    pub access: TokenAccess,
+    /// The databases it works on (lowercase); empty for every one.
+    pub databases: BTreeSet<String>,
+    pub created: i64,
+    /// When it stops working, if ever.
+    pub expires: Option<i64>,
+    pub last_used: Option<i64>,
+}
+
+impl TokenInfo {
+    fn expired(&self, now: i64) -> bool {
+        self.expires.is_some_and(|e| e <= now)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ApiToken {
+    info: TokenInfo,
+    /// The SHA-256 hash of the whole token.
+    hash: [u8; 32],
+    /// The [`Account::id`] it belongs to.
+    account: String,
+}
+
+/// The id of a well-formed API token (whether it exists or not); `None` for other text.
+/// The id is not secret.
+pub(crate) fn token_id(token: &str) -> Option<&str> {
+    let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('_')?;
+    crypto::unhex::<8>(id)?;
+    crypto::unhex::<32>(secret)?;
+    Some(id)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn random_hex<const N: usize>() -> Result<String> {
+    let bytes = crypto::secret_bytes::<N>().map_err(|e| Error::Storage(format!("no random numbers: {e}")))?;
+    Ok(crypto::hex(&bytes))
+}
+
 #[derive(Clone)]
 struct Account {
+    /// A random id, given when the account gets its first API token.
+    id: Option<String>,
     password: PasswordHash,
     /// Roles held on every database.
     roles: BTreeSet<Role>,
@@ -225,11 +330,46 @@ impl Account {
     fn is_admin(&self) -> bool {
         self.roles.contains(&Role::Admin)
     }
+
+    /// What the account may do on every database.
+    fn access(&self) -> Access {
+        self.roles.iter().map(|r| r.access()).max().unwrap_or(Access::None)
+    }
+
+    /// What it may do on database `db`.
+    fn access_on(&self, db: &str) -> Access {
+        let here = self.databases.get(&db_key(db)).into_iter().flatten();
+        self.roles.iter().chain(here).map(|r| r.access()).max().unwrap_or(Access::None)
+    }
+
+    /// The most it may do on some database.
+    fn best_access(&self) -> Access {
+        let all = self.roles.iter().chain(self.databases.values().flatten());
+        all.map(|r| r.access()).max().unwrap_or(Access::None)
+    }
+}
+
+/// What is saved.
+#[derive(Clone, Default)]
+struct Data {
+    accounts: BTreeMap<String, Account>,
+    /// API tokens by id. Each belongs to an account that exists.
+    tokens: BTreeMap<String, ApiToken>,
+}
+
+impl Data {
+    /// Drops the tokens whose account is gone or was replaced.
+    fn drop_orphans(&mut self) {
+        let accounts = &self.accounts;
+        self.tokens.retain(|_, t| {
+            accounts.get(&t.info.user).and_then(|a| a.id.as_ref()).is_some_and(|id| *id == t.account)
+        });
+    }
 }
 
 #[derive(Default)]
 struct State {
-    accounts: BTreeMap<String, Account>,
+    data: Data,
     /// Users whose password was checked: their [`PasswordHash::quick`] hash.
     verified: HashMap<String, [u8; 32]>,
 }
@@ -250,6 +390,8 @@ pub struct Users {
     state: RwLock<State>,
     /// Limits the password hashes computed at once (each takes the hash's memory).
     hashing: Gate,
+    /// When each API token was last used, by id; saved now and then.
+    used: Mutex<HashMap<String, i64>>,
 }
 
 /// A counting semaphore: at most `max` holders at once, the others wait.
@@ -296,7 +438,7 @@ impl fmt::Debug for Users {
         };
         f.debug_struct("Users")
             .field("store", &store)
-            .field("users", &self.read().accounts.keys().collect::<Vec<_>>())
+            .field("users", &self.read().data.accounts.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -313,6 +455,12 @@ pub fn check_name(name: &str) -> Result<()> {
             "invalid user name `{name}`: use 1 to 64 letters, digits, '_', '.', '@' and '-'"
         )))
     }
+}
+
+fn check_token_name(name: &str) -> Result<()> {
+    check_name(name).map_err(|_| {
+        Error::Semantic(format!("invalid token name `{name}`: use 1 to 64 letters, digits, '_', '.', '@' and '-'"))
+    })
 }
 
 /// Checks a new password for `name`.
@@ -342,6 +490,7 @@ impl Users {
             min_password_length: MIN_PASSWORD_LENGTH,
             state: RwLock::default(),
             hashing: Gate::default(),
+            used: Mutex::default(),
         }
     }
 
@@ -351,6 +500,7 @@ impl Users {
     pub fn system(db: Arc<Database<BoxedStore>>) -> Result<Users> {
         let bad = |msg: String| Error::Storage(format!("system database: {msg}"));
         db.execute("CREATE CONSTRAINT system_user_name IF NOT EXISTS FOR (u:User) REQUIRE u.name IS UNIQUE")?;
+        db.execute("CREATE CONSTRAINT system_api_token_id IF NOT EXISTS FOR (t:ApiToken) REQUIRE t.id IS UNIQUE")?;
         let info = db.execute_with_params(
             "MERGE (i:SystemInfo) ON CREATE SET i.version = $version RETURN i.version",
             &BTreeMap::from([("version".to_string(), Value::Int(SYSTEM_VERSION))]),
@@ -368,11 +518,16 @@ impl Users {
             rows => return Err(bad(format!("{} SystemInfo nodes, expected one", rows.len()))),
         }
 
-        let rows = db.execute("MATCH (u:User) RETURN u.name, u.password, u.roles, u.databaseRoles")?.rows;
+        let rows = db.execute("MATCH (u:User) RETURN u.name, u.password, u.roles, u.databaseRoles, u.accountId")?.rows;
         let mut accounts = BTreeMap::new();
         for row in rows {
-            let [ResultValue::String(name), ResultValue::String(hash), roles, db_roles] = row.as_slice() else {
+            let [ResultValue::String(name), ResultValue::String(hash), roles, db_roles, id] = row.as_slice() else {
                 return Err(bad(format!("invalid user record {row:?}")));
+            };
+            let id = match id {
+                ResultValue::Null => None,
+                ResultValue::String(id) => Some(id.clone()),
+                other => return Err(bad(format!("invalid account id {other:?} of `{name}`"))),
             };
             check_name(name).map_err(|_| bad(format!("invalid user name `{name}`")))?;
             let password = PasswordHash::decode(hash).ok_or_else(|| bad(format!("invalid password hash of `{name}`")))?;
@@ -407,19 +562,22 @@ impl Users {
                 }
                 other => return Err(bad(format!("invalid database roles {other:?} of `{name}`"))),
             }
-            if accounts.insert(name.clone(), Account { password, roles, databases }).is_some() {
+            if accounts.insert(name.clone(), Account { id, password, roles, databases }).is_some() {
                 return Err(bad(format!("duplicate user `{name}`")));
             }
         }
+        let mut data = Data { accounts, tokens: load_tokens(&db)? };
+        data.drop_orphans();
         Ok(Users {
             store: Store::System(db),
             params: HashParams::DEFAULT,
             min_password_length: MIN_PASSWORD_LENGTH,
             state: RwLock::new(State {
-                accounts,
+                data,
                 verified: HashMap::new(),
             }),
             hashing: Gate::default(),
+            used: Mutex::default(),
         })
     }
 
@@ -439,7 +597,7 @@ impl Users {
 
     /// Whether some user holds the admin role.
     pub fn has_admin(&self) -> bool {
-        self.read().accounts.values().any(Account::is_admin)
+        self.read().data.accounts.values().any(Account::is_admin)
     }
 
     /// Whether the accounts are kept in the system database.
@@ -456,12 +614,13 @@ impl Users {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read().accounts.is_empty()
+        self.read().data.accounts.is_empty()
     }
 
     /// Every user with their roles, by name.
     pub fn list(&self) -> Vec<(String, Vec<Role>)> {
         self.read()
+            .data
             .accounts
             .iter()
             .map(|(n, a)| (n.clone(), a.roles.iter().copied().collect()))
@@ -470,13 +629,13 @@ impl Users {
 
     /// The roles of `name`, if the user exists.
     pub fn roles(&self, name: &str) -> Option<Vec<Role>> {
-        self.read().accounts.get(name).map(|a| a.roles.iter().copied().collect())
+        self.read().data.accounts.get(name).map(|a| a.roles.iter().copied().collect())
     }
 
     /// The roles `name` holds on database `db` only, by database, if the user exists.
     pub fn database_roles(&self, name: &str) -> Option<BTreeMap<String, Vec<Role>>> {
         let st = self.read();
-        let a = st.accounts.get(name)?;
+        let a = st.data.accounts.get(name)?;
         Some(a.databases.iter().map(|(db, r)| (db.clone(), r.iter().copied().collect())).collect())
     }
 
@@ -484,24 +643,164 @@ impl Users {
     /// is no such user (any more).
     pub(crate) fn access(&self, name: &str) -> Option<Access> {
         let st = self.read();
-        let account = st.accounts.get(name)?;
-        Some(account.roles.iter().map(|r| r.access()).max().unwrap_or(Access::None))
+        let account = st.data.accounts.get(name)?;
+        Some(account.access())
     }
 
     /// What `name` may do on database `db`: its strongest role held everywhere or there.
     pub(crate) fn access_on(&self, name: &str, db: &str) -> Option<Access> {
         let st = self.read();
-        let account = st.accounts.get(name)?;
-        let here = account.databases.get(&db_key(db)).into_iter().flatten();
-        Some(account.roles.iter().chain(here).map(|r| r.access()).max().unwrap_or(Access::None))
+        let account = st.data.accounts.get(name)?;
+        Some(account.access_on(db))
     }
 
     /// The most `name` may do on some database.
     pub(crate) fn best_access(&self, name: &str) -> Option<Access> {
         let st = self.read();
-        let account = st.accounts.get(name)?;
-        let all = account.roles.iter().chain(account.databases.values().flatten());
-        Some(all.map(|r| r.access()).max().unwrap_or(Access::None))
+        let account = st.data.accounts.get(name)?;
+        Some(account.best_access())
+    }
+
+    // ---- API tokens ----
+
+    /// Who the API token `token` belongs to: its principal, also if it has expired (it
+    /// may then do nothing, see [`Users::token_access`]), or `None` if there is no such
+    /// token.
+    pub(crate) fn authenticate_token(&self, token: &str) -> Option<Principal> {
+        let id = token_id(token)?;
+        let now = now_millis();
+        let (who, saved) = {
+            let st = self.read();
+            let t = st.data.tokens.get(id)?;
+            if !crypto::same_bytes(&crypto::sha256(token.as_bytes()), &t.hash) {
+                return None;
+            }
+            let who = Principal::ApiToken { user: t.info.user.clone(), id: id.to_string() };
+            if t.info.expired(now) {
+                return Some(who);
+            }
+            (who, t.info.last_used)
+        };
+        self.used.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), now);
+        if saved.is_none_or(|s| now - s >= SAVE_LAST_USED) {
+            // Only for information: a login does not fail because this could not be saved.
+            let _ = self.change(|d| {
+                if let Some(t) = d.tokens.get_mut(id) {
+                    t.info.last_used = Some(now);
+                }
+                Ok(())
+            });
+        }
+        Some(who)
+    }
+
+    /// What `pick` says of a token that has not expired and its account: `None` for no
+    /// such token (any more).
+    fn token<T>(&self, id: &str, pick: impl FnOnce(&TokenInfo, &Account) -> T) -> Option<T> {
+        let st = self.read();
+        let t = st.data.tokens.get(id).filter(|t| !t.info.expired(now_millis()))?;
+        let account = st.data.accounts.get(&t.info.user)?;
+        Some(pick(&t.info, account))
+    }
+
+    /// What API token `id` may do everywhere: nothing if it is limited to some databases.
+    pub(crate) fn token_access(&self, id: &str) -> Option<Access> {
+        self.token(id, |t, account| match t.databases.is_empty() {
+            true => account.access().min(t.access.access()),
+            false => Access::None,
+        })
+    }
+
+    /// What API token `id` may do on database `db`.
+    pub(crate) fn token_access_on(&self, id: &str, db: &str) -> Option<Access> {
+        self.token(id, |t, account| match t.databases.is_empty() || t.databases.contains(&db_key(db)) {
+            true => account.access_on(db).min(t.access.access()),
+            false => Access::None,
+        })
+    }
+
+    /// The most API token `id` may do on some database.
+    pub(crate) fn token_best_access(&self, id: &str) -> Option<Access> {
+        self.token(id, |t, account| {
+            let most = match t.databases.is_empty() {
+                true => account.best_access(),
+                false => t.databases.iter().map(|db| account.access_on(db)).max().unwrap_or(Access::None),
+            };
+            most.min(t.access.access())
+        })
+    }
+
+    /// Makes an API token of `user` and returns it: the only time its secret is known.
+    /// It may do what `user` may, up to `access`, on `databases` (every one if empty), for
+    /// `lifetime` (`None`: until it is dropped).
+    pub fn create_token(
+        &self,
+        user: &str,
+        name: &str,
+        access: TokenAccess,
+        databases: &[String],
+        lifetime: Option<Duration>,
+    ) -> Result<(String, TokenInfo)> {
+        check_token_name(name)?;
+        let id = random_hex::<8>()?;
+        let token = format!("{TOKEN_PREFIX}{id}_{}", random_hex::<32>()?);
+        let new_account = random_hex::<16>()?;
+        let created = now_millis();
+        let info = TokenInfo {
+            id: id.clone(),
+            name: name.to_string(),
+            user: user.to_string(),
+            access,
+            databases: databases.iter().map(|d| db_key(d)).collect(),
+            created,
+            expires: lifetime.map(|l| created.saturating_add(i64::try_from(l.as_millis()).unwrap_or(i64::MAX))),
+            last_used: None,
+        };
+        let hash = crypto::sha256(token.as_bytes());
+        self.change(|d| {
+            let account = d.accounts.get_mut(user).ok_or_else(|| no_user(user))?;
+            let of_user = || d.tokens.values().filter(|t| t.info.user == user);
+            if of_user().any(|t| t.info.name == name) {
+                return Err(Error::Runtime(format!("user `{user}` already has a token `{name}`")));
+            }
+            if of_user().count() >= MAX_TOKENS {
+                return Err(Error::Runtime(format!("user `{user}` already has {MAX_TOKENS} tokens; drop some first")));
+            }
+            let account = account.id.get_or_insert(new_account).clone();
+            d.tokens.insert(id, ApiToken { info: info.clone(), hash, account });
+            Ok(())
+        })?;
+        Ok((token, info))
+    }
+
+    /// The API tokens of `user` (`None`: of every user), by user and name.
+    pub fn tokens(&self, user: Option<&str>) -> Vec<TokenInfo> {
+        let mut list: Vec<TokenInfo> = {
+            let st = self.read();
+            let wanted = st.data.tokens.values().filter(|t| user.is_none_or(|u| t.info.user == u));
+            wanted.map(|t| t.info.clone()).collect()
+        };
+        let used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        for t in &mut list {
+            t.last_used = t.last_used.max(used.get(&t.id).copied());
+        }
+        list.sort_by(|a, b| (&a.user, &a.name).cmp(&(&b.user, &b.name)));
+        list
+    }
+
+    /// Removes the API token `name` of `user`; returns whether there was one.
+    pub fn drop_token(&self, user: &str, name: &str) -> Result<bool> {
+        let id = {
+            let st = self.read();
+            if !st.data.accounts.contains_key(user) {
+                return Err(no_user(user));
+            }
+            match st.data.tokens.values().find(|t| t.info.user == user && t.info.name == name) {
+                Some(t) => t.info.id.clone(),
+                None => return Ok(false),
+            }
+        };
+        self.change(|d| Ok(d.tokens.remove(&id).is_some()))
     }
 
     /// Whether `password` is `name`'s password. A hash made with parameters other than
@@ -509,7 +808,7 @@ impl Users {
     pub fn authenticate(&self, name: &str, password: &str) -> bool {
         let stored = {
             let st = self.read();
-            let Some(account) = st.accounts.get(name) else {
+            let Some(account) = st.data.accounts.get(name) else {
                 return false;
             };
             if let Some(quick) = st.verified.get(name) {
@@ -525,7 +824,7 @@ impl Users {
         let mut current = stored.clone();
         if stored.params != self.params {
             let new = self.hashing.run(|| PasswordHash::new(password, self.params));
-            let upgraded = self.change(|accounts| match accounts.get_mut(name) {
+            let upgraded = self.change(|d| match d.accounts.get_mut(name) {
                 // Only if the password did not change meanwhile.
                 Some(a) if a.password == stored => {
                     a.password = new.clone();
@@ -539,32 +838,35 @@ impl Users {
         }
         let mut st = self.write();
         // Remember it only if the password did not change meanwhile.
-        if st.accounts.get(name).is_some_and(|a| a.password == current) {
+        if st.data.accounts.get(name).is_some_and(|a| a.password == current) {
             st.verified.insert(name.to_string(), current.quick(password));
         }
         true
     }
 
-    /// Applies `change` to a copy of the accounts, saves the copy, then makes it
-    /// current. Returns what `change` returned.
-    fn change<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Account>) -> Result<T>) -> Result<T> {
+    /// Applies `change` to a copy of the accounts and tokens, drops the tokens of accounts
+    /// that are gone, saves the copy, then makes it current. Returns what `change`
+    /// returned.
+    fn change<T>(&self, change: impl FnOnce(&mut Data) -> Result<T>) -> Result<T> {
         let mut st = self.write();
-        let mut accounts = st.accounts.clone();
-        let out = change(&mut accounts)?;
-        if st.accounts.values().any(Account::is_admin) && !accounts.values().any(Account::is_admin) {
+        let mut data = st.data.clone();
+        let out = change(&mut data)?;
+        data.drop_orphans();
+        let has_admin = |d: &Data| d.accounts.values().any(Account::is_admin);
+        if has_admin(&st.data) && !has_admin(&data) {
             return Err(Error::Constraint(
                 "this would leave no administrator; give another user the admin role first".into(),
             ));
         }
         match &self.store {
             Store::Memory => {}
-            Store::System(db) => save_system(db, &st.accounts, &accounts)?,
+            Store::System(db) => save_system(db, &st.data, &data)?,
         }
-        let State { accounts: old, verified } = &mut *st;
+        let State { data: old, verified } = &mut *st;
         verified.retain(|name, _| {
-            matches!((old.get(name), accounts.get(name)), (Some(a), Some(b)) if a.password == b.password)
+            matches!((old.accounts.get(name), data.accounts.get(name)), (Some(a), Some(b)) if a.password == b.password)
         });
-        st.accounts = accounts;
+        st.data = data;
         Ok(out)
     }
 
@@ -573,11 +875,11 @@ impl Users {
     pub fn create(&self, name: &str, password: &str, roles: &[Role], existing: ExistingDatabase) -> Result<bool> {
         check_name(name)?;
         check_password(name, password, self.min_password_length)?;
-        if existing == ExistingDatabase::Keep && self.read().accounts.contains_key(name) {
+        if existing == ExistingDatabase::Keep && self.read().data.accounts.contains_key(name) {
             return Ok(false);
         }
         let password = PasswordHash::new(password, self.params);
-        self.change(|accounts| {
+        self.change(|Data { accounts, .. }| {
             if accounts.contains_key(name) {
                 match existing {
                     ExistingDatabase::Fail => return Err(Error::Runtime(format!("user `{name}` already exists"))),
@@ -586,7 +888,7 @@ impl Users {
                 }
             }
             let roles = roles.iter().copied().collect();
-            accounts.insert(name.to_string(), Account { password, roles, databases: BTreeMap::new() });
+            accounts.insert(name.to_string(), Account { id: None, password, roles, databases: BTreeMap::new() });
             Ok(true)
         })
     }
@@ -594,11 +896,11 @@ impl Users {
     /// Sets `name`'s password.
     pub fn set_password(&self, name: &str, password: &str) -> Result<()> {
         check_password(name, password, self.min_password_length)?;
-        if !self.read().accounts.contains_key(name) {
+        if !self.read().data.accounts.contains_key(name) {
             return Err(no_user(name));
         }
         let password = PasswordHash::new(password, self.params);
-        self.change(|accounts| {
+        self.change(|Data { accounts, .. }| {
             accounts.get_mut(name).ok_or_else(|| no_user(name))?.password = password;
             Ok(())
         })
@@ -606,12 +908,12 @@ impl Users {
 
     /// Gives `role` to `name`; returns whether the user lacked it.
     pub fn grant(&self, name: &str, role: Role) -> Result<bool> {
-        self.change(|accounts| Ok(accounts.get_mut(name).ok_or_else(|| no_user(name))?.roles.insert(role)))
+        self.change(|d| Ok(d.accounts.get_mut(name).ok_or_else(|| no_user(name))?.roles.insert(role)))
     }
 
     /// Takes `role` from `name`; returns whether the user had it.
     pub fn revoke(&self, name: &str, role: Role) -> Result<bool> {
-        self.change(|accounts| Ok(accounts.get_mut(name).ok_or_else(|| no_user(name))?.roles.remove(&role)))
+        self.change(|d| Ok(d.accounts.get_mut(name).ok_or_else(|| no_user(name))?.roles.remove(&role)))
     }
 
     /// Gives `role` (reader or editor) to `name` on database `db` only; returns whether
@@ -622,7 +924,7 @@ impl Users {
                 "the admin role is held on every database; grant it without ON DATABASE".into(),
             ));
         }
-        self.change(|accounts| {
+        self.change(|Data { accounts, .. }| {
             let a = accounts.get_mut(name).ok_or_else(|| no_user(name))?;
             Ok(a.databases.entry(db_key(db)).or_default().insert(role))
         })
@@ -630,7 +932,7 @@ impl Users {
 
     /// Takes `role` from `name` on database `db`; returns whether the user had it there.
     pub fn revoke_on(&self, name: &str, db: &str, role: Role) -> Result<bool> {
-        self.change(|accounts| {
+        self.change(|Data { accounts, .. }| {
             let a = accounts.get_mut(name).ok_or_else(|| no_user(name))?;
             let key = db_key(db);
             let Some(roles) = a.databases.get_mut(&key) else { return Ok(false) };
@@ -642,18 +944,18 @@ impl Users {
         })
     }
 
-    /// Removes a user; returns whether there was one.
+    /// Removes a user, with their API tokens; returns whether there was one.
     pub fn drop_user(&self, name: &str) -> Result<bool> {
-        if !self.read().accounts.contains_key(name) {
+        if !self.read().data.accounts.contains_key(name) {
             return Ok(false);
         }
-        self.change(|accounts| Ok(accounts.remove(name).is_some()))
+        self.change(|d| Ok(d.accounts.remove(name).is_some()))
     }
 
-    /// Renames a user; returns whether there was one to rename.
+    /// Renames a user, who keeps their API tokens; returns whether there was one to rename.
     pub fn rename(&self, from: &str, to: &str) -> Result<bool> {
         check_name(to)?;
-        self.change(|accounts| {
+        self.change(|Data { accounts, tokens }| {
             if !accounts.contains_key(from) {
                 return Ok(false);
             }
@@ -662,15 +964,85 @@ impl Users {
             }
             let account = accounts.remove(from).expect("checked");
             accounts.insert(to.to_string(), account);
+            for t in tokens.values_mut().filter(|t| t.info.user == from) {
+                t.info.user = to.to_string();
+            }
             Ok(true)
         })
     }
 }
 
+/// The API tokens in the system database, by id.
+fn load_tokens(db: &Database<BoxedStore>) -> Result<BTreeMap<String, ApiToken>> {
+    let bad = |what: &str, id: &str| Error::Storage(format!("system database: invalid {what} of API token `{id}`"));
+    let rows = db
+        .execute(
+            "MATCH (t:ApiToken) RETURN t.id, t.hash, t.name, t.user, t.accountId, t.access, \
+             t.databases, t.created, t.expires, t.lastUsed",
+        )?
+        .rows;
+    let mut tokens = BTreeMap::new();
+    for row in rows {
+        let [id, hash, name, user, account, access, databases, created, expires, last_used] = row.as_slice() else {
+            return Err(bad("record", "?"));
+        };
+        let id = id.as_str().filter(|id| crypto::unhex::<8>(id).is_some()).ok_or_else(|| bad("id", "?"))?;
+        let time = |v: &ResultValue, what: &str| match v {
+            ResultValue::Null => Ok(None),
+            ResultValue::Int(ms) => Ok(Some(*ms)),
+            _ => Err(bad(what, id)),
+        };
+        let databases = match databases {
+            ResultValue::List(list) => list.iter().map(|d| d.as_str().map(db_key)).collect::<Option<BTreeSet<String>>>(),
+            _ => None,
+        };
+        let token = ApiToken {
+            info: TokenInfo {
+                id: id.to_string(),
+                name: name.as_str().ok_or_else(|| bad("name", id))?.to_string(),
+                user: user.as_str().ok_or_else(|| bad("user", id))?.to_string(),
+                access: access.as_str().and_then(|a| TokenAccess::parse(a).ok()).ok_or_else(|| bad("access", id))?,
+                databases: databases.ok_or_else(|| bad("databases", id))?,
+                created: created.as_int().ok_or_else(|| bad("creation time", id))?,
+                expires: time(expires, "expiry")?,
+                last_used: time(last_used, "last use")?,
+            },
+            hash: hash.as_str().and_then(crypto::unhex::<32>).ok_or_else(|| bad("hash", id))?,
+            account: account.as_str().ok_or_else(|| bad("account", id))?.to_string(),
+        };
+        tokens.insert(id.to_string(), token);
+    }
+    Ok(tokens)
+}
+
+/// An API token as the properties of its node.
+fn token_record(t: &ApiToken) -> Value {
+    let s = |v: &str| Value::String(v.to_string());
+    let time = |v: Option<i64>| v.map_or(Value::Null, Value::Int);
+    let fields = [
+        ("id", s(&t.info.id)),
+        ("hash", s(&crypto::hex(&t.hash))),
+        ("name", s(&t.info.name)),
+        ("user", s(&t.info.user)),
+        ("accountId", s(&t.account)),
+        ("access", s(t.info.access.name())),
+        ("databases", Value::List(t.info.databases.iter().map(|d| s(d)).collect())),
+        ("created", Value::Int(t.info.created)),
+        ("expires", time(t.info.expires)),
+        ("lastUsed", time(t.info.last_used)),
+    ];
+    Value::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
 /// Writes the difference between `old` and `new` to the system database, in one
-/// statement: accounts that are gone or renamed are deleted, new and changed ones are
-/// written.
-fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: &BTreeMap<String, Account>) -> Result<()> {
+/// statement: accounts that are gone or renamed and tokens that are gone are deleted, new
+/// and changed ones are written.
+fn save_system(db: &Database<BoxedStore>, old: &Data, new: &Data) -> Result<()> {
+    let drop_tokens: Vec<Value> =
+        old.tokens.keys().filter(|id| !new.tokens.contains_key(*id)).map(|id| Value::String(id.clone())).collect();
+    let tokens: Vec<Value> =
+        new.tokens.iter().filter(|(id, t)| old.tokens.get(*id) != Some(*t)).map(|(_, t)| token_record(t)).collect();
+    let (old, new) = (&old.accounts, &new.accounts);
     let remove: Vec<Value> = old
         .keys()
         .filter(|name| !new.contains_key(*name))
@@ -680,11 +1052,12 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
         .iter()
         .filter(|(name, a)| {
             old.get(*name)
-                .is_none_or(|o| o.roles != a.roles || o.databases != a.databases || o.password != a.password)
+                .is_none_or(|o| o.id != a.id || o.roles != a.roles || o.databases != a.databases || o.password != a.password)
         })
         .map(|(name, a)| {
             Value::Map(BTreeMap::from([
                 ("name".to_string(), Value::String(name.clone())),
+                ("accountId".to_string(), a.id.clone().map_or(Value::Null, Value::String)),
                 ("password".to_string(), Value::String(a.password.encode())),
                 (
                     "roles".to_string(),
@@ -702,19 +1075,25 @@ fn save_system(db: &Database<BoxedStore>, old: &BTreeMap<String, Account>, new: 
             ]))
         })
         .collect();
-    if remove.is_empty() && upsert.is_empty() {
+    if remove.is_empty() && upsert.is_empty() && drop_tokens.is_empty() && tokens.is_empty() {
         return Ok(());
     }
     db.execute_with_params(
         "OPTIONAL MATCH (old:User) WHERE old.name IN $remove \
          DELETE old \
          WITH count(*) AS ignored \
-         UNWIND $upsert AS a \
-         MERGE (u:User {name: a.name}) \
-         SET u.password = a.password, u.roles = a.roles, u.databaseRoles = a.databaseRoles",
+         OPTIONAL MATCH (old:ApiToken) WHERE old.id IN $dropTokens \
+         DELETE old \
+         WITH count(*) AS ignored \
+         FOREACH (a IN $upsert | \
+           MERGE (u:User {name: a.name}) \
+           SET u.password = a.password, u.roles = a.roles, u.databaseRoles = a.databaseRoles, u.accountId = a.accountId) \
+         FOREACH (t IN $tokens | MERGE (k:ApiToken {id: t.id}) SET k = t)",
         &BTreeMap::from([
             ("remove".to_string(), Value::List(remove)),
             ("upsert".to_string(), Value::List(upsert)),
+            ("dropTokens".to_string(), Value::List(drop_tokens)),
+            ("tokens".to_string(), Value::List(tokens)),
         ]),
     )
     .map_err(|e| Error::Storage(format!("saving the accounts in the system database: {e}")))?;
@@ -731,6 +1110,27 @@ pub(crate) enum Principal {
     /// The server token: an administrator that is not a user account.
     Token,
     User(String),
+    /// An API token of `user`.
+    ApiToken { user: String, id: String },
+}
+
+impl Principal {
+    /// The name in logs: a user's, with the id of the API token they used; `token` for the
+    /// server token, and nothing without authentication.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Principal::Open => String::new(),
+            Principal::Token => "token".into(),
+            Principal::User(name) => name.clone(),
+            Principal::ApiToken { user, id } => format!("{user}[{TOKEN_PREFIX}{id}]"),
+        }
+    }
+}
+
+/// The name that failed logins with a bearer credential are counted under: an API token's
+/// public part, or nothing.
+pub(crate) fn bearer_name(credential: &str) -> String {
+    token_id(credential).map_or_else(String::new, |id| format!("{TOKEN_PREFIX}{id}"))
 }
 
 pub(crate) fn resolve(name: &DbName, params: &BTreeMap<String, Value>, what: &str) -> Result<String> {
@@ -787,6 +1187,51 @@ fn user_table(rows: Vec<Vec<ResultValue>>) -> QueryResult {
     }
 }
 
+fn token_row(t: &TokenInfo) -> Vec<ResultValue> {
+    let time = |ms: Option<i64>| {
+        ms.and_then(|ms| Temporal::from_epoch_nanos(i128::from(ms) * 1_000_000).ok())
+            .map_or(ResultValue::Null, ResultValue::Temporal)
+    };
+    vec![
+        ResultValue::String(t.name.clone()),
+        ResultValue::String(t.user.clone()),
+        ResultValue::String(t.access.name().into()),
+        ResultValue::List(t.databases.iter().map(|d| ResultValue::String(d.clone())).collect()),
+        time(Some(t.created)),
+        time(t.expires),
+        time(t.last_used),
+        ResultValue::String(t.id.clone()),
+    ]
+}
+
+const TOKEN_COLUMNS: [&str; 8] = ["name", "user", "access", "databases", "created", "expires", "lastUsed", "id"];
+
+/// The user whose tokens a command is about: the one it names, which needs the admin role
+/// unless it is the client's own, else the client's own.
+fn token_owner(
+    who: &Principal,
+    access: Access,
+    user: &Option<DbName>,
+    params: &BTreeMap<String, Value>,
+    what: &str,
+) -> Result<String> {
+    let own = match who {
+        Principal::User(name) => Some(name),
+        _ => None,
+    };
+    match (user, own) {
+        (Some(u), _) => {
+            let user = resolve(u, params, "user name")?;
+            if own != Some(&user) && access < Access::Admin {
+                return Err(Error::Forbidden(format!("{what} FOR USER another user needs the admin role")));
+            }
+            Ok(user)
+        }
+        (None, Some(name)) => Ok(name.clone()),
+        (None, None) => Err(Error::Semantic(format!("{what} needs FOR USER: this client is not a user account"))),
+    }
+}
+
 /// Runs a user command for `who`, who may do `access`.
 pub(crate) fn run(
     users: &Users,
@@ -795,7 +1240,19 @@ pub(crate) fn run(
     cmd: &UserCommand,
     params: &BTreeMap<String, Value>,
 ) -> Result<QueryResult> {
-    let own = matches!(cmd, UserCommand::ShowCurrentUser | UserCommand::AlterCurrent { .. });
+    // An API token never manages accounts, its own user's tokens and password included.
+    if matches!(who, Principal::ApiToken { .. }) && !matches!(cmd, UserCommand::ShowCurrentUser) {
+        return Err(Error::Forbidden(format!("{} cannot be run with an API token; log in with the password", cmd.name())));
+    }
+    // These check for themselves.
+    let own = matches!(
+        cmd,
+        UserCommand::ShowCurrentUser
+            | UserCommand::AlterCurrent { .. }
+            | UserCommand::CreateToken { .. }
+            | UserCommand::ShowTokens
+            | UserCommand::DropToken { .. }
+    );
     if !own && access < Access::Admin {
         return Err(Error::Forbidden(format!("{} needs the admin role", cmd.name())));
     }
@@ -803,7 +1260,7 @@ pub(crate) fn run(
         UserCommand::ShowUsers => Ok(user_table(users.list().iter().map(|(n, r)| user_row(users, n, r)).collect())),
         UserCommand::ShowCurrentUser => {
             let rows = match who {
-                Principal::User(name) => users.roles(name).map(|r| user_row(users, name, &r)).into_iter().collect(),
+                Principal::User(name) | Principal::ApiToken { user: name, .. } => users.roles(name).map(|r| user_row(users, name, &r)).into_iter().collect(),
                 _ => Vec::new(),
             };
             Ok(user_table(rows))
@@ -909,6 +1366,46 @@ pub(crate) fn run(
                 }
             }
             Ok(changed(n))
+        }
+        UserCommand::CreateToken { name, user, write, databases, expires } => {
+            let user = token_owner(who, access, user, params, cmd.name())?;
+            let name = resolve(name, params, "token name")?;
+            let databases =
+                databases.iter().map(|d| resolve(d, params, "database name")).collect::<Result<Vec<_>>>()?;
+            let token_access = if *write { TokenAccess::Write } else { TokenAccess::Read };
+            let lifetime = match expires {
+                None => Some(DEFAULT_TOKEN_LIFETIME),
+                Some(TokenExpiry::Never) => None,
+                Some(TokenExpiry::Hours(h)) => Some(Duration::from_secs(u64::from(*h) * 3600)),
+            };
+            let (token, info) = users.create_token(&user, &name, token_access, &databases, lifetime)?;
+            let mut row = token_row(&info);
+            row.push(ResultValue::String(token));
+            Ok(QueryResult {
+                columns: TOKEN_COLUMNS.into_iter().chain(["token"]).map(String::from).collect(),
+                rows: vec![row],
+                ..changed(1)
+            })
+        }
+        UserCommand::ShowTokens => {
+            let list = match who {
+                Principal::User(name) if access < Access::Admin => users.tokens(Some(name)),
+                _ => users.tokens(None),
+            };
+            Ok(QueryResult {
+                columns: TOKEN_COLUMNS.map(String::from).to_vec(),
+                rows: list.iter().map(token_row).collect(),
+                ..changed(0)
+            })
+        }
+        UserCommand::DropToken { name, user, if_exists } => {
+            let user = token_owner(who, access, user, params, cmd.name())?;
+            let name = resolve(name, params, "token name")?;
+            match users.drop_token(&user, &name)? {
+                true => Ok(changed(1)),
+                false if *if_exists => Ok(changed(0)),
+                false => Err(Error::Runtime(format!("user `{user}` has no token `{name}`"))),
+            }
         }
     }
 }
@@ -1142,6 +1639,191 @@ mod tests {
     }
 
     #[test]
+    fn tokens_are_capped_by_their_user_access_and_databases() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        users.create("ann", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
+        users.create("bob", "pw", &[], ExistingDatabase::Fail).unwrap();
+        users.grant_on("bob", "movies", Role::Editor).unwrap();
+        let make = |user: &str, name: &str, access, dbs: &[&str]| {
+            let dbs: Vec<String> = dbs.iter().map(|d| d.to_string()).collect();
+            let (token, info) = users.create_token(user, name, access, &dbs, None).unwrap();
+            assert!(token.starts_with(&format!("gbt_{}_", info.id)) && token.len() == 85, "{token}");
+            assert_eq!(token_id(&token), Some(info.id.as_str()));
+            assert_eq!(
+                users.authenticate_token(&token),
+                Some(Principal::ApiToken { user: user.into(), id: info.id.clone() })
+            );
+            info.id
+        };
+        let all = |id: &str| {
+            (
+                users.token_access(id).unwrap(),
+                users.token_access_on(id, "Movies").unwrap(),
+                users.token_access_on(id, "other").unwrap(),
+                users.token_best_access(id).unwrap(),
+            )
+        };
+        use Access::{None as No, Read, Write};
+        // Never admin, also an administrator's.
+        assert_eq!(all(&make("ann", "r", TokenAccess::Read, &[])), (Read, Read, Read, Read));
+        let w = make("ann", "w", TokenAccess::Write, &[]);
+        assert_eq!(all(&w), (Write, Write, Write, Write));
+        assert_eq!(all(&make("ann", "m", TokenAccess::Write, &["MOVIES"])), (No, Write, No, Write));
+        // Never more than the user.
+        assert_eq!(all(&make("bob", "w", TokenAccess::Write, &[])), (No, Write, No, Write));
+        assert_eq!(all(&make("bob", "r", TokenAccess::Read, &[])), (No, Read, No, Read));
+        assert_eq!(all(&make("bob", "o", TokenAccess::Write, &["other"])), (No, No, No, No));
+        // A role taken away applies at once.
+        users.grant("bob", Role::Admin).unwrap();
+        users.revoke("ann", Role::Admin).unwrap();
+        assert_eq!(all(&w), (No, No, No, No));
+
+        // Names are per user.
+        assert!(users.create_token("ann", "w", TokenAccess::Read, &[], None).is_err());
+        assert!(users.create_token("ann", "a b", TokenAccess::Read, &[], None).is_err());
+        assert!(users.create_token("nobody", "x", TokenAccess::Read, &[], None).is_err());
+        assert_eq!(users.tokens(Some("ann")).len(), 3);
+        assert_eq!(users.tokens(None).len(), 6);
+        for i in users.tokens(Some("ann")).len()..MAX_TOKENS {
+            users.create_token("ann", &format!("t{i}"), TokenAccess::Read, &[], None).unwrap();
+        }
+        assert!(users.create_token("ann", "more", TokenAccess::Read, &[], None).is_err());
+    }
+
+    #[test]
+    fn tokens_expire_and_end_with_their_account() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+        let make = |user: &str, name: &str, life| users.create_token(user, name, TokenAccess::Write, &[], life).unwrap();
+
+        // Expired: it is who it is, but may do nothing.
+        let (token, info) = make("ann", "old", Some(Duration::ZERO));
+        assert!(users.authenticate_token(&token).is_some());
+        assert_eq!(users.token_access(&info.id), None);
+        assert_eq!(users.token_access_on(&info.id, "graphbuff"), None);
+        assert_eq!(users.token_best_access(&info.id), None);
+        assert_eq!(users.tokens(Some("ann"))[0].last_used, None);
+
+        let (token, info) = make("ann", "new", Some(Duration::from_secs(3600)));
+        assert!(users.token_access(&info.id).is_some());
+        // Wrong secrets, and what is no token at all.
+        let other = make("ann", "other", None).0;
+        let mixed = format!("{}{}", &token[..21], &other[21..]);
+        for bad in [mixed.as_str(), &token[..84], "gbt_", "", "pw", &token.to_uppercase(), &format!("{token}0")] {
+            assert!(users.authenticate_token(bad).is_none(), "{bad}");
+        }
+        // A token is not a password, and a password not a token.
+        assert!(!users.authenticate("ann", &token));
+        assert!(users.authenticate_token(&token).is_some());
+        assert!(users.tokens(Some("ann")).iter().any(|t| t.name == "new" && t.last_used.is_some()));
+
+        // It stays with its user through a rename and a new password.
+        users.rename("ann", "anna").unwrap();
+        users.set_password("anna", "pw2").unwrap();
+        let who = Principal::ApiToken { user: "anna".into(), id: info.id.clone() };
+        assert_eq!(users.authenticate_token(&token), Some(who));
+        assert_eq!(users.token_access(&info.id), Some(Access::Write));
+        // Dropping it.
+        assert!(users.drop_token("anna", "other").unwrap());
+        assert!(!users.drop_token("anna", "other").unwrap());
+        assert!(users.drop_token("nobody", "other").is_err());
+        assert!(users.authenticate_token(&other).is_none());
+        // Replacing or dropping the user drops their tokens, also once the name is back.
+        users.create("anna", "pw", &[Role::Editor], ExistingDatabase::Replace).unwrap();
+        assert!(users.authenticate_token(&token).is_none());
+        assert_eq!(users.token_access(&info.id), None);
+        let (token, info) = make("anna", "new", None);
+        users.drop_user("anna").unwrap();
+        users.create("anna", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+        assert!(users.authenticate_token(&token).is_none());
+        assert_eq!(users.token_best_access(&info.id), None);
+        assert!(users.tokens(None).is_empty());
+    }
+
+    #[test]
+    fn tokens_persist_in_the_system_database() {
+        let tmp = TempDir::new("tokens");
+        let dir = &tmp.0;
+        let open = |dir: &std::path::Path| {
+            let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
+            let system = mgr.system_database().unwrap();
+            let users = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+            (mgr, system, users)
+        };
+        let (kept, limited, gone, other);
+        {
+            let (_mgr, system, users) = open(dir);
+            users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+            users.create("bob", "pw", &[Role::Reader], ExistingDatabase::Fail).unwrap();
+            let make = |user: &str, name: &str, access, dbs: &[String], life| {
+                users.create_token(user, name, access, dbs, life).unwrap().0
+            };
+            kept = make("ann", "kept", TokenAccess::Write, &[], None);
+            limited = make("ann", "limited", TokenAccess::Read, &["b".into(), "a".into()], Some(DEFAULT_TOKEN_LIFETIME));
+            gone = make("ann", "gone", TokenAccess::Read, &[], None);
+            other = make("bob", "kept", TokenAccess::Read, &[], None);
+            assert!(users.drop_token("ann", "gone").unwrap());
+            assert!(users.authenticate_token(&kept).is_some());
+            users.rename("ann", "anna").unwrap();
+            // Only hashes are stored.
+            let all = format!("{:?}", system.execute("MATCH (n) RETURN n").unwrap().rows);
+            assert!(all.contains(token_id(&kept).unwrap()));
+            for t in [&kept, &limited, &gone, &other] {
+                assert!(!all.contains(&t[21..]), "the secret is stored");
+            }
+        }
+        {
+            let (_mgr, system, users) = open(dir);
+            let list = users.tokens(None);
+            let names: Vec<_> = list.iter().map(|t| (t.user.as_str(), t.name.as_str(), t.access)).collect();
+            assert_eq!(
+                names,
+                [
+                    ("anna", "kept", TokenAccess::Write),
+                    ("anna", "limited", TokenAccess::Read),
+                    ("bob", "kept", TokenAccess::Read)
+                ]
+            );
+            assert!(list[0].last_used.is_some() && list[0].expires.is_none() && list[0].databases.is_empty());
+            assert!(list[1].last_used.is_none());
+            assert_eq!(list[1].expires, Some(list[1].created + DEFAULT_TOKEN_LIFETIME.as_millis() as i64));
+            assert_eq!(list[1].databases, BTreeSet::from(["a".to_string(), "b".to_string()]));
+            for t in [&kept, &limited, &other] {
+                assert!(users.authenticate_token(t).is_some());
+            }
+            assert!(users.authenticate_token(&gone).is_none());
+            // Account changes leave tokens alone.
+            users.grant("bob", Role::Editor).unwrap();
+            assert!(users.authenticate_token(&other).is_some());
+
+            // A version without tokens drops and re-creates a user: it ignores the tokens,
+            // and they do not come back to life.
+            drop(users);
+            system.execute("MATCH (u:User {name: 'bob'}) DELETE u").unwrap();
+            let hash = PasswordHash::new("pw", HashParams::TESTING).encode();
+            system
+                .execute_with_params(
+                    "CREATE (:User {name: 'bob', password: $p, roles: ['admin'], databaseRoles: []})",
+                    &BTreeMap::from([("p".to_string(), Value::String(hash))]),
+                )
+                .unwrap();
+        }
+        let (_mgr, system, users) = open(dir);
+        assert!(users.authenticate_token(&other).is_none());
+        assert!(users.authenticate_token(&kept).is_some());
+        users.create_token("bob", "fresh", TokenAccess::Read, &[], None).unwrap();
+        assert!(users.authenticate_token(&other).is_none());
+        // Dropping a user removes their tokens from the database.
+        users.drop_user("anna").unwrap();
+        let left = system.execute("MATCH (t:ApiToken) WHERE t.user = 'anna' RETURN count(t)").unwrap();
+        assert_eq!(left.rows, vec![vec![ResultValue::Int(0)]]);
+        // A damaged record is refused, not skipped.
+        drop(users);
+        system.execute("MATCH (t:ApiToken {name: 'fresh'}) SET t.access = 'admin'").unwrap();
+        assert!(Users::system(system).is_err());
+    }
+
+    #[test]
     fn a_newer_system_layout_is_refused() {
         let mgr = graphbuff::DatabaseManager::in_memory();
         let system = mgr.system_database().unwrap();
@@ -1185,6 +1867,46 @@ mod tests {
         ));
         run_as(&kim, Access::Write, "ALTER CURRENT USER SET PASSWORD FROM $pw TO 'n'").unwrap();
         assert!(users.authenticate("kim", "n"));
+
+        // API tokens: one's own, or anyone's for administrators.
+        let made = run_as(&kim, Access::Write, "CREATE TOKEN laptop ACCESS WRITE EXPIRES IN 2 DAYS").unwrap();
+        assert_eq!(made.columns.last().unwrap(), "token");
+        let info = &users.tokens(Some("kim"))[0];
+        assert_eq!((info.access, info.expires), (TokenAccess::Write, Some(info.created + 2 * 24 * 3_600_000)));
+        let secret = made.rows[0].last().unwrap().as_str().unwrap().to_string();
+        let token = users.authenticate_token(&secret).unwrap();
+        run_as(&kim, Access::Write, "CREATE TOKEN mine FOR USER kim EXPIRES NEVER").unwrap();
+        assert_eq!(users.tokens(Some("kim"))[1].expires, None);
+        for refused in ["CREATE TOKEN x FOR USER root", "DROP TOKEN x FOR USER root", "CREATE TOKEN x FOR USER ghost"] {
+            assert!(matches!(run_as(&kim, Access::Write, refused), Err(Error::Forbidden(_))), "{refused}");
+        }
+        run_as(&admin, Access::Admin, "CREATE TOKEN given FOR USER kim").unwrap();
+        run_as(&admin, Access::Admin, "CREATE TOKEN own").unwrap();
+        assert_eq!(run_as(&kim, Access::Write, "SHOW TOKENS").unwrap().rows.len(), 3);
+        let shown = run_as(&admin, Access::Admin, "SHOW TOKENS").unwrap();
+        assert_eq!(shown.rows.len(), 4);
+        assert!(!format!("{shown:?}").contains(&secret[21..]));
+        run_as(&kim, Access::Write, "DROP TOKEN given").unwrap();
+        assert!(run_as(&kim, Access::Write, "DROP TOKEN given").is_err());
+        assert_eq!(run_as(&kim, Access::Write, "DROP TOKEN given IF EXISTS").unwrap().stats.system_updates, 0);
+        // The server token has no user of its own.
+        assert!(run_as(&Principal::Token, Access::Admin, "CREATE TOKEN x").is_err());
+        run_as(&Principal::Token, Access::Admin, "CREATE TOKEN x FOR USER kim").unwrap();
+        // A token manages nothing, whatever access is claimed for it.
+        for refused in [
+            "CREATE TOKEN y",
+            "CREATE TOKEN y FOR USER kim",
+            "SHOW TOKENS",
+            "DROP TOKEN mine",
+            "ALTER CURRENT USER SET PASSWORD FROM 'n' TO 'm'",
+            "SHOW USERS",
+            "CREATE USER y SET PASSWORD 'y'",
+            "GRANT ROLE admin TO kim",
+        ] {
+            assert!(matches!(run_as(&token, Access::Admin, refused), Err(Error::Forbidden(_))), "{refused}");
+        }
+        let me = run_as(&token, Access::Write, "SHOW CURRENT USER").unwrap();
+        assert_eq!(me.rows[0][0], ResultValue::String("kim".into()));
 
         let all = run_as(&admin, Access::Admin, "SHOW USERS").unwrap();
         assert_eq!(all.rows.len(), 2);

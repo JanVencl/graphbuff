@@ -17,6 +17,13 @@ the same notes.
   databases, so that the first query after a restart does not build them again. See
   [Approximate indexes](docs/Vectors.md#approximate-indexes-hnsw).
 
+- API tokens, for programs: `CREATE TOKEN laptop [FOR USER u] [ACCESS READ | WRITE]
+  [ON DATABASE db, …] [EXPIRES IN n DAYS | HOURS | EXPIRES NEVER]`, `SHOW TOKENS`,
+  `DROP TOKEN`, and offline `graphbuff-server tokens`. A token logs in as
+  `Authorization: Bearer gbt_…` or with Bolt's `bearer` scheme, and may do what its user
+  may, up to its own cap and never administration. It reads only and expires after 90 days
+  unless made otherwise. See [Users and TLS](docs/Users.md).
+
 ### Fixed
 
 - A search of an HNSW vector index stops at the query's timeout or when it is cancelled;
