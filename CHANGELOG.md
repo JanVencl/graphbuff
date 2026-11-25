@@ -14,6 +14,11 @@ the same notes.
   The syntax is Neo4j's (Cypher 25). See [Filtered search](docs/Vectors.md#filtered-search).
   Existing stores open as they are; 0.5 and older cannot open a store with such an index.
 
+### Fixed
+
+- A search of an HNSW vector index stops at the query's timeout or when it is cancelled;
+  before, only once it was done.
+
 ## 0.5.0 — 2026-11-23
 
 ### Added

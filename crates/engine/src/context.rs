@@ -176,6 +176,8 @@ pub(crate) type Profile = HashMap<usize, OpProfile>;
 pub(crate) struct OpProfile {
     pub rows: u64,
     pub time: Duration,
+    /// The vector searches run, by [`Method`](crate::vector::Method).
+    pub searches: [u64; crate::vector::Method::ALL.len()],
 }
 
 impl<'s> Executor<'s> {
@@ -264,6 +266,13 @@ impl<'s> Executor<'s> {
             let e = p.entry(key).or_default();
             e.rows += rows as u64;
             e.time += time;
+        }
+    }
+
+    /// Notes that the plan node at `key` ran a vector search by `method`.
+    pub fn record_search(&self, key: usize, method: crate::vector::Method) {
+        if let Some(p) = &self.profile {
+            p.borrow_mut().entry(key).or_default().searches[method as usize] += 1;
         }
     }
 

@@ -720,20 +720,32 @@ impl Approximate {
     }
 
     /// The entities of the (up to) `n` vectors the graph finds closest to `q`.
-    fn candidates(&self, q: &[f64], n: usize) -> Vec<u64> {
-        self.graph.search(&self.query(q), n, n).into_iter().map(|(_, slot)| self.ids[slot as usize]).collect()
+    fn candidates(&self, q: &[f64], n: usize, interrupt: &dyn Fn() -> Result<()>) -> Result<Vec<u64>> {
+        let bounds = crate::hnsw::Bounds { budget: usize::MAX, interrupt };
+        let found = self.graph.search_where(&self.query(q), n, n, |_| true, bounds)?.unwrap_or_default();
+        Ok(found.into_iter().map(|(_, slot)| self.ids[slot as usize]).collect())
     }
 
     /// The entities of the (up to) `n` selected vectors the graph finds closest to `q`, at
     /// least `min(k, selected.count())`; `None` if scoring all the selected ones takes
     /// less work, or the search turned out to take as much or to find too few.
-    fn candidates_where(&self, q: &[f64], k: usize, n: usize, selected: &Selection) -> Option<Vec<u64>> {
+    fn candidates_where(
+        &self,
+        q: &[f64],
+        k: usize,
+        n: usize,
+        selected: &Selection,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<Vec<u64>>> {
         let matches = selected.count();
         if matches <= n || filtered_search_cost(n, self.graph.slots(), matches) >= matches as f64 {
-            return None;
+            return Ok(None);
         }
-        let found = self.graph.search_where(&self.query(q), n, n, |slot| selected.contains(slot), matches)?;
-        (found.len() >= k.min(matches)).then(|| found.into_iter().map(|(_, slot)| self.ids[slot as usize]).collect())
+        let bounds = crate::hnsw::Bounds { budget: matches, interrupt };
+        let found = self.graph.search_where(&self.query(q), n, n, |slot| selected.contains(slot), bounds)?;
+        Ok(found
+            .filter(|found| found.len() >= k.min(matches))
+            .map(|found| found.into_iter().map(|(_, slot)| self.ids[slot as usize]).collect()))
     }
 }
 
@@ -878,6 +890,7 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
     let q = query_vector(procedure, &def, &args[2])?
         .ok_or_else(|| Error::Type(format!("{procedure}: the query vector is null")))?;
     Ok(nearest(ctx, &def, &q, k, &[])?
+        .0
         .into_iter()
         .map(|(score, id)| {
             let e = match entity {
@@ -887,6 +900,49 @@ pub fn query_index(ctx: &ProcedureContext<'_>, entity: IndexEntity, args: &[Valu
             vec![e, Value::Float(score)]
         })
         .collect())
+}
+
+/// How a search of a vector index found its results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Method {
+    /// Through the graph of an approximate index.
+    Graph,
+    /// By scoring every vector that passes the filter.
+    Matches,
+    /// By scoring all vectors of the index.
+    All,
+    /// By reading the graph, inside a transaction.
+    Store,
+}
+
+impl Method {
+    pub const ALL: [Method; 4] = [Method::Graph, Method::Matches, Method::All, Method::Store];
+
+    fn text(self) -> &'static str {
+        match self {
+            Method::Graph => "HNSW graph",
+            Method::Matches => "matching vectors",
+            Method::All => "all vectors",
+            Method::Store => "scan of the store",
+        }
+    }
+}
+
+/// The scores and ids a search found, best first, and how, if there was anything to search.
+pub(crate) type Nearest = (Vec<(f64, u64)>, Option<Method>);
+
+/// How many searches used each method, for a `PROFILE` line: ` by HNSW graph`, or
+/// ` by HNSW graph (3), matching vectors (1)`. Empty without any.
+pub(crate) fn methods_text(searches: [u64; Method::ALL.len()]) -> String {
+    let used: Vec<(Method, u64)> = Method::ALL.into_iter().zip(searches).filter(|(_, n)| *n > 0).collect();
+    match &used[..] {
+        [] => String::new(),
+        [(method, _)] => format!(" by {}", method.text()),
+        several => {
+            let parts: Vec<String> = several.iter().map(|(m, n)| format!("{} ({n})", m.text())).collect();
+            format!(" by {}", parts.join(", "))
+        }
+    }
 }
 
 /// The vector `value` to search index `def` with (`None` for null): of the index's
@@ -912,14 +968,17 @@ pub(crate) fn query_vector(what: &str, def: &IndexDef, value: &Value) -> Result<
 /// `filter`: their scores and ids, best first (ties by id). All that pass, if they are
 /// fewer. Exact, except for an approximate index on a committed state when its graph is
 /// searched; even then the scores are exact and `k` entities are returned if as many pass
-/// a (non-empty) filter.
+/// a (non-empty) filter. Also how they were found, if there was anything to search.
 pub(crate) fn nearest(
     ctx: &ProcedureContext<'_>,
     def: &IndexDef,
     q: &[f64],
     k: usize,
     filter: &[Predicate],
-) -> Result<Vec<(f64, u64)>> {
+) -> Result<Nearest> {
+    if k == 0 {
+        return Ok((Vec::new(), None));
+    }
     let (dimensions, similarity) = vector_params(def);
     let interrupt = || ctx.check_interrupt();
     let store = ctx.store();
@@ -927,7 +986,10 @@ pub(crate) fn nearest(
     // The exact scores of `ids`, from the stored vectors.
     let rescore = |ids: &mut dyn Iterator<Item = u64>| -> Result<Vec<(f64, u64)>> {
         let mut out = Vec::new();
-        for id in ids {
+        for (n, id) in ids.enumerate() {
+            if n % 256 == 255 {
+                interrupt()?;
+            }
             if let Some(score) = property(store, def, id, &def.properties[0])?.as_ref().and_then(exact) {
                 out.push((score, id));
             }
@@ -937,7 +999,7 @@ pub(crate) fn nearest(
     // The exact scores of those of `approx` that may be among the best `k`, when each of
     // its scores is within `tolerance` of the exact one.
     let near_the_cut = |(approx, tolerance): (Vec<(f64, u64)>, f64)| -> Result<Vec<(f64, u64)>> {
-        let cut = if approx.len() <= k || k == 0 {
+        let cut = if approx.len() <= k {
             f64::NEG_INFINITY
         } else {
             let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
@@ -947,8 +1009,7 @@ pub(crate) fn nearest(
         rescore(&mut approx.iter().filter(|(s, _)| *s >= cut).map(|(_, id)| *id))
     };
 
-    let mut best: Vec<(f64, u64)> = match ctx.vectors() {
-        _ if k == 0 => Vec::new(),
+    let (mut best, method) = match ctx.vectors() {
         // A committed state: the cached index, then exact scores near the cut.
         Some((cache, snapshot)) => {
             let index = cache.get(snapshot, def, &interrupt)?;
@@ -963,7 +1024,8 @@ pub(crate) fn nearest(
             let query = RowQuery::new(similarity, q);
             match (&*index, selected) {
                 (VectorIndex::Flat(m), Some(s)) if s.count() <= SUBSET_ROWS.max(m.ids.len() / SUBSET_SHARE) => {
-                    near_the_cut(query.scores(s.iter().map(|r| (m.ids[r as usize], m.row(r))), &interrupt)?)?
+                    let approx = query.scores(s.iter().map(|r| (m.ids[r as usize], m.row(r))), &interrupt)?;
+                    (near_the_cut(approx)?, Method::Matches)
                 }
                 (VectorIndex::Flat(m), selected) => {
                     let (all, tolerance) = m.approximate(q, &*ctx.kernels());
@@ -972,15 +1034,21 @@ pub(crate) fn nearest(
                         None => m.ids[r] != FREE,
                     };
                     let approx = all.into_iter().enumerate().filter(|(r, _)| in_use(*r)).map(|(r, s)| (s, m.ids[r]));
-                    near_the_cut((approx.collect(), tolerance))?
+                    (near_the_cut((approx.collect(), tolerance))?, Method::All)
                 }
-                (VectorIndex::Approximate(a), None) => rescore(&mut a.candidates(q, search_width(k)).into_iter())?,
-                (VectorIndex::Approximate(a), Some(s)) => match a.candidates_where(q, k, search_width(k), &s) {
-                    Some(ids) => rescore(&mut ids.into_iter())?,
-                    None => near_the_cut(
-                        query.scores(s.iter().map(|r| (a.ids[r as usize], a.graph.vector(r))), &interrupt)?,
-                    )?,
-                },
+                (VectorIndex::Approximate(a), None) => {
+                    let ids = a.candidates(q, search_width(k), &interrupt)?;
+                    (rescore(&mut ids.into_iter())?, Method::Graph)
+                }
+                (VectorIndex::Approximate(a), Some(s)) => {
+                    match a.candidates_where(q, k, search_width(k), &s, &interrupt)? {
+                        Some(ids) => (rescore(&mut ids.into_iter())?, Method::Graph),
+                        None => {
+                            let rows = s.iter().map(|r| (a.ids[r as usize], a.graph.vector(r)));
+                            (near_the_cut(query.scores(rows, &interrupt)?)?, Method::Matches)
+                        }
+                    }
+                }
             }
         }
         // Inside a transaction (or writing): every entity, as the query sees it.
@@ -995,12 +1063,12 @@ pub(crate) fn nearest(
                 }
                 Ok(())
             })?;
-            out
+            (out, Method::Store)
         }
     };
     best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     best.truncate(k);
-    Ok(best)
+    Ok((best, Some(method)))
 }
 
 #[cfg(test)]
@@ -1151,6 +1219,7 @@ mod tests {
                     .collect();
                 let q = vector_arg("test", q)?.expect("a vector");
                 Ok(nearest(ctx, &def, &q, *k as usize, &filter)?
+                    .0
                     .into_iter()
                     .map(|(score, id)| vec![Value::Int(id as i64), Value::Float(score)])
                     .collect())
@@ -1297,7 +1366,7 @@ mod tests {
             let s = Selection::new(&a.filters, &predicates, &|| Ok(())).unwrap();
             let q: Vec<f64> = queries[0].trim_matches(['[', ']']).split(", ").map(|x| x.parse().unwrap()).collect();
             // Few matches are always scored one by one.
-            let graph = a.candidates_where(&q, 10, search_width(10), &s).is_some();
+            let graph = a.candidates_where(&q, 10, search_width(10), &s, &|| Ok(())).unwrap().is_some();
             assert!(!graph || s.count() * 4 > n, "{filter:?}");
             through_graph += usize::from(graph);
         }
@@ -1309,10 +1378,42 @@ mod tests {
         let mut a = a.clone();
         let all = Selection::new(&a.filters, &[Predicate::one_of(0, (0..100).map(Value::Int).collect())], &|| Ok(())).unwrap();
         let q = vec![1.0; dims];
-        assert_eq!(a.candidates_where(&q, 150, 600, &all).map(|c| c.len()), Some(600));
+        let found = |a: &Approximate, k| a.candidates_where(&q, k, 600, &all, &|| Ok(())).unwrap().map(|c| c.len());
+        assert_eq!(found(&a, 150), Some(600));
         a.graph.cut_off(100);
-        assert!(a.candidates_where(&q, 150, 600, &all).is_none());
-        assert!(a.candidates_where(&q, 1, 600, &all).is_some_and(|c| (1..=100).contains(&c.len())));
+        assert_eq!(found(&a, 150), None);
+        assert!(found(&a, 1).is_some_and(|n| (1..=100).contains(&n)));
+    }
+
+    /// A query cancelled while it searches a graph stops there.
+    #[test]
+    fn graph_searches_are_interrupted() {
+        let db = crate::Database::in_memory();
+        db.execute("CREATE VECTOR INDEX v FOR (n:V) ON n.e WITH [n.p] OPTIONS {indexConfig: {`vector.dimensions`: 4, `vector.hnsw.enabled`: true}}")
+            .unwrap();
+        db.execute("UNWIND range(1, 5000) AS i CREATE (:V {p: i % 10, e: [sin(i), cos(i * 3), sin(i * 7), cos(i * 11)]})").unwrap();
+        let cancel = crate::CancelHandle::new();
+        let (handle, errors) = (cancel.clone(), std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let seen = errors.clone();
+        db.register_procedure(crate::ProcedureSignature::new("test.stopped", [""; 0], ["x"]), move |ctx, _| {
+            let def = ctx.store().indexes().remove(0);
+            let search = || nearest(ctx, &def, &[1.0, 0.0, 0.0, 0.0], 10, &[]);
+            assert_eq!(search()?.1, Some(Method::Graph));
+            handle.cancel();
+            seen.lock().unwrap().push(search().err());
+            Ok(Vec::new())
+        })
+        .unwrap();
+        let options = crate::QueryOptions::default().with_cancel(cancel);
+        let _ = db.execute_with_options("CALL test.stopped()", &Default::default(), &options);
+        assert!(matches!(errors.lock().unwrap()[..], [Some(Error::Cancelled(_))]), "{errors:?}");
+        // A filtered one too.
+        let entry = db.vector_cache.entry("v").unwrap();
+        let VectorIndex::Approximate(a) = &*entry else { panic!("an approximate index") };
+        let s = Selection::new(&a.filters, &[Predicate::one_of(0, (0..9).map(Value::Int).collect())], &|| Ok(())).unwrap();
+        let search = |interrupt: &dyn Fn() -> Result<()>| a.candidates_where(&[1.0, 0.0, 0.0, 0.0], 10, 200, &s, interrupt);
+        assert!(search(&|| Ok(())).unwrap().is_some());
+        assert!(search(&|| Err(Error::Cancelled("stopped".into()))).is_err());
     }
 
     /// How the distances a filtered graph search measures grow: see
@@ -1350,7 +1451,8 @@ mod tests {
                             let mid = (lo + hi) / 2;
                             // Slots in a scrambled order, so that clusters do not line up.
                             let passes = |s: u32| (s.wrapping_mul(2_654_435_761) >> 8).is_multiple_of(every);
-                            if g.search_where(q, 10, 200, passes, mid).is_some() { hi = mid } else { lo = mid }
+                            let bounds = crate::hnsw::Bounds { budget: mid, interrupt: &|| Ok(()) };
+                            if g.search_where(q, 10, 200, passes, bounds).unwrap().is_some() { hi = mid } else { lo = mid }
                         }
                         hi as f64 / (200.0 * f64::from(every))
                     })
@@ -1360,7 +1462,7 @@ mod tests {
                 let passes = |s: u32| (s.wrapping_mul(2_654_435_761) >> 8).is_multiple_of(every);
                 let t = std::time::Instant::now();
                 for q in &queries {
-                    g.search_where(q, 10, 200, passes, usize::MAX);
+                    g.search_where(q, 10, 200, passes, crate::hnsw::Bounds { budget: usize::MAX, interrupt: &|| Ok(()) }).unwrap();
                 }
                 let graph = t.elapsed().as_secs_f64() * 1e5;
                 let t = std::time::Instant::now();

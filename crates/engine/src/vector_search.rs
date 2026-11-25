@@ -179,8 +179,9 @@ impl VectorSearch {
         out
     }
 
-    /// Runs the search for `row`: the entities found with their scores, best first.
-    pub fn run(&self, ex: &Executor<'_>, scope: &Scope, row: &[Value]) -> Result<Vec<(Value, f64)>> {
+    /// Runs the search for `row`: the entities found with their scores, best first. `key`:
+    /// of its plan node, for `PROFILE`.
+    pub fn run(&self, ex: &Executor<'_>, scope: &Scope, row: &[Value], key: usize) -> Result<Vec<(Value, f64)>> {
         let env = Env::new(scope, row);
         let k = match ex.eval(&self.limit, &env)? {
             Value::Int(k) if (0..=MAX_LIMIT).contains(&k) => k as usize,
@@ -200,7 +201,10 @@ impl VectorSearch {
             embedder: ex.embedder.as_ref(),
             writes: None,
         };
-        let found = crate::vector::nearest(&ctx, &self.def, &q, k, &filter)?;
+        let (found, method) = crate::vector::nearest(&ctx, &self.def, &q, k, &filter)?;
+        if let Some(method) = method {
+            ex.record_search(key, method);
+        }
         Ok(found
             .into_iter()
             .map(|(score, id)| match self.def.entity {

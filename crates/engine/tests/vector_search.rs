@@ -312,6 +312,59 @@ fn plans() {
     }
 }
 
+/// `PROFILE` says how the results were found; `EXPLAIN` does not know.
+#[test]
+fn profiled_searches() {
+    let db = Database::open(StorageMode::InMemory).unwrap();
+    for (name, label, hnsw) in [("flat", "F", false), ("graph", "G", true)] {
+        run(
+            &db,
+            &format!(
+                "CREATE VECTOR INDEX {name} FOR (d:{label}) ON d.e WITH [d.p]                  OPTIONS {{indexConfig: {{`vector.dimensions`: 2, `vector.hnsw.enabled`: {hnsw}}}}}"
+            ),
+        );
+    }
+    run(&db, "UNWIND range(1, 2000) AS i CREATE (:F:G {p: i, e: [sin(i), cos(i)]})");
+    let line = |plan: String| {
+        plan.lines().find(|l| l.contains("VectorSearch")).unwrap_or_else(|| panic!("{plan}")).trim().to_string()
+    };
+    let profile = |q: &str| line(run(&db, &format!("PROFILE {q}")).plan.expect("a plan").to_string());
+    let search = |index: &str, inner: &str| {
+        format!("MATCH (d) SEARCH d IN (VECTOR INDEX {index} FOR [1, 0] {inner}) SCORE AS s RETURN d.p")
+    };
+    for (index, inner, how) in [
+        ("flat", "LIMIT 3", "all vectors"),
+        ("flat", "WHERE d.p <= 10 LIMIT 3", "matching vectors"),
+        ("flat", "WHERE d.p <= 1900 LIMIT 3", "all vectors"),
+        ("flat", "WHERE d.p = 0 LIMIT 3", "matching vectors"),
+        ("graph", "LIMIT 3", "HNSW graph"),
+        ("graph", "WHERE d.p <= 10 LIMIT 3", "matching vectors"),
+        ("graph", "WHERE d.p <= 1990 LIMIT 3", "HNSW graph"),
+    ] {
+        let text = profile(&search(index, inner));
+        assert!(text.contains(&format!("SCORE AS s by {how} (~")), "{index} {inner}: {text}");
+        let explained = line(db.explain(&search(index, inner)).unwrap());
+        assert!(!explained.contains(" by "), "{index} {inner}: {explained}");
+    }
+    // Nothing searched.
+    assert!(!profile(&search("flat", "LIMIT 0")).contains(" by "));
+    assert!(!profile("MATCH (d) SEARCH d IN (VECTOR INDEX flat FOR null LIMIT 3) RETURN d").contains(" by "));
+    // Several searches of one step.
+    let text = profile("UNWIND [10, 20, 1900] AS x MATCH (d) SEARCH d IN (VECTOR INDEX flat FOR [1, 0] WHERE d.p <= x LIMIT 3) RETURN d");
+    assert!(text.contains(" by matching vectors (2), all vectors (1) (~"), "{text}");
+    let text = profile("UNWIND [10, 20] AS x MATCH (d) SEARCH d IN (VECTOR INDEX flat FOR [1, 0] WHERE d.p <= x LIMIT 3) RETURN d");
+    assert!(text.contains(" by matching vectors (~"), "{text}");
+    // Inside a transaction.
+    let mut tx = db.begin().unwrap();
+    let r = tx.execute(&format!("PROFILE {}", search("graph", "LIMIT 3"))).unwrap();
+    let text = line(r.plan.expect("a plan").to_string());
+    assert!(text.contains(" by scan of the store"), "{text}");
+    drop(tx);
+    // Other lines say nothing of it.
+    let plan = run(&db, &format!("PROFILE {}", search("flat", "LIMIT 3"))).plan.expect("a plan").to_string();
+    assert_eq!(plan.matches(" by ").count(), 1, "{plan}");
+}
+
 #[test]
 fn errors() {
     let db = Database::open(StorageMode::InMemory).unwrap();

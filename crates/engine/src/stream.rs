@@ -1232,6 +1232,7 @@ fn build_steps<'a>(
                 VectorSearchStep {
                     scope: scope.clone(),
                     search,
+                    key: profile_key(step),
                     var: slot(&search.var),
                     score: search.score.as_deref().map(slot),
                     row: Vec::new(),
@@ -1622,6 +1623,7 @@ fn is_used(row: &[Value], used: &[usize], rel: RelId) -> bool {
 struct VectorSearchStep<'a> {
     scope: Scope,
     search: &'a crate::vector_search::VectorSearch,
+    key: usize,
     var: usize,
     score: Option<usize>,
     row: Row,
@@ -1630,7 +1632,7 @@ struct VectorSearchStep<'a> {
 
 impl<'a> Expander<'a> for VectorSearchStep<'a> {
     fn begin(&mut self, ex: &'a Executor<'_>, row: Row) -> Result<()> {
-        self.found = self.search.run(ex, &self.scope, &row)?.into_iter();
+        self.found = self.search.run(ex, &self.scope, &row, self.key)?.into_iter();
         self.row = row;
         Ok(())
     }
