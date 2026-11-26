@@ -1,5 +1,6 @@
 //! Text embeddings: `vector.embed(text, model?, options?)`, `CALL vector.embedBatch(texts,
-//! model?, options?)` and `CALL vector.models()`.
+//! model?, options?)`, `CALL vector.chunk(text, model?, options?)`, `CALL
+//! vector.embedChunks(text, model?, options?)` and `CALL vector.models()`.
 //!
 //! The engine does not run models itself. An [`Embedder`] does, set with
 //! [`crate::Database::set_embedder`] or [`crate::DatabaseManager::set_embedder`], much
@@ -20,6 +21,7 @@
 //! # Ok::<(), graphbuff::Error>(())
 //! ```
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -96,6 +98,63 @@ impl EmbedOptions {
     }
 }
 
+/// The options of `vector.chunk` and `vector.embedChunks`: `{size, overlap, task}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChunkOptions {
+    /// Tokens per chunk at most; `None`: as many as fit the model.
+    pub size: Option<usize>,
+    /// Tokens a chunk repeats from the end of the one before (it may start a little
+    /// later, at a word).
+    pub overlap: usize,
+    /// What the chunks will be embedded as: its prefix takes room too.
+    pub task: EmbedTask,
+}
+
+impl ChunkOptions {
+    pub(crate) fn from_value(what: &str, v: &Value) -> Result<Self> {
+        let mut o = ChunkOptions::default();
+        let map = match v {
+            Value::Null => return Ok(o),
+            Value::Map(m) => m,
+            other => return Err(Error::Type(format!("{what}: options must be a map, not {}", other.type_name()))),
+        };
+        let count = |k: &str, v: &Value, least: i64| match v {
+            Value::Int(n) if *n >= least => Ok(*n as usize),
+            Value::Int(n) => Err(Error::Semantic(format!("{what}: `{k}` must be at least {least}, not {n}"))),
+            other => Err(Error::Type(format!("{what}: `{k}` must be an integer, not {}", other.type_name()))),
+        };
+        for (k, v) in map {
+            match (k.as_str(), v) {
+                (_, Value::Null) if matches!(k.as_str(), "size" | "overlap" | "task") => {}
+                ("size", v) => o.size = Some(count(k, v, 1)?),
+                ("overlap", v) => o.overlap = count(k, v, 0)?,
+                ("task", _) => {
+                    let single = Value::Map([(k.clone(), v.clone())].into_iter().collect());
+                    o.task = EmbedOptions::from_value(what, &single)?.task;
+                }
+                _ => return Err(Error::Semantic(format!("{what}: unknown option `{k}` (known: size, overlap, task)"))),
+            }
+        }
+        if let Some(size) = o.size
+            && o.overlap >= size
+        {
+            return Err(Error::Semantic(format!("{what}: `overlap` ({}) must be less than `size` ({size})", o.overlap)));
+        }
+        Ok(o)
+    }
+}
+
+/// How a model splits a text into tokens, for chunking.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenSpans {
+    /// Each token's byte range in the text, in order; special tokens and prefixes are not
+    /// in it.
+    pub spans: Vec<Range<usize>>,
+    /// How many of these tokens one input holds: the model's limit less its special
+    /// tokens and the prefix of the task.
+    pub fit: usize,
+}
+
 /// What an embedder has done since it started, for metrics. All totals.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EmbedStats {
@@ -136,6 +195,14 @@ pub trait Embedder: Send + Sync {
         options: &EmbedOptions,
         interrupt: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<f32>>>;
+
+    /// The tokens of `text` for `model` (`None`: the default), and how many fit in one
+    /// input of `task`: what `vector.chunk` cuts text by. Embedders that cannot tell
+    /// fail with `Unsupported`.
+    fn token_spans(&self, model: Option<&str>, text: &str, task: EmbedTask) -> Result<TokenSpans> {
+        let _ = (model, text, task);
+        Err(Error::Unsupported("this embedder cannot split text into chunks".into()))
+    }
 }
 
 /// The error when no embedder is set.
@@ -247,6 +314,202 @@ pub(crate) fn models(ctx: &ProcedureContext<'_>, _args: &[Value]) -> Result<Proc
         .collect())
 }
 
+/// A piece of a text, as `vector.chunk` gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// Its byte range in the text (whitespace at either end left out).
+    pub bytes: Range<usize>,
+    /// Its tokens, as counted in the whole text.
+    pub tokens: usize,
+}
+
+/// How good a place to cut the text before token `k` is: 3 a paragraph, 2 a sentence or
+/// line, 1 a word, 0 inside a word.
+fn break_quality(text: &str, spans: &[Range<usize>], k: usize) -> u8 {
+    if k == 0 || k >= spans.len() {
+        return 3;
+    }
+    let (prev, next) = (&spans[k - 1], &spans[k]);
+    let gap = text.get(prev.end..next.start.max(prev.end)).unwrap_or("");
+    // Some tokenizers (SentencePiece) give the space to the token after it.
+    let own = text.get(next.clone()).unwrap_or("");
+    let lead = &own[..own.len() - own.trim_start().len()];
+    let space: String = [gap, lead].concat();
+    if space.matches('\n').count() >= 2 {
+        3
+    } else if space.contains('\n')
+        || (!space.is_empty()
+            && text.get(..prev.end).and_then(|t| t.trim_end().chars().last()).is_some_and(|c| ".!?…。！？".contains(c)))
+    {
+        2
+    } else if space.chars().any(char::is_whitespace) {
+        1
+    } else {
+        0
+    }
+}
+
+/// `text` (whose tokens are `spans`) in chunks of at most `size` tokens, each repeating
+/// about `overlap` tokens of the one before. A chunk ends at the best break (paragraph,
+/// sentence, word) in the second half of its room; inside a word only when there is
+/// none. Chunks of whitespace only are left out.
+pub fn chunk_spans(text: &str, spans: &[Range<usize>], size: usize, overlap: usize) -> Vec<Chunk> {
+    let (n, size) = (spans.len(), size.max(1));
+    let overlap = overlap.min(size - 1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let hi = (i + size).min(n);
+        let end = if hi == n {
+            n
+        } else {
+            let lo = i + (size / 2).max(1);
+            let mut best = (0, hi);
+            for k in (lo..=hi).rev() {
+                let q = break_quality(text, spans, k);
+                if q > best.0 {
+                    best = (q, k);
+                    if q == 3 {
+                        break;
+                    }
+                }
+            }
+            best.1
+        };
+        let (from, to) = (spans[i].start, spans[end - 1].end.max(spans[i].start));
+        let piece = text.get(from..to).unwrap_or("");
+        let start = from + (piece.len() - piece.trim_start().len());
+        let stop = start + piece.trim().len();
+        if stop > start {
+            out.push(Chunk { bytes: start..stop, tokens: end - i });
+        }
+        if end == n {
+            break;
+        }
+        // The next chunk starts `overlap` tokens back, at the start of a word.
+        let mut next = end.saturating_sub(overlap).max(i + 1);
+        while next < end && break_quality(text, spans, next) == 0 {
+            next += 1;
+        }
+        i = next;
+    }
+    out
+}
+
+/// A text, its chunks, and the model and options they were made for.
+type Chunked<'a> = (&'a str, Vec<Chunk>, Option<&'a str>, ChunkOptions);
+
+/// The chunks of `args` (`text, model, options`) and the options; `None` for a `null`
+/// text.
+fn chunks_of<'a>(what: &str, embedder: &dyn Embedder, args: &'a [Value]) -> Result<Option<Chunked<'a>>> {
+    let text = match &args[0] {
+        Value::Null => return Ok(None),
+        Value::String(s) => s.as_str(),
+        other => return Err(Error::Type(format!("{what}: `text` must be a string, not {}", other.type_name()))),
+    };
+    let model = model_arg(what, args.get(1))?;
+    let options = ChunkOptions::from_value(what, args.get(2).unwrap_or(&Value::Null))?;
+    let tokens = embedder.token_spans(model, text, options.task)?;
+    if tokens.fit == 0 {
+        return Err(Error::Semantic(format!("{what}: no text fits the model with its prefix")));
+    }
+    let size = match options.size {
+        Some(s) if s > tokens.fit => {
+            return Err(Error::Semantic(format!(
+                "{what}: `size` {s} is more than the {} tokens of text that fit the model",
+                tokens.fit
+            )));
+        }
+        Some(s) => s,
+        None => tokens.fit,
+    };
+    if options.overlap >= size {
+        return Err(Error::Semantic(format!("{what}: `overlap` ({}) must be less than the size ({size})", options.overlap)));
+    }
+    let mut out = Vec::new();
+    for c in chunk_spans(text, &tokens.spans, size, options.overlap) {
+        fitted(embedder, model, options.task, text, c, size, 2, &mut out)?;
+    }
+    Ok(Some((text, out, model, options)))
+}
+
+/// `chunk` with the tokens it has on its own after the prefix, which a tokenizer may
+/// count differently than inside the whole text (SentencePiece does): split again if it
+/// does not fit in `size` or the model, at most `depth` more times.
+#[allow(clippy::too_many_arguments)]
+fn fitted(
+    embedder: &dyn Embedder,
+    model: Option<&str>,
+    task: EmbedTask,
+    text: &str,
+    chunk: Chunk,
+    size: usize,
+    depth: usize,
+    out: &mut Vec<Chunk>,
+) -> Result<()> {
+    let piece = &text[chunk.bytes.clone()];
+    let own = embedder.token_spans(model, piece, task)?;
+    let size = size.min(own.fit).max(1);
+    if own.spans.len() <= size || depth == 0 {
+        out.push(Chunk { tokens: own.spans.len(), ..chunk });
+        return Ok(());
+    }
+    for c in chunk_spans(piece, &own.spans, size, 0) {
+        let at = chunk.bytes.start;
+        fitted(embedder, model, task, text, Chunk { bytes: at + c.bytes.start..at + c.bytes.end, tokens: c.tokens }, size, depth - 1, out)?;
+    }
+    Ok(())
+}
+
+/// The rows `index, text, start, length, tokens` of `chunks`; `start` and `length` count
+/// characters, as `substring()` does.
+fn chunk_rows(text: &str, chunks: &[Chunk]) -> Vec<Vec<Value>> {
+    let (mut byte, mut chars) = (0, 0);
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // Chunks start in order, so counting goes on from the last one.
+            chars += text[byte..c.bytes.start].chars().count();
+            byte = c.bytes.start;
+            let piece = &text[c.bytes.clone()];
+            vec![
+                Value::Int(i as i64),
+                Value::String(piece.to_string()),
+                Value::Int(chars as i64),
+                Value::Int(piece.chars().count() as i64),
+                Value::Int(c.tokens as i64),
+            ]
+        })
+        .collect()
+}
+
+/// `CALL vector.chunk(text, model, options) YIELD index, text, start, length, tokens`.
+pub(crate) fn chunk(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<ProcedureRows> {
+    let Some((text, chunks, _, _)) = chunks_of("vector.chunk", ctx.embedder()?, args)? else { return Ok(Vec::new()) };
+    Ok(chunk_rows(text, &chunks))
+}
+
+/// `CALL vector.embedChunks(text, model, options) YIELD index, text, start, length, tokens,
+/// vector`.
+pub(crate) fn embed_chunks(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<ProcedureRows> {
+    let embedder = ctx.embedder()?;
+    let Some((text, chunks, model, options)) = chunks_of("vector.embedChunks", embedder, args)? else {
+        return Ok(Vec::new());
+    };
+    let pieces: Vec<&str> = chunks.iter().map(|c| &text[c.bytes.clone()]).collect();
+    let embed = EmbedOptions { task: options.task, truncate: true };
+    let vectors = embed_checked(embedder, model, &pieces, &embed, &|| ctx.check_interrupt())?;
+    Ok(chunk_rows(text, &chunks)
+        .into_iter()
+        .zip(vectors)
+        .map(|(mut row, v)| {
+            row.push(vector_value(v));
+            row
+        })
+        .collect())
+}
+
 /// A model-free [`Embedder`] for tests: each word (lower-cased, split on whitespace)
 /// adds ±1 to one dimension chosen by its hash, and the sum is L2-normalized. Texts with
 /// the same words get the same vector, and texts that share words are similar.
@@ -346,6 +609,19 @@ impl Embedder for HashEmbedder {
         }
         Ok(out)
     }
+
+    /// Its tokens are the words (split on whitespace); a query's `query:` takes one.
+    fn token_spans(&self, model: Option<&str>, text: &str, task: EmbedTask) -> Result<TokenSpans> {
+        if let Some(name) = model
+            && !self.models.iter().any(|m| m.0 == name)
+        {
+            return Err(Error::Semantic(format!("unknown embedding model '{name}'")));
+        }
+        let base = text.as_ptr() as usize;
+        let spans = text.split_whitespace().map(|w| (w.as_ptr() as usize - base)..(w.as_ptr() as usize - base + w.len())).collect();
+        let fit = self.max_tokens - usize::from(task == EmbedTask::Query).min(self.max_tokens);
+        Ok(TokenSpans { spans, fit })
+    }
 }
 
 /// An option map from pairs, for tests.
@@ -366,6 +642,72 @@ mod tests {
         assert!(EmbedOptions::from_value("f", &options(&[("task", "x".into())])).is_err());
         assert!(EmbedOptions::from_value("f", &options(&[("other", Value::Int(1))])).is_err());
         assert!(EmbedOptions::from_value("f", &Value::Int(1)).is_err());
+    }
+
+    fn words(text: &str) -> Vec<Range<usize>> {
+        HashEmbedder::new([("m", 4)]).token_spans(None, text, EmbedTask::Document).unwrap().spans
+    }
+
+    fn pieces(text: &str, size: usize, overlap: usize) -> Vec<String> {
+        chunk_spans(text, &words(text), size, overlap).iter().map(|c| text[c.bytes.clone()].to_string()).collect()
+    }
+
+    #[test]
+    fn chunks_end_at_the_best_break() {
+        assert_eq!(pieces("just a few words", 8, 0), ["just a few words"]);
+        assert!(pieces("", 8, 0).is_empty());
+        assert!(pieces(" \n\t ", 8, 0).is_empty());
+        let text = "One two three. Four five six. Seven eight nine.";
+        assert_eq!(pieces(text, 5, 0), ["One two three.", "Four five six.", "Seven eight nine."], "sentences");
+        let text = "a b c\n\nd e f. g h i j";
+        assert_eq!(pieces(text, 6, 0), ["a b c", "d e f.", "g h i j"], "a paragraph before a sentence");
+        let text = "a b c d\ne f g h";
+        assert_eq!(pieces(text, 6, 0), ["a b c d", "e f g h"], "a line");
+        // No break in the second half of the room: cut inside the word.
+        let text = "abcdefghij";
+        let chars: Vec<Range<usize>> = (0..text.len()).map(|i| i..i + 1).collect();
+        let got: Vec<&str> = chunk_spans(text, &chars, 4, 0).iter().map(|c| &text[c.bytes.clone()]).collect();
+        assert_eq!(got, ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn chunks_cover_the_text_with_their_overlap() {
+        let text: String = (0..40).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let spans = words(&text);
+        for (size, overlap) in [(8, 0), (8, 3), (5, 4), (40, 0), (100, 10)] {
+            let chunks = chunk_spans(&text, &spans, size, overlap);
+            assert!(chunks.iter().all(|c| c.tokens <= size && c.tokens > 0), "{size}/{overlap}");
+            assert_eq!(chunks[0].bytes.start, 0);
+            assert_eq!(chunks.last().unwrap().bytes.end, text.len());
+            for w in chunks.windows(2) {
+                let (a, b) = (&w[0].bytes, &w[1].bytes);
+                assert!(b.start > a.start && b.start <= a.end + 1, "in order, no gap: {a:?} {b:?}");
+                let shared = text[b.start..a.end.max(b.start)].split_whitespace().count();
+                assert_eq!(shared, overlap.min(size - 1), "{size}/{overlap}: {a:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_options_parse() {
+        let o = ChunkOptions::from_value(
+            "f",
+            &options(&[("size", Value::Int(100)), ("overlap", Value::Int(10)), ("task", "query".into())]),
+        )
+        .unwrap();
+        assert_eq!(o, ChunkOptions { size: Some(100), overlap: 10, task: EmbedTask::Query });
+        assert_eq!(ChunkOptions::from_value("f", &Value::Null).unwrap(), ChunkOptions::default());
+        for (bad, err) in [
+            (options(&[("size", Value::Int(0))]), "at least 1"),
+            (options(&[("overlap", Value::Int(-1))]), "at least 0"),
+            (options(&[("size", Value::Int(4)), ("overlap", Value::Int(4))]), "less than `size`"),
+            (options(&[("size", "x".into())]), "integer"),
+            (options(&[("truncate", Value::Bool(true))]), "unknown option `truncate`"),
+            (options(&[("task", "x".into())]), "'query' or 'document'"),
+        ] {
+            let e = ChunkOptions::from_value("f", &bad).unwrap_err().to_string();
+            assert!(e.contains(err), "{e}");
+        }
     }
 
     #[test]

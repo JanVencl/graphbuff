@@ -68,6 +68,63 @@ fn check_query(dir: &Path, name: &str, tol: f64) {
     assert!(e.embed(None, &refs[..1], &strict, &no_interrupt).is_ok());
 }
 
+/// Chunks of a long text fit the model with either prefix, and their token counts are
+/// what the model gives them; `embedChunks` embeds each as `embed` would.
+fn check_chunks(dir: &Path, name: &str) {
+    let e = Arc::new(embedder_for(dir, name, 8));
+    let db = Database::in_memory();
+    db.set_embedder(e.clone());
+    let base = "Graph databases store nodes and relationships. Příliš žluťoučký kůň úpěl ďábelské ódy!\n\n\
+                Vector indexes find similar embeddings quickly; a model turns text into vectors. ";
+    let max = e.models()[0].max_tokens;
+    // Long enough for more than four chunks of the model's size.
+    let per = e.token_spans(None, base, EmbedTask::Document).unwrap().spans.len();
+    let text = base.repeat(4 * max / per + 2);
+    let specials = e.token_ids(None, "", &EmbedOptions::default()).unwrap().len();
+    for task in ["document", "query"] {
+        let opts = EmbedOptions { task: if task == "query" { EmbedTask::Query } else { EmbedTask::Document }, truncate: false };
+        let fit = e.token_spans(None, &text, opts.task).unwrap().fit;
+        assert!(fit + specials <= max, "{name}: fit {fit}");
+        for (size, overlap) in [(fit, 0), (fit / 2, fit / 8)] {
+            let params = [
+                ("t".to_string(), graphbuff::Value::String(text.clone())),
+                ("o".to_string(), graphbuff::Value::Map([
+                    ("task".to_string(), graphbuff::Value::String(task.into())),
+                    ("size".to_string(), graphbuff::Value::Int(size as i64)),
+                    ("overlap".to_string(), graphbuff::Value::Int(overlap as i64)),
+                ].into_iter().collect())),
+            ].into_iter().collect();
+            let r = db.execute_with_params("CALL vector.embedChunks($t, null, $o) YIELD text, tokens, vector RETURN *", &params).unwrap();
+            assert!(r.len() > 3, "{name}: {} chunks", r.len());
+            let mut pieces = Vec::new();
+            for i in 0..r.len() {
+                let (Some(ResultValue::String(piece)), Some(ResultValue::Int(tokens))) = (r.get(i, "text"), r.get(i, "tokens")) else { panic!() };
+                let ids = e.token_ids(None, piece, &opts).unwrap_or_else(|err| panic!("{name} {task}: {piece:?}: {err}"));
+                assert!(ids.len() <= max, "{name}: {} tokens: {piece:?}", ids.len());
+                assert!(*tokens as usize <= size, "{name}: {tokens} > {size}");
+                let own = e.token_spans(None, piece, opts.task).unwrap();
+                assert_eq!(own.spans.len(), *tokens as usize, "{name}: {piece:?}");
+                assert_eq!(ids.len(), specials + (max - specials - own.fit) + own.spans.len(), "{name}: prefix, text and specials add up");
+                pieces.push(piece.clone());
+            }
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let want = e.embed(None, &refs, &opts, &no_interrupt).unwrap();
+            for (i, w) in want.iter().enumerate() {
+                let Some(ResultValue::List(v)) = r.get(i, "vector") else { panic!() };
+                let got: Vec<f32> = v.iter().map(|x| match x { ResultValue::Float(f) => *f as f32, o => panic!("{o:?}") }).collect();
+                assert_close(&format!("{name} chunk {i}"), &got, &w.iter().map(|x| *x as f64).collect::<Vec<_>>(), 1e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn chunks_fit_the_fixtures() {
+    for name in ["tiny-bert", "tiny-xlmr", "tiny-nomic"] {
+        check_chunks(&fixture_named(name), name);
+    }
+}
+
 #[test]
 fn tiny_bert_matches_transformers() {
     check_model(&fixture(), "tiny-bert", 1e-5);
@@ -178,6 +235,7 @@ fn real_model_matches_transformers() {
     let dir = Path::new(&dir);
     let name = dir.file_name().unwrap().to_str().unwrap();
     check_model(dir, name, 1e-4);
+    check_chunks(dir, name);
 }
 
 #[test]

@@ -294,3 +294,101 @@ fn a_vector_index_records_its_model() {
         .execute("CREATE VECTOR INDEX d FOR (d:Doc) ON (d.e) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 'elsewhere'}}")
         .unwrap();
 }
+
+fn with_text(db: &Database<MemoryGraph>, q: &str, text: &str) -> Result<QueryResult> {
+    let params = [("t".to_string(), graphbuff::Value::String(text.into()))].into_iter().collect();
+    db.execute_with_params(q, &params)
+}
+
+fn strings(r: &QueryResult, col: &str) -> Vec<String> {
+    (0..r.len())
+        .map(|i| match r.get(i, col) {
+            Some(ResultValue::String(s)) => s.clone(),
+            o => panic!("{col}: {o:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn chunks_fit_the_model_and_point_into_the_text() {
+    let e = Arc::new(HashEmbedder::new([("m", 8)]).with_max_tokens(10));
+    let db = db_with(e.clone());
+    let text = "Příliš žluťoučký kůň úpěl ďábelské ódy. ".repeat(6) + "\n\nKonec.";
+    let r = with_text(
+        &db,
+        "CALL vector.chunk($t) YIELD index, text, start, length, tokens \
+         RETURN index, text, tokens, substring($t, start, length) = text AS same",
+        &text,
+    )
+    .unwrap();
+    assert!(r.len() >= 4, "{}", r.len());
+    for i in 0..r.len() {
+        assert_eq!(r.get(i, "index"), Some(&ResultValue::Int(i as i64)));
+        assert_eq!(r.get(i, "same"), Some(&ResultValue::Bool(true)), "row {i}: start and length count characters");
+        let Some(ResultValue::Int(t)) = r.get(i, "tokens") else { panic!() };
+        assert!((1..=10).contains(t));
+    }
+    let chunks = strings(&r, "text");
+    assert!(chunks.iter().take(chunks.len() - 1).all(|c| c.ends_with("ódy.")), "cut at sentences: {chunks:?}");
+    assert!(chunks.last().unwrap().ends_with("ódy. 
+
+Konec."), "what fits stays together: {chunks:?}");
+    // A query's prefix takes a token: chunks of 9.
+    let r = with_text(&db, "CALL vector.chunk($t, null, {task: 'query', size: 9}) YIELD tokens RETURN max(tokens) AS m", &text).unwrap();
+    assert!(matches!(one(&r, "m"), ResultValue::Int(n) if n <= 9));
+    let e2 = with_text(&db, "CALL vector.chunk($t, null, {task: 'query', size: 10}) YIELD text RETURN text", &text).unwrap_err();
+    assert!(e2.to_string().contains("`size` 10 is more than the 9 tokens"), "{e2}");
+}
+
+#[test]
+fn embed_chunks_embeds_each_chunk() {
+    let e = Arc::new(HashEmbedder::new([("m", 8), ("other", 16)]).with_max_tokens(6));
+    let db = db_with(e.clone());
+    let text = "graph nodes edges. vector index search. text model token layer query.";
+    let r = with_text(
+        &db,
+        "CALL vector.embedChunks($t, 'other', {overlap: 2, task: 'query'}) YIELD index, text, vector RETURN *",
+        text,
+    )
+    .unwrap();
+    assert!(r.len() >= 3);
+    let query = EmbedOptions { task: EmbedTask::Query, truncate: true };
+    for (i, chunk) in strings(&r, "text").iter().enumerate() {
+        let v = floats(r.get(i, "vector").unwrap());
+        assert_eq!(v.len(), 16);
+        assert_eq!(v, expected(&e, Some("other"), chunk, &query), "{chunk}");
+    }
+    let calls = e.calls();
+    with_text(&db, "CALL vector.embedChunks($t) YIELD vector RETURN vector", text).unwrap();
+    assert_eq!(e.calls(), calls + 1, "one embedding call for all chunks");
+}
+
+#[test]
+fn chunk_arguments_are_checked() {
+    let (db, _) = hash_db();
+    for q in ["CALL vector.chunk(null) YIELD text RETURN text", "CALL vector.embedChunks('') YIELD text RETURN text"] {
+        assert_eq!(db.execute(q).unwrap().len(), 0, "{q}");
+    }
+    for (q, err) in [
+        ("CALL vector.chunk(5) YIELD text RETURN text", "expects STRING"),
+        ("CALL vector.chunk('a b', 'nope') YIELD text RETURN text", "unknown embedding model"),
+        ("CALL vector.chunk('a b', null, {overlap: 64}) YIELD text RETURN text", "`overlap` (64) must be less than the size (64)"),
+        ("CALL vector.chunk('a b', null, {size: 65}) YIELD text RETURN text", "more than the 64 tokens"),
+        ("CALL vector.chunk('a b', null, {sizes: 5}) YIELD text RETURN text", "unknown option `sizes`"),
+    ] {
+        let e = db.execute(q).unwrap_err().to_string();
+        assert!(e.contains(err), "{q}: {e}");
+    }
+    // An embedder that cannot tell its tokens.
+    struct Plain;
+    impl Embedder for Plain {
+        fn models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+        fn embed(&self, _: Option<&str>, t: &[&str], _: &EmbedOptions, _: &dyn Fn() -> Result<()>) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0]; t.len()])
+        }
+    }
+    let db = db_with(Arc::new(Plain));
+    assert!(matches!(db.execute("CALL vector.chunk('a') YIELD text RETURN text"), Err(Error::Unsupported(_))));
+}

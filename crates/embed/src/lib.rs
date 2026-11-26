@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use burn::tensor::Device;
-use graphbuff::{EmbedOptions, EmbedStats, EmbedTask, Embedder, Error, ModelInfo, Result, accounting};
+use graphbuff::{EmbedOptions, EmbedStats, EmbedTask, Embedder, Error, ModelInfo, Result, TokenSpans, accounting};
 
 pub use manifest::{Architecture, Manifest, Pooling};
 pub use registry::{FeedForward, ModelConfig, ModelSpec, Positions, Registry, Skipped};
@@ -262,12 +262,15 @@ fn guarded<T>(f: impl FnOnce() -> std::result::Result<T, String>) -> std::result
     })
 }
 
-fn with_prefix(spec: &ModelSpec, text: &str, task: EmbedTask) -> String {
-    let prefix = match task {
+fn prefix(spec: &ModelSpec, task: EmbedTask) -> &str {
+    match task {
         EmbedTask::Query => &spec.manifest.query_prefix,
         EmbedTask::Document => &spec.manifest.doc_prefix,
-    };
-    format!("{prefix}{text}")
+    }
+}
+
+fn with_prefix(spec: &ModelSpec, text: &str, task: EmbedTask) -> String {
+    format!("{}{text}", prefix(spec, task))
 }
 
 impl Embedder for LocalEmbedder {
@@ -297,6 +300,13 @@ impl Embedder for LocalEmbedder {
             model_loads: self.cache.loads() as u64,
             load_seconds: c.load_nanos.load(Ordering::Relaxed) as f64 / 1e9,
         }
+    }
+
+    fn token_spans(&self, model: Option<&str>, text: &str, task: EmbedTask) -> Result<TokenSpans> {
+        let spec = self.spec(model)?;
+        let m = self.model(spec)?;
+        let (prefix_tokens, spans) = self.on_pool(|| m.tokenizer.spans(prefix(spec, task), text)).map_err(Error::Semantic)?;
+        Ok(TokenSpans { spans, fit: m.tokenizer.text_tokens().saturating_sub(prefix_tokens) })
     }
 
     fn embed(

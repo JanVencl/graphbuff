@@ -90,7 +90,7 @@ pub use procedures::{
 };
 pub use transaction::Transaction;
 pub use schema::{EntitySchema, GraphSchema, NodeTypeSchema, Pattern, PropertySchema, property_type};
-pub use embed::{EmbedOptions, EmbedStats, EmbedTask, Embedder, HashEmbedder, ModelInfo};
+pub use embed::{Chunk, ChunkOptions, EmbedOptions, EmbedStats, EmbedTask, Embedder, HashEmbedder, ModelInfo, TokenSpans, chunk_spans};
 pub use accel::{KernelMode, KernelStats, kernel_stats};
 #[cfg(feature = "gpu")]
 pub use graphbuff_gpu::WgpuKernels;

@@ -783,6 +783,25 @@ fn register_builtins(p: &mut Procedures) {
         crate::embed::embed_batch,
     );
     add(
+        ProcedureSignature::new("vector.chunk", ["text"], ["index", "text", "start", "length", "tokens"])
+            .optional("model", Value::Null)
+            .optional("options", Value::Null)
+            .input_types([ProcedureType::String, ProcedureType::String, ProcedureType::Map])
+            .description(
+                "Splits a text into chunks that fit an embedding model, cut at paragraphs, sentences or words: \
+                 one row per chunk with its character offset and length and its tokens.",
+            ),
+        crate::embed::chunk,
+    );
+    add(
+        ProcedureSignature::new("vector.embedChunks", ["text"], ["index", "text", "start", "length", "tokens", "vector"])
+            .optional("model", Value::Null)
+            .optional("options", Value::Null)
+            .input_types([ProcedureType::String, ProcedureType::String, ProcedureType::Map])
+            .description("Splits a text into chunks as vector.chunk does and embeds them: one row per chunk, with its vector."),
+        crate::embed::embed_chunks,
+    );
+    add(
         ProcedureSignature::new("vector.models", NONE, ["name", "dimensions", "maxTokens", "loaded"])
             .description("The installed embedding models."),
         crate::embed::models,
