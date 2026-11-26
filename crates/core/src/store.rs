@@ -661,6 +661,9 @@ pub const MAX_VECTOR_DIMENSIONS: u32 = 4096;
 
 /// Set in the similarity byte of an encoded vector index that is approximate (HNSW).
 const HNSW_FLAG: u8 = 0x80;
+/// Set in the similarity byte of a vector index that records its embedding model; the
+/// model's name follows the HNSW settings.
+const MODEL_FLAG: u8 = 0x40;
 
 /// How vectors are compared. Scores are normalized to [0, 1] as Neo4j does, higher
 /// meaning more similar: cosine `(1 + cos) / 2`, euclidean `1 / (1 + d²)`.
@@ -851,6 +854,9 @@ pub struct IndexDef {
     /// vector property first, then its filter properties.
     pub properties: Vec<String>,
     pub kind: IndexKind,
+    /// The embedding model that made a vector index's vectors (`vector.embedding_model`),
+    /// if it was given: search uses it to embed query text. Always `None` for other kinds.
+    pub embedding_model: Option<String>,
 }
 
 impl IndexDef {
@@ -863,6 +869,7 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Range,
+            embedding_model: None,
         }
     }
 
@@ -883,6 +890,7 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Vector { dimensions, similarity, hnsw: None },
+            embedding_model: None,
         }
     }
 
@@ -891,6 +899,12 @@ impl IndexDef {
         if let IndexKind::Vector { hnsw: h, .. } = &mut self.kind {
             *h = Some(hnsw);
         }
+        self
+    }
+
+    /// The same vector index, recording `model` as the embedding model of its vectors.
+    pub fn with_model(mut self, model: impl Into<String>) -> IndexDef {
+        self.embedding_model = Some(model.into());
         self
     }
 
@@ -929,6 +943,7 @@ impl IndexDef {
             extra_labels: labels.collect(),
             properties,
             kind: IndexKind::Fulltext { analyzer },
+            embedding_model: None,
         }
     }
 
@@ -955,6 +970,7 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Point,
+            embedding_model: None,
         }
     }
 
@@ -986,6 +1002,7 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties: Vec::new(),
             kind: IndexKind::Lookup,
+            embedding_model: None,
         }
     }
 
@@ -1032,6 +1049,7 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties: vec![property.into()],
             kind: IndexKind::Range,
+            embedding_model: None,
         }
     }
 
@@ -1088,6 +1106,15 @@ impl IndexDef {
         }
         if (self.is_point() || self.is_text()) && self.properties.len() != 1 {
             return Err(Error::Semantic(format!("a {} index is on exactly one property", self.kind.text().to_lowercase())));
+        }
+        if let Some(m) = &self.embedding_model
+            && (!self.is_vector() || m.trim().is_empty() || m.len() > 256)
+        {
+            return Err(Error::Semantic(if self.is_vector() {
+                "`vector.embedding_model` needs a model name".into()
+            } else {
+                "only a vector index records an embedding model".into()
+            }));
         }
         if !self.extra_labels.is_empty() && !self.is_fulltext() {
             return Err(Error::Semantic("only a full-text index covers several labels or types".into()));
@@ -1164,14 +1191,17 @@ impl IndexDef {
             extra_labels: Vec::new(),
             properties,
             kind: IndexKind::Range,
+            embedding_model: None,
         })
     }
 
     /// Encodes a vector index: the definition as [`encode`](Self::encode) writes it, then
     /// its dimensions and similarity (persistent format 9, hybrid log op 14, memory
     /// snapshot 6). An approximate index sets [`HNSW_FLAG`] in the similarity byte and
-    /// follows it with `m` and `ef_construction`. Filter properties follow the vector
-    /// property in the definition's properties; 0.5 and older refuse such an index.
+    /// follows it with `m` and `ef_construction`; one that records its embedding model sets
+    /// [`MODEL_FLAG`] and ends with the model's name. Filter properties follow the vector
+    /// property in the definition's properties. 0.5 and older refuse an index with filter
+    /// properties or a model.
     pub(crate) fn encode_vector(&self, e: &mut Encoder) {
         let IndexKind::Vector { dimensions, similarity, hnsw } = self.kind else {
             unreachable!("encode_vector of a range index")
@@ -1182,13 +1212,17 @@ impl IndexDef {
             VectorSimilarity::Cosine => 1,
             VectorSimilarity::Euclidean => 2,
         };
+        let model = if self.embedding_model.is_some() { MODEL_FLAG } else { 0 };
         match hnsw {
-            None => e.u8(code),
+            None => e.u8(code | model),
             Some(h) => {
-                e.u8(code | HNSW_FLAG);
+                e.u8(code | model | HNSW_FLAG);
                 e.u32(u32::from(h.m));
                 e.u32(u32::from(h.ef_construction));
             }
+        }
+        if let Some(m) = &self.embedding_model {
+            e.str(m);
         }
     }
 
@@ -1196,7 +1230,7 @@ impl IndexDef {
         let mut def = IndexDef::decode(d)?;
         let dimensions = d.u32()?;
         let code = d.u8()?;
-        let similarity = match code & !HNSW_FLAG {
+        let similarity = match code & !(HNSW_FLAG | MODEL_FLAG) {
             1 => VectorSimilarity::Cosine,
             2 => VectorSimilarity::Euclidean,
             t => return Err(d.corrupt(format!("unknown vector similarity {t}"))),
@@ -1211,6 +1245,9 @@ impl IndexDef {
         } else {
             None
         };
+        if code & MODEL_FLAG != 0 {
+            def.embedding_model = Some(d.str()?);
+        }
         if dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
             return Err(d.corrupt(format!("bad vector index `{}`", def.name)));
         }

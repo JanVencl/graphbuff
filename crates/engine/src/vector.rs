@@ -97,6 +97,8 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
             ("vector.similarity_function", o) => {
                 return Err(Error::Type(format!("`vector.similarity_function` does not accept {}", o.type_name())));
             }
+            // Recorded on the definition: see `embedding_model`.
+            ("vector.embedding_model", _) => {}
             (k, _) if k.starts_with("vector.") => {
                 return Err(Error::Unsupported(format!("vector index setting `{k}` is not supported")));
             }
@@ -122,6 +124,17 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
     Ok(IndexKind::Vector { dimensions, similarity, hnsw })
 }
 
+/// The `vector.embedding_model` of a vector index's `OPTIONS`: the model that makes its
+/// vectors, used by search to embed query text.
+pub fn embedding_model(options: &BTreeMap<String, Value>) -> Result<Option<String>> {
+    let Some(Value::Map(config)) = options.get("indexConfig") else { return Ok(None) };
+    match config.get("vector.embedding_model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(m)) if !m.trim().is_empty() => Ok(Some(m.clone())),
+        Some(o) => Err(Error::Type(format!("`vector.embedding_model` needs a model name (a STRING), not {o}"))),
+    }
+}
+
 /// A `SHOW INDEXES` / `db.indexes()` row: name, entity type, label or type, properties,
 /// index type and options.
 pub fn index_row(d: IndexDef) -> Vec<Value> {
@@ -136,6 +149,9 @@ pub fn index_row(d: IndexDef) -> Vec<Value> {
                 ("vector.similarity_function".to_string(), Value::String(similarity.name().into())),
                 ("vector.hnsw.enabled".to_string(), Value::Bool(hnsw.is_some())),
             ]);
+            if let Some(m) = &d.embedding_model {
+                config.insert("vector.embedding_model".into(), Value::String(m.clone()));
+            }
             if let Some(h) = hnsw {
                 config.insert("vector.hnsw.m".into(), Value::Int(i64::from(h.m)));
                 config.insert("vector.hnsw.ef_construction".into(), Value::Int(i64::from(h.ef_construction)));

@@ -381,7 +381,7 @@ fn reading() {
     let addr = server.mcp_addr().unwrap();
     http_query(&server, "UNWIND range(1, 300) AS i CREATE (:P {i: i, v: [x IN range(1, 40) | toFloat(x)], name: 'p' + i})");
 
-    assert_eq!(tool_names(addr, &rita), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher"]);
+    assert_eq!(tool_names(addr, &rita), ["list_databases", "get_schema", "search", "get_node", "neighbors", "find_path", "read_cypher"]);
     let (text, err) = call(addr, &rita, "read_cypher", &q("MATCH (p:P) WHERE p.i = $i RETURN p.name AS name, p.v AS v", r#""params":{"i":7}"#));
     assert!(!err, "{text}");
     assert_eq!(text, r#"{"database":"graphbuff","columns":["name","v"],"rows":[["p7","<vector 40>"]]}"#);
@@ -428,9 +428,9 @@ fn writing_and_what_mcp_refuses() {
     http_query(&server, "CREATE DATABASE other");
     let (scoped, _) = users.create_token("ed", "s", TokenAccess::Write, &["graphbuff".into()], None).unwrap();
 
-    assert_eq!(tool_names(addr, &ed), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher", "write_cypher"]);
+    assert_eq!(tool_names(addr, &ed), ["list_databases", "get_schema", "search", "get_node", "neighbors", "find_path", "read_cypher", "write_cypher"]);
     // An editor's read-only token sees no write tool.
-    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher"]);
+    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "get_schema", "search", "get_node", "neighbors", "find_path", "read_cypher"]);
 
     let r = obj_of(&call(addr, &ed, "write_cypher", &q("UNWIND range(1, 3) AS i CREATE (n:W {i: i}) RETURN n.i AS i", "")).0);
     assert_eq!(r["stats"], json::parse(r#"{"labelsAdded":3,"nodesCreated":3,"propertiesSet":3}"#).unwrap());
@@ -660,4 +660,71 @@ fn exploring() {
     // Names are quoted, not pasted.
     let (text, err) = call(addr, &rita, "get_node", r#"{"label":"Person) DETACH DELETE (x","property":"name","value":1}"#);
     assert!(!err && text.contains("no node matches"), "{text}");
+}
+
+#[test]
+fn searching() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let mgr = Arc::new(DatabaseManager::in_memory());
+    mgr.set_embedder(Arc::new(graphbuff::HashEmbedder::new([("mini", 8), ("big", 16)])));
+    let server = Server::start(
+        mgr,
+        ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            token: Some("tok".into()),
+            users: Some(users),
+            mcp: Some(McpConfig { bind: "127.0.0.1:0".into(), ..McpConfig::default() }),
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let addr = server.mcp_addr().unwrap();
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"cats"}"#);
+    assert!(err && text.contains("no vector or full-text index"), "{text}");
+
+    http_query(
+        &server,
+        "CREATE VECTOR INDEX docs FOR (d:Doc) ON (d.e) WITH [d.year] OPTIONS {indexConfig: \
+         {`vector.dimensions`: 8, `vector.embedding_model`: 'mini'}}",
+    );
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"cats","model":"big"}"#);
+    assert!(err && text.contains("16 dimensions") && text.contains("fit: mini"), "{text}");
+    http_query(&server, "CREATE FULLTEXT INDEX docs_text FOR (d:Doc) ON EACH [d.text]");
+    http_query(
+        &server,
+        "UNWIND [['the cat sat on the mat', 2020], ['dogs chase cats', 2022], ['a quiet lake', 2024], \
+         ['stock prices fell', 2023]] AS t CREATE (d:Doc {text: t[0], year: t[1]}) \
+         SET d.e = vector.embed(t[0], 'mini', {task: 'query'})",
+    );
+    let first = |text: &str| -> String {
+        let r = obj_of(text);
+        let Json::Array(res) = &r["results"] else { panic!("{text}") };
+        format!("{:?}", res.first().unwrap_or(&Json::Null))
+    };
+
+    // Auto: one label has both kinds, so hybrid.
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"the cat sat on the mat"}"#);
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!(r["mode"], Json::String("hybrid".into()));
+    assert_eq!(r["model"], Json::String("mini".into()));
+    assert!(first(&text).contains("the cat sat"), "{text}");
+
+    // By meaning only, with a filter on the index's filter property.
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"the cat sat on the mat","mode":"vector","filters":{"year":{"gte":2021}}}"#);
+    assert!(!err && !text.contains("the cat sat"), "{text}");
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"x","mode":"vector","filters":{"text":"a"}}"#);
+    assert!(err && text.contains("not a filter property"), "{text}");
+
+    // By words: operators and syntax in the text are just words.
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"cats AND (\"","index":"docs_text","k":5}"#);
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!(r["mode"], Json::String("fulltext".into()));
+    assert!(first(&text).contains("cats"), "{text}");
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"cats","index":"nope"}"#);
+    assert!(err && text.contains("docs (vector") && text.contains("docs_text (fulltext"), "{text}");
+    let (text, err) = call(addr, &rita, "search", r#"{"text":"cats","mode":"semantic"}"#);
+    assert!(err && text.contains("auto, vector, fulltext or hybrid"), "{text}");
 }

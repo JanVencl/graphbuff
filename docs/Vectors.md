@@ -46,6 +46,12 @@ OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.similarity_function`: 'co
   `vector.hnsw.ef_construction` make the index approximate (see
   [Approximate indexes](#approximate-indexes-hnsw)). `indexProvider` is accepted and
   ignored; any other option is an error.
+- `vector.embedding_model: 'name'` records which [embedding model](Embeddings.md) made the
+  vectors, so that searches by text (the MCP `search` tool) embed the question with the same
+  model. A model of the same dimensions but another kind gives poor results without any
+  error, which this prevents. When the server has models, the name must be one of them,
+  with the index's dimensions; without models any name is taken. 0.5 and older cannot
+  open a store with such an index.
 - One property per index. Without a name, the index is called `vector_<Label>_<prop>`.
 - A vector index and a range index may sit on the same property.
 - `SHOW INDEXES` and `CALL db.indexes()` list it with type `VECTOR` and its options;

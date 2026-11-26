@@ -310,6 +310,7 @@ mod tests {
                 properties: vec!["group".into(), "id".into()],
                 extra_labels: Vec::new(),
                 kind: Default::default(),
+                embedding_model: None,
             },
             IndexDef::relationship("by_w", "KNOWS", "w"),
         ]

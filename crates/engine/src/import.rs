@@ -126,6 +126,7 @@ pub fn parse_index(spec: &str) -> Result<IndexDef> {
         properties,
         extra_labels: Vec::new(),
         kind: Default::default(),
+        embedding_model: None,
     })
 }
 

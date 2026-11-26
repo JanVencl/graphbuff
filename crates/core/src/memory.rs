@@ -1589,6 +1589,7 @@ mod tests {
             properties: xy.to_vec(),
             extra_labels: Vec::new(),
             kind: Default::default(),
+            embedding_model: None,
         })
         .unwrap();
         let w = ["w".to_string()];
