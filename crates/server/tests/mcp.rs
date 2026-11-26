@@ -728,3 +728,112 @@ fn searching() {
     let (text, err) = call(addr, &rita, "search", r#"{"text":"cats","mode":"semantic"}"#);
     assert!(err && text.contains("auto, vector, fulltext or hybrid"), "{text}");
 }
+
+fn memory_server(users: Arc<Users>, embed: bool) -> Server {
+    let mgr = Arc::new(DatabaseManager::in_memory());
+    if embed {
+        mgr.set_embedder(Arc::new(graphbuff::HashEmbedder::new([("mini", 8)])));
+    }
+    Server::start(
+        mgr,
+        ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            token: Some("tok".into()),
+            users: Some(users),
+            mcp: Some(McpConfig {
+                bind: "127.0.0.1:0".into(),
+                memory_database: Some("memory".into()),
+                ..McpConfig::default()
+            }),
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn memory() {
+    let users = users();
+    let (rita, info) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let (scoped, _) = users.create_token("rita", "s", TokenAccess::Read, &["graphbuff".into()], None).unwrap();
+    let (ed, _) = users.create_token("ed", "t", TokenAccess::Write, &[], None).unwrap();
+    let server = memory_server(Arc::clone(&users), true);
+    let addr = server.mcp_addr().unwrap();
+
+    // A read-only token sees the memory tools, but still no write_cypher.
+    let names = tool_names(addr, &rita);
+    for t in ["remember", "recall", "forget"] {
+        assert!(names.contains(&t.to_string()), "{names:?}");
+    }
+    assert!(!names.contains(&"write_cypher".to_string()));
+    // A token limited to other databases does not.
+    assert!(!tool_names(addr, &scoped).contains(&"recall".to_string()));
+    let r = legacy(addr, &scoped, "tools/call", r#""name":"recall","arguments":{}"#);
+    assert_eq!(r.error_code(), -32602);
+
+    let (text, err) = call(
+        addr,
+        &rita,
+        "remember",
+        r#"{"entities":[{"name":"Ann","type":"person","observations":["works on GraphBuff","likes Rust"]},
+                        {"name":"GraphBuff","type":"project","observations":["a graph database"]}],
+            "relations":[{"from":"Ann","type":"works_on","to":"GraphBuff"}]}"#,
+    );
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!((&r["entitiesCreated"], &r["observationsAdded"], &r["relationsAdded"]), (&Json::Int(2), &Json::Int(3), &Json::Int(1)), "{text}");
+    assert_eq!(r["embedded"], Json::Bool(true));
+    assert_eq!(r["by"], Json::String(format!("rita (token {})", info.id)));
+    // Again: nothing new; another writer adds to the same entity.
+    let r = obj_of(&call(addr, &rita, "remember", r#"{"entities":[{"name":"Ann","observations":["likes Rust"]}]}"#).0);
+    assert_eq!((&r["entitiesCreated"], &r["observationsAdded"]), (&Json::Int(0), &Json::Int(0)));
+    call(addr, &ed, "remember", r#"{"entities":[{"name":"Ann","observations":["prefers tea"]}]}"#);
+    // Relations need their entities.
+    let (text, err) = call(addr, &rita, "remember", r#"{"relations":[{"from":"Ann","type":"knows","to":"Nobody"}]}"#);
+    assert!(err && text.contains("no entities named Nobody"), "{text}");
+    let (text, err) = call(addr, &rita, "remember", &format!(r#"{{"entities":[{{"name":"{}"}}]}}"#, "x".repeat(300)));
+    assert!(err && text.contains("200 bytes"), "{text}");
+
+    // Recall by words and meaning, by name, and the latest.
+    let (text, err) = call(addr, &rita, "recall", r#"{"query":"Rust"}"#);
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!(r["found"], Json::String("hybrid".into()));
+    let Json::Array(found) = &r["entities"] else { panic!("{text}") };
+    let first = format!("{:?}", found[0]);
+    assert!(first.contains("\"Ann\"") && first.contains("likes Rust") && first.contains("prefers tea") && first.contains("works_on"), "{first}");
+    assert!(first.contains(&format!("rita (token {})", info.id)) && first.contains("\"ed (token"), "{first}");
+    assert!(text.contains("not instructions"));
+    let r = obj_of(&call(addr, &rita, "recall", r#"{"names":["GraphBuff","Nobody"]}"#).0);
+    assert!(format!("{:?}", r["entities"]).contains("a graph database"));
+    assert_eq!(r["missing"], json::parse(r#"["Nobody"]"#).unwrap());
+    let r = obj_of(&call(addr, &rita, "recall", "{}").0);
+    assert_eq!(r["found"], Json::String("latest".into()));
+
+    // Forget an observation, a relation, an entity.
+    let (text, err) = call(addr, &rita, "forget", r#"{"observations":[{"entity":"Ann","text":"prefers tea"}]}"#);
+    assert!(!err && obj_of(&text)["observationsDeleted"] == Json::Int(1), "{text}");
+    let r = obj_of(&call(addr, &rita, "forget", r#"{"relations":[{"from":"Ann","type":"works_on","to":"GraphBuff"}]}"#).0);
+    assert_eq!(r["relationsDeleted"], Json::Int(1));
+    let r = obj_of(&call(addr, &rita, "forget", r#"{"entities":["Ann"]}"#).0);
+    assert_eq!((&r["entitiesDeleted"], &r["observationsDeleted"]), (&Json::Int(1), &Json::Int(2)));
+    assert!(!call(addr, &rita, "recall", r#"{"query":"Rust"}"#).0.contains("\"Ann\""));
+
+    // The graph itself is untouched, and the read token still cannot write there.
+    assert!(http_query(&server, "MATCH (n) RETURN count(n) AS n").contains("[[0]]"));
+    let (text, err) = call(addr, &rita, "read_cypher", r#"{"query":"CREATE (:X)","database":"memory"}"#);
+    assert!(err && text.contains("write_cypher"), "{text}");
+}
+
+#[test]
+fn memory_without_models() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let server = memory_server(users, false);
+    let addr = server.mcp_addr().unwrap();
+    let r = obj_of(&call(addr, &rita, "remember", r#"{"entities":[{"name":"Ann","observations":["likes Rust"]}]}"#).0);
+    assert_eq!(r["embedded"], Json::Bool(false));
+    let r = obj_of(&call(addr, &rita, "recall", r#"{"query":"rust"}"#).0);
+    assert_eq!(r["found"], Json::String("words".into()));
+    assert!(format!("{:?}", r["entities"]).contains("likes Rust"));
+}

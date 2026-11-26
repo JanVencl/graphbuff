@@ -670,6 +670,7 @@ fn main() {
             trusted_proxies: settings.mcp_trusted_proxies.clone(),
             oauth_clients: settings.mcp_oauth_clients.clone(),
             oauth_client_hosts: settings.mcp_oauth_client_hosts.clone(),
+            memory_database: settings.mcp_memory_database.clone(),
         }),
         login_limits: LoginLimits {
             max_failures: settings.max_failed_logins,

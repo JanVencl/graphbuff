@@ -105,7 +105,7 @@ fn plan(indexes: &[IndexDef], named: Option<&str>, mode: Option<&str>) -> Result
 /// `text` as words for a full-text query: everything but letters and digits is a space,
 /// and the words that are operators (`AND`, `OR`, `NOT`, `TO`) are lowered, so that the
 /// text is looked for as it is.
-fn words(text: &str) -> String {
+pub(crate) fn words(text: &str) -> String {
     let plain: String = text.chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
     plain
         .split_whitespace()

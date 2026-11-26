@@ -136,6 +136,43 @@ When the client disconnects, its running query is cancelled and rolled back. Que
 agents are listed by `SHOW TRANSACTIONS` with protocol `mcp`, and can be stopped with
 `TERMINATE TRANSACTIONS`.
 
+## Shared memory
+
+With `memory_database` set in `[mcp]`, agents get a memory they share with each other and
+with people: three tools keep entities, facts about them and relations between them in that
+database, which is created on first use.
+
+```toml
+[mcp]
+memory_database = "memory"
+```
+
+| Tool | What |
+|------|------|
+| `remember` | Adds `entities` (`name`, `type`, `observations`: short facts) and `relations` (`{from, type, to}`). An entity that exists is added to; a fact it has already is not repeated |
+| `recall` | Entities with their observations and relations: by `query` (meaning and words), by `names`, or the latest ones. Each item says who wrote it (`by`) and when |
+| `forget` | Deletes `entities` (with their observations and relations), `observations` (by the id recall gives, or `{entity, text}`) and `relations` |
+
+- **Who:** everyone who may read the memory database sees every memory and may add to it
+  and forget, also with a read-only token. These tools are the one way such a token
+  writes, and only there: `write_cypher` still refuses it, and the graph stays read-only.
+  A token limited to other databases (`ON DATABASE`) has no memory tools.
+- **Authors:** every entity, observation and relation records its writer: the user, and
+  the token or OAuth client (`ann (via https://claude.ai/…)`, `ann (token 3f2a…)`).
+- **Search:** with an embedding model as `embedding.default_model` (or a single installed
+  one), observations are embedded with it, and `recall` searches by meaning and by words
+  (a vector index that records the model, and a full-text index); without models, by
+  words only.
+- **Limits:** names up to 200 bytes, observations up to 2 KiB, 100 items per call.
+- **Storage:** `(:Memory:Entity {name, type, by, at})`, `(:Memory:Observation {text, by, at,
+  embedding})-[:ABOUT]->(entity)` and `(a)-[:RELATES {type, by, at}]->(b)`, with a
+  uniqueness constraint on entity names. People can read and fix it with Cypher, as any
+  database, with the roles they have on it.
+- **A risk to know:** an agent misled by text in the data it read can store a false
+  "fact" that other agents then recall. Recall says that memories are notes, not
+  instructions, and shows who wrote each; drop the memory database's roles from users
+  whose agents read untrusted data, or keep it off.
+
 ## What an agent may do
 
 An agent may do what the token's user may, up to the token's own cap (`ACCESS READ` or
