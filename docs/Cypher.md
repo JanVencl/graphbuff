@@ -49,7 +49,7 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   `db.relationshipTypes()`, `db.propertyKeys()`, the schema procedures (below), `db.indexes()`, `db.constraints()`,
   `db.awaitIndexes()`, `dbms.procedures()`, `dbms.functions()`, `dbms.components()`, the
   vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`), the
-  embedding procedures `vector.embedBatch(texts, model?, options?)` and `vector.models()`
+  embedding procedures `vector.embedBatch(texts, model?, options?)`, `vector.chunk(text, model?, options?)`, `vector.embedChunks(text, model?, options?)` and `vector.models()`
   ([Text embeddings](Embeddings.md)), and
   the writing `db.create.setNodeVectorProperty(node, key, vector)` and
   `db.create.setRelationshipVectorProperty(relationship, key, vector)` (the vector checked:

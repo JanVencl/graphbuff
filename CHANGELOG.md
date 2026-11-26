@@ -70,6 +70,10 @@ the same notes.
   `nomic-embed-text`. A model whose `config.json` names another `model_type` than its
   `architecture` is skipped, with the right architecture in the warning. See
   [Models](docs/Embeddings.md#models).
+- Chunks of long texts: `CALL vector.chunk(text, model?, {size, overlap, task})` splits a
+  text by the model's tokenizer into pieces that fit it, cut at blank lines, sentences or
+  words, with their character offsets; `CALL vector.embedChunks(…)` also embeds them,
+  all in one batch. See [Long texts](docs/Embeddings.md#long-texts-chunks).
 
 ### Fixed
 

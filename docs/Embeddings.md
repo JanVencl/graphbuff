@@ -13,6 +13,7 @@ The vectors are ordinary `LIST<FLOAT>` properties, so they go straight into a
 - [Setting up](#setting-up)
 - [Functions and procedures](#functions-and-procedures)
 - [Embed, index, search](#embed-index-search)
+- [Long texts: chunks](#long-texts-chunks)
 - [Models](#models)
 - [Configuration](#configuration)
 - [Performance](#performance)
@@ -47,12 +48,14 @@ The vectors are ordinary `LIST<FLOAT>` properties, so they go straight into a
 |---|---|
 | `vector.embed(text, model?, options?)` → `LIST<FLOAT>` | The embedding of one text, in any expression |
 | `CALL vector.embedBatch(texts, model?, options?) YIELD index, text, vector` | Many texts in batches: one row per text, in order |
+| `CALL vector.chunk(text, model?, options?) YIELD index, text, start, length, tokens` | A long text in pieces that fit the model (see [Long texts](#long-texts-chunks)) |
+| `CALL vector.embedChunks(text, model?, options?) YIELD index, text, start, length, tokens, vector` | The same, each piece embedded |
 | `CALL vector.models() YIELD name, dimensions, maxTokens, loaded` | The installed models |
 
 - `model` is the name of a model (its folder). `null` or leaving it out uses the default
   model: `embedding.default_model`, or the only installed model. With several models and
   no default, name one.
-- `options` is a map:
+- `options` is a map (for the chunk procedures, see [Long texts](#long-texts-chunks)):
   - `task`: `'document'` (the default) or `'query'`. Some models want a different
     prefix on search queries than on documents (E5 uses `query: ` and `passage: `). The
     model's `model.toml` sets the prefixes, and `task` picks one.
@@ -105,6 +108,47 @@ SET d.embedding = vector
 
 Search with the model the documents were embedded with. Vectors of different models
 cannot be compared, even when their lengths happen to match.
+
+## Long texts: chunks
+
+A model reads at most `maxTokens` tokens (512 for most, 2048 for nomic-embed-text) and
+`vector.embed` cuts the rest, so the end of a long document never reaches its vector.
+Split such texts into chunks and embed each:
+
+```cypher
+MATCH (d:Doc) WHERE NOT EXISTS { (d)<-[:PART_OF]-(:Chunk) }
+CALL vector.embedChunks(d.text, null, {overlap: 32}) YIELD index, text, start, vector
+CREATE (d)<-[:PART_OF]-(:Chunk {index: index, text: text, start: start, embedding: vector});
+
+CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS
+FOR (c:Chunk) ON c.embedding
+OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}};
+
+// The documents of the best chunks.
+CALL db.index.vector.queryNodes('chunk_embedding', 10, vector.embed($question, null, {task: 'query'}))
+YIELD node AS c, score
+MATCH (c)-[:PART_OF]->(d:Doc)
+RETURN d.title, max(score) AS best ORDER BY best DESC LIMIT 5;
+```
+
+- Chunks are cut by the model's own tokenizer, so each one fits the model with the
+  prefix of its `task` and is embedded whole.
+- A chunk ends at the best break in the second half of its room: a blank line, else the
+  end of a sentence or line, else a space. Inside a word only when there is none.
+- Options:
+  - `size`: tokens per chunk at most; by default, and at most, what fits the model.
+    Smaller chunks give more precise matches and more vectors.
+  - `overlap`: tokens each chunk repeats from the end of the one before, 0 by default,
+    less than `size`. Rounded to the start of a word, so a chunk may repeat a few fewer.
+    Overlap keeps a sentence that spans a cut whole in one of the chunks.
+  - `task`: `'document'` (the default) or `'query'`, whose prefix takes room too.
+- Each row: `index` from 0, the chunk's `text` (without whitespace at its ends), its
+  `start` and `length` in characters, so `substring(text, start, length)` gives it
+  back, and its `tokens` (special tokens and the prefix not counted).
+- A `null` or empty text gives no rows. `vector.chunk` loads the model too, for its
+  tokenizer.
+- `embedChunks` embeds all the chunks of a text in one batch. To embed many documents,
+  page them as above.
 
 ## Models
 
@@ -233,8 +277,8 @@ cargo run --release -p graphbuff-embed --example embedbench -- --model path/to/m
   quantized weights, no ONNX.
 - **No downloads:** the server never downloads models. Use `fetch-model.py`, or copy
   the files yourself.
-- **Long text:** text longer than the model's limit is cut (or refused), not split into
-  chunks. Split long documents before embedding them.
+- **Long text:** `vector.embed` and `embedBatch` cut (or refuse) text longer than the
+  model's limit; split it with [`vector.embedChunks`](#long-texts-chunks).
 - **No automatic embedding:** the vector is not computed when a node is written; set it
   in the query.
 - **Text only:** no remote providers (OpenAI and the like), no images.

@@ -278,7 +278,7 @@ pub(crate) fn render(ctx: &Ctx) -> String {
 fn embedding(out: &mut String, e: &dyn graphbuff::Embedder) {
     let s = e.stats();
     for (name, kind, help, value) in [
-        ("graphbuff_embed_calls_total", "counter", "Embedding calls (vector.embed rows and vector.embedBatch calls) that succeeded.", s.calls as f64),
+        ("graphbuff_embed_calls_total", "counter", "Embedding calls (vector.embed rows, vector.embedBatch and vector.embedChunks calls) that succeeded.", s.calls as f64),
         ("graphbuff_embed_texts_total", "counter", "Texts embedded.", s.texts as f64),
         ("graphbuff_embed_tokens_total", "counter", "Tokens embedded (padding not counted).", s.tokens as f64),
         ("graphbuff_embed_seconds_total", "counter", "Time spent embedding.", s.seconds),
