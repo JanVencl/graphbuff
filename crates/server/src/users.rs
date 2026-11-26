@@ -425,6 +425,10 @@ struct Grant {
     created: i64,
     /// The SHA-256 hash of the current refresh token.
     hash: [u8; 32],
+    /// The hashes of the refresh tokens it replaced, newest first, at most
+    /// [`MAX_USED_REFRESH`]: one of them used again ends the grant. Other wrong secrets
+    /// do not, as the family is no secret.
+    used: Vec<[u8; 32]>,
     /// When the current refresh token stops working.
     expires: i64,
     /// The id of the current access token.
@@ -436,6 +440,8 @@ pub const OAUTH_ACCESS_LIFETIME: Duration = Duration::from_secs(3600);
 /// How long a refresh token works unless it is used (and replaced).
 const REFRESH_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 const REFRESH_PREFIX: &str = "gbr_";
+/// How many replaced refresh tokens of a grant are remembered, to notice their reuse.
+const MAX_USED_REFRESH: usize = 64;
 
 /// Why a refresh token does not work.
 #[derive(Debug, PartialEq, Eq)]
@@ -833,6 +839,7 @@ impl Users {
                 audience: audience.to_string(),
                 created: now,
                 hash: crypto::sha256(refresh_token.as_bytes()),
+                used: Vec::new(),
                 expires: now.saturating_add(millis(REFRESH_LIFETIME)).min(now.saturating_add(millis(DEFAULT_TOKEN_LIFETIME))),
                 token: token.info.id.clone(),
             };
@@ -861,11 +868,18 @@ impl Users {
             if g.client != client {
                 return Ok(());
             }
-            if !crypto::same_bytes(&hash, &g.hash) || g.expires <= now {
-                // An old refresh token again, or a stale one: the grant ends.
-                if g.expires > now {
-                    issued = Err(RefreshError::Reused { user: g.user.clone() });
+            if !crypto::same_bytes(&hash, &g.hash) {
+                // An earlier refresh token again: it may have been stolen, the grant ends.
+                // Any other secret is a guess, which leaves the grant alone.
+                if g.used.iter().any(|h| crypto::same_bytes(h, &hash)) {
+                    if g.expires > now {
+                        issued = Err(RefreshError::Reused { user: g.user.clone() });
+                    }
+                    d.grants.remove(family);
                 }
+                return Ok(());
+            }
+            if g.expires <= now {
                 d.grants.remove(family);
                 return Ok(());
             }
@@ -873,8 +887,10 @@ impl Users {
                 new_access(&g.user, family, &g.client, g.access, g.databases.clone(), &g.audience, now)?;
             d.tokens.remove(&g.token);
             let end = g.created.saturating_add(millis(DEFAULT_TOKEN_LIFETIME));
+            let used = std::iter::once(g.hash).chain(g.used.iter().copied()).take(MAX_USED_REFRESH).collect();
             let grant = Grant {
                 hash: crypto::sha256(next.as_bytes()),
+                used,
                 expires: now.saturating_add(millis(REFRESH_LIFETIME)).min(end),
                 token: token.info.id.clone(),
                 ..g.clone()
@@ -1289,12 +1305,13 @@ fn load_grants(db: &Database<BoxedStore>) -> Result<BTreeMap<String, Grant>> {
     let rows = db
         .execute(
             "MATCH (g:OAuthGrant) RETURN g.family, g.user, g.accountId, g.client, g.access, g.databases, \
-             g.audience, g.created, g.hash, g.expires, g.token",
+             g.audience, g.created, g.hash, g.usedHashes, g.expires, g.token",
         )?
         .rows;
     let mut grants = BTreeMap::new();
     for row in rows {
-        let [family, user, account, client, access, databases, audience, created, hash, expires, token] = row.as_slice()
+        let [family, user, account, client, access, databases, audience, created, hash, used, expires, token] =
+            row.as_slice()
         else {
             return Err(bad("record", "?"));
         };
@@ -1302,6 +1319,12 @@ fn load_grants(db: &Database<BoxedStore>) -> Result<BTreeMap<String, Grant>> {
         let text = |v: &ResultValue, what: &str| v.as_str().map(String::from).ok_or_else(|| bad(what, id));
         let databases = match databases {
             ResultValue::List(list) => list.iter().map(|d| d.as_str().map(db_key)).collect::<Option<BTreeSet<String>>>(),
+            _ => None,
+        };
+        // Saved before replaced tokens were remembered: none.
+        let used = match used {
+            ResultValue::Null => Some(Vec::new()),
+            ResultValue::List(list) => list.iter().map(|h| h.as_str().and_then(crypto::unhex::<32>)).collect::<Option<Vec<_>>>(),
             _ => None,
         };
         grants.insert(
@@ -1316,6 +1339,7 @@ fn load_grants(db: &Database<BoxedStore>) -> Result<BTreeMap<String, Grant>> {
                 audience: text(audience, "audience")?,
                 created: created.as_int().ok_or_else(|| bad("creation time", id))?,
                 hash: hash.as_str().and_then(crypto::unhex::<32>).ok_or_else(|| bad("hash", id))?,
+                used: used.ok_or_else(|| bad("used hashes", id))?,
                 expires: expires.as_int().ok_or_else(|| bad("expiry", id))?,
                 token: text(token, "token")?,
             },
@@ -1337,6 +1361,7 @@ fn grant_record(g: &Grant) -> Value {
         ("audience", s(&g.audience)),
         ("created", Value::Int(g.created)),
         ("hash", s(&crypto::hex(&g.hash))),
+        ("usedHashes", Value::List(g.used.iter().map(|h| s(&crypto::hex(h))).collect())),
         ("expires", Value::Int(g.expires)),
         ("token", s(&g.token)),
     ];
@@ -2076,7 +2101,7 @@ mod tests {
             (mgr, system, users)
         };
         let audience = "https://mcp.test/mcp";
-        let (refresh, dropped);
+        let (refresh, dropped, reused);
         {
             let (_mgr, system, users) = open(dir);
             users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
@@ -2090,6 +2115,8 @@ mod tests {
             dropped = users.oauth_grant("ann", "app", TokenAccess::Read, &[], audience).unwrap().refresh_token;
             assert_eq!(users.oauth_revoke(&dropped), Some(("ann".into(), "app".into())));
             assert_eq!(users.oauth_revoke(&dropped), None);
+            let other = users.oauth_grant("ann", "app", TokenAccess::Read, &[], audience).unwrap();
+            reused = [other.refresh_token.clone(), users.oauth_refresh(&other.refresh_token, "app").unwrap().refresh_token];
             users.rename("ann", "anna").unwrap();
             let all = format!("{:?}", system.execute("MATCH (n) RETURN n").unwrap().rows);
             assert!(!all.contains(&refresh[21..]) && !all.contains(&next.access_token[21..]), "a secret is stored");
@@ -2097,6 +2124,9 @@ mod tests {
         {
             let (_mgr, _system, users) = open(dir);
             assert!(users.oauth_refresh(&dropped, "app").is_err());
+            let kept = users.oauth_refresh(&reused[0], "app").unwrap_err();
+            assert_eq!(kept, RefreshError::Reused { user: "anna".into() }, "replaced tokens are remembered");
+            assert!(users.oauth_refresh(&reused[1], "app").is_err());
             let again = users.oauth_refresh(&refresh, "app").expect("the grant survives a restart");
             assert_eq!(again.access, TokenAccess::Write);
             let Some(Principal::ApiToken { user, id }) = users.authenticate_token(&again.access_token) else { panic!() };
@@ -2120,6 +2150,23 @@ mod tests {
         assert_eq!(users.oauth_refresh(&first.refresh_token, "app").unwrap_err(), RefreshError::Reused { user: "ann".into() });
         assert_eq!(users.oauth_refresh(&second.refresh_token, "app").unwrap_err(), RefreshError::Invalid, "the grant is gone");
         assert_eq!(users.oauth_refresh("gbr_nonsense", "app").unwrap_err(), RefreshError::Invalid);
+    }
+
+    #[test]
+    fn a_guessed_refresh_secret_leaves_the_grant_alone() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+        let first = users.oauth_grant("ann", "app", TokenAccess::Read, &[], "https://mcp.test/mcp").unwrap();
+        // The family is public (in the access token's name); a stranger knows it.
+        let family = &first.refresh_token[REFRESH_PREFIX.len()..REFRESH_PREFIX.len() + 16];
+        let guess = format!("{REFRESH_PREFIX}{family}_{}", "0".repeat(64));
+        assert_eq!(users.oauth_refresh(&guess, "app").unwrap_err(), RefreshError::Invalid);
+        assert_eq!(users.oauth_revoke(&guess), None);
+        let second = users.oauth_refresh(&first.refresh_token, "app").expect("the grant survives a guess");
+        let third = users.oauth_refresh(&second.refresh_token, "app").unwrap();
+        // Not only the token just replaced: an older one ends the grant too.
+        assert_eq!(users.oauth_refresh(&first.refresh_token, "app").unwrap_err(), RefreshError::Reused { user: "ann".into() });
+        assert_eq!(users.oauth_refresh(&third.refresh_token, "app").unwrap_err(), RefreshError::Invalid, "the grant is gone");
     }
 
     #[test]
