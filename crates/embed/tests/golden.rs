@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{Reference, TempDir, assert_close, fixture};
+use common::{Reference, TempDir, assert_close, fixture, fixture_named};
 use graphbuff::{Database, EmbedOptions, EmbedTask, Embedder, Error, ResultValue};
 use graphbuff_embed::{EmbedderConfig, LocalEmbedder, ModelSpec, Registry};
 
@@ -46,24 +46,19 @@ fn check_model(dir: &Path, name: &str, tol: f64) {
     }
 }
 
-#[test]
-fn tiny_bert_matches_transformers() {
-    check_model(&fixture(), "tiny-bert", 1e-5);
-}
-
-#[test]
-fn query_prefix_and_truncation() {
-    let reference = Reference::read(&fixture().join("reference.json"));
+/// Token ids and vectors with the query prefix, and the cut at the model's 24 tokens.
+fn check_query(dir: &Path, name: &str, tol: f64) {
+    let reference = Reference::read(&dir.join("reference.json"));
     let texts = reference.texts();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let e = embedder_for(&fixture(), "tiny-bert", 32);
+    let e = embedder_for(dir, name, 32);
     let query = EmbedOptions { task: EmbedTask::Query, ..Default::default() };
     for (i, ids) in reference.ids("query_ids").iter().enumerate() {
         assert_eq!(&e.token_ids(None, &texts[i], &query).unwrap(), ids);
     }
     let got = e.embed(None, &refs, &query, &no_interrupt).unwrap();
     for (i, (g, w)) in got.iter().zip(reference.vectors("query_mean")).enumerate() {
-        assert_close(&format!("query {i}"), g, &w, 1e-5);
+        assert_close(&format!("query {i}"), g, &w, tol);
     }
     // The last text is longer than the model's 24 tokens.
     let long = texts.last().unwrap().as_str();
@@ -71,6 +66,29 @@ fn query_prefix_and_truncation() {
     let strict = EmbedOptions { truncate: false, ..Default::default() };
     assert!(matches!(e.embed(None, &[long], &strict, &no_interrupt), Err(Error::Semantic(m)) if m.contains("24 tokens")));
     assert!(e.embed(None, &refs[..1], &strict, &no_interrupt).is_ok());
+}
+
+#[test]
+fn tiny_bert_matches_transformers() {
+    check_model(&fixture(), "tiny-bert", 1e-5);
+}
+
+#[test]
+fn tiny_xlm_roberta_matches_transformers() {
+    check_model(&fixture_named("tiny-xlmr"), "tiny-xlmr", 1e-5);
+    check_query(&fixture_named("tiny-xlmr"), "tiny-xlmr", 1e-5);
+}
+
+/// Against Nomic's own model code (scripts/make_fixture.py nomic-bert).
+#[test]
+fn tiny_nomic_bert_matches_its_model_code() {
+    check_model(&fixture_named("tiny-nomic"), "tiny-nomic", 1e-5);
+    check_query(&fixture_named("tiny-nomic"), "tiny-nomic", 1e-5);
+}
+
+#[test]
+fn query_prefix_and_truncation() {
+    check_query(&fixture(), "tiny-bert", 1e-5);
 }
 
 #[test]
@@ -208,14 +226,17 @@ fn a_batch_is_charged_to_the_query_thread_while_it_runs() {
 #[test]
 #[ignore = "needs a GPU: cargo test -p graphbuff-embed --features gpu -- --ignored gpu"]
 fn gpu_matches_transformers() {
-    let reference = Reference::read(&fixture().join("reference.json"));
-    let texts = reference.texts();
-    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let spec = ModelSpec::read("tiny-bert", &fixture()).unwrap();
-    let config = EmbedderConfig { device: graphbuff_embed::DeviceKind::Gpu, ..Default::default() };
-    let e = LocalEmbedder::new(Registry::from_specs([spec]), config).unwrap();
-    let got = e.embed(None, &refs, &EmbedOptions::default(), &no_interrupt).unwrap();
-    for (i, (g, w)) in got.iter().zip(reference.vectors("mean")).enumerate() {
-        assert_close(&format!("gpu {i}"), g, &w, 1e-4);
+    for name in ["tiny-bert", "tiny-xlmr", "tiny-nomic"] {
+        let dir = fixture_named(name);
+        let reference = Reference::read(&dir.join("reference.json"));
+        let texts = reference.texts();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let spec = ModelSpec::read(name, &dir).unwrap();
+        let config = EmbedderConfig { device: graphbuff_embed::DeviceKind::Gpu, ..Default::default() };
+        let e = LocalEmbedder::new(Registry::from_specs([spec]), config).unwrap();
+        let got = e.embed(None, &refs, &EmbedOptions::default(), &no_interrupt).unwrap();
+        for (i, (g, w)) in got.iter().zip(reference.vectors("mean")).enumerate() {
+            assert_close(&format!("gpu {name} {i}"), g, &w, 1e-4);
+        }
     }
 }

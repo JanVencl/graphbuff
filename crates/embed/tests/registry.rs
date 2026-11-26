@@ -34,7 +34,7 @@ fn good_and_bad_models() {
     let reason = |n: &str| r.skipped().iter().find(|s| s.name == n).map(|s| s.reason.clone()).unwrap_or_else(|| panic!("{n} not skipped"));
     assert!(reason("Upper").contains("not a valid model name"));
     assert!(reason("wrong-dims").contains("384 dimensions"));
-    assert!(reason("too-long").contains("max_position_embeddings"));
+    assert!(reason("too-long").contains("more than the model's 24 tokens"));
     assert!(reason("bad-toml").contains("model.toml"));
     assert!(reason("no-weights").contains("model.safetensors is missing"));
     assert!(reason("no-manifest").contains("model.toml"));

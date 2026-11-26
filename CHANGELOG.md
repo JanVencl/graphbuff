@@ -63,6 +63,13 @@ the same notes.
   with who wrote each. Everyone who may read it may add to it, also with a read-only
   token. `recall` searches by meaning and by words (by words only without embedding
   models). See [MCP](docs/MCP.md#shared-memory).
+- Two more embedding model architectures: `xlm-roberta` (multilingual-e5-base and
+  -large, bge-m3) and `nomic-bert` (nomic-embed-text v1 and v1.5), set with
+  `architecture` in `model.toml`. `fetch-model.py` reads the architecture from the
+  model's `config.json` and knows `multilingual-e5-small`, `multilingual-e5-base` and
+  `nomic-embed-text`. A model whose `config.json` names another `model_type` than its
+  `architecture` is skipped, with the right architecture in the warning. See
+  [Models](docs/Embeddings.md#models).
 
 ### Fixed
 

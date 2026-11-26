@@ -1,0 +1,8 @@
+# Tiny random xlm-roberta for tests (scripts/make_fixture.py); not a useful model.
+architecture = "xlm-roberta"
+dimensions = 32
+max_tokens = 24
+pooling = "mean"
+normalize = true
+query_prefix = "query: "
+doc_prefix = ""

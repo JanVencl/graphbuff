@@ -1,9 +1,9 @@
 //! `model.toml`, the manifest of a model folder, and the checks on model names.
 //!
 //! ```toml
-//! architecture = "bert"   # required; v1 knows only bert
+//! architecture = "bert"   # required: bert | xlm-roberta | nomic-bert
 //! dimensions   = 384      # required; must equal the model's hidden size
-//! max_tokens   = 512      # default: the model's max_position_embeddings
+//! max_tokens   = 512      # default: the model's limit
 //! pooling      = "mean"   # mean | cls
 //! normalize    = true     # L2-normalize the vectors
 //! query_prefix = ""       # put before texts embedded with {task: 'query'}
@@ -18,8 +18,28 @@ use std::collections::BTreeMap;
 /// The model families the encoder knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
-    /// BERT and its look-alikes: MiniLM, BGE, E5, GTE (small and base).
+    /// BERT and its look-alikes: MiniLM, BGE, E5, GTE (small and base), and multilingual
+    /// models that are a BERT with a SentencePiece tokenizer (multilingual-e5-small,
+    /// paraphrase-multilingual-MiniLM).
     Bert,
+    /// XLM-RoBERTa (multilingual-e5-base and -large, bge-m3): a BERT whose positions
+    /// start after the padding id.
+    XlmRoberta,
+    /// nomic-bert (nomic-embed-text v1 and v1.5): rotary positions, SwiGLU, no biases.
+    NomicBert,
+}
+
+impl Architecture {
+    pub const ALL: [Architecture; 3] = [Architecture::Bert, Architecture::XlmRoberta, Architecture::NomicBert];
+
+    /// Its name in `model.toml`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Architecture::Bert => "bert",
+            Architecture::XlmRoberta => "xlm-roberta",
+            Architecture::NomicBert => "nomic-bert",
+        }
+    }
 }
 
 /// How the token vectors become one vector.
@@ -57,8 +77,10 @@ impl Manifest {
         let mut values = read_flat_toml(text)?;
         let mut take = |key: &str| values.remove(key);
         let architecture = match take("architecture") {
-            Some(Toml::Str(s)) if s == "bert" => Architecture::Bert,
-            Some(Toml::Str(s)) => return Err(format!("unknown architecture `{s}` (known: bert)")),
+            Some(Toml::Str(s)) => match Architecture::ALL.into_iter().find(|a| a.name() == s) {
+                Some(a) => a,
+                None => return Err(format!("unknown architecture `{s}` (known: bert, xlm-roberta, nomic-bert)")),
+            },
             Some(_) => return Err("`architecture` must be a string".into()),
             None => return Err("`architecture` is missing".into()),
         };
