@@ -9,7 +9,7 @@
 //! writing query (it runs as a write and needs write access). Their changes are made when
 //! the call returns, in order, so the next input row's call sees them; the call itself
 //! does not. The built-in ones (`db.labels()`,
-//! `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
+//! `db.relationshipTypes()`, `db.propertyKeys()`, the `db.schema.*` procedures, `db.indexes()`, `db.constraints()`,
 //! `db.awaitIndexes()`, `dbms.procedures()`, `dbms.components()`, the writing
 //! `db.create.setNodeVectorProperty()` and `db.create.setRelationshipVectorProperty()`, and the graph
 //! algorithms `algo.pageRank`, `algo.wcc`, `algo.triangleCount`, `algo.bfs`) are in every
@@ -722,6 +722,35 @@ fn register_builtins(p: &mut Procedures) {
             Ok(keys.into_iter().map(|k| vec![Value::String(k)]).collect())
         },
     );
+    for (name, outputs, what, body) in [
+        (
+            "db.schema.nodeTypeProperties",
+            &["nodeType", "nodeLabels", "propertyName", "propertyTypes", "mandatory"][..],
+            "The properties of each combination of node labels, with their types and whether every node has them.",
+            crate::schema::node_type_properties as Builtin,
+        ),
+        (
+            "db.schema.relTypeProperties",
+            &["relType", "propertyName", "propertyTypes", "mandatory"][..],
+            "The properties of each relationship type, with their types and whether every relationship has them.",
+            crate::schema::rel_type_properties,
+        ),
+        (
+            "db.schema.visualization",
+            &["nodes", "relationships"][..],
+            "The labels (maps of name and count) and which relationship types connect them (maps of type, start, end).",
+            crate::schema::visualization,
+        ),
+    ] {
+        let what = format!("{what} Learnt from a sample; config: sampleSize (1000 per label or type; -1: all).");
+        add(
+            ProcedureSignature::new(name, NONE, outputs.iter().copied())
+                .optional("config", Value::Null)
+                .input_types([ProcedureType::Map])
+                .description(&what),
+            body,
+        );
+    }
     add(
         ProcedureSignature::new(
             "db.indexes",

@@ -19,6 +19,8 @@ pub(crate) struct Input<'a> {
     pub peer: &'a str,
     /// Cancelled when the client leaves: the call's queries run with it.
     pub cancel: &'a graphbuff::CancelHandle,
+    /// The schemas `get_schema` learnt.
+    pub schemas: &'a super::schema::Cache,
 }
 
 /// A tool's answer: text for the model, and whether it is an error the model may correct.
@@ -61,6 +63,15 @@ pub(crate) const TOOLS: &[Tool] = &[
         writes: false,
         idempotent: true,
         run: list_databases,
+    },
+    Tool {
+        name: "get_schema",
+        title: "Get the schema of a database",
+        description: "Describes a graph database, to write Cypher for it: its labels and relationship types with                       their counts and properties (with types; `?` marks properties not every node or relationship                       has), the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes and constraints. Call it                       before writing queries. Pass `labels` to see only the part about those labels.",
+        schema: r#"{"type":"object","properties":{"database":{"type":"string","description":"The database (default: the default database)."},"labels":{"type":"array","items":{"type":"string"},"description":"Only these labels, and the relationships and patterns that touch them."}},"additionalProperties":false}"#,
+        writes: false,
+        idempotent: true,
+        run: super::schema::get_schema,
     },
     Tool {
         name: "read_cypher",

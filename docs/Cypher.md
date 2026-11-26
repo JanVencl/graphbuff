@@ -46,7 +46,7 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   query (one call per row; `YIELD` is required there). A query that is only a `CALL` returns
   every output, and may leave out `YIELD` and the parentheses (`CALL db.labels`; arguments then
   come from the parameters of the same names). Built in: `db.labels()`,
-  `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`, `db.constraints()`,
+  `db.relationshipTypes()`, `db.propertyKeys()`, the schema procedures (below), `db.indexes()`, `db.constraints()`,
   `db.awaitIndexes()`, `dbms.procedures()`, `dbms.functions()`, `dbms.components()`, the
   vector and full-text index procedures (`db.index.vector.*`, `db.index.fulltext.*`), the
   embedding procedures `vector.embedBatch(texts, model?, options?)` and `vector.models()`
@@ -58,6 +58,15 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   needs the editor role), and may end with a call to a `VOID` procedure. `OPTIONAL CALL proc(…) YIELD …` and `OPTIONAL CALL { … }` keep
   an input row the call returns nothing for, with the new variables null (no `YIELD … WHERE`
   after `OPTIONAL CALL`: filter in a `WITH … WHERE`).
+* **Schema:** `db.schema.nodeTypeProperties()` (nodeType, nodeLabels, propertyName,
+  propertyTypes, mandatory: per combination of labels) and `db.schema.relTypeProperties()`
+  (relType, propertyName, propertyTypes, mandatory) give the properties and their types
+  (Neo4j's names: `String`, `Long`, `Double`, `DoubleArray`, `Date`, …; `mandatory` when every
+  node or relationship has it). `db.schema.visualization()` gives `nodes` (maps of a label's
+  `name` and `count`) and `relationships` (maps of `type`, `start` and `end` labels: which
+  types connect which labels); unlike Neo4j's, they are maps, not virtual nodes. They learn
+  from the first 1000 nodes per label and relationships per type; pass
+  `{sampleSize: n}` (or `-1` for all) to change that.
 * **Introspection:** `SHOW [ALL | BUILT IN | USER DEFINED] FUNCTIONS` lists the built-in
   functions (name, category, signature, description, aggregating, isBuiltIn; filter with
   `CALL dbms.functions() YIELD … WHERE …`). On `graphbuff-server`, `SHOW SETTINGS [names]

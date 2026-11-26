@@ -381,7 +381,7 @@ fn reading() {
     let addr = server.mcp_addr().unwrap();
     http_query(&server, "UNWIND range(1, 300) AS i CREATE (:P {i: i, v: [x IN range(1, 40) | toFloat(x)], name: 'p' + i})");
 
-    assert_eq!(tool_names(addr, &rita), ["list_databases", "read_cypher"]);
+    assert_eq!(tool_names(addr, &rita), ["list_databases", "get_schema", "read_cypher"]);
     let (text, err) = call(addr, &rita, "read_cypher", &q("MATCH (p:P) WHERE p.i = $i RETURN p.name AS name, p.v AS v", r#""params":{"i":7}"#));
     assert!(!err, "{text}");
     assert_eq!(text, r#"{"database":"graphbuff","columns":["name","v"],"rows":[["p7","<vector 40>"]]}"#);
@@ -428,9 +428,9 @@ fn writing_and_what_mcp_refuses() {
     http_query(&server, "CREATE DATABASE other");
     let (scoped, _) = users.create_token("ed", "s", TokenAccess::Write, &["graphbuff".into()], None).unwrap();
 
-    assert_eq!(tool_names(addr, &ed), ["list_databases", "read_cypher", "write_cypher"]);
+    assert_eq!(tool_names(addr, &ed), ["list_databases", "get_schema", "read_cypher", "write_cypher"]);
     // An editor's read-only token sees no write tool.
-    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "read_cypher"]);
+    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "get_schema", "read_cypher"]);
 
     let r = obj_of(&call(addr, &ed, "write_cypher", &q("UNWIND range(1, 3) AS i CREATE (n:W {i: i}) RETURN n.i AS i", "")).0);
     assert_eq!(r["stats"], json::parse(r#"{"labelsAdded":3,"nodesCreated":3,"propertiesSet":3}"#).unwrap());
@@ -521,4 +521,64 @@ fn a_client_that_leaves_cancels_its_query() {
     }
     let m = send(server.local_addr(), "GET", "/metrics", &[("Authorization", "Bearer tok")], "");
     assert!(m.body.contains(r#"graphbuff_queries_total{protocol="mcp",outcome="cancelled"} 1"#), "{}", m.body);
+}
+
+#[test]
+fn schema() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let (scoped, _) = users.create_token("rita", "s", TokenAccess::Read, &["graphbuff".into()], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig::default());
+    let addr = server.mcp_addr().unwrap();
+    http_query(&server, "CREATE DATABASE other");
+    http_query(
+        &server,
+        "CREATE (a:Person {name: 'Keanu', born: 1964})-[:ACTED_IN {roles: ['Neo']}]->(m:Movie {title: 'The Matrix'}), \
+         (:Person {name: 'Lana'})-[:DIRECTED]->(m), (:`Odd label` {x: 1.5})",
+    );
+    http_query(&server, "CREATE INDEX person_name FOR (p:Person) ON (p.name)");
+
+    let (text, err) = call(addr, &rita, "get_schema", "{}");
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!(r["database"], Json::String("graphbuff".into()));
+    assert_eq!(
+        r["labels"],
+        json::parse(
+            r#"[{"count":1,"label":"Movie","properties":{"title":"String"}},
+                {"count":1,"label":"Odd label","properties":{"x":"Double"}},
+                {"count":2,"label":"Person","properties":{"born":"Long?","name":"String"}}]"#
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        r["patterns"],
+        json::parse(r#"["(:Person)-[:ACTED_IN]->(:Movie)","(:Person)-[:DIRECTED]->(:Movie)"]"#).unwrap()
+    );
+    assert_eq!(
+        r["relationshipTypes"],
+        json::parse(r#"[{"count":1,"properties":{"roles":"StringArray"},"type":"ACTED_IN"},{"count":1,"properties":{},"type":"DIRECTED"}]"#)
+            .unwrap()
+    );
+    assert!(text.contains("person_name"), "{text}");
+
+    // Some labels only; an unknown one is an error that lists them.
+    let r = obj_of(&call(addr, &rita, "get_schema", r#"{"labels":["Odd label"]}"#).0);
+    assert_eq!(r["patterns"], Json::Array(vec![]));
+    assert_eq!(r["relationshipTypes"], Json::Array(vec![]));
+    assert!(!format!("{:?}", r["indexes"]).contains("person_name"));
+    let (text, err) = call(addr, &rita, "get_schema", r#"{"labels":["Nope"]}"#);
+    assert!(err && text.contains("Movie, Odd label, Person"), "{text}");
+
+    // Cached, but not past a change in the counts.
+    http_query(&server, "CREATE (:Studio {name: 'WB'})");
+    assert!(call(addr, &rita, "get_schema", "{}").0.contains("Studio"));
+
+    // Only databases the token may read.
+    let (text, err) = call(addr, &scoped, "get_schema", r#"{"database":"other"}"#);
+    assert!(err && text.contains("may not read"), "{text}");
+    let (text, err) = call(addr, &rita, "get_schema", r#"{"database":"other"}"#);
+    assert!(!err && text.contains(r#""labels":[]"#), "{text}");
+    let (text, err) = call(addr, &rita, "get_schema", r#"{"x":1}"#);
+    assert!(err && text.contains("unknown argument"), "{text}");
 }

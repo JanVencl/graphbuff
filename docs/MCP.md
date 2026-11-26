@@ -58,8 +58,15 @@ do on every database; prefer an API token.
 | Tool | What |
 |------|------|
 | `list_databases` | The databases the token may use: name, whether it is the default one, the access (`read` or `write`), and the numbers of nodes and relationships |
+| `get_schema` | The labels and relationship types with their counts and properties (with types), the patterns `(:A)-[:TYPE]->(:B)` that occur, and the indexes and constraints; `labels` limits it to some labels |
 | `read_cypher` | Runs a Cypher query that only reads: `query`, and optionally `params`, `database`, `max_rows`. `EXPLAIN` and `PROFILE` work |
 | `write_cypher` | Runs a Cypher query that may write data, indexes or constraints, with the same arguments and `dry_run`. Returns the update counts |
+
+`get_schema` learns properties and patterns from up to 1000 nodes per label and
+relationships per type (counts are exact), and keeps the answer for a minute, or until the
+numbers of nodes or relationships change. A property type ending in `?` is one that not
+every node or relationship has. A schema too big for `max_result_kb` is shown without
+properties; `labels` then shows those of some labels.
 
 The tools a client sees depend on its token: `write_cypher` is listed only for tokens that
 may write somewhere. A query that writes is refused by `read_cypher`, so an agent that
