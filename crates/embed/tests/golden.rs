@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -125,6 +125,80 @@ fn chunks_fit_the_fixtures() {
     }
 }
 
+/// `model`'s weights written again as `dtype` (F16 or BF16) into `<dir>/<name>`, with its
+/// other files; and, as `<name>-f32`, the same rounded weights in F32.
+fn half_copy(model: &Path, dir: &TempDir, name: &str, dtype: safetensors::Dtype) -> (PathBuf, PathBuf) {
+    use burn::tensor::{bf16, f16};
+    use safetensors::tensor::{SafeTensors, TensorView};
+    let bytes = std::fs::read(model.join("model.safetensors")).unwrap();
+    let st = SafeTensors::deserialize(&bytes).unwrap();
+    let mut half = Vec::new();
+    let mut rounded = Vec::new();
+    for (key, view) in st.tensors() {
+        if view.dtype() != safetensors::Dtype::F32 {
+            // Not weights (`position_ids`, I64): as they are.
+            half.push((key.clone(), view.dtype(), view.shape().to_vec(), view.data().to_vec()));
+            rounded.push((key, view.dtype(), view.shape().to_vec(), view.data().to_vec()));
+            continue;
+        }
+        let floats: Vec<f32> = view.data().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        let (h, r): (Vec<u8>, Vec<f32>) = match dtype {
+            safetensors::Dtype::F16 => {
+                let v: Vec<f16> = floats.iter().map(|&x| f16::from_f32(x)).collect();
+                (v.iter().flat_map(|x| x.to_le_bytes()).collect(), v.iter().map(|x| x.to_f32()).collect())
+            }
+            safetensors::Dtype::BF16 => {
+                let v: Vec<bf16> = floats.iter().map(|&x| bf16::from_f32(x)).collect();
+                (v.iter().flat_map(|x| x.to_le_bytes()).collect(), v.iter().map(|x| x.to_f32()).collect())
+            }
+            other => panic!("{other:?}"),
+        };
+        half.push((key.clone(), dtype, view.shape().to_vec(), h));
+        rounded.push((key, safetensors::Dtype::F32, view.shape().to_vec(), r.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()));
+    }
+    let write = |to: &str, tensors: Vec<(String, TensorView<'_>)>| {
+        let to = dir.0.join(to);
+        std::fs::create_dir_all(&to).unwrap();
+        for f in ["config.json", "tokenizer.json", "model.toml", "reference.json"] {
+            std::fs::copy(model.join(f), to.join(f)).unwrap();
+        }
+        safetensors::serialize_to_file(tensors, None, &to.join("model.safetensors")).unwrap();
+        to
+    };
+    let h = write(name, half.iter().map(|(k, d, s, b)| (k.clone(), TensorView::new(*d, s.clone(), b).unwrap())).collect());
+    let f32_name = format!("{name}-f32");
+    let r = write(&f32_name, rounded.iter().map(|(k, d, s, b)| (k.clone(), TensorView::new(*d, s.clone(), b).unwrap())).collect());
+    (h, r)
+}
+
+/// `model` with F16 and BF16 weights: they load as the F32 values they round to, and the
+/// vectors stay within `tol` (F16, BF16) of the F32 model's.
+fn check_half(model: &Path, name: &str, tol: [f64; 2]) {
+    let dir = TempDir::new("half");
+    let reference = Reference::read(&model.join("reference.json"));
+    let texts = reference.texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let want = reference.vectors(if reference.has("mean") { "mean" } else { "vectors" });
+    for (dtype, tol) in [safetensors::Dtype::F16, safetensors::Dtype::BF16].into_iter().zip(tol) {
+        let name = format!("{name}-{dtype:?}").to_lowercase();
+        let (half, rounded) = half_copy(model, &dir, &name, dtype);
+        let got = embedder_for(&half, &name, 32).embed(None, &refs, &EmbedOptions::default(), &no_interrupt).unwrap();
+        let exact = embedder_for(&rounded, "r", 32).embed(None, &refs, &EmbedOptions::default(), &no_interrupt).unwrap();
+        assert_eq!(got, exact, "{name}: widened exactly");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let max = g.iter().zip(w).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max);
+            assert!(max <= tol, "{name}, text {i}: max |diff| {max:e} from the F32 model");
+        }
+    }
+}
+
+#[test]
+fn half_precision_weights() {
+    for name in ["tiny-bert", "tiny-xlmr", "tiny-nomic"] {
+        check_half(&fixture_named(name), name, [2e-3, 1.5e-2]);
+    }
+}
+
 #[test]
 fn tiny_bert_matches_transformers() {
     check_model(&fixture(), "tiny-bert", 1e-5);
@@ -236,6 +310,16 @@ fn real_model_matches_transformers() {
     let name = dir.file_name().unwrap().to_str().unwrap();
     check_model(dir, name, 1e-4);
     check_chunks(dir, name);
+}
+
+/// Writes two copies of the model's weights (F16 or BF16, and rounded F32) to the temp
+/// folder: point TMP or TMPDIR at a disk with room.
+#[test]
+#[ignore = "needs GRAPHBUFF_EMBED_TEST_MODEL (a model folder with reference.json)"]
+fn real_model_in_half_precision() {
+    let dir = std::env::var("GRAPHBUFF_EMBED_TEST_MODEL").expect("set GRAPHBUFF_EMBED_TEST_MODEL");
+    let dir = Path::new(&dir);
+    check_half(dir, dir.file_name().unwrap().to_str().unwrap(), [2e-3, 1e-2]);
 }
 
 #[test]

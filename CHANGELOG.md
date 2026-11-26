@@ -74,6 +74,10 @@ the same notes.
   text by the model's tokenizer into pieces that fit it, cut at blank lines, sentences or
   words, with their character offsets; `CALL vector.embedChunks(…)` also embeds them,
   all in one batch. See [Long texts](docs/Embeddings.md#long-texts-chunks).
+- Embedding models with F16 or BF16 weights (`model.safetensors`) load: half the download
+  and the disk of F32. They are widened to F32 as they load, so they take as much memory
+  and run as fast as F32; vectors differ from the F32 model's by about 1e-3 (F16) or 1e-2
+  (BF16).
 
 ### Fixed
 
