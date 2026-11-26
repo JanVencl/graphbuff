@@ -101,7 +101,7 @@ pub(crate) fn username(who: &Principal) -> String {
     match who {
         Principal::Open => String::new(),
         Principal::Token => "token".into(),
-        Principal::User(name) => name.clone(),
+        Principal::User(name) | Principal::ApiToken { user: name, .. } => name.clone(),
     }
 }
 
@@ -353,10 +353,12 @@ impl Ctx {
         project(SETTINGS_COLUMNS, rows, &cmd.tail, params)
     }
 
-    /// Whether `who` (who may do `access`) sees the transactions of `owner`: their own,
-    /// or everyone's for administrators.
+    /// Whether `who` (who may do `access`) sees the transactions of `owner`: their own
+    /// (a user's include those of their API tokens, but not the other way round), or
+    /// everyone's for administrators.
     fn sees(who: &Principal, access: Access, owner: &Principal) -> bool {
-        access == Access::Admin || matches!(who, Principal::Open | Principal::Token) || who == owner
+        let of_token = matches!((who, owner), (Principal::User(a), Principal::ApiToken { user: b, .. }) if a == b);
+        access == Access::Admin || matches!(who, Principal::Open | Principal::Token) || who == owner || of_token
     }
 
     /// Runs `SHOW TRANSACTIONS` or `TERMINATE TRANSACTIONS` for `who`.
@@ -381,7 +383,7 @@ impl Ctx {
                             }
                         }
                         if let Some(log) = &self.log {
-                            log.info(format_args!("transaction {id} terminated by `{}`", username(who)));
+                            log.info(format_args!("transaction {id} terminated by `{}`", who.label()));
                         }
                         (s(&username(&owner)), "Transaction terminated.")
                     }

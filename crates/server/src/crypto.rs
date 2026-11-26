@@ -1,7 +1,7 @@
 //! The little cryptography the server needs besides Argon2id (password hashes, from the
-//! `argon2` crate), with the standard library only: SHA-256 (the cache of verified
-//! logins), base64 (HTTP Basic authentication, PHC hash strings), random salts and
-//! constant-time comparison.
+//! `argon2` crate), with the standard library and the operating system only: SHA-256 (the
+//! cache of verified logins, API tokens), base64 (HTTP Basic authentication, PHC hash
+//! strings), random salts, secrets and constant-time comparison.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -77,7 +77,6 @@ impl Sha256 {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
@@ -121,7 +120,6 @@ pub(crate) fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-#[cfg(test)]
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -162,6 +160,61 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     }
     // Leftover bits must be padding zeros, and one leftover character is never valid.
     (bits < 6 && acc & ((1 << bits) - 1) == 0).then_some(out)
+}
+
+/// Reads `hex` digits (lowercase, as [`hex`] writes them) into `N` bytes.
+pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let s = s.as_bytes();
+    if s.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (o, [hi, lo]) in out.iter_mut().zip(s.as_chunks::<2>().0) {
+        *o = digit(*hi)? << 4 | digit(*lo)?;
+    }
+    Some(out)
+}
+
+/// Random bytes for secrets, from the operating system's generator.
+pub(crate) fn secret_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    let mut out = [0u8; N];
+    fill_secret(&mut out)?;
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn fill_secret(out: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(out)
+}
+
+#[cfg(windows)]
+fn fill_secret(out: &mut [u8]) -> std::io::Result<()> {
+    const USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(algorithm: *mut std::ffi::c_void, buffer: *mut u8, length: u32, flags: u32) -> i32;
+    }
+
+    let len = u32::try_from(out.len()).map_err(std::io::Error::other)?;
+    // SAFETY: the buffer is valid for `len` bytes; no algorithm handle with this flag.
+    let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), out.as_mut_ptr(), len, USE_SYSTEM_PREFERRED_RNG) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("BCryptGenRandom failed ({status:#x})")))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_secret(_: &mut [u8]) -> std::io::Result<()> {
+    Err(std::io::Error::other("no source of random secrets on this platform"))
 }
 
 /// Unpredictable bytes for salts: the process's random hash keys (from the operating
@@ -232,6 +285,12 @@ mod tests {
             assert_eq!(base64_decode(text).unwrap(), data);
         }
         assert_ne!(random_bytes(), random_bytes());
+        let (a, b) = (secret_bytes::<32>().unwrap(), secret_bytes::<32>().unwrap());
+        assert!(a != b && a != [0; 32] && b != [0; 32]);
+        assert_eq!(unhex::<32>(&hex(&a)), Some(a));
+        for bad in ["", "0", "0g", "0A", "000", "é"] {
+            assert_eq!(unhex::<1>(bad), None, "{bad}");
+        }
         assert!(same_bytes(b"abc", b"abc"));
         assert!(!same_bytes(b"abc", b"abd"));
         assert!(!same_bytes(b"abc", b"ab"));

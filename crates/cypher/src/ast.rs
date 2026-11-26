@@ -968,6 +968,28 @@ pub enum UserCommand {
     Grant { roles: Vec<DbName>, database: Option<DbName>, users: Vec<DbName> },
     /// `REVOKE ROLE[S] r, … [ON DATABASE db] FROM u, …`
     Revoke { roles: Vec<DbName>, database: Option<DbName>, users: Vec<DbName> },
+    /// `CREATE TOKEN name [FOR USER user] [ACCESS READ | WRITE] [ON DATABASE db, …]
+    /// [EXPIRES IN n DAYS | HOURS | EXPIRES NEVER]`: an API token of `user` (the current
+    /// user without `FOR USER`), limited to `databases` unless there are none.
+    CreateToken {
+        name: DbName,
+        user: Option<DbName>,
+        write: bool,
+        databases: Vec<DbName>,
+        expires: Option<TokenExpiry>,
+    },
+    /// `SHOW TOKENS`
+    ShowTokens,
+    /// `DROP TOKEN name [FOR USER user] [IF EXISTS]`
+    DropToken { name: DbName, user: Option<DbName>, if_exists: bool },
+}
+
+/// When an API token stops working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenExpiry {
+    Never,
+    /// This many hours after it was made.
+    Hours(u32),
 }
 
 impl UserCommand {
@@ -983,6 +1005,9 @@ impl UserCommand {
             UserCommand::Drop { .. } => "DROP USER",
             UserCommand::Grant { .. } => "GRANT ROLE",
             UserCommand::Revoke { .. } => "REVOKE ROLE",
+            UserCommand::CreateToken { .. } => "CREATE TOKEN",
+            UserCommand::ShowTokens => "SHOW TOKENS",
+            UserCommand::DropToken { .. } => "DROP TOKEN",
         }
     }
 
@@ -990,7 +1015,10 @@ impl UserCommand {
     pub fn is_updating(&self) -> bool {
         !matches!(
             self,
-            UserCommand::ShowUsers | UserCommand::ShowCurrentUser | UserCommand::ShowRoles
+            UserCommand::ShowUsers
+                | UserCommand::ShowCurrentUser
+                | UserCommand::ShowRoles
+                | UserCommand::ShowTokens
         )
     }
 }

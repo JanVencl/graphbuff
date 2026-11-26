@@ -2,7 +2,8 @@
 
 Clients log in with a user name and password: HTTP Basic authentication
 (`Authorization: Basic …`) or Bolt's `basic` scheme. Accounts cannot be turned off; a
-`security.token` works alongside them, as an administrator. The accounts live in the system database of
+`security.token` works alongside them, as an administrator. Programs may use
+API tokens of a user instead of their password (below). The accounts live in the system database of
 the data directory (`DATA/system/`, synced on every commit; in memory with
 `mode = "memory"`), as Argon2id hashes (64 MiB, 3 passes, random salts) in the PHC string
 format. A hash made with other parameters is replaced at the user's next login.
@@ -88,6 +89,48 @@ REVOKE ROLE editor ON DATABASE movies FROM alice
 - The system database keeps them in each user's `databaseRoles` property. Older versions
   ignore them, so after a downgrade those users have only the roles held everywhere.
 
+**API tokens** let programs log in without a user's password. A user makes their own:
+
+```cypher
+CREATE TOKEN laptop                                            // read only, 90 days
+CREATE TOKEN importer ACCESS WRITE ON DATABASE movies EXPIRES IN 12 HOURS
+CREATE TOKEN agent FOR USER alice EXPIRES NEVER                // for another user: admins
+SHOW TOKENS                                                    // one's own; admins: everyone's
+DROP TOKEN laptop                                              // FOR USER alice: admins
+```
+
+`CREATE TOKEN` returns the token (`gbt_…`) in the column `token`. It is shown only this
+once: the server keeps its SHA-256 hash. Send it as `Authorization: Bearer gbt_…`, with
+Bolt's `bearer` scheme (Python: `auth=bearer_auth("gbt_…")`) or as `graphbuff-cli --token`.
+
+- A token may do what its user may at that moment, but no more than its own cap:
+  `ACCESS READ` (the default) reads, `ACCESS WRITE` also writes data, indexes and
+  constraints. A role taken from the user applies to their tokens at once.
+- `ON DATABASE db, …` limits it to these databases; without it, it works on every database
+  its user may use.
+- It is never an administrator, even an administrator's token. It manages no users, no
+  passwords and no tokens; of the user commands it runs `SHOW CURRENT USER` only.
+- It expires after 90 days, or `EXPIRES IN n DAYS | HOURS` (up to 3650 days), or
+  `EXPIRES NEVER`. An expired token is refused, and stays listed until it is dropped.
+- A user keeps their tokens when they are renamed or get a new password; drop the tokens
+  too if the account may be compromised. Dropping or replacing a user drops them.
+- A user sees and may terminate the queries of their tokens (`SHOW TRANSACTIONS`); a token
+  sees only its own. Logs show `user[gbt_id]`.
+- A user may have 100 tokens, with names that are unique for the user.
+- `SHOW TOKENS` lists `name`, `user`, `access`, `databases` (empty: every one), `created`,
+  `expires`, `lastUsed` and `id` (the public part of the token).
+- These commands are graphbuff's own; Neo4j has none like them. Older versions ignore
+  tokens.
+
+Offline, while no server uses the data folder, `graphbuff-server tokens` does the same. The
+new token is the only output on standard output:
+
+```bash
+graphbuff-server tokens add alice agent --write --database movies --days 30
+graphbuff-server tokens list
+graphbuff-server tokens remove alice agent
+```
+
 **Failed logins** lock a client out for a while, over HTTP and Bolt alike. They are counted
 per client address and user name, and per client address over all names. After
 `security.max_failed_logins` (default 10) failures of one address and name, or three times
@@ -97,7 +140,8 @@ doubles that, up to an hour. While locked out, a login is refused without checki
 password, even a right one: HTTP answers `429 TooManyRequests` with `Retry-After`, Bolt
 fails with `Neo.ClientError.Security.AuthenticationRateLimit`. A successful login clears
 the count of its address and name; counts are forgotten after an hour without failures.
-Requests without credentials are not counted. `max_failed_logins = 0` turns this off. At
+Wrong API tokens are counted per address and token id. Requests without credentials, and
+expired API tokens, are not counted. `max_failed_logins = 0` turns this off. At
 most one password hash per CPU is computed at once, so logins cannot exhaust the memory
 the hashes take.
 

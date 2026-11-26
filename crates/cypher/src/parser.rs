@@ -689,11 +689,96 @@ impl<'a> Parser<'a> {
             } else {
                 UserCommand::Revoke { roles, database, users }
             }
+        } else if self.is_kw("SHOW") && (self.kw_at(1, "TOKENS") || self.kw_at(1, "TOKEN")) {
+            self.pos += 2;
+            UserCommand::ShowTokens
+        } else if self.is_kw("CREATE") && self.kw_at(1, "TOKEN") {
+            self.pos += 2;
+            self.create_token()?
+        } else if self.is_kw("DROP") && self.kw_at(1, "TOKEN") {
+            self.pos += 2;
+            let name = self.db_name()?;
+            let user = if self.eat_kw("FOR") {
+                self.expect_kw("USER")?;
+                Some(self.db_name()?)
+            } else {
+                None
+            };
+            let if_exists = self.eat_kw("IF");
+            if if_exists {
+                self.expect_kw("EXISTS")?;
+            }
+            UserCommand::DropToken { name, user, if_exists }
         } else {
             return Ok(None);
         };
         self.end_of_statement()?;
         Ok(Some(cmd))
+    }
+
+    /// `CREATE TOKEN` after its keywords: the name, then `FOR USER`, `ACCESS`,
+    /// `ON DATABASE` and `EXPIRES`, each at most once, in any order.
+    fn create_token(&mut self) -> Result<UserCommand> {
+        let name = self.db_name()?;
+        let (mut user, mut write, mut databases, mut expires) = (None, None, Vec::new(), None);
+        loop {
+            let offset = self.offset();
+            let twice = |what: &str| Err(Error::syntax(format!("CREATE TOKEN has {what} twice"), offset));
+            if self.eat_kw("FOR") {
+                self.expect_kw("USER")?;
+                if user.replace(self.db_name()?).is_some() {
+                    return twice("FOR USER");
+                }
+            } else if self.eat_kw("ACCESS") {
+                let w = self.eat_kw("WRITE");
+                if !w && !self.eat_kw("READ") {
+                    return self.err(format!("expected READ or WRITE after ACCESS, found {}", self.describe()));
+                }
+                if write.replace(w).is_some() {
+                    return twice("ACCESS");
+                }
+            } else if self.eat_kw("ON") {
+                if !self.eat_kw("DATABASES") {
+                    self.expect_kw("DATABASE")?;
+                }
+                if !databases.is_empty() {
+                    return twice("ON DATABASE");
+                }
+                databases = self.name_list()?;
+            } else if self.eat_kw("EXPIRES") {
+                if expires.replace(self.token_expiry()?).is_some() {
+                    return twice("EXPIRES");
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(UserCommand::CreateToken { name, user, write: write.unwrap_or(false), databases, expires })
+    }
+
+    /// `NEVER` or `IN n DAYS | HOURS`.
+    fn token_expiry(&mut self) -> Result<TokenExpiry> {
+        const MAX_HOURS: i64 = 24 * 3650;
+        if self.eat_kw("NEVER") {
+            return Ok(TokenExpiry::Never);
+        }
+        self.expect_kw("IN")?;
+        let offset = self.offset();
+        let Tok::Int(n) = *self.peek() else {
+            return self.err(format!("expected a number of days or hours, found {}", self.describe()));
+        };
+        self.advance();
+        let unit = if self.eat_kw("DAYS") || self.eat_kw("DAY") {
+            24
+        } else if self.eat_kw("HOURS") || self.eat_kw("HOUR") {
+            1
+        } else {
+            return self.err(format!("expected DAYS or HOURS, found {}", self.describe()));
+        };
+        match n.checked_mul(unit) {
+            Some(h) if (1..=MAX_HOURS).contains(&h) => Ok(TokenExpiry::Hours(h as u32)),
+            _ => Err(Error::syntax("a token expires in 1 hour to 3650 days, or NEVER", offset)),
+        }
     }
 
     /// Names separated by commas.
@@ -3495,7 +3580,46 @@ mod tests {
         ] {
             assert!(matches!(parse_statement(bad), Err(Error::Syntax { .. })), "{bad}");
         }
+        // API tokens.
+        assert_eq!(user("SHOW TOKENS"), UserCommand::ShowTokens);
+        let token = |user, write, databases: &[&str], expires| UserCommand::CreateToken {
+            name: name("laptop"),
+            user,
+            write,
+            databases: databases.iter().map(|d| name(d)).collect(),
+            expires,
+        };
+        assert_eq!(user("CREATE TOKEN laptop"), token(None, false, &[], None));
+        assert_eq!(
+            user("create token laptop for user ann access write on database movies, other.v2 expires in 30 days;"),
+            token(Some(name("ann")), true, &["movies", "other.v2"], Some(TokenExpiry::Hours(720)))
+        );
+        assert_eq!(
+            user("CREATE TOKEN laptop EXPIRES NEVER ON DATABASES movies ACCESS READ FOR USER $u"),
+            token(Some(DbName::Param("u".into())), false, &["movies"], Some(TokenExpiry::Never))
+        );
+        assert_eq!(user("CREATE TOKEN laptop EXPIRES IN 1 HOUR"), token(None, false, &[], Some(TokenExpiry::Hours(1))));
+        assert_eq!(
+            user("DROP TOKEN `my laptop` FOR USER ann IF EXISTS"),
+            UserCommand::DropToken { name: name("my laptop"), user: Some(name("ann")), if_exists: true }
+        );
+        for bad in [
+            "CREATE TOKEN",
+            "CREATE TOKEN a ACCESS ADMIN",
+            "CREATE TOKEN a ACCESS READ ACCESS WRITE",
+            "CREATE TOKEN a EXPIRES IN 0 DAYS",
+            "CREATE TOKEN a EXPIRES IN 3651 DAYS",
+            "CREATE TOKEN a EXPIRES IN 9223372036854775807 DAYS",
+            "CREATE TOKEN a EXPIRES IN 5",
+            "CREATE TOKEN a ON DATABASE",
+            "CREATE TOKEN a FOR ann",
+            "DROP TOKEN",
+            "SHOW TOKENS YIELD name",
+        ] {
+            assert!(matches!(parse_statement(bad), Err(Error::Syntax { .. })), "{bad}");
+        }
         // Patterns and database commands are unaffected.
+        assert!(matches!(parse_statement("CREATE (token:Token)").unwrap(), Statement::Query { .. }));
         assert!(matches!(parse_statement("CREATE (user:User)").unwrap(), Statement::Query { .. }));
         assert!(matches!(
             parse_statement("CREATE OR REPLACE DATABASE users").unwrap(),
