@@ -765,7 +765,7 @@ impl Conn<'_> {
         let counts = matches!(scheme, "basic" | "bearer");
         let attempt = || match scheme {
             "basic" => ctx.login(text("principal"), text("credentials")),
-            "bearer" => ctx.bearer_login(text("credentials")),
+            "bearer" => ctx.bearer_login(text("credentials"), None),
             _ => None,
         };
         let who = ctx.throttled_login("bolt", &self.peer, &user, counts, attempt).map_err(|e| match e {

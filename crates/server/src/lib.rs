@@ -102,7 +102,7 @@ pub mod users;
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use http::Cors;
-pub use mcp::McpConfig;
+pub use mcp::{McpConfig, OAuthClient, check_public_url};
 
 /// `graphbuff-server mcp`: MCP over standard input and output, passed on to a running
 /// server's MCP endpoint. `args` are those after `mcp`.
@@ -340,7 +340,10 @@ impl Server {
             active: AtomicUsize::new(0),
             max_connections: config.max_connections.max(1),
             cors: config.cors,
-            mcp: config.mcp.zip(mcp_addr).map(|(m, at)| mcp::Mcp::new(m, at.ip().is_loopback())),
+            mcp: match config.mcp.zip(mcp_addr) {
+                Some((m, at)) => Some(mcp::Mcp::new(m, at.ip().is_loopback()).map_err(io::Error::other)?),
+                None => None,
+            },
         });
         let mut server = Server {
             addr,

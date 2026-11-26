@@ -71,6 +71,10 @@ max_rows = 100                        # rows a query tool returns (an agent may 
 max_rows_limit = 1000
 max_result_kb = 64                    # and at most this much of them
 query_timeout_ms = 30000              # stop an agent's query that runs longer
+# public_url = "https://mcp.example.com/mcp"   # OAuth for hosted agents (claude.ai, ChatGPT)
+# trusted_proxies = "127.0.0.1"       # proxies whose X-Forwarded-For names the client
+# oauth_clients = "my-agent https://agent.example.com/callback"  # clients registered here
+# oauth_client_hosts = "claude.ai, chatgpt.com"  # fetch client metadata documents only from these
 ```
 
 `[mcp]` is described in [MCP](MCP.md).

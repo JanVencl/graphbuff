@@ -13,6 +13,7 @@
 mod bridge;
 mod cypher;
 mod explore;
+mod oauth;
 mod render;
 mod rpc;
 mod schema;
@@ -35,6 +36,7 @@ use crate::throttle;
 use crate::users::{self, Access, Principal};
 
 pub(crate) use bridge::run as bridge_run;
+pub use oauth::{OAuthClient, check_public_url};
 use rpc::{Era, Message, Parsed, RpcError, obj, string};
 
 /// Settings of the MCP endpoint ([`crate::ServerConfig::mcp`]).
@@ -61,6 +63,15 @@ pub struct McpConfig {
     /// The longest a query of a tool may run (and never longer than
     /// [`crate::ServerConfig::query_timeout`]).
     pub query_timeout: Duration,
+    /// The endpoint's URL as clients reach it, `https://host/mcp` (through a proxy that
+    /// terminates TLS, say): turns on OAuth for hosted clients. `None`: tokens only.
+    pub public_url: Option<String>,
+    /// Proxies whose `X-Forwarded-For` names the client (for the login throttle and logs).
+    pub trusted_proxies: Vec<IpAddr>,
+    /// OAuth clients registered here (besides those with a client metadata document).
+    pub oauth_clients: Vec<OAuthClient>,
+    /// Hosts whose client metadata documents are fetched; empty: any public host.
+    pub oauth_client_hosts: Vec<String>,
 }
 
 impl Default for McpConfig {
@@ -74,6 +85,10 @@ impl Default for McpConfig {
             max_rows_limit: 1000,
             max_result_bytes: 64 << 10,
             query_timeout: Duration::from_secs(30),
+            public_url: None,
+            trusted_proxies: Vec::new(),
+            oauth_clients: Vec::new(),
+            oauth_client_hosts: Vec::new(),
         }
     }
 }
@@ -94,6 +109,8 @@ pub(crate) struct Mcp {
     loopback: bool,
     limiter: Limiter,
     schemas: schema::Cache,
+    /// The authorization server, with `public_url`.
+    oauth: Option<oauth::OAuth>,
 }
 
 /// Request headers a browser app may send (CORS).
@@ -125,7 +142,7 @@ administration (users, roles, databases) are not available here.
 const TTL_MS: i64 = 300_000;
 
 impl Mcp {
-    pub(crate) fn new(config: McpConfig, loopback: bool) -> Mcp {
+    pub(crate) fn new(config: McpConfig, loopback: bool) -> Result<Mcp, String> {
         let limiter = Limiter::new(config.calls_per_minute, config.max_concurrent_per_user.max(1));
         let max_rows_limit = config.max_rows_limit.max(1);
         let limits = Limits {
@@ -134,7 +151,11 @@ impl Mcp {
             max_bytes: config.max_result_bytes.max(1024),
             query_timeout: config.query_timeout,
         };
-        Mcp { config, limits, loopback, limiter, schemas: schema::Cache::default() }
+        let oauth = match &config.public_url {
+            Some(url) => Some(oauth::OAuth::new(url, config.oauth_clients.clone(), config.oauth_client_hosts.clone())?),
+            None => None,
+        };
+        Ok(Mcp { config, limits, loopback, limiter, schemas: schema::Cache::default(), oauth })
     }
 
     /// The answer to a CORS preflight from an allowed origin.
@@ -166,16 +187,25 @@ fn reply(id: Option<&Json>, e: &RpcError) -> Response {
 /// Answers one request to the MCP listener. `client` is the connection's socket, watched
 /// while a tool runs so that its queries are cancelled when the client leaves.
 pub(crate) fn handle(ctx: &Ctx, mcp: &Mcp, req: &Request, peer: &str, client: Option<&TcpStream>) -> Response {
+    let forwarded = forwarded_peer(&mcp.config.trusted_proxies, req, peer);
+    let peer = forwarded.as_deref().unwrap_or(peer);
+    if mcp.loopback
+        && let Some(host) = req.header("host")
+        && !loopback_host(host)
+        && !mcp.oauth.as_ref().is_some_and(|o| o.issuer.strip_prefix("https://").is_some_and(|h| h.eq_ignore_ascii_case(host)))
+    {
+        return refuse(403, "the Host header must name this machine (localhost, 127.0.0.1 or [::1]), or mcp.public_url's host");
+    }
+    // OAuth pages and documents check their own requests (forms carry a CSRF token).
+    if let Some(o) = &mcp.oauth
+        && let Some(resp) = o.handle(ctx, req, peer)
+    {
+        return resp;
+    }
     if let Some(origin) = req.header("origin")
         && !mcp.config.allowed_origins.allows(origin)
     {
         return refuse(403, "requests from this Origin are not allowed; see mcp.allowed_origins");
-    }
-    if mcp.loopback
-        && let Some(host) = req.header("host")
-        && !loopback_host(host)
-    {
-        return refuse(403, "the Host header must name this machine (localhost, 127.0.0.1 or [::1])");
     }
     if req.path != "/mcp" {
         return refuse(404, "the MCP endpoint is /mcp");
@@ -184,13 +214,13 @@ pub(crate) fn handle(ctx: &Ctx, mcp: &Mcp, req: &Request, peer: &str, client: Op
         return refuse(405, "the MCP endpoint takes POST only: this server sends no event streams and keeps no sessions")
             .with_header("Allow", "POST");
     }
-    let who = match login(ctx, req, peer) {
+    let who = match login(ctx, mcp, req, peer) {
         Ok(who) => who,
         Err(resp) => return resp,
     };
     // An expired API token logs in, but has no access.
     if ctx.access(&who).is_none() {
-        return refuse(401, api::no_access(&who)).with_header("WWW-Authenticate", "Bearer");
+        return refuse(401, api::no_access(&who)).with_header("WWW-Authenticate", mcp.challenge());
     }
     if let Some(ct) = req.header("content-type")
         && !ct.to_ascii_lowercase().starts_with("application/json")
@@ -214,14 +244,38 @@ pub(crate) fn handle(ctx: &Ctx, mcp: &Mcp, req: &Request, peer: &str, client: Op
 }
 
 /// Who sent `req`: its `Authorization: Bearer` token, counted against failed logins.
-fn login(ctx: &Ctx, req: &Request, peer: &str) -> Result<Principal, Response> {
+/// The client behind a trusted proxy: the last address in `X-Forwarded-For` that is not
+/// one of `proxies`, when `peer` is one of them.
+fn forwarded_peer(proxies: &[IpAddr], req: &Request, peer: &str) -> Option<String> {
+    let ip = crate::throttle::peer_addr(peer)?;
+    if !proxies.contains(&ip) {
+        return None;
+    }
+    let list = req.header("x-forwarded-for")?;
+    list.rsplit(',')
+        .map(str::trim)
+        .filter_map(|a| a.parse::<IpAddr>().ok().or_else(|| a.parse::<std::net::SocketAddr>().ok().map(|s| s.ip())))
+        .find(|a| !proxies.contains(a))
+        .map(|a| a.to_string())
+}
+
+impl Mcp {
+    /// The `WWW-Authenticate` header of a 401: with the OAuth metadata when there is an
+    /// authorization server, so that clients without a token start a login.
+    fn challenge(&self) -> String {
+        self.oauth.as_ref().map_or_else(|| "Bearer".to_string(), |o| o.challenge())
+    }
+}
+
+fn login(ctx: &Ctx, mcp: &Mcp, req: &Request, peer: &str) -> Result<Principal, Response> {
     let bearer = req.header("authorization").and_then(|h| {
         let (scheme, value) = h.trim().split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then(|| value.trim())
     });
     let name = bearer.map(users::bearer_name).unwrap_or_default();
     let sent = req.header("authorization").is_some();
-    match ctx.throttled_login("mcp", peer, &name, sent, || ctx.bearer_login(bearer?)) {
+    let audience = mcp.oauth.as_ref().map(|o| o.public_url.as_str());
+    match ctx.throttled_login("mcp", peer, &name, sent, || ctx.bearer_login(bearer?, audience)) {
         Ok(who) => Ok(who),
         Err(LoginError::Locked(wait)) => Err(refuse(429, &LoginError::locked_message(wait))
             .with_header("Retry-After", throttle::seconds(wait).to_string())),
@@ -229,7 +283,7 @@ fn login(ctx: &Ctx, req: &Request, peer: &str) -> Result<Principal, Response> {
             401,
             "send an API token (CREATE TOKEN) as `Authorization: Bearer <token>`; passwords are not accepted here",
         )
-        .with_header("WWW-Authenticate", "Bearer")),
+        .with_header("WWW-Authenticate", mcp.challenge())),
     }
 }
 
@@ -507,6 +561,29 @@ impl Limiter {
         }
         *st.running.entry(user.clone()).or_insert(0) += 1;
         Ok(Slot { limiter: self, user })
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn forwarded() {
+        let req = |xff: &str| Request {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            headers: vec![("x-forwarded-for".into(), xff.into())],
+            body: Vec::new(),
+            keep_alive: false,
+        };
+        let proxies: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
+        assert_eq!(forwarded_peer(&proxies, &req("203.0.113.9"), "127.0.0.1:5000").as_deref(), Some("203.0.113.9"));
+        // A client cannot name itself: the last untrusted address counts.
+        assert_eq!(forwarded_peer(&proxies, &req("1.1.1.1, 203.0.113.9, 10.0.0.2"), "127.0.0.1:5000").as_deref(), Some("203.0.113.9"));
+        assert_eq!(forwarded_peer(&proxies, &req("203.0.113.9"), "192.0.2.1:5000"), None);
+        assert_eq!(forwarded_peer(&[], &req("203.0.113.9"), "127.0.0.1:5000"), None);
     }
 }
 

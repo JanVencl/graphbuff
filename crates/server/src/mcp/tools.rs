@@ -67,7 +67,7 @@ pub(crate) const TOOLS: &[Tool] = &[
     Tool {
         name: "get_schema",
         title: "Get the schema of a database",
-        description: "Describes a graph database, to write Cypher for it: its labels and relationship types with                       their counts and properties (with types; `?` marks properties not every node or relationship                       has), the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes and constraints. Call it                       before writing queries. Pass `labels` to see only the part about those labels.",
+        description: "Describes a graph database, to write Cypher for it: its labels and relationship types with their counts and properties (with types; `?` marks properties not every node or relationship has), the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes and constraints. Call it before writing queries. Pass `labels` to see only the part about those labels.",
         schema: r#"{"type":"object","properties":{"database":{"type":"string","description":"The database (default: the default database)."},"labels":{"type":"array","items":{"type":"string"},"description":"Only these labels, and the relationships and patterns that touch them."}},"additionalProperties":false}"#,
         writes: false,
         idempotent: true,
@@ -76,7 +76,7 @@ pub(crate) const TOOLS: &[Tool] = &[
     Tool {
         name: "search",
         title: "Search nodes by meaning or words",
-        description: "Finds the nodes that best match `text`: by meaning through a vector index (the text is                       embedded with the index's model), by words through a full-text index, or both (hybrid, the                       default when one label has both). Without `index` the only fitting one is used. `filters`                       ({property: value or {gte, lte, gt, lt, in}}) narrow a vector search on the index's filter                       properties. Results are best first, with their scores.",
+        description: "Finds the nodes that best match `text`: by meaning through a vector index (the text is embedded with the index's model), by words through a full-text index, or both (hybrid, the default when one label has both). Without `index` the only fitting one is used. `filters` ({property: value or {gte, lte, gt, lt, in}}) narrow a vector search on the index's filter properties. Results are best first, with their scores.",
         schema: r#"{"type":"object","properties":{"text":{"type":"string","description":"What to look for: a question, words or a phrase."},"index":{"type":"string","description":"The vector or full-text index (get_schema lists them)."},"mode":{"type":"string","enum":["auto","vector","fulltext","hybrid"]},"k":{"type":"integer","minimum":1,"description":"The most results (default 10)."},"filters":{"type":"object","description":"{property: value} or {property: {gte, lte, gt, lt, in}}."},"model":{"type":"string","description":"The embedding model (default: the index's, else the server's default)."},"database":{"type":"string"}},"required":["text"],"additionalProperties":false}"#,
         writes: false,
         idempotent: true,
@@ -85,7 +85,7 @@ pub(crate) const TOOLS: &[Tool] = &[
     Tool {
         name: "get_node",
         title: "Get a node",
-        description: "Gets a node with its labels and properties: by `id`, with its numbers of relationships per                       type and direction, or by `label`, `property` and `value` (up to 10 that match). Ids may be                       reused after a delete: do not keep them between conversations.",
+        description: "Gets a node with its labels and properties: by `id`, with its numbers of relationships per type and direction, or by `label`, `property` and `value` (up to 10 that match). Ids may be reused after a delete: do not keep them between conversations.",
         schema: r#"{"type":"object","properties":{"id":{"type":"integer","minimum":0,"description":"The node's id."},"label":{"type":"string"},"property":{"type":"string"},"value":{"description":"The property's value."},"database":{"type":"string"}},"additionalProperties":false}"#,
         writes: false,
         idempotent: true,
@@ -94,7 +94,7 @@ pub(crate) const TOOLS: &[Tool] = &[
     Tool {
         name: "neighbors",
         title: "Get a node's neighbours",
-        description: "Gets the nodes connected to a node: its relationships per type and direction, then up to                       `limit` neighbours spread over the types (with depth 1), or the nodes up to `depth` hops away                       with their distance. Filter with `types` and `direction` (out, in, both).",
+        description: "Gets the nodes connected to a node: its relationships per type and direction, then up to `limit` neighbours spread over the types (with depth 1), or the nodes up to `depth` hops away with their distance. Filter with `types` and `direction` (out, in, both).",
         schema: r#"{"type":"object","properties":{"id":{"type":"integer","minimum":0,"description":"The node's id."},"types":{"type":"array","items":{"type":"string"},"description":"Only these relationship types."},"direction":{"type":"string","enum":["out","in","both"]},"depth":{"type":"integer","minimum":1,"maximum":3},"limit":{"type":"integer","minimum":1,"description":"The most neighbours (default 25)."},"database":{"type":"string"}},"required":["id"],"additionalProperties":false}"#,
         writes: false,
         idempotent: true,
@@ -103,7 +103,7 @@ pub(crate) const TOOLS: &[Tool] = &[
     Tool {
         name: "find_path",
         title: "Find a path between two nodes",
-        description: "Finds a shortest path between two nodes (by id), in either direction, of at most `max_hops`                       relationships (default 5, at most 10), optionally over some relationship `types`. With all:                       true, every shortest path.",
+        description: "Finds a shortest path between two nodes (by id), in either direction, of at most `max_hops` relationships (default 5, at most 10), optionally over some relationship `types`. With all: true, every shortest path.",
         schema: r#"{"type":"object","properties":{"from":{"type":"integer","minimum":0},"to":{"type":"integer","minimum":0},"types":{"type":"array","items":{"type":"string"}},"max_hops":{"type":"integer","minimum":1,"maximum":10},"all":{"type":"boolean"},"database":{"type":"string"}},"required":["from","to"],"additionalProperties":false}"#,
         writes: false,
         idempotent: true,
@@ -204,6 +204,7 @@ mod tests {
             assert!(matches!(json::parse(t.schema), Ok(Json::Object(_))), "{}", t.name);
             assert!(TOOLS[..i].iter().all(|u| u.name != t.name), "{}", t.name);
             assert!(t.name.len() <= 64 && t.name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+            assert!(!t.description.contains("  "), "a run of spaces in the description of {}", t.name);
         }
         assert_eq!(visible(Access::Read).count(), TOOLS.iter().filter(|t| !t.writes).count());
     }

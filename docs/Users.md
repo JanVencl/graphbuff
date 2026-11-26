@@ -119,6 +119,9 @@ Bolt's `bearer` scheme (Python: `auth=bearer_auth("gbt_…")`) or as `graphbuff-
 - A user may have 100 tokens, with names that are unique for the user.
 - `SHOW TOKENS` lists `name`, `user`, `access`, `databases` (empty: every one), `created`,
   `expires`, `lastUsed` and `id` (the public part of the token).
+- An agent that logged in with OAuth ([MCP](MCP.md#hosted-clients-oauth)) has a token
+  named `oauth-…`, renewed every hour while the agent uses it. Dropping it ends the agent's
+  access.
 - These commands are graphbuff's own; Neo4j has none like them. Older versions ignore
   tokens.
 

@@ -51,6 +51,13 @@ the same notes.
 - MCP `search` tool: nodes by meaning (vector index, the text embedded with the index's
   model), by words (full-text index) or both (reciprocal rank fusion), with filters on the
   index's filter properties. See [MCP](docs/MCP.md).
+- OAuth 2.1 for hosted MCP clients (claude.ai, ChatGPT): with `mcp.public_url` set,
+  `graphbuff-server` is its own authorization server. Users log in on its page and choose
+  read or write and the databases; the client gets hour-long access tokens that work only
+  at the MCP endpoint, and rotating refresh tokens. Clients are identified by client
+  metadata documents or listed in `mcp.oauth_clients`; PKCE (S256) is required.
+  `mcp.trusted_proxies` lets the login throttle see clients behind a proxy. See
+  [MCP](docs/MCP.md#hosted-clients-oauth).
 
 ### Fixed
 
