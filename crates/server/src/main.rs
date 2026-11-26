@@ -28,6 +28,8 @@ usage: graphbuff-server [--config FILE]
                         (list [USER] | add USER NAME [--write] [--database DB]...
                          [--days N | --never] | remove USER NAME)
        graphbuff-server admin [--config FILE] (init [NAME] | reset-password NAME)
+       graphbuff-server mcp [--url URL] [--cacert FILE]
+                        (MCP over stdin and stdout, to a running server; see mcp --help)
 
 Settings:
   Every setting is in the config file, graphbuff.toml (TOML). The server reads:
@@ -623,6 +625,13 @@ fn main() {
             Some("admin") => Some(admin_command),
             _ => None,
         };
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        if let Err(e) = graphbuff_server::mcp_bridge(std::env::args().skip(2)) {
+            eprintln!("graphbuff-server mcp: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if let Some(command) = offline {
         if let Err(e) = command(std::env::args().skip(2)) {
             eprintln!("{e}");

@@ -38,6 +38,10 @@ the same notes.
   type) and `db.schema.visualization()` (which relationship types connect which labels).
   They sample 1000 nodes per label and relationships per type (`{sampleSize: n}`). The MCP
   endpoint has a `get_schema` tool built on them. See [Cypher](docs/Cypher.md).
+- `graphbuff-server mcp`: MCP over standard input and output, for agents that start their
+  MCP servers as programs (Claude Desktop). It passes messages to a running server's MCP
+  endpoint (`--url`), with the API token in env `GRAPHBUFF_MCP_TOKEN`. See
+  [MCP](docs/MCP.md#connecting-an-agent).
 
 ### Fixed
 

@@ -10,6 +10,7 @@
 //! token, never a password. Over MCP nobody is more than an editor: administrative
 //! statements cannot be run here, whatever the role.
 
+mod bridge;
 mod cypher;
 mod render;
 mod rpc;
@@ -31,6 +32,7 @@ use crate::json::Json;
 use crate::throttle;
 use crate::users::{self, Access, Principal};
 
+pub(crate) use bridge::run as bridge_run;
 use rpc::{Era, Message, Parsed, RpcError, obj, string};
 
 /// Settings of the MCP endpoint ([`crate::ServerConfig::mcp`]).
