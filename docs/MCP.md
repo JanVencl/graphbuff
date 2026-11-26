@@ -82,6 +82,9 @@ do on every database; prefer an API token.
 |------|------|
 | `list_databases` | The databases the token may use: name, whether it is the default one, the access (`read` or `write`), and the numbers of nodes and relationships |
 | `get_schema` | The labels and relationship types with their counts and properties (with types), the patterns `(:A)-[:TYPE]->(:B)` that occur, and the indexes and constraints; `labels` limits it to some labels |
+| `get_node` | A node by `id`, with its numbers of relationships per type and direction; or the nodes with a `label` whose `property` has a `value` (up to 10) |
+| `neighbors` | A node's relationships per type and direction, then up to `limit` (25) neighbours spread over the types; with `depth` 2 or 3, the nodes that many hops away and their distance. `types` and `direction` (`out`, `in`, `both`) filter |
+| `find_path` | A shortest path between two nodes (`from`, `to`) of at most `max_hops` (5, at most 10) relationships, in either direction, optionally over some `types`; with `all: true`, every shortest path |
 | `read_cypher` | Runs a Cypher query that only reads: `query`, and optionally `params`, `database`, `max_rows`. `EXPLAIN` and `PROFILE` work |
 | `write_cypher` | Runs a Cypher query that may write data, indexes or constraints, with the same arguments and `dry_run`. Returns the update counts |
 
@@ -90,6 +93,11 @@ relationships per type (counts are exact), and keeps the answer for a minute, or
 numbers of nodes or relationships change. A property type ending in `?` is one that not
 every node or relationship has. A schema too big for `max_result_kb` is shown without
 properties; `labels` then shows those of some labels.
+
+`get_node`, `neighbors` and `find_path` build Cypher with parameters and run it as
+`read_cypher` does, so the token's access, the time limit and the row limits apply. Spreading
+`neighbors` over the types keeps a node with 100,000 relationships of one type from hiding
+the others. Node ids may be used again after a node is deleted.
 
 The tools a client sees depend on its token: `write_cypher` is listed only for tokens that
 may write somewhere. A query that writes is refused by `read_cypher`, so an agent that

@@ -381,7 +381,7 @@ fn reading() {
     let addr = server.mcp_addr().unwrap();
     http_query(&server, "UNWIND range(1, 300) AS i CREATE (:P {i: i, v: [x IN range(1, 40) | toFloat(x)], name: 'p' + i})");
 
-    assert_eq!(tool_names(addr, &rita), ["list_databases", "get_schema", "read_cypher"]);
+    assert_eq!(tool_names(addr, &rita), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher"]);
     let (text, err) = call(addr, &rita, "read_cypher", &q("MATCH (p:P) WHERE p.i = $i RETURN p.name AS name, p.v AS v", r#""params":{"i":7}"#));
     assert!(!err, "{text}");
     assert_eq!(text, r#"{"database":"graphbuff","columns":["name","v"],"rows":[["p7","<vector 40>"]]}"#);
@@ -428,9 +428,9 @@ fn writing_and_what_mcp_refuses() {
     http_query(&server, "CREATE DATABASE other");
     let (scoped, _) = users.create_token("ed", "s", TokenAccess::Write, &["graphbuff".into()], None).unwrap();
 
-    assert_eq!(tool_names(addr, &ed), ["list_databases", "get_schema", "read_cypher", "write_cypher"]);
+    assert_eq!(tool_names(addr, &ed), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher", "write_cypher"]);
     // An editor's read-only token sees no write tool.
-    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "get_schema", "read_cypher"]);
+    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "get_schema", "get_node", "neighbors", "find_path", "read_cypher"]);
 
     let r = obj_of(&call(addr, &ed, "write_cypher", &q("UNWIND range(1, 3) AS i CREATE (n:W {i: i}) RETURN n.i AS i", "")).0);
     assert_eq!(r["stats"], json::parse(r#"{"labelsAdded":3,"nodesCreated":3,"propertiesSet":3}"#).unwrap());
@@ -581,4 +581,83 @@ fn schema() {
     assert!(!err && text.contains(r#""labels":[]"#), "{text}");
     let (text, err) = call(addr, &rita, "get_schema", r#"{"x":1}"#);
     assert!(err && text.contains("unknown argument"), "{text}");
+}
+
+#[test]
+fn exploring() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig::default());
+    let addr = server.mcp_addr().unwrap();
+    http_query(
+        &server,
+        "CREATE (k:Person {name: 'Keanu'})-[:ACTED_IN {roles: ['Neo']}]->(m:Movie {title: 'The Matrix'}), \
+         (l:Person {name: 'Lana'})-[:DIRECTED]->(m), (c:Person {name: 'Carrie'})-[:ACTED_IN]->(m), \
+         (k)-[:KNOWS]->(c), (:Person {name: 'Alone'}) \
+         WITH k UNWIND range(1, 200) AS i CREATE (k)-[:LIKES]->(:Thing {i: i})",
+    );
+    let id_of = |name: &str| -> i64 {
+        let r = obj_of(&call(addr, &rita, "get_node", &format!(r#"{{"label":"Person","property":"name","value":"{name}"}}"#)).0);
+        let Json::Array(nodes) = &r["nodes"] else { panic!("{r:?}") };
+        let Json::Object(n) = &nodes[0] else { panic!() };
+        let Json::Int(id) = n["id"] else { panic!() };
+        id
+    };
+    let (keanu, lana, alone) = (id_of("Keanu"), id_of("Lana"), id_of("Alone"));
+
+    // By id: the node and its relationships per type.
+    let (text, err) = call(addr, &rita, "get_node", &format!(r#"{{"id":{keanu}}}"#));
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert!(format!("{:?}", r["node"]).contains("Keanu"));
+    assert_eq!(
+        r["relationships"],
+        json::parse(
+            r#"[{"count":200,"direction":"out","type":"LIKES"},{"count":1,"direction":"out","type":"ACTED_IN"},
+                {"count":1,"direction":"out","type":"KNOWS"}]"#
+        )
+        .unwrap()
+    );
+    let (text, err) = call(addr, &rita, "get_node", r#"{"id":999999}"#);
+    assert!(err && text.contains("no node with id 999999"), "{text}");
+    let (text, err) = call(addr, &rita, "get_node", r#"{"label":"Person","property":"name","value":"Nobody"}"#);
+    assert!(!err && text.contains("no node matches"), "{text}");
+    let (text, err) = call(addr, &rita, "get_node", &format!(r#"{{"id":{keanu},"label":"Person"}}"#));
+    assert!(err && text.contains("not both"), "{text}");
+
+    // A hub: the neighbours are spread over the types.
+    let r = obj_of(&call(addr, &rita, "neighbors", &format!(r#"{{"id":{keanu},"limit":6}}"#)).0);
+    let Json::Array(n) = &r["neighbors"] else { panic!() };
+    let types: Vec<String> = n.iter().map(|x| format!("{:?}", x)).collect();
+    assert!(types.iter().any(|t| t.contains("KNOWS")) && types.iter().any(|t| t.contains("ACTED_IN")), "{types:?}");
+    assert!(n.len() <= 6, "{}", n.len());
+    assert!(matches!(&r["note"], Json::String(s) if s.contains("202 relationships")), "{r:?}");
+    let r = obj_of(&call(addr, &rita, "neighbors", &format!(r#"{{"id":{lana},"direction":"out","types":["DIRECTED"]}}"#)).0);
+    assert!(format!("{:?}", r["neighbors"]).contains("The Matrix"));
+    assert!(!r.contains_key("note"));
+    // Two hops from Lana: the movie, then its actors.
+    let r = obj_of(&call(addr, &rita, "neighbors", &format!(r#"{{"id":{lana},"depth":2}}"#)).0);
+    let Json::Array(n) = &r["neighbors"] else { panic!() };
+    assert_eq!(n.len(), 3, "{n:?}");
+    let (text, err) = call(addr, &rita, "neighbors", &format!(r#"{{"id":{lana},"depth":4}}"#));
+    assert!(err && text.contains("1 to 3"), "{text}");
+    let (text, err) = call(addr, &rita, "neighbors", &format!(r#"{{"id":{lana},"direction":"up"}}"#));
+    assert!(err && text.contains("out, in or both"), "{text}");
+
+    // Paths.
+    let r = obj_of(&call(addr, &rita, "find_path", &format!(r#"{{"from":{lana},"to":{keanu}}}"#)).0);
+    let Json::Array(p) = &r["paths"] else { panic!() };
+    assert_eq!(p.len(), 1);
+    let Json::Object(path) = &p[0] else { panic!() };
+    assert_eq!(path["hops"], Json::Int(2), "{p:?}");
+    assert!(matches!(&path["nodes"], Json::Array(n) if n.len() == 3));
+    let r = obj_of(&call(addr, &rita, "find_path", &format!(r#"{{"from":{lana},"to":{keanu},"types":["KNOWS"]}}"#)).0);
+    assert!(matches!(&r["note"], Json::String(s) if s.contains("no path")), "{r:?}");
+    let r = obj_of(&call(addr, &rita, "find_path", &format!(r#"{{"from":{lana},"to":{alone}}}"#)).0);
+    assert_eq!(r["paths"], Json::Array(vec![]));
+    let (text, err) = call(addr, &rita, "find_path", &format!(r#"{{"from":{lana},"to":{keanu},"max_hops":11}}"#));
+    assert!(err && text.contains("1 to 10"), "{text}");
+    // Names are quoted, not pasted.
+    let (text, err) = call(addr, &rita, "get_node", r#"{"label":"Person) DETACH DELETE (x","property":"name","value":1}"#);
+    assert!(!err && text.contains("no node matches"), "{text}");
 }

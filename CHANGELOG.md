@@ -42,6 +42,9 @@ the same notes.
   MCP servers as programs (Claude Desktop). It passes messages to a running server's MCP
   endpoint (`--url`), with the API token in env `GRAPHBUFF_MCP_TOKEN`. See
   [MCP](docs/MCP.md#connecting-an-agent).
+- MCP tools to explore a graph without writing Cypher: `get_node` (by id, or by label and
+  property), `neighbors` (relationships per type, then neighbours spread over the types, or
+  up to 3 hops) and `find_path` (shortest paths, up to 10 hops). See [MCP](docs/MCP.md).
 
 ### Fixed
 

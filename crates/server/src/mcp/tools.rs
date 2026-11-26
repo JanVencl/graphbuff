@@ -74,6 +74,33 @@ pub(crate) const TOOLS: &[Tool] = &[
         run: super::schema::get_schema,
     },
     Tool {
+        name: "get_node",
+        title: "Get a node",
+        description: "Gets a node with its labels and properties: by `id`, with its numbers of relationships per                       type and direction, or by `label`, `property` and `value` (up to 10 that match). Ids may be                       reused after a delete: do not keep them between conversations.",
+        schema: r#"{"type":"object","properties":{"id":{"type":"integer","minimum":0,"description":"The node's id."},"label":{"type":"string"},"property":{"type":"string"},"value":{"description":"The property's value."},"database":{"type":"string"}},"additionalProperties":false}"#,
+        writes: false,
+        idempotent: true,
+        run: super::explore::get_node,
+    },
+    Tool {
+        name: "neighbors",
+        title: "Get a node's neighbours",
+        description: "Gets the nodes connected to a node: its relationships per type and direction, then up to                       `limit` neighbours spread over the types (with depth 1), or the nodes up to `depth` hops away                       with their distance. Filter with `types` and `direction` (out, in, both).",
+        schema: r#"{"type":"object","properties":{"id":{"type":"integer","minimum":0,"description":"The node's id."},"types":{"type":"array","items":{"type":"string"},"description":"Only these relationship types."},"direction":{"type":"string","enum":["out","in","both"]},"depth":{"type":"integer","minimum":1,"maximum":3},"limit":{"type":"integer","minimum":1,"description":"The most neighbours (default 25)."},"database":{"type":"string"}},"required":["id"],"additionalProperties":false}"#,
+        writes: false,
+        idempotent: true,
+        run: super::explore::neighbors,
+    },
+    Tool {
+        name: "find_path",
+        title: "Find a path between two nodes",
+        description: "Finds a shortest path between two nodes (by id), in either direction, of at most `max_hops`                       relationships (default 5, at most 10), optionally over some relationship `types`. With all:                       true, every shortest path.",
+        schema: r#"{"type":"object","properties":{"from":{"type":"integer","minimum":0},"to":{"type":"integer","minimum":0},"types":{"type":"array","items":{"type":"string"}},"max_hops":{"type":"integer","minimum":1,"maximum":10},"all":{"type":"boolean"},"database":{"type":"string"}},"required":["from","to"],"additionalProperties":false}"#,
+        writes: false,
+        idempotent: true,
+        run: super::explore::find_path,
+    },
+    Tool {
         name: "read_cypher",
         title: "Run a read-only Cypher query",
         description: "Runs a Cypher query that only reads, and returns its columns and rows as JSON. Pass values as \
