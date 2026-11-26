@@ -60,6 +60,14 @@ pub struct Config {
     pub slow_query: Option<Duration>,
     // [embedding]
     pub embedding: Embedding,
+    // [mcp]
+    /// `mcp.bind`: where the MCP endpoint listens; `None`: off.
+    pub mcp_bind: Option<String>,
+    /// `mcp.allowed_origins`, checked.
+    pub mcp_origins: graphbuff_server::Cors,
+    pub mcp_max_concurrent: usize,
+    /// `mcp.calls_per_minute`; 0: no limit.
+    pub mcp_calls_per_minute: u32,
 }
 
 /// `[embedding]`: the local embedding models (`vector.embed`), in a build with `embed`.
@@ -128,6 +136,10 @@ impl Default for Config {
             log_level: Level::Info,
             slow_query: None,
             embedding: Embedding::default(),
+            mcp_bind: None,
+            mcp_origins: graphbuff_server::Cors::default(),
+            mcp_max_concurrent: 8,
+            mcp_calls_per_minute: 120,
         }
     }
 }
@@ -251,6 +263,18 @@ threads = 0
 max_loaded_models = 2
 # cpu, or gpu (needs a build with the `gpu` feature too).
 device = "cpu"
+
+[mcp]
+# The Model Context Protocol endpoint for AI agents (Claude, Cursor, ...): set an address to
+# turn it on; agents then connect to http://ADDRESS/mcp with an API token (CREATE TOKEN).
+# bind = "127.0.0.1:7476"
+# Web pages from these origins may call it from the browser: a comma-separated list, or
+# "*". Requests from other pages are refused; agents send no origin.
+# allowed_origins = "https://app.example.com"
+# Tool calls one user may have running at once.
+max_concurrent_per_user = 8
+# Tool calls per minute and API token (0: no limit).
+calls_per_minute = 120
 "#;
 
 /// The `data` line of [`TEMPLATE`] for a config file next to the program.
@@ -346,6 +370,15 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("threads", Kind::Count, "Threads that run the models (0: half the cores)."),
             ("max_loaded_models", Kind::Positive, "Embedding models kept in memory at once."),
             ("device", Kind::Str, "Where the models run: cpu or gpu."),
+        ],
+    ),
+    (
+        "mcp",
+        &[
+            ("bind", Kind::Str, "Address of the MCP endpoint for AI agents (off when not set)."),
+            ("allowed_origins", Kind::Str, "Web page origins whose browser apps may call the MCP endpoint."),
+            ("max_concurrent_per_user", Kind::Positive, "MCP tool calls one user may have running at once."),
+            ("calls_per_minute", Kind::Count, "MCP tool calls per minute and API token (0: no limit)."),
         ],
     ),
 ];
@@ -453,6 +486,13 @@ impl Config {
                         other => return Err(format!("{}: embedding.device is \"cpu\" or \"gpu\", not \"{other}\"", at())),
                     }
                 }
+                ("mcp", "bind") => c.mcp_bind = Some(str_of(value)).filter(|b| !b.is_empty()),
+                ("mcp", "allowed_origins") => {
+                    c.mcp_origins = graphbuff_server::Cors::parse(&str_of(value))
+                        .map_err(|e| format!("{}: mcp.allowed_origins: {e}", at()))?;
+                }
+                ("mcp", "max_concurrent_per_user") => c.mcp_max_concurrent = int_of(value) as usize,
+                ("mcp", "calls_per_minute") => c.mcp_calls_per_minute = int_of(value).min(u64::from(u32::MAX)) as u32,
                 _ => unreachable!("checked by read_toml"),
             }
         }
@@ -534,6 +574,10 @@ impl Config {
                 }
                 .into(),
             ),
+            ("mcp", "bind") => self.mcp_bind.clone(),
+            ("mcp", "allowed_origins") => self.mcp_origins.is_on().then(|| self.mcp_origins.origins().join(", ")),
+            ("mcp", "max_concurrent_per_user") => Some(self.mcp_max_concurrent.to_string()),
+            ("mcp", "calls_per_minute") => Some(self.mcp_calls_per_minute.to_string()),
             _ => return Err(()),
         })
     }
@@ -874,6 +918,8 @@ max_memory_mb = 512").unwrap();
         assert!(e("[server]\nbind = \"x").contains("no closing"));
         assert!(e("[server]\nbind = \"x\" y").contains("after the value"));
         assert!(e("[server]\ncors_origins = \"example.com\"").contains("server.cors_origins"));
+        assert!(e("[mcp]\nallowed_origins = \"example.com\"").contains("mcp.allowed_origins"));
+        assert!(e("[mcp]\nmax_concurrent_per_user = 0").contains("greater than 0"));
         assert!(e("[storage]\nload_csv_urls = \"https://a.example\"").contains("storage.load_csv_urls"));
         let urls = parse("[storage]\nload_csv_urls = \"https://a.example/x/, http://b.example/\"").unwrap();
         assert_eq!(urls.load_csv_urls, ["https://a.example/x/", "http://b.example/"]);
@@ -906,6 +952,9 @@ max_memory_mb = 512").unwrap();
         assert_eq!(next.bind.as_deref(), Some("127.0.0.1:7475"));
         let user = Config::parse(Path::new("u/graphbuff.toml"), &template(false)).unwrap();
         assert_eq!(user.data, None);
+        assert_eq!((user.mcp_bind, user.mcp_max_concurrent, user.mcp_calls_per_minute), (None, 8, 120));
+        let on = Config::parse(Path::new("x.toml"), "[mcp]\nbind = \"127.0.0.1:7476\"\ncalls_per_minute = 0").unwrap();
+        assert_eq!((on.mcp_bind.as_deref(), on.mcp_calls_per_minute), (Some("127.0.0.1:7476"), 0));
     }
 
     /// The files the release archives and the Docker image ship.

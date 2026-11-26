@@ -87,3 +87,12 @@ batch_size = 32
 threads = 0
 # Models kept in memory at once; the least recently used one is unloaded.
 max_loaded_models = 2
+
+[mcp]
+# The Model Context Protocol endpoint for AI agents: set an address to turn it on; agents
+# connect to http://HOST:7476/mcp with an API token (CREATE TOKEN). Publish the port too.
+# bind = "0.0.0.0:7476"
+# Web pages from these origins may call it from the browser ("*": every origin).
+# allowed_origins = "https://app.example.com"
+max_concurrent_per_user = 8
+calls_per_minute = 120

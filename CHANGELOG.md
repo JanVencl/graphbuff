@@ -23,6 +23,12 @@ the same notes.
   `Authorization: Bearer gbt_…` or with Bolt's `bearer` scheme, and may do what its user
   may, up to its own cap and never administration. It reads only and expires after 90 days
   unless made otherwise. See [Users and TLS](docs/Users.md).
+- An MCP (Model Context Protocol) endpoint for AI agents such as Claude and Cursor: set
+  `bind` in the new `[mcp]` section of the config file, and agents connect to
+  `http://ADDRESS/mcp` with an API token. It speaks MCP 2026-07-28 and the
+  `initialize`-based 2025-06-18 and 2025-11-25, without sessions, and offers the tool
+  `list_databases` so far. Over MCP nobody is more than an editor. Tool calls are limited
+  per token and user, and counted in `/metrics`. See [MCP](docs/MCP.md).
 
 ### Fixed
 

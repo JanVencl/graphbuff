@@ -16,7 +16,7 @@ use graphbuff::{DatabaseManager, StorageKind, SyncPolicy};
 use graphbuff::cypher::ast::ExistingDatabase;
 use settings::{Config, LogDir, Storage};
 use graphbuff_server::{
-    DEFAULT_TOKEN_LIFETIME, Log, LogConfig, LoginLimits, Role, Server, ServerConfig, TlsConfig, TokenAccess, Users,
+    DEFAULT_TOKEN_LIFETIME, Log, LogConfig, LoginLimits, McpConfig, Role, Server, ServerConfig, TlsConfig, TokenAccess, Users,
 };
 
 const USAGE: &str = "\
@@ -648,6 +648,12 @@ fn main() {
         test_procedures: settings.test_procedures,
         cors: settings.cors_origins.clone(),
         settings: settings.listing(),
+        mcp: settings.mcp_bind.clone().map(|bind| McpConfig {
+            bind,
+            allowed_origins: settings.mcp_origins.clone(),
+            max_concurrent_per_user: settings.mcp_max_concurrent,
+            calls_per_minute: settings.mcp_calls_per_minute,
+        }),
         login_limits: LoginLimits {
             max_failures: settings.max_failed_logins,
             lockout: settings.login_lockout,
@@ -804,19 +810,21 @@ fn main() {
         Err(e) => fatal(&format!(
             "cannot listen on {}{}: {e}",
             config.bind,
-            config.bolt.as_ref().map_or(String::new(), |b| format!(" or {b}"))
+            config.bolt.iter().chain(config.mcp.as_ref().map(|m| &m.bind)).map(|b| format!(" or {b}")).collect::<String>()
         )),
     };
     let addr = server.local_addr();
     let tls = config.tls.is_some();
-    if !tls && (!addr.ip().is_loopback() || server.bolt_addr().is_some_and(|b| !b.ip().is_loopback())) {
+    let remote = |a: Option<std::net::SocketAddr>| a.is_some_and(|a| !a.ip().is_loopback());
+    if !tls && (!addr.ip().is_loopback() || remote(server.bolt_addr()) || remote(server.mcp_addr())) {
         warn("without TLS (security.tls_cert, tls_key), passwords and tokens cross the network in clear text");
     }
     let (http, bolt) = if tls { ("https", "bolt+s") } else { ("http", "bolt") };
     let listening = format!(
-        "graphbuff-server {} listening on {http}://{addr}{} ({})",
+        "graphbuff-server {} listening on {http}://{addr}{}{} ({})",
         env!("CARGO_PKG_VERSION"),
         server.bolt_addr().map_or(String::new(), |b| format!(" and {bolt}://{b}")),
+        server.mcp_addr().map_or(String::new(), |m| format!(", MCP on {http}://{m}/mcp")),
         match &data {
             Some(d) => format!("data in {}", d.display()),
             None => "in-memory databases, lost when the server stops".into(),

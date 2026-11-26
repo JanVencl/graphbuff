@@ -10,7 +10,8 @@
 //! With [`ServerConfig::users`], clients log in as user accounts (HTTP Basic
 //! authentication, Bolt `basic`) whose roles decide what they may run; see [`users`].
 //! With [`ServerConfig::tls`] (and the `tls` or `tls-rustcrypto` feature) both protocols
-//! run over TLS.
+//! run over TLS. With [`ServerConfig::mcp`] it also serves the Model Context Protocol, for
+//! AI agents, on a port of its own (see [`McpConfig`]).
 //!
 //! ```text
 //! GET  /health              {"status":"ok"} (no token needed)
@@ -78,9 +79,15 @@ pub mod fuzzing {
     pub fn bolt_message(data: &[u8]) {
         crate::bolt::fuzz_message(data);
     }
+
+    /// Reads `data` as an MCP JSON-RPC message and finds its protocol era.
+    pub fn mcp_message(data: &[u8]) {
+        crate::mcp::fuzz_message(data);
+    }
 }
 mod http;
 pub mod log;
+mod mcp;
 mod net;
 pub mod packstream;
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
@@ -95,6 +102,7 @@ pub mod users;
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use http::Cors;
+pub use mcp::McpConfig;
 pub use net::TlsConfig;
 pub use throttle::{LoginLimits, MAX_LOCKOUT};
 pub use users::{DEFAULT_TOKEN_LIFETIME, HashParams, MIN_PASSWORD_LENGTH, Role, TokenAccess, TokenInfo, Users};
@@ -179,6 +187,9 @@ pub struct ServerConfig {
     pub cors: http::Cors,
     /// What `SHOW SETTINGS` lists (for administrators). Default: nothing.
     pub settings: Vec<Setting>,
+    /// Serve the Model Context Protocol (AI agents) on [`McpConfig::bind`]. `None` (the
+    /// default): no MCP.
+    pub mcp: Option<McpConfig>,
 }
 
 /// A row of `SHOW SETTINGS`.
@@ -213,6 +224,7 @@ impl Default for ServerConfig {
             login_limits: LoginLimits::default(),
             cors: http::Cors::default(),
             settings: Vec::new(),
+            mcp: None,
         }
     }
 }
@@ -224,6 +236,7 @@ impl Default for ServerConfig {
 pub struct Server {
     addr: SocketAddr,
     bolt_addr: Option<SocketAddr>,
+    mcp_addr: Option<SocketAddr>,
     stop: Arc<AtomicBool>,
     /// The accept threads, with the address each listens on.
     acceptors: Vec<(SocketAddr, JoinHandle<()>)>,
@@ -241,6 +254,7 @@ struct Shared {
     active: AtomicUsize,
     max_connections: usize,
     cors: http::Cors,
+    mcp: Option<mcp::Mcp>,
 }
 
 impl Shared {
@@ -254,6 +268,22 @@ impl Shared {
 enum Protocol {
     Http,
     Bolt,
+    Mcp,
+}
+
+impl Protocol {
+    fn name(self) -> &'static str {
+        match self {
+            Protocol::Http => "http",
+            Protocol::Bolt => "bolt",
+            Protocol::Mcp => "mcp",
+        }
+    }
+
+    /// It is HTTP underneath, so refusals can be answered.
+    fn is_http(self) -> bool {
+        !matches!(self, Protocol::Bolt)
+    }
 }
 
 impl Server {
@@ -267,6 +297,11 @@ impl Server {
             None => None,
         };
         let bolt_addr = bolt.as_ref().map(TcpListener::local_addr).transpose()?;
+        let mcp_listener = match &config.mcp {
+            Some(m) => Some(TcpListener::bind(&m.bind)?),
+            None => None,
+        };
+        let mcp_addr = mcp_listener.as_ref().map(TcpListener::local_addr).transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let running = Arc::new(crate::running::Running::default());
@@ -299,10 +334,12 @@ impl Server {
             active: AtomicUsize::new(0),
             max_connections: config.max_connections.max(1),
             cors: config.cors,
+            mcp: config.mcp.zip(mcp_addr).map(|(m, at)| mcp::Mcp::new(m, at.ip().is_loopback())),
         });
         let mut server = Server {
             addr,
             bolt_addr,
+            mcp_addr,
             stop,
             acceptors: Vec::new(),
             conns,
@@ -310,7 +347,9 @@ impl Server {
             abort,
             grace: config.shutdown_grace,
         };
-        let listeners = std::iter::once((listener, Protocol::Http)).chain(bolt.map(|b| (b, Protocol::Bolt)));
+        let listeners = std::iter::once((listener, Protocol::Http))
+            .chain(bolt.map(|b| (b, Protocol::Bolt)))
+            .chain(mcp_listener.map(|m| (m, Protocol::Mcp)));
         for (listener, protocol) in listeners {
             let at = listener.local_addr()?;
             let (shared, conns) = (Arc::clone(&shared), Arc::clone(&server.conns));
@@ -331,6 +370,11 @@ impl Server {
     /// The address the Bolt protocol is served on, if [`ServerConfig::bolt`] is set.
     pub fn bolt_addr(&self) -> Option<SocketAddr> {
         self.bolt_addr
+    }
+
+    /// The address the MCP endpoint (`/mcp`) is served on, if [`ServerConfig::mcp`] is set.
+    pub fn mcp_addr(&self) -> Option<SocketAddr> {
+        self.mcp_addr
     }
 
     /// Blocks until the server stops (it runs until the process ends or another thread
@@ -395,10 +439,7 @@ fn accept_loop(
             break;
         }
         let Ok(stream) = stream else { continue };
-        let name = match protocol {
-            Protocol::Http => "http",
-            Protocol::Bolt => "bolt",
-        };
+        let name = protocol.name();
         if shared.active.load(Ordering::SeqCst) >= shared.max_connections {
             if let Some(log) = &shared.ctx.log {
                 log.warn(format_args!(
@@ -409,7 +450,7 @@ fn accept_loop(
             }
             shared.ctx.metrics.refused();
             // A Bolt client sees the connection close during the handshake.
-            if let Protocol::Http = protocol {
+            if protocol.is_http() {
                 let resp = api::error(503, "Busy", "too many connections; try again later");
                 let mut stream = Stream::Plain(stream);
                 let _ = http::write_response(&mut stream, &resp, false);
@@ -428,7 +469,7 @@ fn accept_loop(
             .spawn(move || {
                 if let Some(stream) = open(stream, protocol, &s) {
                     match protocol {
-                        Protocol::Http => serve(stream, &s),
+                        Protocol::Http | Protocol::Mcp => serve(stream, protocol, &s),
                         Protocol::Bolt => bolt::serve(stream, &s),
                     }
                 }
@@ -461,7 +502,7 @@ fn open(tcp: TcpStream, protocol: Protocol, shared: &Shared) -> Option<Stream> {
     match net::accept(tcp, shared.tls.as_ref(), shared.limits.request, &|| shared.stop()) {
         Accepted::Stream(s) => Some(s),
         Accepted::PlainRefused(tcp) => {
-            if let Protocol::Http = protocol {
+            if protocol.is_http() {
                 let mut reader = BufReader::new(Stream::Plain(tcp.try_clone().ok()?));
                 let resp = api::error(400, "BadRequest", "this server only accepts HTTPS");
                 let _ = http::write_response(&mut Stream::Plain(tcp), &resp, false);
@@ -473,7 +514,12 @@ fn open(tcp: TcpStream, protocol: Protocol, shared: &Shared) -> Option<Stream> {
     }
 }
 
-fn serve(stream: Stream, shared: &Shared) {
+/// Serves HTTP requests: the JSON API, or (`protocol` [`Protocol::Mcp`]) the MCP endpoint.
+fn serve(stream: Stream, protocol: Protocol, shared: &Shared) {
+    let mcp = match protocol {
+        Protocol::Mcp => shared.mcp.as_ref(),
+        _ => None,
+    };
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
@@ -485,15 +531,25 @@ fn serve(stream: Stream, shared: &Shared) {
             Ok(None) => return,
             Ok(Some(req)) => {
                 let keep = req.keep_alive && !stop();
-                if let Some(resp) = shared.cors.preflight(&req) {
+                let preflight = match mcp {
+                    Some(m) => m.preflight(&req),
+                    None => shared.cors.preflight(&req),
+                };
+                if let Some(resp) = preflight {
                     if http::write_response(&mut writer, &resp, keep).is_err() || !keep {
                         return;
                     }
                     continue;
                 }
-                let cors = shared.cors.headers(&req);
+                let cors = match mcp {
+                    Some(m) => m.cors_headers(&req),
+                    None => shared.cors.headers(&req),
+                };
                 let mut out = http::Out { w: &mut writer, keep_alive: keep, headers: cors, written: None };
-                let mut resp = api::handle(&shared.ctx, &req, &peer, &mut out);
+                let mut resp = match mcp {
+                    Some(m) => mcp::handle(&shared.ctx, m, &req, &peer),
+                    None => api::handle(&shared.ctx, &req, &peer, &mut out),
+                };
                 let sent = match out.written {
                     Some(r) => r,
                     None => {
