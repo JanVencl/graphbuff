@@ -74,7 +74,7 @@ query_timeout_ms = 30000              # stop an agent's query that runs longer
 # public_url = "https://mcp.example.com/mcp"   # OAuth for hosted agents (claude.ai, ChatGPT)
 # trusted_proxies = "127.0.0.1"       # proxies whose X-Forwarded-For names the client
 # oauth_clients = "my-agent https://agent.example.com/callback"  # clients registered here
-# oauth_client_hosts = "claude.ai, chatgpt.com"  # fetch client metadata documents only from these
+# oauth_client_hosts = "claude.ai, chatgpt.com"  # (the default) fetch client metadata documents only from these; "*": any
 # memory_database = "memory"          # a memory agents share: remember, recall, forget
 ```
 

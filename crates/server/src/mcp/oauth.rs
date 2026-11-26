@@ -280,7 +280,7 @@ impl OAuth {
             ("token_endpoint_auth_methods_supported", list(&["none"])),
             ("revocation_endpoint_auth_methods_supported", list(&["none"])),
             ("scopes_supported", list(&["read", "write"])),
-            ("client_id_metadata_document_supported", Json::Bool(true)),
+            ("client_id_metadata_document_supported", Json::Bool(!self.client_hosts.is_empty())),
             ("authorization_response_iss_parameter_supported", Json::Bool(true)),
         ]);
         Response::json(200, encode(&body)).with_header("Cache-Control", "max-age=300")

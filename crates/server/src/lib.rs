@@ -102,7 +102,7 @@ pub mod users;
 pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use http::Cors;
-pub use mcp::{McpConfig, OAuthClient, check_public_url};
+pub use mcp::{DEFAULT_OAUTH_CLIENT_HOSTS, McpConfig, OAuthClient, check_public_url};
 
 /// `graphbuff-server mcp`: MCP over standard input and output, passed on to a running
 /// server's MCP endpoint. `args` are those after `mcp`.
