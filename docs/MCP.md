@@ -50,6 +50,29 @@ Clients configured with JSON (Cursor, and others that take a URL and headers):
 }
 ```
 
+Clients that start their MCP servers as programs and talk over standard input and output
+(Claude Desktop, for one) use `graphbuff-server mcp`, a bridge that passes each message to
+the endpoint of a server that is already running. It never opens a data folder itself.
+
+```json
+{
+  "mcpServers": {
+    "graphbuff": {
+      "command": "/path/to/graphbuff-server",
+      "args": ["mcp", "--url", "http://127.0.0.1:7476/mcp"],
+      "env": { "GRAPHBUFF_MCP_TOKEN": "gbt_…" }
+    }
+  }
+}
+```
+
+`--url` defaults to `http://127.0.0.1:7476/mcp` (also env `GRAPHBUFF_MCP_URL`). For an
+`https://` URL the bridge checks the server's certificate against `--cacert FILE` (PEM),
+else env `SSL_CERT_FILE`, else the system's CA bundle on Linux and macOS; on Windows, pass
+one of the first two. When the server cannot be reached, each request gets an error that
+says so, and the bridge keeps running. A request the client cancels is stopped on the
+server. The bridge ends when its input does.
+
 The server token (`security.token`) works too, but gives the agent everything an editor may
 do on every database; prefer an API token.
 
@@ -150,5 +173,8 @@ ports. Calls are counted in `/metrics` (`graphbuff_mcp_tool_calls_total`,
   answer any request.
 - Bad tool arguments are tool results with `isError: true`, so that the model can correct
   itself; unknown tools and malformed requests are JSON-RPC errors.
+- The bridge speaks MCP over stdio: one JSON-RPC message per line. It adds the
+  2026-07-28 headers from each body, and sends the version `initialize` agreed on with the
+  requests of older clients.
 - Not supported: batches, server-sent events and subscriptions, sampling, elicitation,
   roots, logging, and the older HTTP+SSE transport.

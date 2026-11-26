@@ -1,9 +1,11 @@
-//! `LOAD CSV` from the web (`storage.load_csv_urls`): a small HTTP/1.1 client for `GET`,
-//! over TLS when the build has it, following redirects only to allowed URLs.
+//! A small HTTP/1.1 client, over TLS when the build has it: `GET` for `LOAD CSV` from the
+//! web (`storage.load_csv_urls`), following redirects only to allowed URLs, and `POST`
+//! for the MCP bridge.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Redirects followed before giving up.
@@ -136,27 +138,26 @@ enum Reply {
     Redirect(String),
 }
 
-/// One `GET`.
-fn get(url: &Url) -> io::Result<Reply> {
+/// The TCP connection to `url`'s host.
+fn open_tcp(url: &Url) -> io::Result<TcpStream> {
     let addr = (url.host.as_str(), url.port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::other(format!("{} has no address", url.host)))?;
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    tcp.set_read_timeout(Some(READ_TIMEOUT))?;
-    tcp.set_write_timeout(Some(READ_TIMEOUT))?;
-    let mut stream = connect(url, tcp)?;
+    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+}
+
+/// The `Host` header for `url`.
+fn host_header(url: &Url) -> String {
     let host = if url.host.contains(':') { format!("[{}]", url.host) } else { url.host.clone() };
-    let host = if url.port == if url.tls { 443 } else { 80 } { host } else { format!("{host}:{}", url.port) };
-    write!(
-        stream,
-        "GET {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: graphbuff-server/{}\r\nAccept: text/csv, */*\r\n\
-         Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        url.path,
-        env!("CARGO_PKG_VERSION")
-    )?;
-    stream.flush()?;
-    let mut r = BufReader::new(stream);
+    if url.port == if url.tls { 443 } else { 80 } { host } else { format!("{host}:{}", url.port) }
+}
+
+/// Response headers: lower-cased names and their values.
+type Headers = Vec<(String, String)>;
+
+/// Reads a response's status, status line and headers.
+fn head(r: &mut impl BufRead) -> io::Result<(u16, String, Headers)> {
     let mut line = String::new();
     r.read_line(&mut line)?;
     let status: u16 = line
@@ -181,6 +182,87 @@ fn get(url: &Url) -> io::Result<Reply> {
             headers.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
     }
+    Ok((status, line.trim_end().to_string(), headers))
+}
+
+/// The most bytes of an answer [`post`] reads.
+const MAX_ANSWER: u64 = 64 << 20;
+
+/// Checks that `url` is one [`post`] can send to.
+pub(crate) fn check_url(url: &str) -> Result<(), String> {
+    let u = Url::parse(url).map_err(|e| format!("`{url}`: {e}"))?;
+    if u.tls && cfg!(not(any(feature = "tls", feature = "tls-rustcrypto"))) {
+        return Err(format!("`{url}`: this build has no TLS for https:// URLs (build with the `tls` feature)"));
+    }
+    Ok(())
+}
+
+/// One `POST` of the JSON `body` to `url`, with `headers` besides the usual ones: the
+/// status and the body of the answer. `opened` gets the TCP connection once it is open;
+/// shutting it down aborts the request. Redirects are not followed.
+pub(crate) fn post(
+    url: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+    opened: &mut dyn FnMut(&TcpStream),
+) -> io::Result<(u16, Vec<u8>)> {
+    let url = Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let tcp = open_tcp(&url)?;
+    tcp.set_write_timeout(Some(READ_TIMEOUT))?;
+    opened(&tcp);
+    let mut stream = connect(&url, tcp)?;
+    let mut req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: graphbuff-server/{}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+        url.path,
+        host_header(&url),
+        env!("CARGO_PKG_VERSION"),
+        body.len()
+    );
+    for (n, v) in headers {
+        if v.contains(['\r', '\n']) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("a line break in header {n}")));
+        }
+        req.push_str(&format!("{n}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    let mut r = BufReader::new(stream);
+    let (status, _, headers) = head(&mut r)?;
+    let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+    let mut answer = Vec::new();
+    if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+        Chunked { r, left: 0, done: false }.take(MAX_ANSWER).read_to_end(&mut answer)?;
+    } else if let Some(n) = header("content-length").and_then(|n| n.parse::<u64>().ok()) {
+        if n > MAX_ANSWER {
+            return Err(io::Error::other(format!("an answer of {n} bytes is too big")));
+        }
+        Exact { r: r.take(n), expected: n }.read_to_end(&mut answer)?;
+    } else {
+        r.take(MAX_ANSWER).read_to_end(&mut answer)?;
+    }
+    Ok((status, answer))
+}
+
+/// One `GET`.
+fn get(url: &Url) -> io::Result<Reply> {
+    let tcp = open_tcp(url)?;
+    tcp.set_read_timeout(Some(READ_TIMEOUT))?;
+    tcp.set_write_timeout(Some(READ_TIMEOUT))?;
+    let mut stream = connect(url, tcp)?;
+    let host = host_header(url);
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: graphbuff-server/{}\r\nAccept: text/csv, */*\r\n\
+         Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+        url.path,
+        env!("CARGO_PKG_VERSION")
+    )?;
+    stream.flush()?;
+    let mut r = BufReader::new(stream);
+    let (status, line, headers) = head(&mut r)?;
     let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
     match status {
         200 => {}
@@ -188,7 +270,7 @@ fn get(url: &Url) -> io::Result<Reply> {
             let location = header("location").ok_or_else(|| io::Error::other(format!("{status} without a Location")))?;
             return Ok(Reply::Redirect(location.to_string()));
         }
-        _ => return Err(io::Error::other(format!("the server answered {}", line.trim_end()))),
+        _ => return Err(io::Error::other(format!("the server answered {line}"))),
     }
     if header("content-encoding").is_some_and(|e| !e.eq_ignore_ascii_case("identity")) {
         return Err(io::Error::other("the server sent a Content-Encoding other than identity"));
@@ -294,7 +376,18 @@ const SYSTEM_BUNDLES: &[&str] = &[
     "/usr/local/etc/openssl/cert.pem",
 ];
 
-/// Trusts the certificates in `SSL_CERT_FILE`, or else the system's CA bundle. Built once.
+/// A CA file chosen on the command line, before any `https://` request.
+static CA_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Trusts the certificates in `file` (PEM) for `https://`, instead of `SSL_CERT_FILE` or
+/// the system's CA bundle. Only before the first `https://` request.
+pub(crate) fn set_ca_file(file: PathBuf) -> Result<(), String> {
+    std::fs::metadata(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    CA_FILE.set(file).map_err(|_| "the CA file is set already".to_string())
+}
+
+/// Trusts the certificates of [`set_ca_file`], else `SSL_CERT_FILE`, else the system's CA
+/// bundle. Built once.
 #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
 fn client_config() -> io::Result<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
@@ -302,9 +395,10 @@ fn client_config() -> io::Result<Arc<rustls::ClientConfig>> {
     static CONFIG: std::sync::OnceLock<Result<Arc<rustls::ClientConfig>, String>> = std::sync::OnceLock::new();
     let built = CONFIG.get_or_init(|| {
         let mut roots = rustls::RootCertStore::empty();
-        let files: Vec<std::path::PathBuf> = match std::env::var_os("SSL_CERT_FILE") {
-            Some(f) => vec![f.into()],
-            None => SYSTEM_BUNDLES.iter().map(Into::into).collect(),
+        let files: Vec<std::path::PathBuf> = match (CA_FILE.get(), std::env::var_os("SSL_CERT_FILE")) {
+            (Some(f), _) => vec![f.clone()],
+            (None, Some(f)) => vec![f.into()],
+            (None, None) => SYSTEM_BUNDLES.iter().map(Into::into).collect(),
         };
         for file in &files {
             if let Ok(it) = CertificateDer::pem_file_iter(file) {
@@ -312,7 +406,9 @@ fn client_config() -> io::Result<Arc<rustls::ClientConfig>> {
             }
         }
         if roots.is_empty() {
-            return Err("no CA certificates found to check https:// servers; set SSL_CERT_FILE to a PEM bundle".into());
+            return Err("no CA certificates found to check https:// servers; set SSL_CERT_FILE to a PEM bundle \
+                        (or pass --cacert to graphbuff-server mcp)"
+                .into());
         }
         rustls::ClientConfig::builder_with_provider(Arc::new(crate::tls::provider()))
             .with_safe_default_protocol_versions()

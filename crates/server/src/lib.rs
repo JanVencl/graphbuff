@@ -103,6 +103,12 @@ pub use graphbuff::json;
 pub use log::{Level, Log, LogConfig};
 pub use http::Cors;
 pub use mcp::McpConfig;
+
+/// `graphbuff-server mcp`: MCP over standard input and output, passed on to a running
+/// server's MCP endpoint. `args` are those after `mcp`.
+pub fn mcp_bridge(args: impl Iterator<Item = String>) -> Result<(), String> {
+    mcp::bridge_run(args)
+}
 pub use net::TlsConfig;
 pub use throttle::{LoginLimits, MAX_LOCKOUT};
 pub use users::{DEFAULT_TOKEN_LIFETIME, HashParams, MIN_PASSWORD_LENGTH, Role, TokenAccess, TokenInfo, Users};
