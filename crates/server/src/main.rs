@@ -653,6 +653,10 @@ fn main() {
             allowed_origins: settings.mcp_origins.clone(),
             max_concurrent_per_user: settings.mcp_max_concurrent,
             calls_per_minute: settings.mcp_calls_per_minute,
+            max_rows: settings.mcp_max_rows,
+            max_rows_limit: settings.mcp_max_rows_limit,
+            max_result_bytes: settings.mcp_max_result_kb << 10,
+            query_timeout: settings.mcp_query_timeout,
         }),
         login_limits: LoginLimits {
             max_failures: settings.max_failed_logins,

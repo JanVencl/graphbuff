@@ -547,7 +547,7 @@ fn serve(stream: Stream, protocol: Protocol, shared: &Shared) {
                 };
                 let mut out = http::Out { w: &mut writer, keep_alive: keep, headers: cors, written: None };
                 let mut resp = match mcp {
-                    Some(m) => mcp::handle(&shared.ctx, m, &req, &peer),
+                    Some(m) => mcp::handle(&shared.ctx, m, &req, &peer, Some(reader.get_ref().tcp())),
                     None => api::handle(&shared.ctx, &req, &peer, &mut out),
                 };
                 let sent = match out.written {

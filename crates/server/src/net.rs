@@ -38,7 +38,8 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
-    fn tcp(&self) -> &TcpStream {
+    /// The TCP connection under it.
+    pub(crate) fn tcp(&self) -> &TcpStream {
         match self {
             Stream::Plain(s) => s,
             #[cfg(any(feature = "tls", feature = "tls-rustcrypto"))]
