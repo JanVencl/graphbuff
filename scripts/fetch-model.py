@@ -8,8 +8,8 @@
 
 It fetches config.json, tokenizer.json and model.safetensors of the repository and writes
 model.toml, in <dir>/<name>/. Restart graphbuff-server to use the model (built with the
-`embed` feature). BERT, XLM-RoBERTa and nomic-bert models with F32 safetensors weights
-work; the architecture is read from config.json.
+`embed` feature). BERT, XLM-RoBERTa and nomic-bert models with F32, F16 or BF16 safetensors
+weights work; the architecture is read from config.json.
 
 The default folder: the folder this script is in when that is called `model` (the release
 archives ship it there), else ./model. HF_ENDPOINT changes the server (a mirror). Python 3.8+,

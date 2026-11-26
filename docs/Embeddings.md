@@ -159,7 +159,7 @@ A model is a folder with four files:
 | `model.toml` | What graphbuff needs to know (below) |
 | `config.json` | The model's Hugging Face config: layers, heads, sizes |
 | `tokenizer.json` | The model's Hugging Face tokenizer |
-| `model.safetensors` | The weights, as Hugging Face publishes them (F32) |
+| `model.safetensors` | The weights, as Hugging Face publishes them: F32, F16 or BF16 |
 
 ```toml
 architecture = "bert"   # required: bert, xlm-roberta or nomic-bert (as config.json's model_type)
@@ -273,8 +273,10 @@ cargo run --release -p graphbuff-embed --example embedbench -- --model path/to/m
 
 ## Limits
 
-- **Architectures:** BERT-family encoders only, with F32 safetensors weights. No
-  quantized weights, no ONNX.
+- **Architectures:** BERT-family encoders only, with F32, F16 or BF16 safetensors
+  weights. Half-precision weights halve the download and the disk, not the memory: they
+  are widened to F32 as they load, and the model runs in F32. No int8 or other quantized
+  weights, no ONNX.
 - **No downloads:** the server never downloads models. Use `fetch-model.py`, or copy
   the files yourself.
 - **Long text:** `vector.embed` and `embedBatch` cut (or refuse) text longer than the

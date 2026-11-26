@@ -1,5 +1,6 @@
 //! The encoder models in Burn, with weights read straight from a Hugging Face
-//! `model.safetensors`:
+//! `model.safetensors` (F32, F16 or BF16; half-precision weights are widened to f32 as
+//! they load):
 //!
 //! - BERT (`BertModel` key names, with or without a `bert.` prefix) and XLM-RoBERTa (the
 //!   same names, perhaps with a `roberta.` prefix; positions start after the padding id);
@@ -13,7 +14,7 @@
 
 use std::path::Path;
 
-use burn::tensor::{Device, Tensor, TensorData, activation};
+use burn::tensor::{Device, Tensor, TensorData, activation, bf16, f16};
 
 use crate::manifest::{Architecture, Pooling};
 use crate::registry::{FeedForward, ModelConfig, Positions};
@@ -114,13 +115,17 @@ impl Weights<'_> {
             .iter()
             .find_map(|p| self.st.tensor(&format!("{p}{name}")).ok())
             .ok_or_else(|| format!("the weights have no `{name}`"))?;
-        if view.dtype() != safetensors::Dtype::F32 {
-            return Err(format!("`{name}` is {:?}; only F32 weights are supported", view.dtype()));
-        }
         if view.shape() != shape {
             return Err(format!("`{name}` has shape {:?}, expected {shape:?}", view.shape()));
         }
-        Ok(view.data().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+        // Half-precision weights are widened: the model runs in f32 either way.
+        let data = view.data();
+        Ok(match view.dtype() {
+            safetensors::Dtype::F32 => data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+            safetensors::Dtype::F16 => data.as_chunks::<2>().0.iter().map(|c| f16::from_le_bytes(*c).to_f32()).collect(),
+            safetensors::Dtype::BF16 => data.as_chunks::<2>().0.iter().map(|c| bf16::from_le_bytes(*c).to_f32()).collect(),
+            other => return Err(format!("`{name}` is {other:?}; only F32, F16 and BF16 weights are supported")),
+        })
     }
 
     fn bias(&self, name: &str, size: usize, has: bool) -> Result<Option<Tensor<1>>, String> {
