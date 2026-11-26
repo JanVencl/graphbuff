@@ -437,6 +437,15 @@ pub const OAUTH_ACCESS_LIFETIME: Duration = Duration::from_secs(3600);
 const REFRESH_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 const REFRESH_PREFIX: &str = "gbr_";
 
+/// Why a refresh token does not work.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefreshError {
+    /// Not a refresh token of a grant (any more), or not of this client.
+    Invalid,
+    /// An earlier refresh token of the grant of `user`, used again: the grant is ended.
+    Reused { user: String },
+}
+
 /// Tokens an OAuth login or refresh gives a client.
 #[derive(Debug)]
 pub(crate) struct Issued {
@@ -836,15 +845,17 @@ impl Users {
 
     /// Replaces refresh token `refresh` of `client` with a new one, and its grant's
     /// access token with a new one. A refresh token used a second time ends its grant
-    /// (it may have been stolen). `None` for a refresh token that does not work.
-    pub(crate) fn oauth_refresh(&self, refresh: &str, client: &str) -> Option<Issued> {
-        let (family, secret) = refresh.strip_prefix(REFRESH_PREFIX)?.split_once('_')?;
-        crypto::unhex::<8>(family)?;
-        crypto::unhex::<32>(secret)?;
+    /// (it may have been stolen).
+    pub(crate) fn oauth_refresh(&self, refresh: &str, client: &str) -> std::result::Result<Issued, RefreshError> {
+        let parts = refresh.strip_prefix(REFRESH_PREFIX).and_then(|t| t.split_once('_'));
+        let Some((family, _)) = parts.filter(|(f, s)| crypto::unhex::<8>(f).is_some() && crypto::unhex::<32>(s).is_some())
+        else {
+            return Err(RefreshError::Invalid);
+        };
         let now = now_millis();
-        let next = format!("{REFRESH_PREFIX}{family}_{}", random_hex::<32>().ok()?);
+        let next = format!("{REFRESH_PREFIX}{family}_{}", random_hex::<32>().map_err(|_| RefreshError::Invalid)?);
         let hash = crypto::sha256(refresh.as_bytes());
-        let mut issued = None;
+        let mut issued = Err(RefreshError::Invalid);
         let _ = self.change(|d| {
             let Some(g) = d.grants.get(family).cloned() else { return Ok(()) };
             if g.client != client {
@@ -852,6 +863,9 @@ impl Users {
             }
             if !crypto::same_bytes(&hash, &g.hash) || g.expires <= now {
                 // An old refresh token again, or a stale one: the grant ends.
+                if g.expires > now {
+                    issued = Err(RefreshError::Reused { user: g.user.clone() });
+                }
                 d.grants.remove(family);
                 return Ok(());
             }
@@ -871,7 +885,7 @@ impl Users {
             }
             d.tokens.insert(token.info.id.clone(), ApiToken { account: g.account.clone(), ..token });
             d.grants.insert(family.to_string(), grant);
-            issued = Some(Issued {
+            issued = Ok(Issued {
                 access_token,
                 refresh_token: next.clone(),
                 expires_in: OAUTH_ACCESS_LIFETIME.as_secs(),
@@ -892,10 +906,11 @@ impl Users {
         });
     }
 
-    /// Ends the OAuth grant of `token` (its access or refresh token). Other tokens, and
-    /// tokens that do not work, are left alone.
-    pub(crate) fn oauth_revoke(&self, token: &str) {
+    /// Ends the OAuth grant of `token` (its access or refresh token): the user and client
+    /// of the grant ended. Other tokens, and tokens that do not work, are left alone.
+    pub(crate) fn oauth_revoke(&self, token: &str) -> Option<(String, String)> {
         let hash = crypto::sha256(token.as_bytes());
+        let mut ended = None;
         let _ = self.change(|d| {
             let family = if let Some((family, _)) = token.strip_prefix(REFRESH_PREFIX).and_then(|t| t.split_once('_')) {
                 d.grants.get(family).filter(|g| crypto::same_bytes(&g.hash, &hash)).map(|g| g.family.clone())
@@ -908,11 +923,12 @@ impl Users {
             } else {
                 None
             };
-            if let Some(f) = family {
-                d.grants.remove(&f);
+            if let Some(g) = family.and_then(|f| d.grants.remove(&f)) {
+                ended = Some((g.user, g.client));
             }
             Ok(())
         });
+        ended
     }
 
     /// What `pick` says of a token that has not expired and its account: `None` for no
@@ -2072,14 +2088,15 @@ mod tests {
             assert!(users.authenticate_token(&issued.access_token).is_none(), "the old access token is gone");
             refresh = next.refresh_token;
             dropped = users.oauth_grant("ann", "app", TokenAccess::Read, &[], audience).unwrap().refresh_token;
-            users.oauth_revoke(&dropped);
+            assert_eq!(users.oauth_revoke(&dropped), Some(("ann".into(), "app".into())));
+            assert_eq!(users.oauth_revoke(&dropped), None);
             users.rename("ann", "anna").unwrap();
             let all = format!("{:?}", system.execute("MATCH (n) RETURN n").unwrap().rows);
             assert!(!all.contains(&refresh[21..]) && !all.contains(&next.access_token[21..]), "a secret is stored");
         }
         {
             let (_mgr, _system, users) = open(dir);
-            assert!(users.oauth_refresh(&dropped, "app").is_none());
+            assert!(users.oauth_refresh(&dropped, "app").is_err());
             let again = users.oauth_refresh(&refresh, "app").expect("the grant survives a restart");
             assert_eq!(again.access, TokenAccess::Write);
             let Some(Principal::ApiToken { user, id }) = users.authenticate_token(&again.access_token) else { panic!() };
@@ -2089,8 +2106,20 @@ mod tests {
             // Dropping the user ends the grant.
             users.create("root", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
             users.drop_user("anna").unwrap();
-            assert!(users.oauth_refresh(&again.refresh_token, "app").is_none());
+            assert!(users.oauth_refresh(&again.refresh_token, "app").is_err());
         }
+    }
+
+    #[test]
+    fn a_refresh_token_used_twice_is_reported() {
+        let users = Users::in_memory().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+        users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+        let first = users.oauth_grant("ann", "app", TokenAccess::Read, &[], "https://mcp.test/mcp").unwrap();
+        let second = users.oauth_refresh(&first.refresh_token, "app").unwrap();
+        assert_eq!(users.oauth_refresh(&second.refresh_token, "other").unwrap_err(), RefreshError::Invalid);
+        assert_eq!(users.oauth_refresh(&first.refresh_token, "app").unwrap_err(), RefreshError::Reused { user: "ann".into() });
+        assert_eq!(users.oauth_refresh(&second.refresh_token, "app").unwrap_err(), RefreshError::Invalid, "the grant is gone");
+        assert_eq!(users.oauth_refresh("gbr_nonsense", "app").unwrap_err(), RefreshError::Invalid);
     }
 
     #[test]

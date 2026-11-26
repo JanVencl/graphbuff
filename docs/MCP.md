@@ -246,7 +246,10 @@ Then, in claude.ai (Settings, Connectors, add a custom connector) or ChatGPT, gi
   `client_id` is either listed in `oauth_clients`, or an `https://` URL of its
   [client metadata document](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration),
   which this server fetches (public addresses only, no redirects, at most 64 KiB in 5
-  seconds) and keeps for 10 minutes. claude.ai and ChatGPT use such documents. Dynamic
+  seconds, four at a time) and keeps for 10 minutes; one that cannot be fetched or read is
+  not tried again for a minute. claude.ai and ChatGPT use such documents. Such a document
+  names its app as it likes, so the consent page shows the host the document is on, and
+  warns when the access goes to another host. Dynamic
   client registration is not offered. Redirect URIs must match exactly, except that a
   `localhost` one may use any port.
 - **Discovery:** `/.well-known/oauth-protected-resource/mcp` (RFC 9728) names the
@@ -254,9 +257,12 @@ Then, in claude.ai (Settings, Connectors, add a custom connector) or ChatGPT, gi
   `/.well-known/openid-configuration` describe it. A request to `/mcp` without a token
   answers `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. The answer to a
   login carries `iss` (RFC 9207); `resource` (RFC 8707), when sent, must be `public_url`.
-- **Security:** the form carries a token that must match a cookie of the page, against
-  forged requests; the page may not be framed. Failed logins count against
-  `security.max_failed_logins` as elsewhere, and a consent is written to `security.log`.
+- **Security:** the server keeps no state for an open login page: its form carries the
+  request, signed with a key made at each start, and a token that must match a cookie of
+  the page, against forged requests. A page works for 10 minutes (and not after a
+  restart), gives one code, and may not be framed. Failed logins count against
+  `security.max_failed_logins` as elsewhere. `security.log` records each consent and
+  denial, a code or refresh token used twice (the grant ends), and each revocation.
   API tokens keep working as before, also with OAuth on.
 
 ## Browsers and other machines

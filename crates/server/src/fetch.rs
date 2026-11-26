@@ -67,6 +67,10 @@ struct Url {
 
 impl Url {
     fn parse(s: &str) -> Result<Url, String> {
+        // It goes into the request line and the Host header as it is.
+        if s.bytes().any(|b| b <= b' ' || b == 0x7f) {
+            return Err("the URL has spaces or control characters".into());
+        }
         let lower = s.get(..8).unwrap_or(s).to_ascii_lowercase();
         let (tls, rest) = if lower.starts_with("https://") {
             (true, &s[8..])
@@ -153,13 +157,58 @@ fn host_header(url: &Url) -> String {
     if url.port == if url.tls { 443 } else { 80 } { host } else { format!("{host}:{}", url.port) }
 }
 
+/// The longest status, header or chunk-size line read.
+const MAX_LINE: u64 = 16 << 10;
+
+/// `read_line`, but at most [`MAX_LINE`] bytes: a longer line is an error.
+fn read_line(r: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let n = r.by_ref().take(MAX_LINE).read_line(line)?;
+    if n as u64 == MAX_LINE && !line.ends_with('\n') {
+        return Err(io::Error::other(format!("a line of the response is longer than {} KiB", MAX_LINE >> 10)));
+    }
+    Ok(n)
+}
+
+/// A connection that fails once `at` has passed, however slowly the other side sends.
+struct Deadline {
+    tcp: TcpStream,
+    at: std::time::Instant,
+}
+
+impl Deadline {
+    fn left(&self) -> io::Result<Duration> {
+        self.at
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "it took longer than 5 seconds"))
+    }
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tcp.set_read_timeout(Some(self.left()?))?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Deadline {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tcp.set_write_timeout(Some(self.left()?))?;
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 /// Response headers: lower-cased names and their values.
 type Headers = Vec<(String, String)>;
 
 /// Reads a response's status, status line and headers.
 fn head(r: &mut impl BufRead) -> io::Result<(u16, String, Headers)> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    read_line(r, &mut line)?;
     let status: u16 = line
         .split(' ')
         .nth(1)
@@ -168,7 +217,7 @@ fn head(r: &mut impl BufRead) -> io::Result<(u16, String, Headers)> {
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
-        if r.read_line(&mut h)? == 0 {
+        if read_line(r, &mut h)? == 0 {
             return Err(io::Error::other("the response ends in its headers"));
         }
         let h = h.trim_end();
@@ -291,6 +340,9 @@ const PUBLIC_TIMEOUT: Duration = Duration::from_secs(5);
 /// must be one), from `hosts` when that is not empty, without redirects, within 5
 /// seconds, at most 64 KiB. Returns the body of a `200`.
 pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> {
+    if !url.is_ascii() {
+        return Err("the URL has non-ASCII characters".into());
+    }
     let u = Url::parse(url)?;
     if !u.tls {
         return Err("only https:// URLs are fetched".into());
@@ -309,17 +361,22 @@ pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> 
     if let Some(a) = addrs.iter().find(|a| !is_public(a.ip())) {
         return Err(format!("{} has the address {}, which is not public", u.host, a.ip()));
     }
-    // Connect to the address checked, not to the name again.
+    // Connect to the address checked, not to the name again. The whole exchange, TLS
+    // and headers included, ends within the time.
+    let deadline = std::time::Instant::now() + PUBLIC_TIMEOUT;
     let tcp = TcpStream::connect_timeout(&addrs[0], PUBLIC_TIMEOUT).map_err(|e| e.to_string())?;
     let io = |e: io::Error| e.to_string();
-    tcp.set_read_timeout(Some(PUBLIC_TIMEOUT)).map_err(io)?;
-    tcp.set_write_timeout(Some(PUBLIC_TIMEOUT)).map_err(io)?;
-    let deadline = std::time::Instant::now() + PUBLIC_TIMEOUT;
-    let mut stream = connect(&u, tcp).map_err(io)?;
+    let mut stream = connect(&u, Deadline { tcp, at: deadline }).map_err(io)?;
     write!(
         stream,
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: graphbuff-server/{}\r\nAccept: application/json\r\n\
-         Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+        "GET {} HTTP/1.1
+Host: {}
+User-Agent: graphbuff-server/{}
+Accept: application/json
+         Accept-Encoding: identity
+Connection: close
+
+",
         u.path,
         host_header(&u),
         env!("CARGO_PKG_VERSION")
@@ -332,25 +389,15 @@ pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> 
         return Err(format!("the server answered {line} (redirects are not followed)"));
     }
     let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
-    let mut body = Vec::new();
-    let mut reader: Box<dyn Read> = if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+    let reader: Box<dyn Read> = if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
         Box::new(Chunked { r, left: 0, done: false })
     } else {
         Box::new(r)
     };
-    let mut buf = [0u8; 4096];
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return Err("it took longer than 5 seconds".into());
-        }
-        let n = reader.read(&mut buf).map_err(io)?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&buf[..n]);
-        if body.len() as u64 > MAX_PUBLIC {
-            return Err("it is larger than 64 KiB".into());
-        }
+    let mut body = Vec::new();
+    reader.take(MAX_PUBLIC + 1).read_to_end(&mut body).map_err(io)?;
+    if body.len() as u64 > MAX_PUBLIC {
+        return Err("it is larger than 64 KiB".into());
     }
     String::from_utf8(body).map_err(|_| "it is not UTF-8".to_string())
 }
@@ -427,7 +474,7 @@ impl<R: BufRead> Read for Chunked<R> {
         }
         if self.left == 0 {
             let mut line = String::new();
-            self.r.read_line(&mut line)?;
+            read_line(&mut self.r, &mut line)?;
             let size = line.trim().split(';').next().unwrap_or("");
             self.left = u64::from_str_radix(size, 16).map_err(|_| io::Error::other("bad chunk size"))?;
             if self.left == 0 {
@@ -443,14 +490,14 @@ impl<R: BufRead> Read for Chunked<R> {
         self.left -= n as u64;
         if self.left == 0 {
             let mut crlf = String::new();
-            self.r.read_line(&mut crlf)?;
+            read_line(&mut self.r, &mut crlf)?;
         }
         Ok(n)
     }
 }
 
 /// The connection: TCP, or TLS over it for `https://`.
-fn connect(url: &Url, tcp: TcpStream) -> io::Result<Box<dyn ReadWrite>> {
+fn connect<S: Read + Write + Send + 'static>(url: &Url, tcp: S) -> io::Result<Box<dyn ReadWrite>> {
     if !url.tls {
         return Ok(Box::new(tcp));
     }
@@ -580,5 +627,43 @@ mod tests {
         assert_eq!(body, "name\nAnn\n");
         let mut short = Vec::new();
         assert!(Exact { r: (&b"abc"[..]).take(5), expected: 5 }.read_to_end(&mut short).is_err());
+        let endless = vec![b'f'; (MAX_LINE as usize) * 2];
+        let mut body = String::new();
+        assert!(Chunked { r: &endless[..], left: 0, done: false }.read_to_string(&mut body).is_err());
+    }
+
+    #[test]
+    fn long_lines() {
+        let mut ok = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "a".repeat(1000));
+        assert_eq!(head(&mut ok.as_bytes()).unwrap().0, 200);
+        ok = format!("HTTP/1.1 200 OK\r\nX: {}", "a".repeat(MAX_LINE as usize * 4));
+        assert!(head(&mut ok.as_bytes()).unwrap_err().to_string().contains("longer than"));
+        assert!(Url::parse("https://h/a b").is_err());
+        assert!(Url::parse("https://h/a\r\nX: y").is_err());
+        assert!(get_public("https://h/caf\u{e9}", &[]).unwrap_err().contains("non-ASCII"));
+    }
+
+    #[test]
+    fn deadline_holds_against_a_trickle() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            for _ in 0..40 {
+                if s.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = std::time::Instant::now();
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut d = Deadline { tcp, at: start + Duration::from_millis(300) };
+        let mut all = Vec::new();
+        let e = d.read_to_end(&mut all).unwrap_err();
+        assert!(matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock), "{e}");
+        assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
+        drop(d);
+        server.join().unwrap();
     }
 }
