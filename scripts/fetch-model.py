@@ -8,7 +8,8 @@
 
 It fetches config.json, tokenizer.json and model.safetensors of the repository and writes
 model.toml, in <dir>/<name>/. Restart graphbuff-server to use the model (built with the
-`embed` feature). Only BERT-family models with safetensors weights work.
+`embed` feature). BERT, XLM-RoBERTa and nomic-bert models with F32 safetensors weights
+work; the architecture is read from config.json.
 
 The default folder: the folder this script is in when that is called `model` (the release
 archives ship it there), else ./model. HF_ENDPOINT changes the server (a mirror). Python 3.8+,
@@ -31,7 +32,26 @@ KNOWN = {
     "bge-small-en": ("BAAI/bge-small-en-v1.5", "cls", 512,
                      "Represent this sentence for searching relevant passages: ", ""),
     "e5-small": ("intfloat/e5-small-v2", "mean", 512, "query: ", "passage: "),
+    "multilingual-e5-small": ("intfloat/multilingual-e5-small", "mean", 512, "query: ", "passage: "),
+    "multilingual-e5-base": ("intfloat/multilingual-e5-base", "mean", 512, "query: ", "passage: "),
+    "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", "mean", 2048, "search_query: ", "search_document: "),
 }
+# config.json's model_type: the architecture in model.toml.
+ARCHITECTURES = {"bert": "bert", "xlm-roberta": "xlm-roberta", "nomic_bert": "nomic-bert"}
+
+
+def model_shape(config):
+    """(architecture, dimensions, the most tokens it takes) from config.json."""
+    arch = ARCHITECTURES.get(config.get("model_type"))
+    if arch is None:
+        raise ValueError(f"model_type {config.get('model_type')!r} is not supported "
+                         f"(only {', '.join(ARCHITECTURES)})")
+    if arch == "nomic-bert":
+        return arch, config["n_embd"], min(config.get("max_trained_positions", config["n_positions"]), config["n_positions"])
+    limit = config["max_position_embeddings"]
+    if arch == "xlm-roberta":
+        limit -= config.get("pad_token_id", 1) + 1  # positions start after the padding id
+    return arch, config["hidden_size"], limit
 FILES = ("config.json", "tokenizer.json", "model.safetensors")
 NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -77,7 +97,7 @@ def main():
 
     if a.list:
         for name, (repo, pooling, max_tokens, qp, _) in KNOWN.items():
-            print(f"{name:14} {repo}  ({pooling} pooling, {max_tokens} tokens{', query prefix' if qp else ''})")
+            print(f"{name:22} {repo}  ({pooling} pooling, {max_tokens} tokens{', query prefix' if qp else ''})")
         return 0
     if not a.name:
         p.error("name a model (see --list)")
@@ -104,20 +124,23 @@ def main():
             url = f"{endpoint}/{repo}/resolve/{a.revision}/{f}"
             print(f"fetching {url}")
             download(url, os.path.join(work, f))
-        with open(os.path.join(work, "config.json"), encoding="utf-8") as f:
-            config = json.load(f)
-        if config.get("model_type") not in ("bert", None):
-            print(f"warning: model_type is {config.get('model_type')!r}; graphbuff runs BERT models only", file=sys.stderr)
-        dims = config["hidden_size"]
-        max_tokens = min(max_tokens or config["max_position_embeddings"], config["max_position_embeddings"])
+            if f == "config.json":
+                # Before the weights: a model graphbuff cannot run is not downloaded.
+                with open(os.path.join(work, f), encoding="utf-8") as c:
+                    arch, dims, limit = model_shape(json.load(c))
+        max_tokens = min(max_tokens or limit, limit)
         with open(os.path.join(work, "model.toml"), "w", encoding="utf-8") as f:
             f.write(f"# {repo} (revision {a.revision}), fetched by fetch-model.py\n"
-                    f"architecture = \"bert\"\ndimensions = {dims}\nmax_tokens = {max_tokens}\n"
+                    f"architecture = \"{arch}\"\ndimensions = {dims}\nmax_tokens = {max_tokens}\n"
                     f"pooling = \"{pooling}\"\nnormalize = true\n"
                     f"query_prefix = {toml_str(qp)}\ndoc_prefix = {toml_str(dp)}\n")
         if os.path.exists(target):
             shutil.rmtree(target)
         os.replace(work, target)
+    except ValueError as e:
+        shutil.rmtree(work, ignore_errors=True)
+        print(f"cannot use {repo}: {e}", file=sys.stderr)
+        return 1
     except urllib.error.URLError as e:
         shutil.rmtree(work, ignore_errors=True)
         print(f"cannot fetch {repo}: {e} (is the repository public, with {', '.join(FILES)}?)", file=sys.stderr)
@@ -125,7 +148,7 @@ def main():
     except Exception:
         shutil.rmtree(work, ignore_errors=True)
         raise
-    print(f"{a.name}: {dims} dimensions, {pooling} pooling, in {target}")
+    print(f"{a.name}: {arch}, {dims} dimensions, {pooling} pooling, in {target}")
     print("restart graphbuff-server to use it: RETURN vector.embed('hello', '%s')" % a.name)
     return 0
 

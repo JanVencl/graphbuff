@@ -1,6 +1,7 @@
 //! Local text embedding models for graphbuff: a [`graphbuff::Embedder`] that runs
-//! BERT-family sentence encoders (MiniLM, BGE, E5, GTE …) in [Burn](https://burn.dev),
-//! on the CPU or, with the `gpu` feature, through wgpu.
+//! sentence encoders (BERT: MiniLM, BGE, E5, GTE …; XLM-RoBERTa: multilingual E5, bge-m3;
+//! nomic-bert: nomic-embed-text) in [Burn](https://burn.dev), on the CPU or, with the
+//! `gpu` feature, through wgpu.
 //!
 //! Models live in a folder, one sub-folder per model (see [`registry`]). They are read
 //! from Hugging Face files as they are (`config.json`, `tokenizer.json`,
@@ -19,7 +20,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub mod bert;
+pub mod encoder;
 pub mod cache;
 pub mod manifest;
 pub mod registry;
@@ -33,9 +34,9 @@ use burn::tensor::Device;
 use graphbuff::{EmbedOptions, EmbedStats, EmbedTask, Embedder, Error, ModelInfo, Result, accounting};
 
 pub use manifest::{Architecture, Manifest, Pooling};
-pub use registry::{BertConfig, ModelSpec, Registry, Skipped};
+pub use registry::{FeedForward, ModelConfig, ModelSpec, Positions, Registry, Skipped};
 
-use bert::Bert;
+use encoder::Encoder;
 use cache::ModelCache;
 use tokenize::{TextTokenizer, Tokens};
 
@@ -72,7 +73,7 @@ impl Default for EmbedderConfig {
 /// A model in memory.
 pub struct LoadedModel {
     tokenizer: TextTokenizer,
-    bert: Bert,
+    encoder: Encoder,
 }
 
 /// A model that was just loaded, for [`LocalEmbedder::on_load`].
@@ -224,8 +225,8 @@ impl LocalEmbedder {
                 let weights = spec.dir.join(registry::WEIGHTS);
                 let model = accounting::exempt(|| -> std::result::Result<LoadedModel, String> {
                     let tokenizer = TextTokenizer::load(&spec.dir.join(registry::TOKENIZER), spec.max_tokens())?;
-                    let bert = self.on_pool(|| Bert::load(&weights, &spec.config, &self.device))?;
-                    Ok(LoadedModel { tokenizer, bert })
+                    let encoder = self.on_pool(|| Encoder::load(&weights, &spec.config, &self.device))?;
+                    Ok(LoadedModel { tokenizer, encoder })
                 })?;
                 let took = started.elapsed();
                 self.counters.load_nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
@@ -324,10 +325,10 @@ impl Embedder for LocalEmbedder {
             let padded = m.tokenizer.pad(&chunk.iter().map(|&i| &tokens[i]).collect::<Vec<_>>());
             // The pass runs on the pool's threads, whose memory the query's thread does
             // not count: charge its estimate to the query while it runs (and check it).
-            let _charge = accounting::charge(m.bert.activation_bytes(padded.rows, padded.width));
+            let _charge = accounting::charge(m.encoder.activation_bytes(padded.rows, padded.width));
             interrupt()?;
             let vectors = self
-                .on_pool(|| m.bert.embed(&padded, spec.manifest.pooling, spec.manifest.normalize))
+                .on_pool(|| m.encoder.embed(&padded, spec.manifest.pooling, spec.manifest.normalize))
                 .map_err(|e| Error::Runtime(format!("embedding model '{}': {e}", spec.name)))?;
             for (&i, v) in chunk.iter().zip(vectors) {
                 out[i] = v;

@@ -118,9 +118,9 @@ A model is a folder with four files:
 | `model.safetensors` | The weights, as Hugging Face publishes them (F32) |
 
 ```toml
-architecture = "bert"   # required; the only one for now
+architecture = "bert"   # required: bert, xlm-roberta or nomic-bert (as config.json's model_type)
 dimensions   = 384      # required; must equal hidden_size in config.json
-max_tokens   = 256      # longer texts are cut; default: the model's max_position_embeddings
+max_tokens   = 256      # longer texts are cut; default: the model's limit
 pooling      = "mean"   # mean or cls, as the model card says
 normalize    = true     # L2-normalize: what cosine indexes expect
 query_prefix = ""       # put before texts embedded with {task: 'query'}
@@ -135,15 +135,30 @@ doc_prefix   = ""       # put before documents
   | `minilm` | sentence-transformers/all-MiniLM-L6-v2 | 384 | mean | small and fast, English |
   | `bge-small-en` | BAAI/bge-small-en-v1.5 | 384 | cls | query prefix |
   | `e5-small` | intfloat/e5-small-v2 | 384 | mean | `query: ` / `passage: ` prefixes |
+  | `multilingual-e5-small` | intfloat/multilingual-e5-small | 384 | mean | about 100 languages; `query: ` / `passage: ` |
+  | `multilingual-e5-base` | intfloat/multilingual-e5-base | 768 | mean | XLM-RoBERTa, about 100 languages; `query: ` / `passage: ` |
+  | `nomic-embed-text` | nomic-ai/nomic-embed-text-v1.5 | 768 | mean | 2048 tokens; `search_query: ` / `search_document: ` |
 
-  For other BERT models use `--repo owner/name --pooling …`.
-- BERT-family models work: BERT, MiniLM, BGE, E5 and GTE, small and base. Other
-  architectures (XLM-RoBERTa, nomic-bert, decoder models) are not supported yet.
+  For other models use `--repo owner/name --pooling …`; the script reads the
+  architecture from `config.json`.
+- Three architectures work:
+
+  | `architecture` | `model_type` | Models |
+  |---|---|---|
+  | `bert` | `bert` | BERT, MiniLM, BGE, E5, GTE (small and base), multilingual-e5-small, paraphrase-multilingual-MiniLM |
+  | `xlm-roberta` | `xlm-roberta` | multilingual-e5-base and -large, bge-m3 (dense vectors) |
+  | `nomic-bert` | `nomic_bert` | nomic-embed-text v1 and v1.5 (full dimensions; no Matryoshka cut) |
+
+  The server refuses a model whose `config.json` names another `model_type` than
+  `architecture`: an XLM-RoBERTa run as BERT would give wrong vectors without failing.
+  nomic-bert models are limited to the length they were trained on
+  (`max_trained_positions`, 2048), as graphbuff does not scale rotary positions.
+  Decoder models (Qwen3-Embedding, gte-Qwen) are not supported.
 - At startup the server checks every folder: manifest, config, files, and that the
   dimensions match. A bad folder is skipped with a warning and the others still load.
   The weights are read on a model's first use.
-- Vectors match Hugging Face `transformers` (sentence-transformers' pooling) to about
-  1e-6. The GPU gives slightly different floats than the CPU.
+- Vectors match Hugging Face `transformers` (sentence-transformers' pooling; Nomic's own
+  model code for nomic-bert) to about 1e-6. The GPU gives slightly different floats than the CPU.
 
 ## Configuration
 

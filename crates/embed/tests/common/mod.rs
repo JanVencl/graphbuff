@@ -7,7 +7,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use graphbuff::json::{self, Json};
 
 pub fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-bert")
+    fixture_named("tiny-bert")
+}
+
+/// A tiny random model of tests/fixtures (scripts/make_fixture.py).
+pub fn fixture_named(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
 /// A temporary model folder, removed on drop.

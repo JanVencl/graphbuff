@@ -26,7 +26,7 @@ To use another folder, set `model_dir` in the `[embedding]` section of
 `model.toml`:
 
 ```toml
-architecture = "bert"   # BERT-family models: MiniLM, BGE, E5, GTE
+architecture = "bert"   # bert, xlm-roberta or nomic-bert: config.json's model_type
 dimensions   = 384      # the model's hidden_size
 max_tokens   = 256      # longer texts are cut (default: the model's limit)
 pooling      = "mean"   # mean or cls, as the model card says
