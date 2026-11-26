@@ -61,4 +61,12 @@ gpu = false                           # graph kernels on the GPU (`gpu` build fe
 dir = "/var/log/graphbuff"            # "-" for standard error; default: DATA/logs
 level = "info"                        # error, warn, info or debug
 slow_query_ms = 500                   # log queries that take this long to query.log
+
+[mcp]
+bind = "127.0.0.1:7476"               # MCP endpoint for AI agents, at /mcp (off when not set)
+# allowed_origins = "https://app.example.com"  # browser apps on these origins may call it
+max_concurrent_per_user = 8           # tool calls one user may have running at once
+calls_per_minute = 120                # tool calls per minute and API token (0: no limit)
 ```
+
+`[mcp]` is described in [MCP](MCP.md).

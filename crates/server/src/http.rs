@@ -275,11 +275,14 @@ pub fn read_request(
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         411 => "Length Required",
         413 => "Content Too Large",
@@ -423,11 +426,16 @@ impl Cors {
         !self.origins.is_empty()
     }
 
+    /// Whether the page origin `origin` is allowed.
+    pub fn allows(&self, origin: &str) -> bool {
+        let lower = origin.to_ascii_lowercase();
+        self.origins.iter().any(|o| o == "*" || *o == lower)
+    }
+
     /// The allowed `Origin` of `req`, if it has one.
     fn allowed<'r>(&self, req: &'r Request) -> Option<&'r str> {
         let origin = req.header("origin")?;
-        let lower = origin.to_ascii_lowercase();
-        self.origins.iter().any(|o| o == "*" || *o == lower).then_some(origin)
+        self.allows(origin).then_some(origin)
     }
 
     /// The headers a response to `req` carries: none unless it comes from an allowed origin.
@@ -445,14 +453,20 @@ impl Cors {
     /// The answer to a preflight (`OPTIONS` with `Access-Control-Request-Method`) from an
     /// allowed origin. Preflights carry no credentials, so this comes before logging in.
     pub fn preflight(&self, req: &Request) -> Option<Response> {
+        self.preflight_with(req, CORS_METHODS, CORS_HEADERS)
+    }
+
+    /// [`preflight`](Cors::preflight) for an endpoint that takes `methods` and the request
+    /// headers `headers`.
+    pub(crate) fn preflight_with(&self, req: &Request, methods: &str, headers: &str) -> Option<Response> {
         if req.method != "OPTIONS" || req.header("access-control-request-method").is_none() {
             return None;
         }
         self.allowed(req)?;
         let mut r = Response::text(204, String::new(), "text/plain");
         r.headers = self.headers(req);
-        r.headers.push(("Access-Control-Allow-Methods", CORS_METHODS.into()));
-        r.headers.push(("Access-Control-Allow-Headers", CORS_HEADERS.into()));
+        r.headers.push(("Access-Control-Allow-Methods", methods.into()));
+        r.headers.push(("Access-Control-Allow-Headers", headers.into()));
         r.headers.push(("Access-Control-Max-Age", "600".into()));
         Some(r)
     }

@@ -93,3 +93,15 @@ threads = 0
 max_loaded_models = 2
 # cpu, or gpu (needs a build with the `gpu` feature too).
 device = "cpu"
+
+[mcp]
+# The Model Context Protocol endpoint for AI agents (Claude, Cursor, ...): set an address to
+# turn it on; agents then connect to http://ADDRESS/mcp with an API token (CREATE TOKEN).
+# bind = "127.0.0.1:7476"
+# Web pages from these origins may call it from the browser: a comma-separated list, or
+# "*". Requests from other pages are refused; agents send no origin.
+# allowed_origins = "https://app.example.com"
+# Tool calls one user may have running at once.
+max_concurrent_per_user = 8
+# Tool calls per minute and API token (0: no limit).
+calls_per_minute = 120

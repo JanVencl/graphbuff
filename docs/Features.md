@@ -161,7 +161,7 @@ Counters start at zero when the server starts.
 |--------|------|------|
 | `graphbuff_info{version}` | gauge | always 1; the server's version |
 | `graphbuff_uptime_seconds` | gauge | seconds since the server started |
-| `graphbuff_queries_total{protocol, outcome}` | counter | queries run over `http` or `bolt`; `outcome` is `ok`, `error`, `timeout`, `cancelled` or `memory_limit` |
+| `graphbuff_queries_total{protocol, outcome}` | counter | queries run over `http`, `bolt` or `mcp`; `outcome` is `ok`, `error`, `timeout`, `cancelled` or `memory_limit` |
 | `graphbuff_query_duration_seconds{protocol}` | histogram | how long queries ran (buckets from 1 ms to 10 s) |
 | `graphbuff_transactions{protocol, status}` | gauge | open transactions and queries run on their own, `running` or `idle` (as `SHOW TRANSACTIONS` lists them) |
 | `graphbuff_connections{protocol}` | gauge | connections open now |
@@ -169,6 +169,8 @@ Counters start at zero when the server starts.
 | `graphbuff_connections_refused_total` | counter | connections refused because `server.max_connections` were open |
 | `graphbuff_failed_logins_total{protocol}` | counter | requests and Bolt logons with wrong or missing credentials |
 | `graphbuff_login_lockouts_total` | counter | clients locked out by `security.max_failed_logins` |
+| `graphbuff_mcp_tool_calls_total{tool, outcome}` | counter | [MCP](MCP.md) tool calls; `outcome` is `ok`, `error` (a result the agent is told is an error) or `limited` (refused by `mcp.calls_per_minute` or `mcp.max_concurrent_per_user`) |
+| `graphbuff_mcp_tool_call_duration_seconds{tool}` | histogram | how long MCP tool calls took |
 | `graphbuff_database_nodes{database}` | gauge | nodes |
 | `graphbuff_database_relationships{database}` | gauge | relationships |
 | `graphbuff_database_store_bytes{database}` | gauge | size of a durable database's files (not for in-memory databases) |

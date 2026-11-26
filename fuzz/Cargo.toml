@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "mcp_message"
+path = "fuzz_targets/mcp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "storage"
 path = "fuzz_targets/storage.rs"
 test = false

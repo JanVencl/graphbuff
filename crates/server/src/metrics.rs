@@ -15,13 +15,17 @@ use graphbuff::{Error, StorageKind};
 use crate::api::Ctx;
 
 /// The protocols a server speaks, in the order metrics list them.
-const PROTOCOLS: [&str; 2] = ["http", "bolt"];
+const PROTOCOLS: [&str; 3] = ["http", "bolt", "mcp"];
 
 /// Upper bounds of the query latency histogram's buckets, in seconds.
 const BUCKETS: [f64; 12] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
 /// The outcomes a query is counted under.
 const OUTCOMES: [&str; 5] = ["ok", "error", "timeout", "cancelled", "memory_limit"];
+
+/// The outcomes an MCP tool call is counted under: `error` is a result the model is told
+/// is one, `limited` a call refused by the rate or concurrency limit.
+const TOOL_OUTCOMES: [&str; 3] = ["ok", "error", "limited"];
 
 #[derive(Default)]
 struct Histogram {
@@ -30,6 +34,29 @@ struct Histogram {
     buckets: [u64; BUCKETS.len()],
     count: u64,
     sum: f64,
+}
+
+impl Histogram {
+    fn add(&mut self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        self.count += 1;
+        self.sum += secs;
+        if let Some(i) = BUCKETS.iter().position(|b| secs <= *b) {
+            self.buckets[i] += 1;
+        }
+    }
+
+    /// Writes the samples of histogram `name` with the label `labels` (`key="value"`).
+    fn write(&self, out: &mut String, name: &str, labels: &str) {
+        let mut cumulative = 0;
+        for (b, n) in BUCKETS.iter().zip(self.buckets) {
+            cumulative += n;
+            let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{b}\"}} {cumulative}");
+        }
+        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {}", self.count);
+        let _ = writeln!(out, "{name}_sum{{{labels}}} {}", self.sum);
+        let _ = writeln!(out, "{name}_count{{{labels}}} {}", self.count);
+    }
 }
 
 #[derive(Default)]
@@ -41,6 +68,9 @@ struct State {
     /// Per protocol: connections accepted, and open now.
     accepted: BTreeMap<&'static str, u64>,
     open: BTreeMap<&'static str, u64>,
+    /// MCP tool calls per (tool, outcome), and their durations per tool.
+    tool_calls: BTreeMap<(&'static str, &'static str), u64>,
+    tool_latency: BTreeMap<&'static str, Histogram>,
 }
 
 /// The server's counters.
@@ -87,13 +117,14 @@ impl Metrics {
         let protocol = protocol_key(protocol);
         let mut st = self.state();
         *st.queries.entry((protocol, outcome(error))).or_insert(0) += 1;
-        let h = st.latency.entry(protocol).or_default();
-        let secs = elapsed.as_secs_f64();
-        h.count += 1;
-        h.sum += secs;
-        if let Some(i) = BUCKETS.iter().position(|b| secs <= *b) {
-            h.buckets[i] += 1;
-        }
+        st.latency.entry(protocol).or_default().add(elapsed);
+    }
+
+    /// Counts a finished MCP tool call.
+    pub fn mcp_call(&self, tool: &'static str, outcome: &'static str, elapsed: Duration) {
+        let mut st = self.state();
+        *st.tool_calls.entry((tool, outcome)).or_insert(0) += 1;
+        st.tool_latency.entry(tool).or_default().add(elapsed);
     }
 
     pub fn failed_login(&self, protocol: &str) {
@@ -167,15 +198,7 @@ pub(crate) fn render(ctx: &Ctx) -> String {
         family(&mut out, "graphbuff_query_duration_seconds", "histogram", "How long queries ran, by protocol.");
         let empty = Histogram::default();
         for p in PROTOCOLS {
-            let h = st.latency.get(p).unwrap_or(&empty);
-            let mut cumulative = 0;
-            for (b, n) in BUCKETS.iter().zip(h.buckets) {
-                cumulative += n;
-                let _ = writeln!(out, "graphbuff_query_duration_seconds_bucket{{protocol=\"{p}\",le=\"{b}\"}} {cumulative}");
-            }
-            let _ = writeln!(out, "graphbuff_query_duration_seconds_bucket{{protocol=\"{p}\",le=\"+Inf\"}} {}", h.count);
-            let _ = writeln!(out, "graphbuff_query_duration_seconds_sum{{protocol=\"{p}\"}} {}", h.sum);
-            let _ = writeln!(out, "graphbuff_query_duration_seconds_count{{protocol=\"{p}\"}} {}", h.count);
+            st.latency.get(p).unwrap_or(&empty).write(&mut out, "graphbuff_query_duration_seconds", &format!("protocol=\"{p}\""));
         }
         family(&mut out, "graphbuff_connections_accepted_total", "counter", "Connections accepted, by protocol.");
         for p in PROTOCOLS {
@@ -188,6 +211,17 @@ pub(crate) fn render(ctx: &Ctx) -> String {
         family(&mut out, "graphbuff_failed_logins_total", "counter", "Logins refused for wrong or missing credentials, by protocol.");
         for p in PROTOCOLS {
             let _ = writeln!(out, "graphbuff_failed_logins_total{{protocol=\"{p}\"}} {}", st.failed_logins.get(p).unwrap_or(&0));
+        }
+        family(&mut out, "graphbuff_mcp_tool_calls_total", "counter", "MCP tool calls, by tool and outcome.");
+        for t in crate::mcp::tool_names() {
+            for o in TOOL_OUTCOMES {
+                let n = st.tool_calls.get(&(t, o)).unwrap_or(&0);
+                let _ = writeln!(out, "graphbuff_mcp_tool_calls_total{{tool=\"{t}\",outcome=\"{o}\"}} {n}");
+            }
+        }
+        family(&mut out, "graphbuff_mcp_tool_call_duration_seconds", "histogram", "How long MCP tool calls took, by tool.");
+        for t in crate::mcp::tool_names() {
+            st.tool_latency.get(t).unwrap_or(&empty).write(&mut out, "graphbuff_mcp_tool_call_duration_seconds", &format!("tool=\"{t}\""));
         }
     }
     family(&mut out, "graphbuff_connections_refused_total", "counter", "Connections refused because too many were open.");
