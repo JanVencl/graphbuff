@@ -138,21 +138,20 @@ impl Test {
         )
     }
 
-    /// Opens the consent page: the form's request id and the cookie.
+    /// Opens the consent page: the form's signed request and the cookie.
     fn page(&self, scope: &str) -> (String, String) {
         let r = send(self.mcp, "GET", &self.authorize_url(&format!("&scope={}", enc(scope))), &[], "");
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("Connect an app") && r.body.contains("localhost"), "{}", r.body);
         assert_eq!(r.header("X-Frame-Options"), Some("DENY"));
         let cookie = r.header("Set-Cookie").unwrap().split(';').next().unwrap().to_string();
-        let id = cookie.strip_prefix("gbo_").unwrap().split('=').next().unwrap().to_string();
-        assert!(r.body.contains(&id));
-        (id, cookie)
+        assert!(cookie.starts_with("gbo_"), "{cookie}");
+        let request = r.body.split("name=request value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        (request, cookie)
     }
 
     fn answer(&self, id: &str, cookie: &str, fields: &[(&str, &str)]) -> Reply {
-        let csrf = cookie.split_once('=').unwrap().1;
-        let mut all = vec![("request", id), ("csrf", csrf)];
+        let mut all = vec![("request", id)];
         all.extend_from_slice(fields);
         send(
             self.mcp,
@@ -256,15 +255,21 @@ fn login_consent_and_tokens() {
 
     // The form needs its cookie, and the right password.
     let (id, cookie) = t.page("read");
-    let csrf = cookie.split_once('=').unwrap().1;
     let r = send(
         t.mcp,
         "POST",
         "/oauth/authorize",
         &[("Content-Type", "application/x-www-form-urlencoded")],
-        &form(&[("request", &id), ("csrf", csrf), ("user", "ann"), ("password", "annpw"), ("action", "allow")]),
+        &form(&[("request", &id), ("user", "ann"), ("password", "annpw"), ("action", "allow")]),
     );
     assert_eq!(r.status, 403, "{}", r.body);
+    // Another page's cookie does not fit.
+    let (_, other) = t.page("read");
+    let r = t.answer(&id, &other, &[("user", "ann"), ("password", "annpw"), ("action", "allow")]);
+    assert_eq!(r.status, 403, "{}", r.body);
+    // A changed request is refused.
+    let r = t.answer(&id.replacen('e', "f", 1).replacen('A', "B", 1), &cookie, &[("action", "deny")]);
+    assert!(r.status == 400 && r.body.contains("expired"), "{}", r.body);
     let r = t.answer(&id, &cookie, &[("user", "ann"), ("password", "wrong"), ("action", "allow")]);
     assert!(r.status == 401 && r.body.contains("wrong user name or password"), "{}", r.body);
     // Deny.
@@ -284,6 +289,13 @@ fn login_consent_and_tokens() {
     assert!(r.status == 400 && r.field("error") == "invalid_grant", "{}", r.body);
     // A code that failed once is spent.
     assert_eq!(t.exchange(&code).field("error"), "invalid_grant");
+
+    // A page gives one code.
+    let (id, cookie) = t.page("read");
+    let allow = [("user", "ann"), ("password", "annpw"), ("action", "allow")];
+    assert_eq!(t.answer(&id, &cookie, &allow).status, 302);
+    let r = t.answer(&id, &cookie, &allow);
+    assert!(r.status == 400 && r.body.contains("answered already"), "{}", r.body);
 
     let code = t.code("ann", "annpw", "write");
     let r = t.exchange(&code);

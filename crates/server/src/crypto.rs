@@ -77,6 +77,20 @@ impl Sha256 {
     }
 }
 
+/// HMAC-SHA256 (RFC 2104) of `data` with a 32-byte `key`.
+pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut pad = [0u8; 64];
+    pad[..32].copy_from_slice(key);
+    let mut inner = Sha256::new();
+    inner.update(&pad.map(|b| b ^ 0x36));
+    inner.update(data);
+    let inner = inner.finish();
+    let mut outer = Sha256::new();
+    outer.update(&pad.map(|b| b ^ 0x5c));
+    outer.update(&inner);
+    outer.finish()
+}
+
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
@@ -242,6 +256,17 @@ pub(crate) fn random_bytes() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_vectors() {
+        // RFC 4231, test case 2 (a short key is padded with zeros either way).
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        assert_eq!(
+            hex(&hmac_sha256(&key, b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
 
     #[test]
     fn sha256_vectors() {

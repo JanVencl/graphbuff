@@ -14,14 +14,15 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::{Ctx, LoginError};
 use crate::crypto;
 use crate::http::{Request, Response, form_fields, percent_encode};
 use crate::json::{self, Json};
 use crate::throttle;
-use crate::users::{Access, Principal, TokenAccess};
+use crate::users::{Access, Principal, RefreshError, TokenAccess};
 
 use super::rpc::{encode, obj, string};
 
@@ -29,11 +30,15 @@ use super::rpc::{encode, obj, string};
 const PENDING_LIFETIME: Duration = Duration::from_secs(600);
 /// How long a code works.
 const CODE_LIFETIME: Duration = Duration::from_secs(60);
-/// Pages and codes kept at once, against a flood of them.
-const MAX_PENDING: usize = 1000;
+/// Codes (and consent forms answered) kept at once. Only a login makes one.
+const MAX_CODES: usize = 1000;
 /// How long a fetched client metadata document is kept.
 const DOCUMENT_LIFETIME: Duration = Duration::from_secs(600);
+/// How long a client metadata document that could not be fetched or read is not tried again.
+const FAILED_LIFETIME: Duration = Duration::from_secs(60);
 const MAX_DOCUMENTS: usize = 1000;
+/// Client metadata documents fetched at once: each may hold a connection for 5 s.
+const MAX_FETCHES: usize = 4;
 
 /// A client listed in `mcp.oauth_clients`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,19 +149,26 @@ struct Client {
     /// What the consent page calls it.
     name: String,
     redirect_uris: Vec<String>,
+    /// Whether it is listed in `mcp.oauth_clients` (else it has a metadata document).
+    listed: bool,
 }
 
-/// A login and consent page that was shown.
+/// A login and consent page that was shown. The server keeps none: the page's form
+/// carries it, signed (see [`OAuth::ticket`]), so that opening pages costs no memory.
 struct Pending {
+    /// Names the cookie.
+    id: String,
     client: Client,
     redirect_uri: String,
     state: Option<String>,
     challenge: String,
     /// Whether the client asked to write.
     wants_write: bool,
-    /// Sent back in the form (against forgery), and set as a cookie.
+    /// The cookie's value (against forgery): only the browser the page was shown in can
+    /// send the form.
     csrf: String,
-    created: Instant,
+    /// When the page was shown, in seconds since 1970.
+    created: u64,
 }
 
 /// A code given to a client, and what it stands for.
@@ -172,6 +184,9 @@ struct Code {
     used: Option<String>,
 }
 
+/// A client metadata document as fetched (or why it could not be), and when.
+type Document = (Instant, Result<Client, String>);
+
 /// The authorization server's state.
 pub(crate) struct OAuth {
     /// `https://host/mcp`: the resource, and the audience of the tokens.
@@ -181,23 +196,32 @@ pub(crate) struct OAuth {
     clients: Vec<OAuthClient>,
     /// Hosts whose client metadata documents are fetched; empty: any public one.
     client_hosts: Vec<String>,
-    pending: Mutex<HashMap<String, Pending>>,
+    /// Signs the consent forms; new at each start, which ends the pages open then.
+    key: [u8; 32],
+    /// Consent forms that gave a code, by the SHA-256 of their ticket: each gives one.
+    answered: Mutex<HashMap<[u8; 32], Instant>>,
     /// By the SHA-256 of the code.
     codes: Mutex<HashMap<[u8; 32], Code>>,
-    documents: Mutex<HashMap<String, (Instant, Client)>>,
+    /// Client metadata documents, and those that could not be fetched or read.
+    documents: Mutex<HashMap<String, Document>>,
+    /// Client metadata documents being fetched.
+    fetching: AtomicUsize,
 }
 
 impl OAuth {
     pub(crate) fn new(public_url: &str, clients: Vec<OAuthClient>, client_hosts: Vec<String>) -> Result<OAuth, String> {
         let issuer = check_public_url(public_url)?;
+        let key = crypto::secret_bytes::<32>().map_err(|e| format!("no random numbers for OAuth: {e}"))?;
         Ok(OAuth {
             public_url: public_url.to_string(),
             issuer,
             clients,
             client_hosts: client_hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect(),
-            pending: Mutex::new(HashMap::new()),
+            key,
+            answered: Mutex::new(HashMap::new()),
             codes: Mutex::new(HashMap::new()),
             documents: Mutex::new(HashMap::new()),
+            fetching: AtomicUsize::new(0),
         })
     }
 
@@ -221,8 +245,8 @@ impl OAuth {
             ("GET", "/.well-known/oauth-authorization-server" | "/.well-known/openid-configuration") => self.metadata(),
             ("GET", "/oauth/authorize") => self.authorize_page(&form_fields(&req.query)),
             ("POST", "/oauth/authorize") => self.authorize_answer(ctx, req, peer),
-            ("POST", "/oauth/token") => self.token(ctx, req),
-            ("POST", "/oauth/revoke") => self.revoke(ctx, req),
+            ("POST", "/oauth/token") => self.token(ctx, req, peer),
+            ("POST", "/oauth/revoke") => self.revoke(ctx, req, peer),
             (_, "/oauth/authorize") => Response::text(405, "GET or POST".into(), "text/plain").with_header("Allow", "GET, POST"),
             (_, "/oauth/token" | "/oauth/revoke") => Response::text(405, "POST only".into(), "text/plain").with_header("Allow", "POST"),
             (_, p) if p.starts_with("/.well-known/") => Response::text(404, "not found".into(), "text/plain"),
@@ -267,26 +291,91 @@ impl OAuth {
     /// The client `id`: listed, or described by the metadata document at `id`.
     fn client(&self, id: &str) -> Result<Client, String> {
         if let Some(c) = self.clients.iter().find(|c| c.id == id) {
-            return Ok(Client { id: c.id.clone(), name: c.id.clone(), redirect_uris: c.redirect_uris.clone() });
+            return Ok(Client { id: c.id.clone(), name: c.id.clone(), redirect_uris: c.redirect_uris.clone(), listed: true });
         }
         if !id.starts_with("https://") {
             return Err(format!("unknown client `{id}`: it is not in mcp.oauth_clients, and not an https:// URL of a client metadata document"));
         }
-        if let Some((at, c)) = self.documents.lock().unwrap_or_else(|e| e.into_inner()).get(id)
-            && at.elapsed() < DOCUMENT_LIFETIME
+        let fresh = |(at, c): &Document| {
+            at.elapsed() < if c.is_ok() { DOCUMENT_LIFETIME } else { FAILED_LIFETIME }
+        };
+        if let Some(entry) = self.documents.lock().unwrap_or_else(|e| e.into_inner()).get(id)
+            && fresh(entry)
         {
-            return Ok(c.clone());
+            return entry.1.clone();
         }
-        let text = crate::fetch::get_public(id, &self.client_hosts).map_err(|e| format!("the client's metadata document {id}: {e}"))?;
-        let c = parse_document(id, &text)?;
+        let Some(_slot) = FetchSlot::take(&self.fetching, MAX_FETCHES) else {
+            return Err("too many client metadata documents are being fetched; try again in a moment".into());
+        };
+        let c = crate::fetch::get_public(id, &self.client_hosts)
+            .map_err(|e| format!("the client's metadata document {id}: {e}"))
+            .and_then(|text| parse_document(id, &text));
         let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         if docs.len() >= MAX_DOCUMENTS {
-            docs.retain(|_, (at, _)| at.elapsed() < DOCUMENT_LIFETIME);
+            docs.retain(|_, entry| fresh(entry));
         }
         if docs.len() < MAX_DOCUMENTS {
             docs.insert(id.to_string(), (Instant::now(), c.clone()));
         }
-        Ok(c)
+        c
+    }
+
+    // ---- consent forms ----------------------------------------------------------------
+
+    /// `p` as the form's `request` field: its fields, and their HMAC under this server's key.
+    fn ticket(&self, p: &Pending) -> String {
+        let body = obj([
+            ("i", string(p.id.clone())),
+            ("c", string(p.client.id.clone())),
+            ("r", string(p.redirect_uri.clone())),
+            ("s", p.state.clone().map_or(Json::Null, string)),
+            ("p", string(p.challenge.clone())),
+            ("w", Json::Bool(p.wants_write)),
+            ("x", string(p.csrf.clone())),
+            ("t", Json::Int(p.created as i64)),
+        ]);
+        let payload = crypto::base64_encode(encode(&body).as_bytes());
+        let mac = crypto::hex(&crypto::hmac_sha256(&self.key, payload.as_bytes()));
+        format!("{payload}.{mac}")
+    }
+
+    /// The page that `ticket` stands for, if this server signed it and it is not too old.
+    fn open_ticket(&self, ticket: &str) -> Result<Pending, String> {
+        const EXPIRED: &str = "this page has expired: go back to the app and connect again";
+        let (payload, mac) = ticket.rsplit_once('.').ok_or(EXPIRED)?;
+        // A page shown before the server restarted fails here too.
+        if !api_same(mac, &crypto::hex(&crypto::hmac_sha256(&self.key, payload.as_bytes()))) {
+            return Err(EXPIRED.into());
+        }
+        let text = crypto::base64_decode(payload).and_then(|b| String::from_utf8(b).ok()).ok_or(EXPIRED)?;
+        let Ok(Json::Object(m)) = json::parse(&text) else { return Err(EXPIRED.into()) };
+        let field = |k: &str| match m.get(k) {
+            Some(Json::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let created = match m.get("t") {
+            Some(Json::Int(t)) if *t >= 0 => *t as u64,
+            _ => return Err(EXPIRED.into()),
+        };
+        let now = unix_now();
+        if now.saturating_sub(created) >= PENDING_LIFETIME.as_secs() || created > now + 60 {
+            return Err(EXPIRED.into());
+        }
+        let (Some(id), Some(client), Some(redirect_uri), Some(challenge), Some(csrf)) =
+            (field("i"), field("c"), field("r"), field("p"), field("x"))
+        else {
+            return Err(EXPIRED.into());
+        };
+        Ok(Pending {
+            id,
+            client: self.client(&client)?,
+            redirect_uri,
+            state: field("s"),
+            challenge,
+            wants_write: matches!(m.get("w"), Some(Json::Bool(true))),
+            csrf,
+            created,
+        })
     }
 
     // ---- authorize --------------------------------------------------------------------
@@ -336,23 +425,16 @@ impl OAuth {
             _ => return error_page(500, "no random numbers"),
         };
         let pending = Pending {
+            id: id.clone(),
             client,
             redirect_uri,
             state,
             challenge: challenge.to_string(),
             wants_write: scopes.contains(&"write"),
             csrf: csrf.clone(),
-            created: Instant::now(),
+            created: unix_now(),
         };
-        let page = consent_page(&id, &pending, None);
-        {
-            let mut all = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            all.retain(|_, p| p.created.elapsed() < PENDING_LIFETIME);
-            if all.len() >= MAX_PENDING {
-                return error_page(503, "too many logins are under way; try again in a few minutes");
-            }
-            all.insert(id.clone(), pending);
-        }
+        let page = consent_page(&self.ticket(&pending), &pending, None);
         html(200, page).with_header(
             "Set-Cookie",
             format!("gbo_{id}={csrf}; Path=/oauth; Max-Age=600; HttpOnly; Secure; SameSite=Strict"),
@@ -371,17 +453,18 @@ impl OAuth {
     fn authorize_answer(&self, ctx: &Ctx, req: &Request, peer: &str) -> Response {
         let f = form_fields(&String::from_utf8_lossy(&req.body));
         let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        let Some(id) = get("request") else { return error_page(400, "the form has no request") };
-        let cookie = cookie(req, &format!("gbo_{id}"));
-        let mut all = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(p) = all.get(id).filter(|p| p.created.elapsed() < PENDING_LIFETIME) else {
-            return error_page(400, "this page has expired: go back to the app and connect again");
+        let Some(ticket) = get("request") else { return error_page(400, "the form has no request") };
+        let p = match self.open_ticket(ticket) {
+            Ok(p) => p,
+            Err(e) => return error_page(400, &e),
         };
-        if !cookie.is_some_and(|c| api_same(c, &p.csrf)) || !get("csrf").is_some_and(|c| api_same(c, &p.csrf)) {
+        if !cookie(req, &format!("gbo_{}", p.id)).is_some_and(|c| api_same(c, &p.csrf)) {
             return error_page(403, "this form was not sent from the page this server showed (check that cookies are on)");
         }
         if get("action") != Some("allow") {
-            let p = all.remove(id).expect("checked");
+            if let Some(log) = &ctx.log {
+                log.security(format_args!("oauth {peer} - DENY: client {} ({})", p.client.id, p.client.name));
+            }
             return self.redirect_error(&p.redirect_uri, p.state.as_deref(), "access_denied", "the user did not allow access");
         }
         let user = get("user").unwrap_or("").trim().to_string();
@@ -395,31 +478,42 @@ impl OAuth {
         let who = match login {
             Ok(w) => w,
             Err(LoginError::Locked(wait)) => {
-                let page = consent_page(id, p, Some(&format!("too many failed logins: try again in {} s", throttle::seconds(wait))));
-                return html(429, page);
+                let why = format!("too many failed logins: try again in {} s", throttle::seconds(wait));
+                return html(429, consent_page(ticket, &p, Some(&why)));
             }
-            Err(LoginError::Wrong) => return html(401, consent_page(id, p, Some("wrong user name or password"))),
+            Err(LoginError::Wrong) => return html(401, consent_page(ticket, &p, Some("wrong user name or password"))),
         };
         let best = super::cap(ctx.best_access(&who));
         if best < Access::Read {
-            return html(403, consent_page(id, p, Some(&format!("user `{user}` may not read any database"))));
+            return html(403, consent_page(ticket, &p, Some(&format!("user `{user}` may not read any database"))));
         }
         let access = if get("access") == Some("write") && best >= Access::Write { TokenAccess::Write } else { TokenAccess::Read };
         let mut databases = Vec::new();
         for d in get("databases").unwrap_or("").split(',').map(str::trim).filter(|d| !d.is_empty()) {
             if ctx.mgr.database(d).is_err() || ctx.access_on(&who, &d.to_ascii_lowercase()) < Access::Read {
-                return html(400, consent_page(id, p, Some(&format!("no database `{d}` that you may read"))));
+                return html(400, consent_page(ticket, &p, Some(&format!("no database `{d}` that you may read"))));
             }
             databases.push(d.to_ascii_lowercase());
         }
-        let p = all.remove(id).expect("checked");
-        drop(all);
+        {
+            // A form gives one code, however often it is sent.
+            let mut answered = self.answered.lock().unwrap_or_else(|e| e.into_inner());
+            answered.retain(|_, at| at.elapsed() < PENDING_LIFETIME);
+            let key = crypto::sha256(ticket.as_bytes());
+            if answered.contains_key(&key) {
+                return error_page(400, "this page was answered already: go back to the app and connect again");
+            }
+            if answered.len() >= MAX_CODES {
+                return error_page(503, "too many logins are under way; try again in a few minutes");
+            }
+            answered.insert(key, Instant::now());
+        }
         let Some(code) = random() else { return error_page(500, "no random numbers") };
         let code = format!("gbc_{code}");
         {
             let mut codes = self.codes.lock().unwrap_or_else(|e| e.into_inner());
             codes.retain(|_, c| c.created.elapsed() < CODE_LIFETIME * 10);
-            if codes.len() >= MAX_PENDING {
+            if codes.len() >= MAX_CODES {
                 return error_page(503, "too many logins are under way; try again in a minute");
             }
             codes.insert(
@@ -428,20 +522,22 @@ impl OAuth {
                     client: p.client.id.clone(),
                     redirect_uri: p.redirect_uri.clone(),
                     challenge: p.challenge,
-                    user,
+                    user: user.clone(),
                     access,
-                    databases,
+                    databases: databases.clone(),
                     created: Instant::now(),
                     used: None,
                 },
             );
         }
         if let Some(log) = &ctx.log {
+            let on = if databases.is_empty() { "every database".to_string() } else { databases.join(", ") };
             log.security(format_args!(
-                "oauth {peer} `{}` CONSENT: client {} gets {} access",
-                p.client.id.replace(['\r', '\n'], " "),
-                p.client.name.replace(['\r', '\n'], " "),
-                access.name()
+                "oauth {peer} {user} CONSENT: client {} ({}) gets {} access on {on}, sent to {}",
+                p.client.id,
+                p.client.name,
+                access.name(),
+                host_of(&p.redirect_uri)
             ));
         }
         let mut params = vec![("code", code)];
@@ -454,7 +550,7 @@ impl OAuth {
 
     // ---- token ------------------------------------------------------------------------
 
-    fn token(&self, ctx: &Ctx, req: &Request) -> Response {
+    fn token(&self, ctx: &Ctx, req: &Request, peer: &str) -> Response {
         let f = form_fields(&String::from_utf8_lossy(&req.body));
         let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         if req.header("authorization").is_some() {
@@ -481,6 +577,12 @@ impl OAuth {
                 if let Some(refresh) = &c.used {
                     // The grant ends, also when its refresh token was replaced since.
                     users.oauth_end(refresh);
+                    if let Some(log) = &ctx.log {
+                        log.security(format_args!(
+                            "oauth {peer} {} CODE REUSED: client {}; the grant it gave is ended",
+                            c.user, c.client
+                        ));
+                    }
                     return token_error(400, "invalid_grant", "the code was used already; the tokens it gave are revoked");
                 }
                 if c.created.elapsed() >= CODE_LIFETIME
@@ -489,6 +591,12 @@ impl OAuth {
                     || !pkce_ok(verifier, &c.challenge)
                 {
                     c.used = Some(String::new());
+                    if let Some(log) = &ctx.log {
+                        log.security(format_args!(
+                            "oauth {peer} {} CODE REFUSED: sent by client {client} for client {}; the code is spent",
+                            c.user, c.client
+                        ));
+                    }
                     return token_error(400, "invalid_grant", "the code does not fit this client, redirect URI or verifier, or has expired");
                 }
                 match users.oauth_grant(&c.user, &c.client, c.access, &c.databases, &self.public_url) {
@@ -502,8 +610,15 @@ impl OAuth {
             Some("refresh_token") => {
                 let Some(r) = get("refresh_token") else { return token_error(400, "invalid_request", "refresh_token is required") };
                 match users.oauth_refresh(r, client) {
-                    Some(i) => i,
-                    None => return token_error(400, "invalid_grant", "the refresh token does not work (any more)"),
+                    Ok(i) => i,
+                    Err(e) => {
+                        if let (RefreshError::Reused { user }, Some(log)) = (&e, &ctx.log) {
+                            log.security(format_args!(
+                                "oauth {peer} {user} REFRESH TOKEN REUSED: client {client}; its grant is ended"
+                            ));
+                        }
+                        return token_error(400, "invalid_grant", "the refresh token does not work (any more)");
+                    }
                 }
             }
             _ => return token_error(400, "unsupported_grant_type", "grant_type is authorization_code or refresh_token"),
@@ -518,12 +633,14 @@ impl OAuth {
         Response::json(200, encode(&body)).with_header("Cache-Control", "no-store").with_header("Pragma", "no-cache")
     }
 
-    fn revoke(&self, ctx: &Ctx, req: &Request) -> Response {
+    fn revoke(&self, ctx: &Ctx, req: &Request, peer: &str) -> Response {
         let f = form_fields(&String::from_utf8_lossy(&req.body));
         if let Some((_, t)) = f.iter().find(|(n, _)| n == "token")
             && let Some(users) = &ctx.users
+            && let Some((user, client)) = users.oauth_revoke(t)
+            && let Some(log) = &ctx.log
         {
-            users.oauth_revoke(t);
+            log.security(format_args!("oauth {peer} {user} REVOKE: the grant of client {client} is ended"));
         }
         Response::json(200, "{}".into()).with_header("Cache-Control", "no-store")
     }
@@ -555,7 +672,30 @@ fn parse_document(url: &str, text: &str) -> Result<Client, String> {
         Some(Json::String(s)) if s == "none" => {}
         Some(_) => return Err(format!("{url}: this server takes public clients only (token_endpoint_auth_method none)")),
     }
-    Ok(Client { id: url.to_string(), name, redirect_uris })
+    Ok(Client { id: url.to_string(), name, redirect_uris, listed: false })
+}
+
+/// A place among the client metadata documents fetched at once; given back when dropped.
+struct FetchSlot<'a>(&'a AtomicUsize);
+
+impl<'a> FetchSlot<'a> {
+    fn take(count: &'a AtomicUsize, max: usize) -> Option<FetchSlot<'a>> {
+        if count.fetch_add(1, Ordering::SeqCst) >= max {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(FetchSlot(count))
+    }
+}
+
+impl Drop for FetchSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// `base64url(sha256(verifier)) == challenge`, and the verifier is well formed.
@@ -655,22 +795,38 @@ fn host_of(uri: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
-fn consent_page(id: &str, p: &Pending, error: Option<&str>) -> String {
+fn consent_page(ticket: &str, p: &Pending, error: Option<&str>) -> String {
     let local = loopback(&p.redirect_uri).is_some();
+    let to = host_of(&p.redirect_uri);
+    // A metadata document names the app as it likes: where the document is says who it is.
+    let from = host_of(&p.client.id);
+    let who = if p.client.listed {
+        format!("<b>{}</b><br>listed in this server's settings", escape(&p.client.name))
+    } else {
+        format!("<b>{}</b> (as it calls itself)<br>an app described at <b>{}</b>", escape(&p.client.name), escape(from))
+    };
     let warn = if local {
         "<p class=warn>This app runs on your computer: it will receive the access, through \
          <code>localhost</code>. Allow only if you started it.</p>"
+            .to_string()
+    } else if !p.client.listed && !to.eq_ignore_ascii_case(from) {
+        format!(
+            "<p class=warn>The access goes to <b>{to}</b>, not to <b>{from}</b>, where the app is described. \
+             Allow only if you trust <b>{to}</b>.</p>",
+            to = escape(to),
+            from = escape(from)
+        )
     } else {
-        ""
+        String::new()
     };
     let error = error.map(|e| format!("<p class=err>{}</p>", escape(e))).unwrap_or_default();
     let (read_checked, write_checked) = if p.wants_write { ("", " checked") } else { (" checked", "") };
     format!(
         "<!doctype html><html><head><meta charset=utf-8><title>Connect to GraphBuff</title><style>{STYLE}</style></head><body>\
          <h1>Connect an app to GraphBuff</h1>\
-         <div class=box><b>{name}</b><br>client <code>{client}</code><br>will be sent back to <b>{host}</b></div>{warn}{error}\
+         <div class=box>{who}<br>client <code>{client}</code><br>will be sent back to <b>{host}</b></div>{warn}{error}\
          <form method=post action=/oauth/authorize>\
-         <input type=hidden name=request value=\"{id}\"><input type=hidden name=csrf value=\"{csrf}\">\
+         <input type=hidden name=request value=\"{ticket}\">\
          <label for=u>User</label><input type=text id=u name=user autocomplete=username required autofocus>\
          <label for=pw>Password</label><input type=password id=pw name=password autocomplete=current-password required>\
          <label>Access</label>\
@@ -680,11 +836,9 @@ fn consent_page(id: &str, p: &Pending, error: Option<&str>) -> String {
          <button type=submit name=action value=allow>Allow</button><button type=submit name=action value=deny formnovalidate>Deny</button>\
          </form><p>The app gets a token that works for an hour and is renewed while you use it. \
          <code>SHOW TOKENS</code> lists it, and <code>DROP TOKEN</code> takes the access away.</p></body></html>",
-        name = escape(&p.client.name),
         client = escape(&p.client.id),
-        host = escape(host_of(&p.redirect_uri)),
-        csrf = escape(&p.csrf),
-        id = escape(id),
+        host = escape(to),
+        ticket = escape(ticket),
     )
 }
 
@@ -749,15 +903,76 @@ mod tests {
     #[test]
     fn page_is_escaped() {
         let p = Pending {
-            client: Client { id: "https://x/<zz>".into(), name: "<script>".into(), redirect_uris: vec![] },
+            id: "id".into(),
+            client: Client { id: "https://x/<zz>".into(), name: "<script>".into(), redirect_uris: vec![], listed: false },
             redirect_uri: "https://evil\"/cb".into(),
             state: None,
             challenge: String::new(),
             wants_write: false,
             csrf: "c".into(),
-            created: Instant::now(),
+            created: 0,
         };
-        let page = consent_page("id", &p, Some("<qq>"));
+        let page = consent_page("t\"<", &p, Some("<qq>"));
         assert!(!page.contains("<script>") && !page.contains("<zz>") && !page.contains("<qq>") && !page.contains("evil\""));
+        assert!(!page.contains("t\"<"));
+        assert!(page.contains("class=warn"), "the access goes elsewhere than the app's host: {page}");
+    }
+
+    #[test]
+    fn consent_page_names_the_hosts() {
+        let mut p = Pending {
+            id: "id".into(),
+            client: Client {
+                id: "https://claude.ai/oauth/client.json".into(),
+                name: "Claude".into(),
+                redirect_uris: vec![],
+                listed: false,
+            },
+            redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
+            state: None,
+            challenge: String::new(),
+            wants_write: false,
+            csrf: "c".into(),
+            created: 0,
+        };
+        let page = consent_page("t", &p, None);
+        assert!(page.contains("described at <b>claude.ai</b>") && !page.contains("class=warn"), "{page}");
+        p.redirect_uri = "https://evil.example/cb".into();
+        let page = consent_page("t", &p, None);
+        assert!(page.contains("goes to <b>evil.example</b>, not to <b>claude.ai</b>"), "{page}");
+        p.client.listed = true;
+        assert!(!consent_page("t", &p, None).contains("class=warn"));
+    }
+
+    #[test]
+    fn tickets() {
+        let o = OAuth::new("https://mcp.example.com/mcp", OAuthClient::parse_list("app https://a.example/cb").unwrap(), vec![])
+            .unwrap();
+        let p = Pending {
+            id: "abc".into(),
+            client: o.client("app").unwrap(),
+            redirect_uri: "https://a.example/cb".into(),
+            state: Some("s&t\"".into()),
+            challenge: "ch".into(),
+            wants_write: true,
+            csrf: "x".into(),
+            created: unix_now(),
+        };
+        let t = o.ticket(&p);
+        let back = o.open_ticket(&t).unwrap();
+        assert_eq!(
+            (back.id.as_str(), back.redirect_uri.as_str(), back.state.as_deref(), back.challenge.as_str(), back.wants_write, back.csrf.as_str()),
+            ("abc", "https://a.example/cb", Some("s&t\""), "ch", true, "x")
+        );
+        // Changed, signed by another server, or too old: refused.
+        let (payload, mac) = t.rsplit_once('.').unwrap();
+        let forged = crypto::base64_encode(
+            String::from_utf8(crypto::base64_decode(payload).unwrap()).unwrap().replace("a.example", "b.example").as_bytes(),
+        );
+        assert!(o.open_ticket(&format!("{forged}.{mac}")).is_err());
+        let other = OAuth::new("https://mcp.example.com/mcp", o.clients.clone(), vec![]).unwrap();
+        assert!(other.open_ticket(&t).is_err());
+        let old = Pending { created: unix_now() - PENDING_LIFETIME.as_secs(), ..p };
+        assert!(o.open_ticket(&o.ticket(&old)).is_err());
     }
 }
