@@ -250,6 +250,9 @@ fn login_consent_and_tokens() {
     let r = send(t.mcp, "GET", &t.authorize_url("").replace("&code_challenge_method=S256", ""), &[], "");
     assert_eq!(r.status, 302);
     assert_eq!(param(r.header("Location").unwrap(), "error").as_deref(), Some("invalid_request"));
+    let bad = format!("{}~", &CHALLENGE[..42]);
+    let r = send(t.mcp, "GET", &t.authorize_url("").replace(CHALLENGE, &bad), &[], "");
+    assert_eq!(param(r.header("Location").unwrap(), "error").as_deref(), Some("invalid_request"), "not base64url");
     let r = send(t.mcp, "GET", &t.authorize_url("").replace(&enc(URL), &enc("https://other.test/mcp")), &[], "");
     assert_eq!(param(r.header("Location").unwrap(), "error").as_deref(), Some("invalid_target"));
 
