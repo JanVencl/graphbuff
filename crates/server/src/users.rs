@@ -882,6 +882,16 @@ impl Users {
         issued
     }
 
+    /// Ends the OAuth grant that `refresh` (a refresh token this server issued, perhaps
+    /// replaced since) belongs to.
+    pub(crate) fn oauth_end(&self, refresh: &str) {
+        let Some((family, _)) = refresh.strip_prefix(REFRESH_PREFIX).and_then(|t| t.split_once('_')) else { return };
+        let _ = self.change(|d| {
+            d.grants.remove(family);
+            Ok(())
+        });
+    }
+
     /// Ends the OAuth grant of `token` (its access or refresh token). Other tokens, and
     /// tokens that do not work, are left alone.
     pub(crate) fn oauth_revoke(&self, token: &str) {

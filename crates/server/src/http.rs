@@ -350,6 +350,15 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Appends a header line. Line breaks and other control characters in `value` become
+/// spaces, so that no value can add headers or end the head.
+fn push_header(head: &mut String, name: &str, value: &str) {
+    head.push_str(name);
+    head.push_str(": ");
+    head.extend(value.chars().map(|c| if c.is_control() { ' ' } else { c }));
+    head.push_str("\r\n");
+}
+
 pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
@@ -360,10 +369,7 @@ pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::
         if keep_alive { "keep-alive" } else { "close" }
     );
     for (name, value) in &resp.headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+        push_header(&mut head, name, value);
     }
     head.push_str("\r\n");
     // One write for small responses keeps Nagle's algorithm out of the way.
@@ -386,10 +392,7 @@ pub fn write_chunked_head(
         if keep_alive { "keep-alive" } else { "close" }
     );
     for (name, value) in headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+        push_header(&mut head, name, value);
     }
     head.push_str("\r\n");
     w.write_all(head.as_bytes())
@@ -538,6 +541,13 @@ mod tests {
             body: Vec::new(),
             keep_alive: true,
         }
+    }
+
+    #[test]
+    fn header_values_cannot_add_headers() {
+        let mut head = String::new();
+        push_header(&mut head, "Location", "https://a/cb\r\nSet-Cookie: x=y\r\n\r\nHTTP/1.1 200 OK");
+        assert_eq!(head, "Location: https://a/cb  Set-Cookie: x=y    HTTP/1.1 200 OK\r\n");
     }
 
     #[test]

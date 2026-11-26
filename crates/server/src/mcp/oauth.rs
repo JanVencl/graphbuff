@@ -81,12 +81,21 @@ pub fn check_public_url(url: &str) -> Result<String, String> {
     Ok(format!("https://{authority}"))
 }
 
-/// Whether `uri` may be a redirect URI: `https://`, or `http://` to a loopback host.
+/// Whether `uri` may be a redirect URI: `https://` with a host, or `http://` to a
+/// loopback host; printable ASCII only (it goes into a `Location` header), without a
+/// fragment or credentials.
 fn check_redirect(uri: &str) -> Result<(), String> {
+    if !uri.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+        return Err(format!("redirect URI {uri:?} has spaces, control or non-ASCII characters"));
+    }
     if uri.contains('#') {
         return Err(format!("redirect URI `{uri}` has a fragment"));
     }
-    if uri.starts_with("https://") && uri.len() > 8 {
+    if let Some(rest) = uri.strip_prefix("https://") {
+        let authority = rest.split(['/', '?']).next().unwrap_or("");
+        if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+            return Err(format!("redirect URI `{uri}` has no valid host"));
+        }
         return Ok(());
     }
     if loopback(uri).is_some() {
@@ -469,8 +478,9 @@ impl OAuth {
                 let Some(c) = codes.get_mut(&crypto::sha256(code.as_bytes())) else {
                     return token_error(400, "invalid_grant", "unknown or expired code");
                 };
-                if let Some(refresh) = c.used.take() {
-                    users.oauth_revoke(&refresh);
+                if let Some(refresh) = &c.used {
+                    // The grant ends, also when its refresh token was replaced since.
+                    users.oauth_end(refresh);
                     return token_error(400, "invalid_grant", "the code was used already; the tokens it gave are revoked");
                 }
                 if c.created.elapsed() >= CODE_LIFETIME
@@ -691,6 +701,12 @@ mod tests {
         assert!(check_redirect("http://example.com/cb").is_err());
         assert!(check_redirect("http://localhost.evil.com/cb").is_err());
         assert!(check_redirect("https://a/cb#x").is_err());
+        assert!(check_redirect("https://a/cb\r\nSet-Cookie: x=y").is_err());
+        assert!(check_redirect("https://a/c b").is_err());
+        assert!(check_redirect("https://a/caf\u{e9}").is_err());
+        assert!(check_redirect("https://user@a/cb").is_err());
+        assert!(check_redirect("https:///cb").is_err());
+        assert!(redirect_matches(&["https://a/x\ny".to_string()], "https://a/x\ny"), "matching alone does not check");
         let reg = vec!["http://localhost/callback".to_string(), "https://app.example/cb".to_string()];
         assert!(redirect_matches(&reg, "http://localhost:51234/callback"));
         assert!(!redirect_matches(&reg, "http://localhost:51234/other"));
