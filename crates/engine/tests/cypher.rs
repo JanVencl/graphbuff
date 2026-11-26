@@ -2096,3 +2096,70 @@ fn load_csv_gzip_and_urls() {
     let other = db.execute("LOAD CSV FROM 'https://elsewhere.example.com/p.csv' AS row RETURN row").unwrap_err();
     assert!(other.to_string().contains("allowed URL prefixes"), "{other}");
 }
+
+#[test]
+fn schema_procedures() {
+    let db = Database::in_memory();
+    run(
+        &db,
+        "CREATE (a:Person:Actor {name: 'Keanu', born: 1964}), (b:Person {name: 'Lana'}), \
+         (m:Movie {title: 'The Matrix', tags: ['sf'], v: [0.5, 1]}), \
+         (a)-[:ACTED_IN {roles: ['Neo']}]->(m), (b)-[:DIRECTED]->(m), (:Unlabelled)-[:X]->(m)",
+    );
+    let r = run(
+        &db,
+        "CALL db.schema.nodeTypeProperties() YIELD nodeType, nodeLabels, propertyName, propertyTypes, mandatory \
+         RETURN nodeType, nodeLabels, propertyName, propertyTypes, mandatory",
+    );
+    assert_eq!(
+        rows(&r),
+        [
+            r#"":`Actor`:`Person`", ["Actor", "Person"], "born", ["Long"], true"#,
+            r#"":`Actor`:`Person`", ["Actor", "Person"], "name", ["String"], true"#,
+            r#"":`Movie`", ["Movie"], "tags", ["StringArray"], true"#,
+            r#"":`Movie`", ["Movie"], "title", ["String"], true"#,
+            r#"":`Movie`", ["Movie"], "v", ["DoubleArray"], true"#,
+            r#"":`Person`", ["Person"], "name", ["String"], true"#,
+            r#"":`Unlabelled`", ["Unlabelled"], null, null, false"#,
+        ]
+    );
+    let r = run(&db, "CALL db.schema.relTypeProperties()");
+    assert_eq!(r.columns, ["relType", "propertyName", "propertyTypes", "mandatory"]);
+    assert_eq!(
+        rows(&r),
+        [
+            r#"":`ACTED_IN`", "roles", ["StringArray"], true"#,
+            r#"":`DIRECTED`", null, null, false"#,
+            r#"":`X`", null, null, false"#,
+        ]
+    );
+    let r = run(
+        &db,
+        "CALL db.schema.visualization() YIELD nodes, relationships \
+         UNWIND relationships AS r RETURN r.start, r.type, r.end, size(nodes)",
+    );
+    assert_eq!(
+        rows(&r),
+        [
+            r#""Actor", "ACTED_IN", "Movie", 4"#,
+            r#""Person", "ACTED_IN", "Movie", 4"#,
+            r#""Person", "DIRECTED", "Movie", 4"#,
+            r#""Unlabelled", "X", "Movie", 4"#,
+        ]
+    );
+    // Born only on one of the two people: not mandatory for Person.
+    let r = run(&db, "CALL db.schema.nodeTypeProperties({sampleSize: -1})");
+    assert_eq!(r.rows.len(), 7);
+    assert!(db.execute("CALL db.schema.visualization({sample: 1})").is_err());
+    assert!(db.execute("CALL db.schema.visualization({sampleSize: 0})").is_err());
+
+    let s = db.schema(1000, &Default::default()).unwrap();
+    let person = s.labels.iter().find(|l| l.name == "Person").unwrap();
+    assert_eq!((person.count, person.sampled), (2, 2));
+    let born = person.properties.iter().find(|p| p.name == "born").unwrap();
+    assert!(!born.mandatory);
+    assert_eq!(s.relationship_types.iter().map(|t| (t.name.as_str(), t.count)).collect::<Vec<_>>(), [("ACTED_IN", 1), ("DIRECTED", 1), ("X", 1)]);
+    // A sample of one person.
+    let s = db.schema(1, &Default::default()).unwrap();
+    assert_eq!(s.labels.iter().find(|l| l.name == "Person").unwrap().sampled, 1);
+}

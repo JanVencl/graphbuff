@@ -33,6 +33,12 @@ the same notes.
   administration and `LOAD CSV` are refused. Tool calls are limited per token and user,
   and counted in `/metrics`. See [MCP](docs/MCP.md).
 
+- Schema procedures, with Neo4j's names: `db.schema.nodeTypeProperties()`,
+  `db.schema.relTypeProperties()` (properties and their types per label and relationship
+  type) and `db.schema.visualization()` (which relationship types connect which labels).
+  They sample 1000 nodes per label and relationships per type (`{sampleSize: n}`). The MCP
+  endpoint has a `get_schema` tool built on them. See [Cypher](docs/Cypher.md).
+
 ### Fixed
 
 - A search of an HNSW vector index stops at the query's timeout or when it is cancelled;

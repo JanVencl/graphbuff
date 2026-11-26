@@ -13,6 +13,7 @@
 mod cypher;
 mod render;
 mod rpc;
+mod schema;
 mod tools;
 
 use std::collections::HashMap;
@@ -88,6 +89,7 @@ pub(crate) struct Mcp {
     /// The listener is on a loopback address: check `Host`.
     loopback: bool,
     limiter: Limiter,
+    schemas: schema::Cache,
 }
 
 /// Request headers a browser app may send (CORS).
@@ -100,8 +102,8 @@ much as Neo4j is.
 
 - Call list_databases to see the databases you may use and whether you may write to them. Tools run on the \
 default database unless given `database`.
-- Learn a graph before querying it: CALL db.labels(), CALL db.relationshipTypes(), CALL db.propertyKeys(), \
-SHOW INDEXES and SHOW CONSTRAINTS, or a sample such as MATCH (n:Label) RETURN n LIMIT 3.
+- Call get_schema before writing queries: it gives the labels, relationship types, properties with their \
+types, the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes. Use only names it lists.
 - Read with read_cypher; change data, indexes or constraints with write_cypher. Try a change with \
 dry_run: true first when you are not sure of it; it reports the update counts and is rolled back.
 - Pass values as params ({\"name\": \"Ann\"} for $name), never pasted into the query text.
@@ -126,7 +128,7 @@ impl Mcp {
             max_bytes: config.max_result_bytes.max(1024),
             query_timeout: config.query_timeout,
         };
-        Mcp { config, limits, loopback, limiter }
+        Mcp { config, limits, loopback, limiter, schemas: schema::Cache::default() }
     }
 
     /// The answer to a CORS preflight from an allowed origin.
@@ -344,6 +346,7 @@ impl Call<'_> {
                     limits: &self.mcp.limits,
                     peer: self.peer,
                     cancel: &cancel,
+                    schemas: &self.mcp.schemas,
                 };
                 let out = watch_client(self.client, &cancel, || (tool.run)(&input));
                 let outcome = if out.is_error { "error" } else { "ok" };

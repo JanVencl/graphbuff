@@ -51,6 +51,7 @@ mod point_index;
 mod text_index;
 mod procedures;
 mod regex;
+mod schema;
 mod result;
 mod stream;
 mod transaction;
@@ -88,6 +89,7 @@ pub use procedures::{
     Procedures,
 };
 pub use transaction::Transaction;
+pub use schema::{EntitySchema, GraphSchema, NodeTypeSchema, Pattern, PropertySchema, property_type};
 pub use embed::{EmbedOptions, EmbedStats, EmbedTask, Embedder, HashEmbedder, ModelInfo};
 pub use accel::{KernelMode, KernelStats, kernel_stats};
 #[cfg(feature = "gpu")]
@@ -750,6 +752,15 @@ impl<S: GraphStore> Database<S> {
     /// (built by a query on the last committed state, and kept up to date since).
     pub fn cached_indexes(&self) -> usize {
         self.vector_cache.len() + self.text_cache.len() + self.point_cache.len() + self.trigram_cache.len()
+    }
+
+    /// The schema of the last committed state (see [`GraphSchema`]): properties and
+    /// patterns from up to `sample` nodes per label and relationships per type (`0`:
+    /// all), exact counts. Stops with an error at the timeout or cancel of `options`.
+    pub fn schema(&self, sample: usize, options: &QueryOptions) -> Result<GraphSchema> {
+        let interrupt = Interrupt::start(options);
+        let check = || interrupt.as_ref().map_or(Ok(()), |i| i.check_now());
+        self.view(|s| schema::sample(s, sample, &check))
     }
 
     pub fn node_count(&self) -> usize {
