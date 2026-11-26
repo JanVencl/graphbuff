@@ -125,3 +125,7 @@ query_timeout_ms = 30000
 # oauth_clients = "my-agent https://agent.example.com/callback"
 # Only fetch client metadata documents from these hosts (comma-separated; empty: any).
 # oauth_client_hosts = "claude.ai, chatgpt.com"
+# A memory that agents share: the tools remember, recall and forget keep entities, facts
+# about them and relations in this database (created on first use). Everyone who may read
+# it sees all memories and may add to them, read-only tokens too.
+# memory_database = "memory"

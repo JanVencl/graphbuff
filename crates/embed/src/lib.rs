@@ -270,6 +270,10 @@ fn with_prefix(spec: &ModelSpec, text: &str, task: EmbedTask) -> String {
 }
 
 impl Embedder for LocalEmbedder {
+    fn default_model(&self) -> Option<String> {
+        self.default_model.clone()
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         self.registry
             .models()

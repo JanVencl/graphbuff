@@ -58,6 +58,11 @@ the same notes.
   metadata documents or listed in `mcp.oauth_clients`; PKCE (S256) is required.
   `mcp.trusted_proxies` lets the login throttle see clients behind a proxy. See
   [MCP](docs/MCP.md#hosted-clients-oauth).
+- A memory that MCP agents share: with `mcp.memory_database` set, the tools `remember`,
+  `recall` and `forget` keep entities, facts about them and relations in that database,
+  with who wrote each. Everyone who may read it may add to it, also with a read-only
+  token. `recall` searches by meaning and by words (by words only without embedding
+  models). See [MCP](docs/MCP.md#shared-memory).
 
 ### Fixed
 

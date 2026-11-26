@@ -79,6 +79,8 @@ pub struct Config {
     /// `mcp.oauth_clients` as written, for `SHOW SETTINGS`.
     pub mcp_oauth_clients_text: String,
     pub mcp_oauth_client_hosts: Vec<String>,
+    /// `mcp.memory_database`: turns on the memory tools.
+    pub mcp_memory_database: Option<String>,
 }
 
 /// `[embedding]`: the local embedding models (`vector.embed`), in a build with `embed`.
@@ -160,6 +162,7 @@ impl Default for Config {
             mcp_oauth_clients: Vec::new(),
             mcp_oauth_clients_text: String::new(),
             mcp_oauth_client_hosts: Vec::new(),
+            mcp_memory_database: None,
         }
     }
 }
@@ -315,6 +318,10 @@ query_timeout_ms = 30000
 # oauth_clients = "my-agent https://agent.example.com/callback"
 # Only fetch client metadata documents from these hosts (comma-separated; empty: any).
 # oauth_client_hosts = "claude.ai, chatgpt.com"
+# A memory that agents share: the tools remember, recall and forget keep entities, facts
+# about them and relations in this database (created on first use). Everyone who may read
+# it sees all memories and may add to them, read-only tokens too.
+# memory_database = "memory"
 "#;
 
 /// The `data` line of [`TEMPLATE`] for a config file next to the program.
@@ -427,6 +434,7 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("trusted_proxies", Kind::Str, "Proxies whose X-Forwarded-For header names the MCP client."),
             ("oauth_clients", Kind::Str, "OAuth clients registered here: client_id and redirect URIs, ';' between clients."),
             ("oauth_client_hosts", Kind::Str, "Hosts whose OAuth client metadata documents are fetched (empty: any)."),
+            ("memory_database", Kind::Str, "The database of the agents' shared memory (no memory tools when not set)."),
         ],
     ),
 ];
@@ -565,6 +573,17 @@ impl Config {
                     c.mcp_oauth_clients = graphbuff_server::OAuthClient::parse_list(&c.mcp_oauth_clients_text)
                         .map_err(|e| format!("{}: mcp.oauth_clients: {e}", at()))?;
                 }
+                ("mcp", "memory_database") => {
+                    let name = str_of(value);
+                    if !name.is_empty() {
+                        if graphbuff::cypher::parse_statement(&format!("CREATE DATABASE `{}`", name.replace('`', "``"))).is_err()
+                            || name.eq_ignore_ascii_case("system")
+                        {
+                            return Err(format!("{}: mcp.memory_database: `{name}` is not a database name", at()));
+                        }
+                        c.mcp_memory_database = Some(name.to_ascii_lowercase());
+                    }
+                }
                 ("mcp", "oauth_client_hosts") => {
                     c.mcp_oauth_client_hosts =
                         str_of(value).split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect();
@@ -670,6 +689,7 @@ impl Config {
             ("mcp", "trusted_proxies") => (!self.mcp_trusted_proxies.is_empty())
                 .then(|| self.mcp_trusted_proxies.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")),
             ("mcp", "oauth_clients") => (!self.mcp_oauth_clients_text.is_empty()).then(|| self.mcp_oauth_clients_text.clone()),
+            ("mcp", "memory_database") => self.mcp_memory_database.clone(),
             ("mcp", "oauth_client_hosts") => {
                 (!self.mcp_oauth_client_hosts.is_empty()).then(|| self.mcp_oauth_client_hosts.join(", "))
             }

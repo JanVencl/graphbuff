@@ -115,6 +115,12 @@ pub trait Embedder: Send + Sync {
     /// The installed models.
     fn models(&self) -> Vec<ModelInfo>;
 
+    /// The model [`embed`](Self::embed) uses when it is given none: the first one, unless
+    /// the embedder says otherwise.
+    fn default_model(&self) -> Option<String> {
+        self.models().into_iter().next().map(|m| m.name)
+    }
+
     /// Its totals so far; all zero if it keeps none.
     fn stats(&self) -> EmbedStats {
         EmbedStats::default()
