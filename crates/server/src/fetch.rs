@@ -337,7 +337,7 @@ const PUBLIC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `GET`s a small JSON document from an `https://` URL someone else chose (an OAuth
 /// client's metadata document): only from public addresses (every address of the host
-/// must be one), from `hosts` when that is not empty, without redirects, within 5
+/// must be one), from one of `hosts` (any public host if one is `*`), without redirects, within 5
 /// seconds, at most 64 KiB. Returns the body of a `200`.
 pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> {
     if !url.is_ascii() {
@@ -350,7 +350,7 @@ pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> 
     if u.path == "/" {
         return Err("the URL needs a path".into());
     }
-    if !hosts.is_empty() && !hosts.iter().any(|h| h.eq_ignore_ascii_case(&u.host)) {
+    if !hosts.iter().any(|h| h == "*" || h.eq_ignore_ascii_case(&u.host)) {
         return Err(format!("{} is not in mcp.oauth_client_hosts", u.host));
     }
     let addrs: Vec<std::net::SocketAddr> =
@@ -641,6 +641,9 @@ mod tests {
         assert!(Url::parse("https://h/a b").is_err());
         assert!(Url::parse("https://h/a\r\nX: y").is_err());
         assert!(get_public("https://h/caf\u{e9}", &[]).unwrap_err().contains("non-ASCII"));
+        let hosts = ["claude.ai".to_string()];
+        assert!(get_public("https://evil.example/client.json", &hosts).unwrap_err().contains("not in mcp.oauth_client_hosts"));
+        assert!(get_public("https://claude.ai/client.json", &[]).unwrap_err().contains("not in mcp.oauth_client_hosts"));
     }
 
     #[test]

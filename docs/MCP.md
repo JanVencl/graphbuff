@@ -227,7 +227,7 @@ trusted_proxies = "127.0.0.1"
 | `public_url` | The endpoint's URL as clients reach it: `https://HOST[:PORT]/mcp`. Turns OAuth on |
 | `trusted_proxies` | Proxies (comma-separated addresses) whose `X-Forwarded-For` names the client: the login throttle and the logs then see the client, not the proxy |
 | `oauth_clients` | Clients registered here: `"client_id redirect_uri [redirect_uri…]"`, `;` between clients. Clients with a client metadata document need no entry |
-| `oauth_client_hosts` | Fetch client metadata documents only from these hosts (comma-separated; empty: any public host) |
+| `oauth_client_hosts` | Fetch client metadata documents only from these hosts (comma-separated). Default `claude.ai, chatgpt.com`: claude.ai, Claude Desktop, Claude Code, ChatGPT and Codex. `"*"`: any public host; `""`: none, only `oauth_clients` (the server then does not offer client metadata documents) |
 
 Then, in claude.ai (Settings, Connectors, add a custom connector) or ChatGPT, give
 `https://mcp.example.com/mcp`; the agent opens the login page.

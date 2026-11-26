@@ -71,12 +71,17 @@ pub struct McpConfig {
     pub trusted_proxies: Vec<IpAddr>,
     /// OAuth clients registered here (besides those with a client metadata document).
     pub oauth_clients: Vec<OAuthClient>,
-    /// Hosts whose client metadata documents are fetched; empty: any public host.
+    /// Hosts whose client metadata documents are fetched: [`DEFAULT_OAUTH_CLIENT_HOSTS`]
+    /// unless set; `"*"` among them: any public host; empty: none (only `oauth_clients`).
     pub oauth_client_hosts: Vec<String>,
     /// The database of the agents' shared memory (`remember`, `recall`, `forget`),
     /// created on first use; `None`: no memory tools.
     pub memory_database: Option<String>,
 }
+
+/// The hosts of the client metadata documents of claude.ai, Claude Desktop and Claude
+/// Code (`claude.ai`), and of ChatGPT and Codex (`chatgpt.com`).
+pub const DEFAULT_OAUTH_CLIENT_HOSTS: [&str; 2] = ["claude.ai", "chatgpt.com"];
 
 impl Default for McpConfig {
     fn default() -> Self {
@@ -92,7 +97,7 @@ impl Default for McpConfig {
             public_url: None,
             trusted_proxies: Vec::new(),
             oauth_clients: Vec::new(),
-            oauth_client_hosts: Vec::new(),
+            oauth_client_hosts: DEFAULT_OAUTH_CLIENT_HOSTS.map(String::from).to_vec(),
             memory_database: None,
         }
     }

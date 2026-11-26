@@ -161,7 +161,7 @@ impl Default for Config {
             mcp_trusted_proxies: Vec::new(),
             mcp_oauth_clients: Vec::new(),
             mcp_oauth_clients_text: String::new(),
-            mcp_oauth_client_hosts: Vec::new(),
+            mcp_oauth_client_hosts: graphbuff_server::DEFAULT_OAUTH_CLIENT_HOSTS.map(String::from).to_vec(),
             mcp_memory_database: None,
         }
     }
@@ -316,7 +316,9 @@ query_timeout_ms = 30000
 # separated by ";". Clients with a client metadata document (an https:// client_id, as
 # claude.ai and ChatGPT use) need no entry.
 # oauth_clients = "my-agent https://agent.example.com/callback"
-# Only fetch client metadata documents from these hosts (comma-separated; empty: any).
+# Only fetch client metadata documents from these hosts (comma-separated; "*": any
+# public host; "": none, only oauth_clients). The default covers claude.ai, Claude
+# Desktop, Claude Code, ChatGPT and Codex.
 # oauth_client_hosts = "claude.ai, chatgpt.com"
 # A memory that agents share: the tools remember, recall and forget keep entities, facts
 # about them and relations in this database (created on first use). Everyone who may read
@@ -433,7 +435,7 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("public_url", Kind::Str, "The MCP endpoint's https:// URL as clients reach it; turns on OAuth."),
             ("trusted_proxies", Kind::Str, "Proxies whose X-Forwarded-For header names the MCP client."),
             ("oauth_clients", Kind::Str, "OAuth clients registered here: client_id and redirect URIs, ';' between clients."),
-            ("oauth_client_hosts", Kind::Str, "Hosts whose OAuth client metadata documents are fetched (empty: any)."),
+            ("oauth_client_hosts", Kind::Str, "Hosts whose OAuth client metadata documents are fetched ('*': any, '': none)."),
             ("memory_database", Kind::Str, "The database of the agents' shared memory (no memory tools when not set)."),
         ],
     ),
@@ -690,9 +692,7 @@ impl Config {
                 .then(|| self.mcp_trusted_proxies.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")),
             ("mcp", "oauth_clients") => (!self.mcp_oauth_clients_text.is_empty()).then(|| self.mcp_oauth_clients_text.clone()),
             ("mcp", "memory_database") => self.mcp_memory_database.clone(),
-            ("mcp", "oauth_client_hosts") => {
-                (!self.mcp_oauth_client_hosts.is_empty()).then(|| self.mcp_oauth_client_hosts.join(", "))
-            }
+            ("mcp", "oauth_client_hosts") => Some(self.mcp_oauth_client_hosts.join(", ")),
             _ => return Err(()),
         })
     }
@@ -1011,6 +1011,18 @@ max_memory_mb = 512").unwrap();
         assert_eq!(get("embedding.device").value.as_deref(), Some("gpu"));
         assert_eq!(get("embedding.device").default.as_deref(), Some("cpu"));
         assert_eq!(get("embedding.batch_size").default.as_deref(), Some("32"));
+    }
+
+    #[test]
+    fn oauth_client_hosts() {
+        let hosts = |t: &str| parse(t).unwrap().mcp_oauth_client_hosts;
+        assert_eq!(hosts(""), ["claude.ai", "chatgpt.com"], "the hosted clients by default");
+        assert_eq!(hosts("[mcp]\noauth_client_hosts = \"a.test, B.test\""), ["a.test", "B.test"]);
+        assert_eq!(hosts("[mcp]\noauth_client_hosts = \"*\""), ["*"]);
+        assert!(hosts("[mcp]\noauth_client_hosts = \"\"").is_empty(), "none");
+        let list = parse("[mcp]\noauth_client_hosts = \"\"").unwrap().listing();
+        let row = list.iter().find(|s| s.name == "mcp.oauth_client_hosts").unwrap();
+        assert_eq!((row.value.as_deref(), row.default.as_deref()), (Some(""), Some("claude.ai, chatgpt.com")));
     }
 
     #[test]
