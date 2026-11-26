@@ -594,3 +594,31 @@ fn restart_time() {
         assert_eq!(a, first("without its file"));
     }
 }
+
+/// `vector.embedding_model` is kept, in the log and after a checkpoint.
+#[test]
+fn the_embedding_model_is_kept() {
+    for kind in ["hybrid", "persistent"] {
+        for checkpoint in [false, true] {
+            let dir = Dir::new("model");
+            let db = open(kind, &dir.0);
+            run(
+                &db,
+                "CREATE VECTOR INDEX docs FOR (d:Doc) ON (d.e) WITH [d.year] OPTIONS {indexConfig: \
+                 {`vector.dimensions`: 4, `vector.embedding_model`: 'mini', `vector.hnsw.enabled`: true}}",
+            );
+            run(&db, "CREATE VECTOR INDEX plain FOR (d:Doc) ON (d.f) OPTIONS {indexConfig: {`vector.dimensions`: 4}}");
+            if checkpoint {
+                db.checkpoint().unwrap();
+            }
+            drop(db);
+            let db = open(kind, &dir.0);
+            let models: Vec<(String, Option<String>)> =
+                db.read(|s| s.indexes().into_iter().map(|d| (d.name, d.embedding_model)).collect());
+            assert!(models.contains(&("docs".into(), Some("mini".into()))), "{kind} {checkpoint}: {models:?}");
+            assert!(models.contains(&("plain".into(), None)), "{kind} {checkpoint}: {models:?}");
+            let shown = run(&db, "CALL db.indexes() YIELD name, options WITH name, options WHERE name = 'docs' RETURN options");
+            assert!(shown[0].contains(r#"vector.embedding_model: "mini""#), "{shown:?}");
+        }
+    }
+}

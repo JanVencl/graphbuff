@@ -271,3 +271,26 @@ fn stored_vectors_survive_a_restart_without_an_embedder() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_vector_index_records_its_model() {
+    let (db, _) = hash_db();
+    db.execute(
+        "CREATE VECTOR INDEX docs FOR (d:Doc) ON (d.e) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 'small'}}",
+    )
+    .unwrap();
+    let r = db.execute("CALL db.indexes() YIELD name, options WITH name, options WHERE name = 'docs' RETURN options.indexConfig.`vector.embedding_model` AS m").unwrap();
+    assert_eq!(r.rows[0][0], ResultValue::String("small".into()));
+    let err = |q: &str| db.execute(q).unwrap_err().to_string();
+    let e = err("CREATE VECTOR INDEX a FOR (d:Doc) ON (d.a) OPTIONS {indexConfig: {`vector.dimensions`: 4, `vector.embedding_model`: 'small'}}");
+    assert!(e.contains("8 dimensions, not 4"), "{e}");
+    let e = err("CREATE VECTOR INDEX b FOR (d:Doc) ON (d.b) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 'nope'}}");
+    assert!(e.contains("the models are large, small"), "{e}");
+    let e = err("CREATE VECTOR INDEX c FOR (d:Doc) ON (d.c) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 3}}");
+    assert!(e.contains("model name"), "{e}");
+    // Without models any name is taken.
+    let plain = Database::in_memory();
+    plain
+        .execute("CREATE VECTOR INDEX d FOR (d:Doc) ON (d.e) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 'elsewhere'}}")
+        .unwrap();
+}

@@ -507,7 +507,11 @@ impl Executor<'_> {
                     extra_labels: labels.cloned().collect(),
                     properties: properties.iter().chain(filters).cloned().collect(),
                     kind: crate::vector::index_kind(*kind, &options)?,
+                    embedding_model: crate::vector::embedding_model(&options)?,
                 };
+                if let (Some(m), graphbuff_core::IndexKind::Vector { dimensions, .. }) = (&def.embedding_model, def.kind) {
+                    self.check_embedding_model(m, dimensions)?;
+                }
                 let existing = self.store().indexes();
                 let exists = existing.iter().any(|d| d.name == def.name || d.same_index(&def));
                 if exists && *if_not_exists {
@@ -661,6 +665,29 @@ impl Executor<'_> {
                     }
                 }
                 Ok(out)
+            }
+        }
+    }
+
+    /// Fails if `model`, named as a vector index's embedding model, is not one of the
+    /// database's models, or makes vectors of other than `dimensions`. Without models
+    /// (no embedder) any name is taken: the store may be used where they are installed.
+    fn check_embedding_model(&self, model: &str, dimensions: u32) -> Result<()> {
+        let Some(e) = &self.embedder else { return Ok(()) };
+        let models = e.models();
+        if models.is_empty() {
+            return Ok(());
+        }
+        match models.iter().find(|m| m.name == model) {
+            Some(m) if m.dimensions == dimensions as usize => Ok(()),
+            Some(m) => Err(Error::Semantic(format!(
+                "embedding model `{model}` makes vectors of {} dimensions, not {dimensions}",
+                m.dimensions
+            ))),
+            None => {
+                let mut names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+                names.sort();
+                Err(Error::Semantic(format!("no embedding model `{model}`; the models are {}", names.join(", "))))
             }
         }
     }

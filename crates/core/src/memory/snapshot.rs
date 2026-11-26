@@ -267,6 +267,7 @@ mod tests {
             properties: vec!["name".into(), "kind".into()],
             extra_labels: Vec::new(),
             kind: Default::default(),
+            embedding_model: None,
         })
         .unwrap();
         g.delete_node(gone, false).unwrap();

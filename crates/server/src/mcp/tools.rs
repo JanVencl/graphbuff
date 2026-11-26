@@ -74,6 +74,15 @@ pub(crate) const TOOLS: &[Tool] = &[
         run: super::schema::get_schema,
     },
     Tool {
+        name: "search",
+        title: "Search nodes by meaning or words",
+        description: "Finds the nodes that best match `text`: by meaning through a vector index (the text is                       embedded with the index's model), by words through a full-text index, or both (hybrid, the                       default when one label has both). Without `index` the only fitting one is used. `filters`                       ({property: value or {gte, lte, gt, lt, in}}) narrow a vector search on the index's filter                       properties. Results are best first, with their scores.",
+        schema: r#"{"type":"object","properties":{"text":{"type":"string","description":"What to look for: a question, words or a phrase."},"index":{"type":"string","description":"The vector or full-text index (get_schema lists them)."},"mode":{"type":"string","enum":["auto","vector","fulltext","hybrid"]},"k":{"type":"integer","minimum":1,"description":"The most results (default 10)."},"filters":{"type":"object","description":"{property: value} or {property: {gte, lte, gt, lt, in}}."},"model":{"type":"string","description":"The embedding model (default: the index's, else the server's default)."},"database":{"type":"string"}},"required":["text"],"additionalProperties":false}"#,
+        writes: false,
+        idempotent: true,
+        run: super::search::search,
+    },
+    Tool {
         name: "get_node",
         title: "Get a node",
         description: "Gets a node with its labels and properties: by `id`, with its numbers of relationships per                       type and direction, or by `label`, `property` and `value` (up to 10 that match). Ids may be                       reused after a delete: do not keep them between conversations.",

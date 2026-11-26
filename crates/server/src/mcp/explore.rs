@@ -21,33 +21,33 @@ const MAX_HOPS: i64 = 10;
 /// A node as the tools show it.
 const NODE: &str = "{id: id(N), labels: labels(N), properties: properties(N)}";
 
-fn node(var: &str) -> String {
+pub(crate) fn node(var: &str) -> String {
     NODE.replace('N', var)
 }
 
 /// `` `name` ``, quoted for Cypher.
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
 /// The checked arguments of a tool.
-struct Checked<'a> {
-    args: &'a BTreeMap<String, Json>,
+pub(crate) struct Checked<'a> {
+    pub args: &'a BTreeMap<String, Json>,
 }
 
 impl<'a> Checked<'a> {
-    fn new(i: &'a Input, known: &[&str]) -> Result<Checked<'a>, String> {
+    pub(crate) fn new(i: &'a Input, known: &[&str]) -> Result<Checked<'a>, String> {
         if let Some(k) = i.args.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("unknown argument `{k}`; the arguments are {}", known.join(", ")));
         }
         Ok(Checked { args: i.args })
     }
 
-    fn present(&self, name: &str) -> bool {
+    pub(crate) fn present(&self, name: &str) -> bool {
         !matches!(self.args.get(name), None | Some(Json::Null))
     }
 
-    fn int(&self, name: &str, range: std::ops::RangeInclusive<i64>, default: Option<i64>) -> Result<i64, String> {
+    pub(crate) fn int(&self, name: &str, range: std::ops::RangeInclusive<i64>, default: Option<i64>) -> Result<i64, String> {
         match self.args.get(name) {
             None | Some(Json::Null) => default.ok_or_else(|| format!("`{name}` (a node id) is required")),
             Some(Json::Int(n)) if range.contains(n) => Ok(*n),
@@ -59,7 +59,7 @@ impl<'a> Checked<'a> {
         self.int(name, 0..=i64::MAX, None)
     }
 
-    fn string(&self, name: &str) -> Result<Option<String>, String> {
+    pub(crate) fn string(&self, name: &str) -> Result<Option<String>, String> {
         match self.args.get(name) {
             None | Some(Json::Null) => Ok(None),
             Some(Json::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
@@ -67,7 +67,7 @@ impl<'a> Checked<'a> {
         }
     }
 
-    fn database(&self) -> Result<Option<String>, String> {
+    pub(crate) fn database(&self) -> Result<Option<String>, String> {
         self.string("database")
     }
 
@@ -89,7 +89,7 @@ impl<'a> Checked<'a> {
         }
     }
 
-    fn bool(&self, name: &str) -> Result<bool, String> {
+    pub(crate) fn bool(&self, name: &str) -> Result<bool, String> {
         match self.args.get(name) {
             None | Some(Json::Null) => Ok(false),
             Some(Json::Bool(b)) => Ok(*b),
@@ -100,14 +100,14 @@ impl<'a> Checked<'a> {
 
 /// What a query gave: its database, its rows as objects of the column names, and
 /// whether rows were left out.
-struct Rows {
-    database: String,
-    rows: Vec<Json>,
-    truncated: bool,
+pub(crate) struct Rows {
+    pub database: String,
+    pub rows: Vec<Json>,
+    pub truncated: bool,
 }
 
 /// Runs `query` as a read, at most `max_rows` rows.
-fn read(i: &Input, database: &Option<String>, query: &str, params: BTreeMap<String, Value>, max_rows: usize) -> Result<Rows, Output> {
+pub(crate) fn read(i: &Input, database: &Option<String>, query: &str, params: BTreeMap<String, Value>, max_rows: usize) -> Result<Rows, Output> {
     let a = Args { query: query.to_string(), params, database: database.clone(), max_rows, dry_run: false };
     let out = execute(i, &a, false);
     if out.is_error {
@@ -138,12 +138,12 @@ fn read(i: &Input, database: &Option<String>, query: &str, params: BTreeMap<Stri
     })
 }
 
-fn params<const N: usize>(pairs: [(&str, Value); N]) -> BTreeMap<String, Value> {
+pub(crate) fn params<const N: usize>(pairs: [(&str, Value); N]) -> BTreeMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
 /// The text for the model: the fields in this order.
-fn text(fields: Vec<(&str, Json)>) -> Output {
+pub(crate) fn text(fields: Vec<(&str, Json)>) -> Output {
     let mut t = String::from("{");
     for (i, (k, v)) in fields.iter().enumerate() {
         if i > 0 {

@@ -16,6 +16,7 @@ mod explore;
 mod render;
 mod rpc;
 mod schema;
+mod search;
 mod tools;
 
 use std::collections::HashMap;
@@ -107,6 +108,7 @@ much as Neo4j is.
 default database unless given `database`.
 - Call get_schema before writing queries: it gives the labels, relationship types, properties with their \
 types, the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes. Use only names it lists.
+- To find nodes by meaning or words, use search (vector, full-text or both); get_schema lists the indexes.
 - To look around without Cypher: get_node, neighbors (a node's relationships and neighbours) and find_path.
 - Read with read_cypher; change data, indexes or constraints with write_cypher. Try a change with \
 dry_run: true first when you are not sure of it; it reports the update counts and is rolled back.

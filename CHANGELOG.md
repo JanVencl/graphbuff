@@ -45,6 +45,12 @@ the same notes.
 - MCP tools to explore a graph without writing Cypher: `get_node` (by id, or by label and
   property), `neighbors` (relationships per type, then neighbours spread over the types, or
   up to 3 hops) and `find_path` (shortest paths, up to 10 hops). See [MCP](docs/MCP.md).
+- `vector.embedding_model` in a vector index's `indexConfig` records the embedding model of
+  its vectors (checked against the installed models), shown by `SHOW INDEXES`. 0.5 and older
+  cannot open a store with such an index. See [Vectors](docs/Vectors.md#vector-indexes).
+- MCP `search` tool: nodes by meaning (vector index, the text embedded with the index's
+  model), by words (full-text index) or both (reciprocal rank fusion), with filters on the
+  index's filter properties. See [MCP](docs/MCP.md).
 
 ### Fixed
 

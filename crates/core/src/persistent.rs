@@ -3213,6 +3213,7 @@ mod tests {
                 properties: xy.to_vec(),
                 extra_labels: Vec::new(),
                 kind: Default::default(),
+                embedding_model: None,
             })
             .unwrap();
             g.create_relationship(b, a, "R", props("w", Value::Int(6))).unwrap();
