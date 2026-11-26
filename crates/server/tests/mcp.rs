@@ -324,3 +324,201 @@ fn limits_and_metrics() {
         assert!(m.body.lines().any(|l| l == line), "no `{line}` in\n{}", m.body);
     }
 }
+
+// ---- Cypher tools ---------------------------------------------------------------------------
+
+/// Calls `tool` with `args` (a JSON object) as a legacy client: its text, and whether it is
+/// an error.
+fn call(addr: SocketAddr, token: &str, tool: &str, args: &str) -> (String, bool) {
+    legacy(addr, token, "tools/call", &format!(r#""name":"{tool}","arguments":{args}"#)).tool_text()
+}
+
+/// The arguments `{"query": query}` with more fields (`rest`, an object's inside, may be
+/// empty).
+fn q(query: &str, rest: &str) -> String {
+    let mut s = String::from(r#"{"query":"#);
+    json::write_str(&mut s, query);
+    if !rest.is_empty() {
+        s.push(',');
+        s.push_str(rest);
+    }
+    s.push('}');
+    s
+}
+
+fn obj_of(text: &str) -> BTreeMap<String, Json> {
+    match json::parse(text) {
+        Ok(Json::Object(m)) => m,
+        _ => panic!("not an object: {text}"),
+    }
+}
+
+/// Runs `query` on the JSON API as the server token.
+fn http_query(server: &Server, query: &str) -> String {
+    let r = send(server.local_addr(), "POST", "/query", &[("Authorization", "Bearer tok")], &q(query, ""));
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.body
+}
+
+fn tool_names(addr: SocketAddr, token: &str) -> Vec<String> {
+    let Some(Json::Array(list)) = legacy(addr, token, "tools/list", "").result().remove("tools") else { panic!() };
+    list.into_iter()
+        .map(|t| match t {
+            Json::Object(mut t) => match t.remove("name") {
+                Some(Json::String(n)) => n,
+                _ => panic!(),
+            },
+            _ => panic!(),
+        })
+        .collect()
+}
+
+#[test]
+fn reading() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig::default());
+    let addr = server.mcp_addr().unwrap();
+    http_query(&server, "UNWIND range(1, 300) AS i CREATE (:P {i: i, v: [x IN range(1, 40) | toFloat(x)], name: 'p' + i})");
+
+    assert_eq!(tool_names(addr, &rita), ["list_databases", "read_cypher"]);
+    let (text, err) = call(addr, &rita, "read_cypher", &q("MATCH (p:P) WHERE p.i = $i RETURN p.name AS name, p.v AS v", r#""params":{"i":7}"#));
+    assert!(!err, "{text}");
+    assert_eq!(text, r#"{"database":"graphbuff","columns":["name","v"],"rows":[["p7","<vector 40>"]]}"#);
+
+    // Capped: 100 rows by default, or what the call asks, up to the limit.
+    let r = obj_of(&call(addr, &rita, "read_cypher", &q("MATCH (p:P) RETURN p.i AS i", "")).0);
+    assert_eq!((&r["truncated"], &r["shown"]), (&Json::Bool(true), &Json::Int(100)));
+    assert!(matches!(&r["hint"], Json::String(h) if h.contains("LIMIT")));
+    let r = obj_of(&call(addr, &rita, "read_cypher", &q("MATCH (p:P) RETURN p.i AS i", r#""max_rows":5"#)).0);
+    assert_eq!(r["shown"], Json::Int(5));
+    let (text, err) = call(addr, &rita, "read_cypher", &q("RETURN 1", r#""max_rows":5000"#));
+    assert!(err && text.contains("1 to 1000"), "{text}");
+    let r = obj_of(&call(addr, &rita, "read_cypher", &q("MATCH (p:P) RETURN count(*) AS n", "")).0);
+    assert_eq!(r["rows"], json::parse("[[300]]").unwrap());
+    assert!(!r.contains_key("truncated"));
+    // EXPLAIN of a write is a read; the plan comes along.
+    let r = obj_of(&call(addr, &rita, "read_cypher", &q("EXPLAIN CREATE (:X)", "")).0);
+    assert!(r.contains_key("plan"), "{r:?}");
+
+    // Errors are results the model can correct.
+    let (text, err) = call(addr, &rita, "read_cypher", &q("CREATE (:X)", ""));
+    assert!(err && text.contains("write_cypher"), "{text}");
+    let (text, err) = call(addr, &rita, "read_cypher", &q("MATCH (a)-[:R]->{1,3}(b) RETURN b", ""));
+    assert!(err && text.starts_with("SyntaxError") && text.contains("[:R*1..3]"), "{text}");
+    let (text, err) = call(addr, &rita, "read_cypher", &q("RETURN 1", r#""database":"nope""#));
+    assert!(err && text.contains("`nope` does not exist"), "{text}");
+    let (text, err) = call(addr, &rita, "read_cypher", &q("RETURN 1", r#""dry_run":true"#));
+    assert!(err && text.contains("unknown argument `dry_run`"), "{text}");
+    let (text, err) = call(addr, &rita, "read_cypher", "{}");
+    assert!(err && text.contains("`query`"), "{text}");
+    // A reader's token does not see write_cypher, and cannot call it.
+    let r = legacy(addr, &rita, "tools/call", r#""name":"write_cypher","arguments":{"query":"CREATE ()"}"#);
+    assert_eq!(r.error_code(), -32602);
+}
+
+#[test]
+fn writing_and_what_mcp_refuses() {
+    let users = users();
+    let (ed, _) = users.create_token("ed", "t", TokenAccess::Write, &[], None).unwrap();
+    let (ed_read, _) = users.create_token("ed", "r", TokenAccess::Read, &[], None).unwrap();
+    let (root, _) = users.create_token("root", "t", TokenAccess::Write, &[], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig::default());
+    let addr = server.mcp_addr().unwrap();
+    http_query(&server, "CREATE DATABASE other");
+    let (scoped, _) = users.create_token("ed", "s", TokenAccess::Write, &["graphbuff".into()], None).unwrap();
+
+    assert_eq!(tool_names(addr, &ed), ["list_databases", "read_cypher", "write_cypher"]);
+    // An editor's read-only token sees no write tool.
+    assert_eq!(tool_names(addr, &ed_read), ["list_databases", "read_cypher"]);
+
+    let r = obj_of(&call(addr, &ed, "write_cypher", &q("UNWIND range(1, 3) AS i CREATE (n:W {i: i}) RETURN n.i AS i", "")).0);
+    assert_eq!(r["stats"], json::parse(r#"{"labelsAdded":3,"nodesCreated":3,"propertiesSet":3}"#).unwrap());
+    // A dry run reports and rolls back.
+    let (text, err) = call(addr, &ed, "write_cypher", &q("MATCH (n:W) DETACH DELETE n", r#""dry_run":true"#));
+    assert!(!err, "{text}");
+    let r = obj_of(&text);
+    assert_eq!((&r["dryRun"], &r["rolledBack"]), (&Json::Bool(true), &Json::Bool(true)));
+    assert_eq!(r["stats"], json::parse(r#"{"nodesDeleted":3}"#).unwrap());
+    let count = |db: &str| {
+        let args = q("MATCH (n:W) RETURN count(n) AS n", &format!(r#""database":"{db}""#));
+        obj_of(&call(addr, &ed, "read_cypher", &args).0)["rows"].clone()
+    };
+    assert_eq!(count("graphbuff"), json::parse("[[3]]").unwrap());
+    let (text, err) = call(addr, &ed, "write_cypher", &q("CREATE INDEX w_i FOR (n:W) ON (n.i)", r#""dry_run":true"#));
+    assert!(!err, "{text}");
+    assert!(!http_query(&server, "SHOW INDEXES").contains("w_i"), "a dry run leaves no index");
+    let (text, err) = call(addr, &ed, "write_cypher", &q("CREATE INDEX w_i FOR (n:W) ON (n.i)", ""));
+    assert!(!err && text.contains(r#""indexesAdded":1"#), "{text}");
+    let in_tx = "MATCH (n:W) CALL { WITH n SET n.x = 1 } IN TRANSACTIONS RETURN 1";
+    let (text, err) = call(addr, &ed, "write_cypher", &q(in_tx, r#""dry_run":true"#));
+    assert!(err && text.contains("dry run"), "{text}");
+    // Writes on another database, by name or USE; not for a token limited to one.
+    call(addr, &ed, "write_cypher", &q("CREATE (:W)", r#""database":"other""#));
+    assert_eq!(count("other"), json::parse("[[1]]").unwrap());
+    let (text, err) = call(addr, &scoped, "read_cypher", &q("USE other MATCH (n) RETURN n", ""));
+    assert!(err && text.starts_with("Forbidden"), "{text}");
+
+    // Not over MCP, whatever the role.
+    for (query, what) in [
+        ("CREATE DATABASE x", "administration"),
+        ("DROP DATABASE other", "administration"),
+        ("CREATE USER bob SET PASSWORD 'secret12'", "administration"),
+        ("GRANT ROLE admin TO ed", "administration"),
+        ("CREATE TOKEN more", "administration"),
+        ("SHOW USERS", "administration"),
+        ("SHOW DATABASES", "list_databases"),
+        ("SHOW SETTINGS", "not available"),
+        ("TERMINATE TRANSACTIONS 'graphbuff-transaction-1'", "not available"),
+        ("SHOW TRANSACTIONS", "not available"),
+        ("USE other", "USE on its own"),
+        ("LOAD CSV FROM 'https://example.com/a.csv' AS r CREATE (:R {v: r[0]})", "LOAD CSV"),
+        ("MATCH (n) CALL { LOAD CSV FROM 'file:///etc/passwd' AS r RETURN r } RETURN r", "LOAD CSV"),
+    ] {
+        let (text, err) = call(addr, &root, "write_cypher", &q(query, ""));
+        assert!(err && text.contains(what), "{query}: {text}");
+    }
+    assert!(!http_query(&server, "SHOW DATABASES").contains("\"x\""));
+}
+
+const SLOW: &str = "UNWIND range(1, 5000000) AS i UNWIND range(1, 1000) AS j WITH j WHERE j < 0 RETURN count(*) AS n";
+
+#[test]
+fn time_limit() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig { query_timeout: Duration::from_millis(300), ..McpConfig::default() });
+    let (text, err) = call(server.mcp_addr().unwrap(), &rita, "read_cypher", &q(SLOW, ""));
+    assert!(err && text.starts_with("Timeout"), "{text}");
+}
+
+#[test]
+fn a_client_that_leaves_cancels_its_query() {
+    let users = users();
+    let (rita, _) = users.create_token("rita", "t", TokenAccess::Read, &[], None).unwrap();
+    let server = start(Arc::clone(&users), McpConfig { query_timeout: Duration::from_secs(60), ..McpConfig::default() });
+    let addr = server.mcp_addr().unwrap();
+    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_cypher","arguments":{}}}}}"#, q(SLOW, ""));
+    let mut s = TcpStream::connect(addr).unwrap();
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {rita}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let listed = || http_query(&server, "SHOW TRANSACTIONS YIELD protocol, currentQuery").contains(r#""mcp""#);
+    let mut waited = 0;
+    while !listed() {
+        assert!(waited < 100, "the query never showed in SHOW TRANSACTIONS");
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    drop(s);
+    let mut waited = 0;
+    while listed() {
+        assert!(waited < 200, "the query was not cancelled when its client left");
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    let m = send(server.local_addr(), "GET", "/metrics", &[("Authorization", "Bearer tok")], "");
+    assert!(m.body.contains(r#"graphbuff_queries_total{protocol="mcp",outcome="cancelled"} 1"#), "{}", m.body);
+}

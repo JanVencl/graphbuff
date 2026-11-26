@@ -26,9 +26,12 @@ the same notes.
 - An MCP (Model Context Protocol) endpoint for AI agents such as Claude and Cursor: set
   `bind` in the new `[mcp]` section of the config file, and agents connect to
   `http://ADDRESS/mcp` with an API token. It speaks MCP 2026-07-28 and the
-  `initialize`-based 2025-06-18 and 2025-11-25, without sessions, and offers the tool
-  `list_databases` so far. Over MCP nobody is more than an editor. Tool calls are limited
-  per token and user, and counted in `/metrics`. See [MCP](docs/MCP.md).
+  `initialize`-based 2025-06-18 and 2025-11-25, without sessions. Tools: `list_databases`,
+  `read_cypher` (refuses queries that write) and `write_cypher` (only for tokens that may
+  write, with `dry_run`). Results are compact and capped (`max_rows`, `max_result_kb`), and
+  a query is cancelled when its client leaves. Over MCP nobody is more than an editor:
+  administration and `LOAD CSV` are refused. Tool calls are limited per token and user,
+  and counted in `/metrics`. See [MCP](docs/MCP.md).
 
 ### Fixed
 

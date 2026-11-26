@@ -68,6 +68,10 @@ pub struct Config {
     pub mcp_max_concurrent: usize,
     /// `mcp.calls_per_minute`; 0: no limit.
     pub mcp_calls_per_minute: u32,
+    pub mcp_max_rows: usize,
+    pub mcp_max_rows_limit: usize,
+    pub mcp_max_result_kb: usize,
+    pub mcp_query_timeout: Duration,
 }
 
 /// `[embedding]`: the local embedding models (`vector.embed`), in a build with `embed`.
@@ -140,6 +144,10 @@ impl Default for Config {
             mcp_origins: graphbuff_server::Cors::default(),
             mcp_max_concurrent: 8,
             mcp_calls_per_minute: 120,
+            mcp_max_rows: 100,
+            mcp_max_rows_limit: 1000,
+            mcp_max_result_kb: 64,
+            mcp_query_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -275,6 +283,14 @@ device = "cpu"
 max_concurrent_per_user = 8
 # Tool calls per minute and API token (0: no limit).
 calls_per_minute = 120
+# Rows a query tool returns unless the agent asks for fewer or more, and the most it may
+# ask for.
+max_rows = 100
+max_rows_limit = 1000
+# The most KiB of rows a query tool returns.
+max_result_kb = 64
+# Stop a query of an agent that runs longer (and never longer than queries.query_timeout_ms).
+query_timeout_ms = 30000
 "#;
 
 /// The `data` line of [`TEMPLATE`] for a config file next to the program.
@@ -379,6 +395,10 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("allowed_origins", Kind::Str, "Web page origins whose browser apps may call the MCP endpoint."),
             ("max_concurrent_per_user", Kind::Positive, "MCP tool calls one user may have running at once."),
             ("calls_per_minute", Kind::Count, "MCP tool calls per minute and API token (0: no limit)."),
+            ("max_rows", Kind::Positive, "Rows an MCP query tool returns unless the agent asks otherwise."),
+            ("max_rows_limit", Kind::Positive, "The most rows an agent may ask an MCP query tool for."),
+            ("max_result_kb", Kind::Positive, "The most KiB of rows an MCP query tool returns."),
+            ("query_timeout_ms", Kind::Positive, "Stop a query of an MCP agent that runs longer."),
         ],
     ),
 ];
@@ -493,6 +513,10 @@ impl Config {
                 }
                 ("mcp", "max_concurrent_per_user") => c.mcp_max_concurrent = int_of(value) as usize,
                 ("mcp", "calls_per_minute") => c.mcp_calls_per_minute = int_of(value).min(u64::from(u32::MAX)) as u32,
+                ("mcp", "max_rows") => c.mcp_max_rows = int_of(value) as usize,
+                ("mcp", "max_rows_limit") => c.mcp_max_rows_limit = int_of(value) as usize,
+                ("mcp", "max_result_kb") => c.mcp_max_result_kb = int_of(value) as usize,
+                ("mcp", "query_timeout_ms") => c.mcp_query_timeout = Duration::from_millis(int_of(value)),
                 _ => unreachable!("checked by read_toml"),
             }
         }
@@ -500,6 +524,14 @@ impl Config {
             return Err(format!(
                 "{}: storage.data is set, but storage.mode = \"memory\" keeps no data on disk",
                 path.display()
+            ));
+        }
+        if c.mcp_max_rows > c.mcp_max_rows_limit {
+            return Err(format!(
+                "{}: mcp.max_rows ({}) is more than mcp.max_rows_limit ({})",
+                path.display(),
+                c.mcp_max_rows,
+                c.mcp_max_rows_limit
             ));
         }
         match (&c.tls_cert, &c.tls_key) {
@@ -578,6 +610,10 @@ impl Config {
             ("mcp", "allowed_origins") => self.mcp_origins.is_on().then(|| self.mcp_origins.origins().join(", ")),
             ("mcp", "max_concurrent_per_user") => Some(self.mcp_max_concurrent.to_string()),
             ("mcp", "calls_per_minute") => Some(self.mcp_calls_per_minute.to_string()),
+            ("mcp", "max_rows") => Some(self.mcp_max_rows.to_string()),
+            ("mcp", "max_rows_limit") => Some(self.mcp_max_rows_limit.to_string()),
+            ("mcp", "max_result_kb") => Some(self.mcp_max_result_kb.to_string()),
+            ("mcp", "query_timeout_ms") => Some(self.mcp_query_timeout.as_millis().to_string()),
             _ => return Err(()),
         })
     }
@@ -920,6 +956,7 @@ max_memory_mb = 512").unwrap();
         assert!(e("[server]\ncors_origins = \"example.com\"").contains("server.cors_origins"));
         assert!(e("[mcp]\nallowed_origins = \"example.com\"").contains("mcp.allowed_origins"));
         assert!(e("[mcp]\nmax_concurrent_per_user = 0").contains("greater than 0"));
+        assert!(e("[mcp]\nmax_rows = 2000").contains("more than mcp.max_rows_limit"));
         assert!(e("[storage]\nload_csv_urls = \"https://a.example\"").contains("storage.load_csv_urls"));
         let urls = parse("[storage]\nload_csv_urls = \"https://a.example/x/, http://b.example/\"").unwrap();
         assert_eq!(urls.load_csv_urls, ["https://a.example/x/", "http://b.example/"]);

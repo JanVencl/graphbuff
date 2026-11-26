@@ -105,3 +105,11 @@ device = "cpu"
 max_concurrent_per_user = 8
 # Tool calls per minute and API token (0: no limit).
 calls_per_minute = 120
+# Rows a query tool returns unless the agent asks for fewer or more, and the most it may
+# ask for.
+max_rows = 100
+max_rows_limit = 1000
+# The most KiB of rows a query tool returns.
+max_result_kb = 64
+# Stop a query of an agent that runs longer (and never longer than queries.query_timeout_ms).
+query_timeout_ms = 30000

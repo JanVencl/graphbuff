@@ -67,6 +67,10 @@ bind = "127.0.0.1:7476"               # MCP endpoint for AI agents, at /mcp (off
 # allowed_origins = "https://app.example.com"  # browser apps on these origins may call it
 max_concurrent_per_user = 8           # tool calls one user may have running at once
 calls_per_minute = 120                # tool calls per minute and API token (0: no limit)
+max_rows = 100                        # rows a query tool returns (an agent may ask for up to max_rows_limit)
+max_rows_limit = 1000
+max_result_kb = 64                    # and at most this much of them
+query_timeout_ms = 30000              # stop an agent's query that runs longer
 ```
 
 `[mcp]` is described in [MCP](MCP.md).

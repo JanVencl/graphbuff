@@ -17,6 +17,7 @@
 * **Cypher** queries ([supported Cypher](./docs/Cypher.md))
 * **Bolt** ([Neo4j drivers](./docs/Bolt.md))
 * **HTTP/JSON** ([REST API](./docs/HTTP.md))
+* **MCP** for AI agents such as Claude and Cursor ([details](./docs/MCP.md))
 * **user accounts** and **TLS** ([details](./docs/Users.md))
 * **GPU** (wgpu; [kernels and algorithms](./docs/Kernels.md))
 * **persistent storage** ([storage modes](./docs/Storage.md))
@@ -65,6 +66,7 @@ More in [Command-line client](./docs/CLI.md).
 | [Backup, restore and consistency checks](./docs/Backup.md) | online backups and checks |
 | [CSR adjacency export](./docs/Kernels.md) | graph kernels, algorithms, GPU |
 | [HTTP server](./docs/HTTP.md) | the REST API and a Java client |
+| [MCP](./docs/MCP.md) | the Model Context Protocol endpoint for AI agents |
 | [Features](./docs/Features.md) | transactions, timeouts, values, errors, logs, stopping |
 | [Command-line client](./docs/CLI.md) | `graphbuff-cli` |
 | [Bolt](./docs/Bolt.md) | Neo4j drivers |

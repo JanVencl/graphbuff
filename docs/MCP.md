@@ -58,17 +58,50 @@ do on every database; prefer an API token.
 | Tool | What |
 |------|------|
 | `list_databases` | The databases the token may use: name, whether it is the default one, the access (`read` or `write`), and the numbers of nodes and relationships |
+| `read_cypher` | Runs a Cypher query that only reads: `query`, and optionally `params`, `database`, `max_rows`. `EXPLAIN` and `PROFILE` work |
+| `write_cypher` | Runs a Cypher query that may write data, indexes or constraints, with the same arguments and `dry_run`. Returns the update counts |
 
-The tools a client sees depend on its token: tools that write are listed only for tokens
-that may write somewhere.
+The tools a client sees depend on its token: `write_cypher` is listed only for tokens that
+may write somewhere. A query that writes is refused by `read_cypher`, so an agent that
+means to read cannot change data by mistake.
+
+With `dry_run: true`, `write_cypher` runs the query in a transaction, reports its rows and
+update counts, and rolls it back. It holds the database's write lock meanwhile, so it may
+take at most 10 seconds. `CALL { … } IN TRANSACTIONS` cannot be a dry run.
+
+Results are compact JSON text:
+
+```json
+{"database":"movies","columns":["title","released"],"rows":[["The Matrix",1999]],
+ "truncated":true,"shown":100,"hint":"only the first 100 rows fit …","stats":{"nodesCreated":1}}
+```
+
+`truncated` and `hint` appear only when rows were left out, and `stats` only for queries
+that changed something; a cut write also gives `rowCount`. Lists of more than 16 numbers
+(embeddings) are shown as `"<vector 384>"`, and strings longer than 4 KiB are cut. A read
+stops when its result is full; a write runs to its end. Errors (a syntax error, a refused
+statement, a timeout) are tool results with `isError: true` and a message the agent can act
+on.
+
+When the client disconnects, its running query is cancelled and rolled back. Queries of
+agents are listed by `SHOW TRANSACTIONS` with protocol `mcp`, and can be stopped with
+`TERMINATE TRANSACTIONS`.
 
 ## What an agent may do
 
 An agent may do what the token's user may, up to the token's own cap (`ACCESS READ` or
-`WRITE`, and its databases), and never more than an editor: administrative statements
-(users, roles, databases, settings, `TERMINATE TRANSACTIONS`) cannot be run over MCP,
-whatever the user's role. A dropped token, or a role taken from its user, applies to the
-next request.
+`WRITE`, and its databases), and never more than an editor. Over MCP:
+
+| Statement | |
+|-----------|---|
+| Queries that read, `SHOW INDEXES`, `SHOW CONSTRAINTS`, read procedures | `read_cypher` (or `write_cypher`) |
+| Queries that write, index and constraint commands, write procedures | `write_cypher` |
+| `USE db` before a query | as the token may on `db` |
+| `LOAD CSV` | refused: an instruction planted in the data could make an agent send data out in a URL |
+| `SHOW DATABASES` | refused: `list_databases` gives the databases the token may use |
+| User, role, token, database and alias commands, `SHOW` / `TERMINATE TRANSACTIONS`, `SHOW SETTINGS`, `USE` on its own | refused, whatever the user's role |
+
+A dropped token, or a role taken from its user, applies to the next request.
 
 ## Limits
 
@@ -76,6 +109,10 @@ next request.
 |--------------------|---------|------|
 | `max_concurrent_per_user` | 8 | Tool calls one user may have running at once, over all their tokens |
 | `calls_per_minute` | 120 | Tool calls per minute and token (or server token); bursts up to this many are allowed. 0: no limit |
+| `max_rows` | 100 | Rows `read_cypher` and `write_cypher` return, unless the call asks with `max_rows` |
+| `max_rows_limit` | 1000 | The most rows a call may ask for |
+| `max_result_kb` | 64 | The most KiB of rows a call returns |
+| `query_timeout_ms` | 30000 | The longest an agent's query may run; never longer than `queries.query_timeout_ms` |
 
 A call over a limit is answered as a tool error that says when to try again, so that the
 agent can wait. Failed logins count against `security.max_failed_logins` as on the other
