@@ -72,6 +72,13 @@ pub struct Config {
     pub mcp_max_rows_limit: usize,
     pub mcp_max_result_kb: usize,
     pub mcp_query_timeout: Duration,
+    /// `mcp.public_url`, checked: turns on OAuth.
+    pub mcp_public_url: Option<String>,
+    pub mcp_trusted_proxies: Vec<std::net::IpAddr>,
+    pub mcp_oauth_clients: Vec<graphbuff_server::OAuthClient>,
+    /// `mcp.oauth_clients` as written, for `SHOW SETTINGS`.
+    pub mcp_oauth_clients_text: String,
+    pub mcp_oauth_client_hosts: Vec<String>,
 }
 
 /// `[embedding]`: the local embedding models (`vector.embed`), in a build with `embed`.
@@ -148,6 +155,11 @@ impl Default for Config {
             mcp_max_rows_limit: 1000,
             mcp_max_result_kb: 64,
             mcp_query_timeout: Duration::from_secs(30),
+            mcp_public_url: None,
+            mcp_trusted_proxies: Vec::new(),
+            mcp_oauth_clients: Vec::new(),
+            mcp_oauth_clients_text: String::new(),
+            mcp_oauth_client_hosts: Vec::new(),
         }
     }
 }
@@ -291,6 +303,18 @@ max_rows_limit = 1000
 max_result_kb = 64
 # Stop a query of an agent that runs longer (and never longer than queries.query_timeout_ms).
 query_timeout_ms = 30000
+# OAuth, for hosted agents (claude.ai, ChatGPT) that cannot send a fixed token: the
+# endpoint's URL as they reach it, https://HOST/mcp (behind a proxy that terminates TLS
+# and forwards to bind). Users then log in on a page of this server and allow the agent.
+# public_url = "https://mcp.example.com/mcp"
+# Proxies whose X-Forwarded-For header names the client (comma-separated addresses).
+# trusted_proxies = "127.0.0.1"
+# OAuth clients registered here: "client_id redirect_uri [redirect_uri...]", clients
+# separated by ";". Clients with a client metadata document (an https:// client_id, as
+# claude.ai and ChatGPT use) need no entry.
+# oauth_clients = "my-agent https://agent.example.com/callback"
+# Only fetch client metadata documents from these hosts (comma-separated; empty: any).
+# oauth_client_hosts = "claude.ai, chatgpt.com"
 "#;
 
 /// The `data` line of [`TEMPLATE`] for a config file next to the program.
@@ -399,6 +423,10 @@ const SETTINGS: &[(&str, &[(&str, Kind, &str)])] = &[
             ("max_rows_limit", Kind::Positive, "The most rows an agent may ask an MCP query tool for."),
             ("max_result_kb", Kind::Positive, "The most KiB of rows an MCP query tool returns."),
             ("query_timeout_ms", Kind::Positive, "Stop a query of an MCP agent that runs longer."),
+            ("public_url", Kind::Str, "The MCP endpoint's https:// URL as clients reach it; turns on OAuth."),
+            ("trusted_proxies", Kind::Str, "Proxies whose X-Forwarded-For header names the MCP client."),
+            ("oauth_clients", Kind::Str, "OAuth clients registered here: client_id and redirect URIs, ';' between clients."),
+            ("oauth_client_hosts", Kind::Str, "Hosts whose OAuth client metadata documents are fetched (empty: any)."),
         ],
     ),
 ];
@@ -517,6 +545,30 @@ impl Config {
                 ("mcp", "max_rows_limit") => c.mcp_max_rows_limit = int_of(value) as usize,
                 ("mcp", "max_result_kb") => c.mcp_max_result_kb = int_of(value) as usize,
                 ("mcp", "query_timeout_ms") => c.mcp_query_timeout = Duration::from_millis(int_of(value)),
+                ("mcp", "public_url") => {
+                    let url = str_of(value);
+                    if !url.is_empty() {
+                        graphbuff_server::check_public_url(&url).map_err(|e| format!("{}: {e}", at()))?;
+                        c.mcp_public_url = Some(url);
+                    }
+                }
+                ("mcp", "trusted_proxies") => {
+                    c.mcp_trusted_proxies = str_of(value)
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.parse().map_err(|_| format!("{}: mcp.trusted_proxies: `{p}` is not an IP address", at())))
+                        .collect::<Result<_, _>>()?;
+                }
+                ("mcp", "oauth_clients") => {
+                    c.mcp_oauth_clients_text = str_of(value);
+                    c.mcp_oauth_clients = graphbuff_server::OAuthClient::parse_list(&c.mcp_oauth_clients_text)
+                        .map_err(|e| format!("{}: mcp.oauth_clients: {e}", at()))?;
+                }
+                ("mcp", "oauth_client_hosts") => {
+                    c.mcp_oauth_client_hosts =
+                        str_of(value).split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect();
+                }
                 _ => unreachable!("checked by read_toml"),
             }
         }
@@ -614,6 +666,13 @@ impl Config {
             ("mcp", "max_rows_limit") => Some(self.mcp_max_rows_limit.to_string()),
             ("mcp", "max_result_kb") => Some(self.mcp_max_result_kb.to_string()),
             ("mcp", "query_timeout_ms") => Some(self.mcp_query_timeout.as_millis().to_string()),
+            ("mcp", "public_url") => self.mcp_public_url.clone(),
+            ("mcp", "trusted_proxies") => (!self.mcp_trusted_proxies.is_empty())
+                .then(|| self.mcp_trusted_proxies.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")),
+            ("mcp", "oauth_clients") => (!self.mcp_oauth_clients_text.is_empty()).then(|| self.mcp_oauth_clients_text.clone()),
+            ("mcp", "oauth_client_hosts") => {
+                (!self.mcp_oauth_client_hosts.is_empty()).then(|| self.mcp_oauth_client_hosts.join(", "))
+            }
             _ => return Err(()),
         })
     }
@@ -957,6 +1016,16 @@ max_memory_mb = 512").unwrap();
         assert!(e("[mcp]\nallowed_origins = \"example.com\"").contains("mcp.allowed_origins"));
         assert!(e("[mcp]\nmax_concurrent_per_user = 0").contains("greater than 0"));
         assert!(e("[mcp]\nmax_rows = 2000").contains("more than mcp.max_rows_limit"));
+        assert!(e("[mcp]\npublic_url = \"http://mcp.example.com/mcp\"").contains("https://"));
+        assert!(e("[mcp]\ntrusted_proxies = \"proxy\"").contains("not an IP address"));
+        assert!(e("[mcp]\noauth_clients = \"app http://example.com/cb\"").contains("mcp.oauth_clients"));
+        let on = Config::parse(
+            Path::new("x.toml"),
+            "[mcp]\nbind = \"127.0.0.1:7476\"\npublic_url = \"https://mcp.example.com/mcp\"\noauth_clients = \"app https://a.example/cb\"",
+        )
+        .unwrap();
+        assert_eq!(on.mcp_public_url.as_deref(), Some("https://mcp.example.com/mcp"));
+        assert_eq!(on.mcp_oauth_clients.len(), 1);
         assert!(e("[storage]\nload_csv_urls = \"https://a.example\"").contains("storage.load_csv_urls"));
         let urls = parse("[storage]\nload_csv_urls = \"https://a.example/x/, http://b.example/\"").unwrap();
         assert_eq!(urls.load_csv_urls, ["https://a.example/x/", "http://b.example/"]);

@@ -113,3 +113,15 @@ max_rows_limit = 1000
 max_result_kb = 64
 # Stop a query of an agent that runs longer (and never longer than queries.query_timeout_ms).
 query_timeout_ms = 30000
+# OAuth, for hosted agents (claude.ai, ChatGPT) that cannot send a fixed token: the
+# endpoint's URL as they reach it, https://HOST/mcp (behind a proxy that terminates TLS
+# and forwards to bind). Users then log in on a page of this server and allow the agent.
+# public_url = "https://mcp.example.com/mcp"
+# Proxies whose X-Forwarded-For header names the client (comma-separated addresses).
+# trusted_proxies = "127.0.0.1"
+# OAuth clients registered here: "client_id redirect_uri [redirect_uri...]", clients
+# separated by ";". Clients with a client metadata document (an https:// client_id, as
+# claude.ai and ChatGPT use) need no entry.
+# oauth_clients = "my-agent https://agent.example.com/callback"
+# Only fetch client metadata documents from these hosts (comma-separated; empty: any).
+# oauth_client_hosts = "claude.ai, chatgpt.com"

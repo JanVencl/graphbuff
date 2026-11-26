@@ -666,6 +666,10 @@ fn main() {
             max_rows_limit: settings.mcp_max_rows_limit,
             max_result_bytes: settings.mcp_max_result_kb << 10,
             query_timeout: settings.mcp_query_timeout,
+            public_url: settings.mcp_public_url.clone(),
+            trusted_proxies: settings.mcp_trusted_proxies.clone(),
+            oauth_clients: settings.mcp_oauth_clients.clone(),
+            oauth_client_hosts: settings.mcp_oauth_client_hosts.clone(),
         }),
         login_limits: LoginLimits {
             max_failures: settings.max_failed_logins,

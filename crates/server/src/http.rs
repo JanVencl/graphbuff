@@ -21,10 +21,57 @@ pub struct Request {
     pub method: String,
     /// The path without the query string.
     pub path: String,
+    /// The query string, without the `?` (empty if there is none).
+    pub query: String,
     /// Header names are lower-cased.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub keep_alive: bool,
+}
+
+/// Decodes `%XX` escapes, and `+` as a space when `plus` (form encoding).
+pub(crate) fn percent_decode(s: &str, plus: bool) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(if plus && b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Encodes `s` for a URL's query or a form: everything but unreserved characters as
+/// `%XX`.
+pub(crate) fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The fields of `application/x-www-form-urlencoded` text (a query string or a form
+/// body), in order. A name given twice is kept twice.
+pub(crate) fn form_fields(text: &str) -> Vec<(String, String)> {
+    text.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (percent_decode(k, true), percent_decode(v, true)),
+            None => (percent_decode(p, true), String::new()),
+        })
+        .collect()
 }
 
 impl Request {
@@ -262,10 +309,14 @@ pub fn read_request(
         t.exact(&mut body, n)?;
     }
 
-    let path = target.split('?').next().unwrap_or("").to_string();
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.split('#').next().unwrap_or("").to_string()),
+        None => (target.to_string(), String::new()),
+    };
     Ok(Some(Request {
         method: method.to_string(),
         path,
+        query,
         headers,
         body,
         keep_alive,
@@ -276,6 +327,8 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         202 => "Accepted",
+        302 => "Found",
+        303 => "See Other",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -297,6 +350,15 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Appends a header line. Line breaks and other control characters in `value` become
+/// spaces, so that no value can add headers or end the head.
+fn push_header(head: &mut String, name: &str, value: &str) {
+    head.push_str(name);
+    head.push_str(": ");
+    head.extend(value.chars().map(|c| if c.is_control() { ' ' } else { c }));
+    head.push_str("\r\n");
+}
+
 pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
@@ -307,10 +369,7 @@ pub fn write_response(w: &mut Stream, resp: &Response, keep_alive: bool) -> io::
         if keep_alive { "keep-alive" } else { "close" }
     );
     for (name, value) in &resp.headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+        push_header(&mut head, name, value);
     }
     head.push_str("\r\n");
     // One write for small responses keeps Nagle's algorithm out of the way.
@@ -333,10 +392,7 @@ pub fn write_chunked_head(
         if keep_alive { "keep-alive" } else { "close" }
     );
     for (name, value) in headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+        push_header(&mut head, name, value);
     }
     head.push_str("\r\n");
     w.write_all(head.as_bytes())
@@ -480,10 +536,18 @@ mod tests {
         Request {
             method: method.into(),
             path: "/db".into(),
+            query: String::new(),
             headers: headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
             body: Vec::new(),
             keep_alive: true,
         }
+    }
+
+    #[test]
+    fn header_values_cannot_add_headers() {
+        let mut head = String::new();
+        push_header(&mut head, "Location", "https://a/cb\r\nSet-Cookie: x=y\r\n\r\nHTTP/1.1 200 OK");
+        assert_eq!(head, "Location: https://a/cb  Set-Cookie: x=y    HTTP/1.1 200 OK\r\n");
     }
 
     #[test]

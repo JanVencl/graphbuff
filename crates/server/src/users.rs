@@ -275,6 +275,11 @@ pub struct TokenInfo {
     /// When it stops working, if ever.
     pub expires: Option<i64>,
     pub last_used: Option<i64>,
+    /// The OAuth client it was issued to, for a token an OAuth login made (see
+    /// [`Users::oauth_grant`]); such a token works only at its [`audience`](Self::audience).
+    pub client: Option<String>,
+    /// The URL of the MCP endpoint an OAuth token was issued for.
+    pub audience: Option<String>,
 }
 
 impl TokenInfo {
@@ -299,6 +304,35 @@ pub(crate) fn token_id(token: &str) -> Option<&str> {
     crypto::unhex::<8>(id)?;
     crypto::unhex::<32>(secret)?;
     Some(id)
+}
+
+/// A new OAuth access token of `user` for grant `family`: its text, and its record (the
+/// account id is filled in by the caller).
+fn new_access(
+    user: &str,
+    family: &str,
+    client: &str,
+    access: TokenAccess,
+    databases: BTreeSet<String>,
+    audience: &str,
+    now: i64,
+) -> Result<(String, ApiToken)> {
+    let id = random_hex::<8>()?;
+    let token = format!("{TOKEN_PREFIX}{id}_{}", random_hex::<32>()?);
+    let info = TokenInfo {
+        id,
+        name: format!("oauth-{family}"),
+        user: user.to_string(),
+        access,
+        databases,
+        created: now,
+        expires: Some(now.saturating_add(millis(OAUTH_ACCESS_LIFETIME))),
+        last_used: None,
+        client: Some(client.to_string()),
+        audience: Some(audience.to_string()),
+    };
+    let hash = crypto::sha256(token.as_bytes());
+    Ok((token, ApiToken { info, hash, account: String::new() }))
 }
 
 fn now_millis() -> i64 {
@@ -355,16 +389,66 @@ struct Data {
     accounts: BTreeMap<String, Account>,
     /// API tokens by id. Each belongs to an account that exists.
     tokens: BTreeMap<String, ApiToken>,
+    /// OAuth grants by family id. Each has its access token in `tokens`.
+    grants: BTreeMap<String, Grant>,
 }
 
 impl Data {
-    /// Drops the tokens whose account is gone or was replaced.
+    /// Drops the tokens whose account is gone or was replaced, the grants whose access
+    /// token is gone (dropped with DROP TOKEN, or with its account), and the access tokens
+    /// of grants that are gone.
     fn drop_orphans(&mut self) {
         let accounts = &self.accounts;
         self.tokens.retain(|_, t| {
             accounts.get(&t.info.user).and_then(|a| a.id.as_ref()).is_some_and(|id| *id == t.account)
         });
+        let tokens = &self.tokens;
+        self.grants.retain(|_, g| tokens.get(&g.token).is_some_and(|t| t.account == g.account));
+        let live: BTreeSet<&str> = self.grants.values().map(|g| g.token.as_str()).collect();
+        self.tokens.retain(|id, t| t.info.client.is_none() || live.contains(id.as_str()));
     }
+}
+
+/// What an OAuth login allowed a client: a family of refresh tokens, each replacing the
+/// one before, and the access token (an API token) of the latest.
+#[derive(Clone, PartialEq, Eq)]
+struct Grant {
+    /// The public part of its refresh tokens: they read `gbr_<family>_<secret>`.
+    family: String,
+    user: String,
+    /// The [`Account::id`] it belongs to.
+    account: String,
+    client: String,
+    access: TokenAccess,
+    databases: BTreeSet<String>,
+    audience: String,
+    created: i64,
+    /// The SHA-256 hash of the current refresh token.
+    hash: [u8; 32],
+    /// When the current refresh token stops working.
+    expires: i64,
+    /// The id of the current access token.
+    token: String,
+}
+
+/// How long an OAuth access token works.
+pub const OAUTH_ACCESS_LIFETIME: Duration = Duration::from_secs(3600);
+/// How long a refresh token works unless it is used (and replaced).
+const REFRESH_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
+const REFRESH_PREFIX: &str = "gbr_";
+
+/// Tokens an OAuth login or refresh gives a client.
+#[derive(Debug)]
+pub(crate) struct Issued {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// Seconds the access token works.
+    pub expires_in: u64,
+    pub access: TokenAccess,
+}
+
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[derive(Default)]
@@ -566,7 +650,7 @@ impl Users {
                 return Err(bad(format!("duplicate user `{name}`")));
             }
         }
-        let mut data = Data { accounts, tokens: load_tokens(&db)? };
+        let mut data = Data { accounts, tokens: load_tokens(&db)?, grants: load_grants(&db)? };
         data.drop_orphans();
         Ok(Users {
             store: Store::System(db),
@@ -694,6 +778,143 @@ impl Users {
         Some(who)
     }
 
+    /// The endpoint an OAuth access token works at; `None` for other tokens (and for no
+    /// such token).
+    pub(crate) fn token_audience(&self, id: &str) -> Option<String> {
+        self.read().data.tokens.get(id).and_then(|t| t.info.audience.clone())
+    }
+
+    /// Lets OAuth `client` act as `user`, up to `access` on `databases` (every one if
+    /// empty), at the MCP endpoint `audience`: an access token for an hour and a refresh
+    /// token, which [`oauth_refresh`](Self::oauth_refresh) replaces. The grant ends at the latest after
+    /// [`DEFAULT_TOKEN_LIFETIME`], and with DROP TOKEN of its access token.
+    pub(crate) fn oauth_grant(
+        &self,
+        user: &str,
+        client: &str,
+        access: TokenAccess,
+        databases: &[String],
+        audience: &str,
+    ) -> Result<Issued> {
+        let family = random_hex::<8>()?;
+        let now = now_millis();
+        let (access_token, token) = new_access(user, &family, client, access, databases.iter().map(|d| db_key(d)).collect(), audience, now)?;
+        let refresh_token = format!("{REFRESH_PREFIX}{family}_{}", random_hex::<32>()?);
+        let new_account = random_hex::<16>()?;
+        self.change(|d| {
+            let account = d.accounts.get_mut(user).ok_or_else(|| no_user(user))?;
+            let account = account.id.get_or_insert(new_account).clone();
+            // Expired grants of the user go first, so that they do not count.
+            let gone: Vec<String> =
+                d.grants.values().filter(|g| g.user == user && g.expires <= now).map(|g| g.family.clone()).collect();
+            for f in gone {
+                d.grants.remove(&f);
+            }
+            d.drop_orphans();
+            if d.tokens.values().filter(|t| t.info.user == user).count() >= MAX_TOKENS {
+                return Err(Error::Runtime(format!("user `{user}` already has {MAX_TOKENS} tokens; drop some first")));
+            }
+            let grant = Grant {
+                family: family.clone(),
+                user: user.to_string(),
+                account: account.clone(),
+                client: client.to_string(),
+                access,
+                databases: token.info.databases.clone(),
+                audience: audience.to_string(),
+                created: now,
+                hash: crypto::sha256(refresh_token.as_bytes()),
+                expires: now.saturating_add(millis(REFRESH_LIFETIME)).min(now.saturating_add(millis(DEFAULT_TOKEN_LIFETIME))),
+                token: token.info.id.clone(),
+            };
+            d.tokens.insert(token.info.id.clone(), ApiToken { account, ..token });
+            d.grants.insert(family.clone(), grant);
+            Ok(())
+        })?;
+        Ok(Issued { access_token, refresh_token, expires_in: OAUTH_ACCESS_LIFETIME.as_secs(), access })
+    }
+
+    /// Replaces refresh token `refresh` of `client` with a new one, and its grant's
+    /// access token with a new one. A refresh token used a second time ends its grant
+    /// (it may have been stolen). `None` for a refresh token that does not work.
+    pub(crate) fn oauth_refresh(&self, refresh: &str, client: &str) -> Option<Issued> {
+        let (family, secret) = refresh.strip_prefix(REFRESH_PREFIX)?.split_once('_')?;
+        crypto::unhex::<8>(family)?;
+        crypto::unhex::<32>(secret)?;
+        let now = now_millis();
+        let next = format!("{REFRESH_PREFIX}{family}_{}", random_hex::<32>().ok()?);
+        let hash = crypto::sha256(refresh.as_bytes());
+        let mut issued = None;
+        let _ = self.change(|d| {
+            let Some(g) = d.grants.get(family).cloned() else { return Ok(()) };
+            if g.client != client {
+                return Ok(());
+            }
+            if !crypto::same_bytes(&hash, &g.hash) || g.expires <= now {
+                // An old refresh token again, or a stale one: the grant ends.
+                d.grants.remove(family);
+                return Ok(());
+            }
+            let (access_token, token) =
+                new_access(&g.user, family, &g.client, g.access, g.databases.clone(), &g.audience, now)?;
+            d.tokens.remove(&g.token);
+            let end = g.created.saturating_add(millis(DEFAULT_TOKEN_LIFETIME));
+            let grant = Grant {
+                hash: crypto::sha256(next.as_bytes()),
+                expires: now.saturating_add(millis(REFRESH_LIFETIME)).min(end),
+                token: token.info.id.clone(),
+                ..g.clone()
+            };
+            if grant.expires <= now {
+                d.grants.remove(family);
+                return Ok(());
+            }
+            d.tokens.insert(token.info.id.clone(), ApiToken { account: g.account.clone(), ..token });
+            d.grants.insert(family.to_string(), grant);
+            issued = Some(Issued {
+                access_token,
+                refresh_token: next.clone(),
+                expires_in: OAUTH_ACCESS_LIFETIME.as_secs(),
+                access: g.access,
+            });
+            Ok(())
+        });
+        issued
+    }
+
+    /// Ends the OAuth grant that `refresh` (a refresh token this server issued, perhaps
+    /// replaced since) belongs to.
+    pub(crate) fn oauth_end(&self, refresh: &str) {
+        let Some((family, _)) = refresh.strip_prefix(REFRESH_PREFIX).and_then(|t| t.split_once('_')) else { return };
+        let _ = self.change(|d| {
+            d.grants.remove(family);
+            Ok(())
+        });
+    }
+
+    /// Ends the OAuth grant of `token` (its access or refresh token). Other tokens, and
+    /// tokens that do not work, are left alone.
+    pub(crate) fn oauth_revoke(&self, token: &str) {
+        let hash = crypto::sha256(token.as_bytes());
+        let _ = self.change(|d| {
+            let family = if let Some((family, _)) = token.strip_prefix(REFRESH_PREFIX).and_then(|t| t.split_once('_')) {
+                d.grants.get(family).filter(|g| crypto::same_bytes(&g.hash, &hash)).map(|g| g.family.clone())
+            } else if let Some(id) = token_id(token) {
+                d.tokens
+                    .get(id)
+                    .filter(|t| t.info.client.is_some() && crypto::same_bytes(&t.hash, &hash))
+                    .and_then(|_| d.grants.values().find(|g| g.token == id))
+                    .map(|g| g.family.clone())
+            } else {
+                None
+            };
+            if let Some(f) = family {
+                d.grants.remove(&f);
+            }
+            Ok(())
+        });
+    }
+
     /// What `pick` says of a token that has not expired and its account: `None` for no
     /// such token (any more).
     fn token<T>(&self, id: &str, pick: impl FnOnce(&TokenInfo, &Account) -> T) -> Option<T> {
@@ -755,6 +976,8 @@ impl Users {
             created,
             expires: lifetime.map(|l| created.saturating_add(i64::try_from(l.as_millis()).unwrap_or(i64::MAX))),
             last_used: None,
+            client: None,
+            audience: None,
         };
         let hash = crypto::sha256(token.as_bytes());
         self.change(|d| {
@@ -952,10 +1175,11 @@ impl Users {
         self.change(|d| Ok(d.accounts.remove(name).is_some()))
     }
 
-    /// Renames a user, who keeps their API tokens; returns whether there was one to rename.
+    /// Renames a user, who keeps their API tokens and OAuth grants; returns whether there
+    /// was one to rename.
     pub fn rename(&self, from: &str, to: &str) -> Result<bool> {
         check_name(to)?;
-        self.change(|Data { accounts, tokens }| {
+        self.change(|Data { accounts, tokens, grants }| {
             if !accounts.contains_key(from) {
                 return Ok(false);
             }
@@ -966,6 +1190,9 @@ impl Users {
             accounts.insert(to.to_string(), account);
             for t in tokens.values_mut().filter(|t| t.info.user == from) {
                 t.info.user = to.to_string();
+            }
+            for g in grants.values_mut().filter(|g| g.user == from) {
+                g.user = to.to_string();
             }
             Ok(true)
         })
@@ -978,12 +1205,14 @@ fn load_tokens(db: &Database<BoxedStore>) -> Result<BTreeMap<String, ApiToken>> 
     let rows = db
         .execute(
             "MATCH (t:ApiToken) RETURN t.id, t.hash, t.name, t.user, t.accountId, t.access, \
-             t.databases, t.created, t.expires, t.lastUsed",
+             t.databases, t.created, t.expires, t.lastUsed, t.client, t.audience",
         )?
         .rows;
     let mut tokens = BTreeMap::new();
     for row in rows {
-        let [id, hash, name, user, account, access, databases, created, expires, last_used] = row.as_slice() else {
+        let [id, hash, name, user, account, access, databases, created, expires, last_used, client, audience] =
+            row.as_slice()
+        else {
             return Err(bad("record", "?"));
         };
         let id = id.as_str().filter(|id| crypto::unhex::<8>(id).is_some()).ok_or_else(|| bad("id", "?"))?;
@@ -1006,6 +1235,8 @@ fn load_tokens(db: &Database<BoxedStore>) -> Result<BTreeMap<String, ApiToken>> 
                 created: created.as_int().ok_or_else(|| bad("creation time", id))?,
                 expires: time(expires, "expiry")?,
                 last_used: time(last_used, "last use")?,
+                client: client.as_str().map(String::from),
+                audience: audience.as_str().map(String::from),
             },
             hash: hash.as_str().and_then(crypto::unhex::<32>).ok_or_else(|| bad("hash", id))?,
             account: account.as_str().ok_or_else(|| bad("account", id))?.to_string(),
@@ -1030,6 +1261,68 @@ fn token_record(t: &ApiToken) -> Value {
         ("created", Value::Int(t.info.created)),
         ("expires", time(t.info.expires)),
         ("lastUsed", time(t.info.last_used)),
+        ("client", t.info.client.as_deref().map_or(Value::Null, s)),
+        ("audience", t.info.audience.as_deref().map_or(Value::Null, s)),
+    ];
+    Value::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// The OAuth grants in the system database, by family.
+fn load_grants(db: &Database<BoxedStore>) -> Result<BTreeMap<String, Grant>> {
+    let bad = |what: &str, id: &str| Error::Storage(format!("system database: invalid {what} of OAuth grant `{id}`"));
+    let rows = db
+        .execute(
+            "MATCH (g:OAuthGrant) RETURN g.family, g.user, g.accountId, g.client, g.access, g.databases, \
+             g.audience, g.created, g.hash, g.expires, g.token",
+        )?
+        .rows;
+    let mut grants = BTreeMap::new();
+    for row in rows {
+        let [family, user, account, client, access, databases, audience, created, hash, expires, token] = row.as_slice()
+        else {
+            return Err(bad("record", "?"));
+        };
+        let id = family.as_str().filter(|f| crypto::unhex::<8>(f).is_some()).ok_or_else(|| bad("family", "?"))?;
+        let text = |v: &ResultValue, what: &str| v.as_str().map(String::from).ok_or_else(|| bad(what, id));
+        let databases = match databases {
+            ResultValue::List(list) => list.iter().map(|d| d.as_str().map(db_key)).collect::<Option<BTreeSet<String>>>(),
+            _ => None,
+        };
+        grants.insert(
+            id.to_string(),
+            Grant {
+                family: id.to_string(),
+                user: text(user, "user")?,
+                account: text(account, "account")?,
+                client: text(client, "client")?,
+                access: access.as_str().and_then(|a| TokenAccess::parse(a).ok()).ok_or_else(|| bad("access", id))?,
+                databases: databases.ok_or_else(|| bad("databases", id))?,
+                audience: text(audience, "audience")?,
+                created: created.as_int().ok_or_else(|| bad("creation time", id))?,
+                hash: hash.as_str().and_then(crypto::unhex::<32>).ok_or_else(|| bad("hash", id))?,
+                expires: expires.as_int().ok_or_else(|| bad("expiry", id))?,
+                token: text(token, "token")?,
+            },
+        );
+    }
+    Ok(grants)
+}
+
+/// An OAuth grant as the properties of its node.
+fn grant_record(g: &Grant) -> Value {
+    let s = |v: &str| Value::String(v.to_string());
+    let fields = [
+        ("family", s(&g.family)),
+        ("user", s(&g.user)),
+        ("accountId", s(&g.account)),
+        ("client", s(&g.client)),
+        ("access", s(g.access.name())),
+        ("databases", Value::List(g.databases.iter().map(|d| s(d)).collect())),
+        ("audience", s(&g.audience)),
+        ("created", Value::Int(g.created)),
+        ("hash", s(&crypto::hex(&g.hash))),
+        ("expires", Value::Int(g.expires)),
+        ("token", s(&g.token)),
     ];
     Value::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
@@ -1042,6 +1335,10 @@ fn save_system(db: &Database<BoxedStore>, old: &Data, new: &Data) -> Result<()> 
         old.tokens.keys().filter(|id| !new.tokens.contains_key(*id)).map(|id| Value::String(id.clone())).collect();
     let tokens: Vec<Value> =
         new.tokens.iter().filter(|(id, t)| old.tokens.get(*id) != Some(*t)).map(|(_, t)| token_record(t)).collect();
+    let drop_grants: Vec<Value> =
+        old.grants.keys().filter(|id| !new.grants.contains_key(*id)).map(|id| Value::String(id.clone())).collect();
+    let grants: Vec<Value> =
+        new.grants.iter().filter(|(id, g)| old.grants.get(*id) != Some(*g)).map(|(_, g)| grant_record(g)).collect();
     let (old, new) = (&old.accounts, &new.accounts);
     let remove: Vec<Value> = old
         .keys()
@@ -1075,7 +1372,13 @@ fn save_system(db: &Database<BoxedStore>, old: &Data, new: &Data) -> Result<()> 
             ]))
         })
         .collect();
-    if remove.is_empty() && upsert.is_empty() && drop_tokens.is_empty() && tokens.is_empty() {
+    if remove.is_empty()
+        && upsert.is_empty()
+        && drop_tokens.is_empty()
+        && tokens.is_empty()
+        && drop_grants.is_empty()
+        && grants.is_empty()
+    {
         return Ok(());
     }
     db.execute_with_params(
@@ -1085,15 +1388,21 @@ fn save_system(db: &Database<BoxedStore>, old: &Data, new: &Data) -> Result<()> 
          OPTIONAL MATCH (old:ApiToken) WHERE old.id IN $dropTokens \
          DELETE old \
          WITH count(*) AS ignored \
+         OPTIONAL MATCH (old:OAuthGrant) WHERE old.family IN $dropGrants \
+         DELETE old \
+         WITH count(*) AS ignored \
          FOREACH (a IN $upsert | \
            MERGE (u:User {name: a.name}) \
            SET u.password = a.password, u.roles = a.roles, u.databaseRoles = a.databaseRoles, u.accountId = a.accountId) \
-         FOREACH (t IN $tokens | MERGE (k:ApiToken {id: t.id}) SET k = t)",
+         FOREACH (t IN $tokens | MERGE (k:ApiToken {id: t.id}) SET k = t) \
+         FOREACH (g IN $grants | MERGE (k:OAuthGrant {family: g.family}) SET k = g)",
         &BTreeMap::from([
             ("remove".to_string(), Value::List(remove)),
             ("upsert".to_string(), Value::List(upsert)),
             ("dropTokens".to_string(), Value::List(drop_tokens)),
             ("tokens".to_string(), Value::List(tokens)),
+            ("dropGrants".to_string(), Value::List(drop_grants)),
+            ("grants".to_string(), Value::List(grants)),
         ]),
     )
     .map_err(|e| Error::Storage(format!("saving the accounts in the system database: {e}")))?;
@@ -1738,6 +2047,50 @@ mod tests {
         assert!(users.authenticate_token(&token).is_none());
         assert_eq!(users.token_best_access(&info.id), None);
         assert!(users.tokens(None).is_empty());
+    }
+
+    #[test]
+    fn oauth_grants_persist_in_the_system_database() {
+        let tmp = TempDir::new("grants");
+        let dir = &tmp.0;
+        let open = |dir: &std::path::Path| {
+            let mgr = graphbuff::DatabaseManager::open(dir).unwrap();
+            let system = mgr.system_database().unwrap();
+            let users = Users::system(Arc::clone(&system)).unwrap().with_hash_params(HashParams::TESTING).with_min_password_length(1);
+            (mgr, system, users)
+        };
+        let audience = "https://mcp.test/mcp";
+        let (refresh, dropped);
+        {
+            let (_mgr, system, users) = open(dir);
+            users.create("ann", "pw", &[Role::Editor], ExistingDatabase::Fail).unwrap();
+            let issued = users.oauth_grant("ann", "app", TokenAccess::Write, &["Movies".into()], audience).unwrap();
+            assert_eq!(issued.expires_in, 3600);
+            let Some(Principal::ApiToken { id, .. }) = users.authenticate_token(&issued.access_token) else { panic!() };
+            assert_eq!(users.token_audience(&id).as_deref(), Some(audience));
+            let next = users.oauth_refresh(&issued.refresh_token, "app").unwrap();
+            assert!(users.authenticate_token(&issued.access_token).is_none(), "the old access token is gone");
+            refresh = next.refresh_token;
+            dropped = users.oauth_grant("ann", "app", TokenAccess::Read, &[], audience).unwrap().refresh_token;
+            users.oauth_revoke(&dropped);
+            users.rename("ann", "anna").unwrap();
+            let all = format!("{:?}", system.execute("MATCH (n) RETURN n").unwrap().rows);
+            assert!(!all.contains(&refresh[21..]) && !all.contains(&next.access_token[21..]), "a secret is stored");
+        }
+        {
+            let (_mgr, _system, users) = open(dir);
+            assert!(users.oauth_refresh(&dropped, "app").is_none());
+            let again = users.oauth_refresh(&refresh, "app").expect("the grant survives a restart");
+            assert_eq!(again.access, TokenAccess::Write);
+            let Some(Principal::ApiToken { user, id }) = users.authenticate_token(&again.access_token) else { panic!() };
+            assert_eq!(user, "anna");
+            assert_eq!(users.token_access_on(&id, "movies"), Some(Access::Write));
+            assert_eq!(users.token_access_on(&id, "other"), Some(Access::None));
+            // Dropping the user ends the grant.
+            users.create("root", "pw", &[Role::Admin], ExistingDatabase::Fail).unwrap();
+            users.drop_user("anna").unwrap();
+            assert!(users.oauth_refresh(&again.refresh_token, "app").is_none());
+        }
     }
 
     #[test]

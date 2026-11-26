@@ -168,14 +168,68 @@ agent can wait. Failed logins count against `security.max_failed_logins` as on t
 ports. Calls are counted in `/metrics` (`graphbuff_mcp_tool_calls_total`,
 `graphbuff_mcp_tool_call_duration_seconds`; see [Features](Features.md)).
 
+## Hosted clients (OAuth)
+
+Hosted agents such as claude.ai and ChatGPT cannot be given a fixed token everywhere.
+For them, `graphbuff-server` is its own OAuth 2.1 authorization server, on the MCP port:
+the user adds the server's URL in the agent, logs in on a page of this server with their
+GraphBuff user name and password, and chooses what the agent may do.
+
+It needs the endpoint to be reachable over HTTPS, usually through a proxy that terminates
+TLS and forwards to `bind`:
+
+```toml
+[mcp]
+bind = "127.0.0.1:7476"
+public_url = "https://mcp.example.com/mcp"
+trusted_proxies = "127.0.0.1"
+```
+
+| Setting in `[mcp]` | What |
+|--------------------|------|
+| `public_url` | The endpoint's URL as clients reach it: `https://HOST[:PORT]/mcp`. Turns OAuth on |
+| `trusted_proxies` | Proxies (comma-separated addresses) whose `X-Forwarded-For` names the client: the login throttle and the logs then see the client, not the proxy |
+| `oauth_clients` | Clients registered here: `"client_id redirect_uri [redirect_uri…]"`, `;` between clients. Clients with a client metadata document need no entry |
+| `oauth_client_hosts` | Fetch client metadata documents only from these hosts (comma-separated; empty: any public host) |
+
+Then, in claude.ai (Settings, Connectors, add a custom connector) or ChatGPT, give
+`https://mcp.example.com/mcp`; the agent opens the login page.
+
+- **The page** shows which client asks (its name and `client_id`) and where it will be sent
+  back; for a client on this computer (a `localhost` redirect) it says so. The user picks
+  read only, or read and write, and may limit the databases. Write needs a role that
+  writes; nobody gets administration. Deny sends the client away with `access_denied`.
+- **Tokens:** the client gets an access token that works for an hour, only at this
+  endpoint (not on the HTTP or Bolt ports), and a refresh token that gets it new ones. Each
+  refresh replaces both; a refresh token used a second time (it may have been stolen) ends
+  the grant. A grant lasts at most 90 days, and 30 days without use. `SHOW TOKENS` lists
+  the access token as `oauth-…`; `DROP TOKEN` ends the grant at once, as do dropping the
+  user and `POST /oauth/revoke`.
+- **Clients** are public (no secret; PKCE with S256 stands in for one). A client's
+  `client_id` is either listed in `oauth_clients`, or an `https://` URL of its
+  [client metadata document](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration),
+  which this server fetches (public addresses only, no redirects, at most 64 KiB in 5
+  seconds) and keeps for 10 minutes. claude.ai and ChatGPT use such documents. Dynamic
+  client registration is not offered. Redirect URIs must match exactly, except that a
+  `localhost` one may use any port.
+- **Discovery:** `/.well-known/oauth-protected-resource/mcp` (RFC 9728) names the
+  authorization server; `/.well-known/oauth-authorization-server` (RFC 8414) and
+  `/.well-known/openid-configuration` describe it. A request to `/mcp` without a token
+  answers `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. The answer to a
+  login carries `iss` (RFC 9207); `resource` (RFC 8707), when sent, must be `public_url`.
+- **Security:** the form carries a token that must match a cookie of the page, against
+  forged requests; the page may not be framed. Failed logins count against
+  `security.max_failed_logins` as elsewhere, and a consent is written to `security.log`.
+  API tokens keep working as before, also with OAuth on.
+
 ## Browsers and other machines
 
 - Requests that carry an `Origin` header (from web pages) are refused with `403` unless the
   origin is listed in `allowed_origins`, a comma-separated list such as
   `"https://app.example.com"`, or `"*"`. Agents send no `Origin`.
 - On a loopback address (the default), the `Host` header must name this machine
-  (`localhost`, `127.0.0.1` or `[::1]`), so that a web page cannot reach the endpoint
-  through DNS rebinding.
+  (`localhost`, `127.0.0.1` or `[::1]`) or the host of `public_url`, so that a web page
+  cannot reach the endpoint through DNS rebinding.
 - To let agents on other machines in, bind another address and set up TLS
   (`security.tls_cert`, `tls_key`): the endpoint then speaks HTTPS with the same
   certificate. Without TLS, tokens cross the network in clear text, and the server warns.

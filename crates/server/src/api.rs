@@ -186,10 +186,23 @@ impl Ctx {
 
     /// Who the bearer credential `token` belongs to: the holder of the server token, or an
     /// API token.
-    pub(crate) fn bearer_login(&self, token: &str) -> Option<Principal> {
+    /// The login of a bearer token at an endpoint: the MCP endpoint's public URL
+    /// (`audience`), or `None` elsewhere. An OAuth access token logs in only at the
+    /// endpoint it was issued for.
+    pub(crate) fn bearer_login(&self, token: &str, audience: Option<&str>) -> Option<Principal> {
         match &self.token {
             Some(t) if same_secret(token, t) => Some(Principal::Token),
-            _ => self.users.as_ref()?.authenticate_token(token),
+            _ => {
+                let users = self.users.as_ref()?;
+                let who = users.authenticate_token(token)?;
+                if let Principal::ApiToken { id, .. } = &who
+                    && let Some(a) = users.token_audience(id)
+                    && Some(a.as_str()) != audience
+                {
+                    return None;
+                }
+                Some(who)
+            }
         }
     }
 
@@ -502,7 +515,7 @@ fn authenticate(ctx: &Ctx, req: &Request) -> Option<Principal> {
     let (scheme, value) = header.split_once(' ')?;
     let value = value.trim();
     if scheme.eq_ignore_ascii_case("bearer") {
-        return ctx.bearer_login(value);
+        return ctx.bearer_login(value, None);
     }
     if scheme.eq_ignore_ascii_case("basic") {
         let decoded = String::from_utf8(crypto::base64_decode(value)?).ok()?;
@@ -553,23 +566,7 @@ pub(crate) fn same_secret(given: &str, secret: &str) -> bool {
 }
 
 fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && let Some(v) = s
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(v);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::http::percent_decode(s, false)
 }
 
 // ---- errors -------------------------------------------------------------------------------

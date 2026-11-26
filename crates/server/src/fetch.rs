@@ -246,6 +246,115 @@ pub(crate) fn post(
     Ok((status, answer))
 }
 
+/// Whether `ip` is a public address: not loopback, private, link-local, shared,
+/// multicast, documentation or otherwise special.
+pub(crate) fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 192 && b == 0)
+                || (a == 198 && (18..20).contains(&b))
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || first == 0x2001 && v6.segments()[1] == 0xdb8
+                || first == 0x64 && v6.segments()[1] == 0xff9b)
+        }
+    }
+}
+
+/// The most bytes [`get_public`] reads.
+const MAX_PUBLIC: u64 = 64 << 10;
+const PUBLIC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET`s a small JSON document from an `https://` URL someone else chose (an OAuth
+/// client's metadata document): only from public addresses (every address of the host
+/// must be one), from `hosts` when that is not empty, without redirects, within 5
+/// seconds, at most 64 KiB. Returns the body of a `200`.
+pub(crate) fn get_public(url: &str, hosts: &[String]) -> Result<String, String> {
+    let u = Url::parse(url)?;
+    if !u.tls {
+        return Err("only https:// URLs are fetched".into());
+    }
+    if u.path == "/" {
+        return Err("the URL needs a path".into());
+    }
+    if !hosts.is_empty() && !hosts.iter().any(|h| h.eq_ignore_ascii_case(&u.host)) {
+        return Err(format!("{} is not in mcp.oauth_client_hosts", u.host));
+    }
+    let addrs: Vec<std::net::SocketAddr> =
+        (u.host.as_str(), u.port).to_socket_addrs().map_err(|e| format!("{}: {e}", u.host))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{} has no address", u.host));
+    }
+    if let Some(a) = addrs.iter().find(|a| !is_public(a.ip())) {
+        return Err(format!("{} has the address {}, which is not public", u.host, a.ip()));
+    }
+    // Connect to the address checked, not to the name again.
+    let tcp = TcpStream::connect_timeout(&addrs[0], PUBLIC_TIMEOUT).map_err(|e| e.to_string())?;
+    let io = |e: io::Error| e.to_string();
+    tcp.set_read_timeout(Some(PUBLIC_TIMEOUT)).map_err(io)?;
+    tcp.set_write_timeout(Some(PUBLIC_TIMEOUT)).map_err(io)?;
+    let deadline = std::time::Instant::now() + PUBLIC_TIMEOUT;
+    let mut stream = connect(&u, tcp).map_err(io)?;
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: graphbuff-server/{}\r\nAccept: application/json\r\n\
+         Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+        u.path,
+        host_header(&u),
+        env!("CARGO_PKG_VERSION")
+    )
+    .map_err(io)?;
+    stream.flush().map_err(io)?;
+    let mut r = BufReader::new(stream);
+    let (status, line, headers) = head(&mut r).map_err(io)?;
+    if status != 200 {
+        return Err(format!("the server answered {line} (redirects are not followed)"));
+    }
+    let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+    let mut body = Vec::new();
+    let mut reader: Box<dyn Read> = if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+        Box::new(Chunked { r, left: 0, done: false })
+    } else {
+        Box::new(r)
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("it took longer than 5 seconds".into());
+        }
+        let n = reader.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+        if body.len() as u64 > MAX_PUBLIC {
+            return Err("it is larger than 64 KiB".into());
+        }
+    }
+    String::from_utf8(body).map_err(|_| "it is not UTF-8".to_string())
+}
+
 /// One `GET`.
 fn get(url: &Url) -> io::Result<Reply> {
     let tcp = open_tcp(url)?;
@@ -431,6 +540,23 @@ mod tests {
         assert_eq!(Url::parse("http://[::1]:9/x").unwrap().host, "::1");
         assert!(Url::parse("ftp://h/x").is_err());
         assert!(Url::parse("http://user:pw@h/x").is_err());
+        for (ip, public) in [
+            ("8.8.8.8", true),
+            ("127.0.0.1", false),
+            ("10.1.2.3", false),
+            ("172.16.0.1", false),
+            ("192.168.1.1", false),
+            ("169.254.169.254", false),
+            ("100.64.0.1", false),
+            ("0.0.0.0", false),
+            ("2606:4700::1111", true),
+            ("::1", false),
+            ("fd00::1", false),
+            ("fe80::1", false),
+            ("::ffff:127.0.0.1", false),
+        ] {
+            assert_eq!(is_public(ip.parse().unwrap()), public, "{ip}");
+        }
         assert_eq!(u.join("/c.csv"), "https://Data.example.com/c.csv");
         assert_eq!(u.join("c.csv"), "https://Data.example.com/a/c.csv");
         assert_eq!(u.join("http://other/x"), "http://other/x");
