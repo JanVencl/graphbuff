@@ -405,7 +405,7 @@ impl OAuth {
         if get("response_type") != Some("code") {
             return back("unsupported_response_type", "only response_type=code is supported");
         }
-        let Some(challenge) = get("code_challenge").filter(|c| (43..=128).contains(&c.len())) else {
+        let Some(challenge) = get("code_challenge").filter(|c| s256_challenge_ok(c)) else {
             return back("invalid_request", "PKCE is required: send code_challenge (S256)");
         };
         if get("code_challenge_method") != Some("S256") {
@@ -698,6 +698,15 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Whether `challenge` can be an S256 code challenge: a SHA-256 hash in unpadded
+/// base64url, 43 characters, the last of which carries 2 bits only.
+fn s256_challenge_ok(challenge: &str) -> bool {
+    let b = challenge.as_bytes();
+    b.len() == 43
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(c))
+        && b"AEIMQUYcgkosw048".contains(&b[42])
+}
+
 /// `base64url(sha256(verifier)) == challenge`, and the verifier is well formed.
 fn pkce_ok(verifier: &str, challenge: &str) -> bool {
     if !(43..=128).contains(&verifier.len()) || !verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)) {
@@ -875,6 +884,12 @@ mod tests {
         assert!(pkce_ok("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
         assert!(!pkce_ok("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXx", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
         assert!(!pkce_ok("short", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
+        assert!(s256_challenge_ok("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
+        assert!(!s256_challenge_ok("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cMA"), "44 characters");
+        assert!(!s256_challenge_ok("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c"), "42 characters");
+        assert!(!s256_challenge_ok("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw+cM"), "not base64url");
+        assert!(!s256_challenge_ok("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cN"), "bits past the hash");
+        assert!(!s256_challenge_ok(&"a".repeat(128)), "a plain verifier");
     }
 
     #[test]
