@@ -17,12 +17,12 @@ use super::tools::{Input, Output};
 const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The arguments of the Cypher tools.
-struct Args {
-    query: String,
-    params: BTreeMap<String, Value>,
-    database: Option<String>,
-    max_rows: usize,
-    dry_run: bool,
+pub(crate) struct Args {
+    pub query: String,
+    pub params: BTreeMap<String, Value>,
+    pub database: Option<String>,
+    pub max_rows: usize,
+    pub dry_run: bool,
 }
 
 fn args(i: &Input, write: bool) -> Result<Args, String> {
@@ -134,11 +134,16 @@ pub(crate) fn write_cypher(i: &Input) -> Output {
 }
 
 fn run(i: &Input, write: bool) -> Output {
+    match args(i, write) {
+        Ok(a) => execute(i, &a, write),
+        Err(e) => Output::error(e),
+    }
+}
+
+/// Runs `a.query` as `read_cypher` (or, with `write`, `write_cypher`) does: checked,
+/// listed, limited and rendered.
+pub(crate) fn execute(i: &Input, a: &Args, write: bool) -> Output {
     let ctx = i.ctx;
-    let a = match args(i, write) {
-        Ok(a) => a,
-        Err(e) => return Output::error(e),
-    };
     let current = match &a.database {
         Some(d) => match ctx.mgr.database(d) {
             Ok(_) => ctx.mgr.resolve_name(&d.to_ascii_lowercase()),

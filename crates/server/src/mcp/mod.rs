@@ -12,6 +12,7 @@
 
 mod bridge;
 mod cypher;
+mod explore;
 mod render;
 mod rpc;
 mod schema;
@@ -106,6 +107,7 @@ much as Neo4j is.
 default database unless given `database`.
 - Call get_schema before writing queries: it gives the labels, relationship types, properties with their \
 types, the patterns (:A)-[:TYPE]->(:B) that occur, and the indexes. Use only names it lists.
+- To look around without Cypher: get_node, neighbors (a node's relationships and neighbours) and find_path.
 - Read with read_cypher; change data, indexes or constraints with write_cypher. Try a change with \
 dry_run: true first when you are not sure of it; it reports the update counts and is rolled back.
 - Pass values as params ({\"name\": \"Ann\"} for $name), never pasted into the query text.
