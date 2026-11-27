@@ -231,6 +231,11 @@ impl Kernels for WgpuKernels {
         "wgpu"
     }
 
+    fn device(&self) -> String {
+        let f64 = if self.has_f64() { "" } else { "; PageRank on the CPU, no 64-bit floats" };
+        format!("wgpu, {}{f64}", self.adapter())
+    }
+
     fn expand(&self, csr: &Csr, sources: &[u32], dir: Direction, types: &[u32]) -> ExpandBatch {
         self.cpu.expand(csr, sources, dir, types)
     }

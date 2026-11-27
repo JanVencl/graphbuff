@@ -104,6 +104,7 @@ pub struct LocalEmbedder {
     config: EmbedderConfig,
     default_model: Option<String>,
     device: Device,
+    adapter: Option<String>,
     pool: rayon::ThreadPool,
     cache: ModelCache<LoadedModel>,
     counters: Counters,
@@ -120,15 +121,29 @@ impl std::fmt::Debug for LocalEmbedder {
     }
 }
 
-/// The device of `kind`.
-fn device(kind: DeviceKind) -> std::result::Result<Device, String> {
+/// The device of `kind`, and for the GPU its adapter (name and graphics API).
+fn device(kind: DeviceKind) -> std::result::Result<(Device, Option<String>), String> {
     match kind {
-        DeviceKind::Cpu => Ok(Device::from(burn::backend::FlexDevice)),
+        DeviceKind::Cpu => Ok((Device::from(burn::backend::FlexDevice), None)),
         #[cfg(feature = "gpu")]
-        DeviceKind::Gpu => Ok(Device::from(burn::backend::WgpuDevice::default())),
+        DeviceKind::Gpu => gpu_device().map(|(d, a)| (d, Some(a))),
         #[cfg(not(feature = "gpu"))]
         DeviceKind::Gpu => Err("the GPU needs a build with the `gpu` feature".into()),
     }
+}
+
+/// The wgpu device, brought up once per process so that its adapter is known (and a
+/// machine without one fails here, not in the first query).
+#[cfg(feature = "gpu")]
+fn gpu_device() -> std::result::Result<(Device, String), String> {
+    static GPU: std::sync::OnceLock<std::result::Result<(Device, String), String>> = std::sync::OnceLock::new();
+    GPU.get_or_init(|| {
+        let (device, setup) =
+            Device::wgpu_options().init_with_setup().map_err(|e| format!("no GPU for the embedding models: {e}"))?;
+        let info = setup.adapter.get_info();
+        Ok((device, format!("{} ({:?})", info.name, info.backend)))
+    })
+    .clone()
 }
 
 impl LocalEmbedder {
@@ -157,8 +172,10 @@ impl LocalEmbedder {
             .thread_name(|i| format!("graphbuff-embed-{i}"))
             .build()
             .map_err(|e| format!("starting the embedding threads: {e}"))?;
+        let (device, adapter) = device(config.device)?;
         Ok(LocalEmbedder {
-            device: device(config.device)?,
+            device,
+            adapter,
             cache: ModelCache::new(config.max_loaded_models),
             registry,
             config,
@@ -187,6 +204,11 @@ impl LocalEmbedder {
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// The GPU adapter the models run on (name and graphics API); `None` on the CPU.
+    pub fn adapter(&self) -> Option<&str> {
+        self.adapter.as_deref()
     }
 
     /// The model used when a query names none.

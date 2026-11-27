@@ -596,7 +596,10 @@ fn start_embedding(
         dir.display(),
         names.join(", "),
         embedder.default_model().unwrap_or("none (queries name the model)"),
-        if e.device == settings::EmbedDevice::Gpu { "gpu" } else { "cpu" }
+        match embedder.adapter() {
+            Some(a) => format!("gpu ({a})"),
+            None => "cpu".to_string(),
+        }
     ));
     mgr.set_embedder(Arc::new(embedder));
     Ok(())
@@ -816,7 +819,10 @@ fn main() {
     });
     if gpu {
         match graphbuff::gpu_kernels() {
-            Ok(k) => mgr.set_kernels(k),
+            Ok(k) => {
+                log.info(format_args!("queries: graph kernels on the GPU ({})", k.device()));
+                mgr.set_kernels(k);
+            }
             Err(e) => fatal(&format!("queries.gpu: {e}")),
         }
     }

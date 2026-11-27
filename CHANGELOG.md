@@ -3,6 +3,16 @@
 Notable changes per release. Releases are also tagged (`vX.Y.Z`); the tag messages carry
 the same notes.
 
+## Unreleased
+
+### Changed
+
+- The server logs the GPU adapter it uses at startup: `queries: graph kernels on the GPU
+  (wgpu, AMD Radeon RX 5700 XT (Vulkan))` with `gpu = true`, and `device: gpu (…)` in the
+  embedding line with `device = "gpu"`. The embedding models' GPU is now set up at startup,
+  so a machine without one stops the server with an error instead of failing the first
+  `vector.embed`.
+
 ## 0.6.0 — 2026-11-27
 
 ### Added

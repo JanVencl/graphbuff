@@ -740,6 +740,12 @@ pub trait Kernels: Send + Sync {
     /// A short name for plans (`"cpu"`, `"wgpu"`, …).
     fn name(&self) -> &str;
 
+    /// What runs the kernels, for logs: the GPU backend names its adapter. By default,
+    /// [`Kernels::name`].
+    fn device(&self) -> String {
+        self.name().to_string()
+    }
+
     /// Expands every source (one per input row) over the relationships of `types` in
     /// `dir`. Output rows are grouped by input row, in input order; within a row they come
     /// in [`Csr::expand`] order, with self-loops once under `Direction::Both`.
