@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "graphbuff-core",
  "graphbuff-cypher",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "graphbuff",
  "graphbuff-server",
@@ -3385,18 +3385,18 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-core"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "graphbuff-cypher"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "graphbuff-core",
 ]
 
 [[package]]
 name = "graphbuff-embed"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "burn",
  "graphbuff",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-gpu"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytemuck",
  "graphbuff-core",
@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "argon2",
  "graphbuff",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "graphbuff-wasm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "graphbuff",
 ]

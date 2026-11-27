@@ -215,7 +215,7 @@ The `[embedding]` section of `graphbuff.toml`:
 | `batch_size` | 32 | Texts per forward pass |
 | `threads` | 0 (half the cores) | Threads that run the models, apart from the query threads |
 | `max_loaded_models` | 2 | Models kept in memory; the least recently used one is unloaded |
-| `device` | `cpu` | `gpu` runs the models through wgpu (a build with `embed` and `gpu`) |
+| `device` | `cpu` | `gpu` runs the models through wgpu (a build with `embed` and `gpu`, such as the macOS, Windows and `-gpu` Linux release archives) |
 
 ## Performance
 

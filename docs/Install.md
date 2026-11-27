@@ -129,6 +129,8 @@ graphbuff-VERSION-PLATFORM/
 |----------|---------|
 | Linux x86-64 (static, any distribution) | `graphbuff-linux-x86_64.tar.gz` |
 | Linux ARM64 (static, any distribution) | `graphbuff-linux-aarch64.tar.gz` |
+| Linux x86-64 with the GPU (glibc 2.35 or newer) | `graphbuff-linux-x86_64-gpu.tar.gz` |
+| Linux ARM64 with the GPU (glibc 2.35 or newer) | `graphbuff-linux-aarch64-gpu.tar.gz` |
 | macOS Apple silicon | `graphbuff-macos-arm64.tar.gz` |
 | macOS Intel | `graphbuff-macos-x86_64.tar.gz` |
 | Windows x86-64 | `graphbuff-windows-x86_64.zip` |
@@ -147,5 +149,11 @@ To load the movies demo graph, set `demo = "movies"` in `[storage]` of
 `config/graphbuff.toml` first.
 
 The binaries are built with the `tls` feature (HTTPS and Bolt over TLS; see
-[Users and TLS](Users.md)), not with `gpu`. Releases are cut by pushing a
+[Users and TLS](Users.md)) and the server with `embed` ([Text embeddings](Embeddings.md)).
+The servers for macOS (Metal), Windows (Direct3D 12 or Vulkan) and the `-gpu` Linux
+archives (Vulkan) are also built with `gpu`: `gpu = true` in `[queries]` runs graph kernels
+on the GPU ([GPU kernels](Kernels.md#gpu-kernels)) and `device = "gpu"` in `[embedding]`
+runs the embedding models there. Both are off in the shipped `config/graphbuff.toml`. The
+static Linux archives have no GPU: a statically linked program cannot load the Vulkan
+driver. The Docker image has no GPU either. Releases are cut by pushing a
 tag `vX.Y.Z` that matches the workspace version ([release.yml](../.github/workflows/release.yml)).

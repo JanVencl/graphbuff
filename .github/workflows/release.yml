@@ -1,13 +1,18 @@
 # Pushing a tag `vX.Y.Z` publishes a release:
 #   * archives of `graphbuff-server` (with TLS and embedding models) and `graphbuff-cli`
-#     (with TLS) for Linux
-#     (x86-64 and ARM64), macOS and Windows, plus SHA256SUMS, attached to the GitHub release of the tag;
+#     (with TLS) for Linux (x86-64 and ARM64), macOS and Windows, plus SHA256SUMS,
+#     attached to the GitHub release of the tag. The macOS and Windows servers and the
+#     `-gpu` Linux archives (glibc, so that they can load the Vulkan driver) have the GPU
+#     (`gpu` feature); the static Linux archives do not;
 #   * the image ghcr.io/janvencl/graphbuff, tagged X.Y.Z and latest (amd64 and arm64).
+# A pull request that changes this workflow builds the archives, and publishes nothing.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
 
 permissions:
   contents: read
@@ -21,7 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - shell: bash
+      - if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: |
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
@@ -38,12 +44,17 @@ jobs:
       matrix:
         include:
           # Statically linked (musl): runs on any x86-64 or ARM64 Linux, whatever its libc.
-          # The ARM64 build runs natively on GitHub's arm64 runner.
-          - { name: linux-x86_64,   os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
-          - { name: linux-aarch64,  os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { name: macos-arm64,    os: macos-latest,     target: aarch64-apple-darwin }
-          - { name: macos-x86_64,   os: macos-latest,     target: x86_64-apple-darwin }
-          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc }
+          # A static program cannot load the Vulkan driver, so these have no GPU.
+          # The ARM64 builds run natively on GitHub's arm64 runners.
+          - { name: linux-x86_64,      os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { name: linux-aarch64,     os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          # Dynamically linked (glibc 2.35 or newer), with the GPU (Vulkan).
+          - { name: linux-x86_64-gpu,  os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  gpu: true }
+          - { name: linux-aarch64-gpu, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, gpu: true }
+          # With the GPU: Metal on macOS, Direct3D 12 or Vulkan on Windows.
+          - { name: macos-arm64,       os: macos-latest,     target: aarch64-apple-darwin,      gpu: true }
+          - { name: macos-x86_64,      os: macos-latest,     target: x86_64-apple-darwin,       gpu: true }
+          - { name: windows-x86_64,    os: windows-latest,   target: x86_64-pc-windows-msvc,    gpu: true }
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -59,11 +70,13 @@ jobs:
       - name: Build
         run: >-
           cargo build --release --locked --target ${{ matrix.target }}
-          -p graphbuff-server -p graphbuff-cli --features graphbuff-server/tls,graphbuff-server/embed,graphbuff-cli/tls
+          -p graphbuff-server -p graphbuff-cli
+          --features graphbuff-server/tls,graphbuff-server/embed,graphbuff-cli/tls${{ matrix.gpu && ',graphbuff-server/gpu' || '' }}
       - name: Package
         shell: bash
         run: |
-          dir=graphbuff-${GITHUB_REF_NAME#v}-${{ matrix.name }}
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          dir=graphbuff-$version-${{ matrix.name }}
           mkdir -p "$dir/config/model" dist
           cp README.md "$dir/"
           cp packaging/config/graphbuff.toml "$dir/config/"
@@ -85,6 +98,7 @@ jobs:
 
   release:
     name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: archives
     runs-on: ubuntu-latest
     permissions:
@@ -111,6 +125,7 @@ jobs:
 
   image:
     name: container image
+    if: startsWith(github.ref, 'refs/tags/')
     needs: check
     runs-on: ubuntu-latest
     permissions:
