@@ -212,7 +212,7 @@ struct SelfCancelling(CancelHandle);
 
 impl Embedder for SelfCancelling {
     fn models(&self) -> Vec<ModelInfo> {
-        vec![ModelInfo { name: "m".into(), dimensions: 2, max_tokens: 8, loaded: false, matryoshka: false }]
+        vec![ModelInfo { name: "m".into(), dimensions: 2, max_tokens: 8, loaded: false, matryoshka: false, sparse: false, multi_vector: false }]
     }
 
     fn embed(&self, _: Option<&str>, texts: &[&str], _: &EmbedOptions, interrupt: &dyn Fn() -> Result<()>) -> Result<Vec<Vec<f32>>> {
@@ -412,4 +412,61 @@ fn chunk_arguments_are_checked() {
     }
     let db = db_with(Arc::new(Plain));
     assert!(matches!(db.execute("CALL vector.chunk('a') YIELD text RETURN text"), Err(Error::Unsupported(_))));
+}
+
+#[test]
+fn lexical_weights_and_per_token_vectors() {
+    let (db, _) = hash_db();
+    let one = |q: &str| db.execute(q).unwrap().rows[0][0].clone();
+    // HashEmbedder: weight 1 per distinct word; a vector per word.
+    assert_eq!(one("RETURN size(keys(vector.embedSparse('a b a c'))) AS n"), ResultValue::Int(3));
+    assert_eq!(one("RETURN vector.embedSparse('a b a c').a AS w"), ResultValue::Float(1.0));
+    assert_eq!(one("RETURN vector.embedSparse(null) AS w"), ResultValue::Null);
+    assert_eq!(one("RETURN size(vector.embedMulti('a b c', 'large')) AS n"), ResultValue::Int(3));
+    assert_eq!(one("RETURN size(vector.embedMulti('a b c', 'large')[0]) AS n"), ResultValue::Int(32));
+    // Scores.
+    assert_eq!(one("RETURN vector.sparseScore({a: 2, b: 0.5}, {b: 4.0, c: 9}) AS s"), ResultValue::Float(2.0));
+    assert_eq!(one("RETURN vector.sparseScore({a: 1}, {}) AS s"), ResultValue::Float(0.0));
+    assert_eq!(one("RETURN vector.sparseScore(null, {a: 1}) AS s"), ResultValue::Null);
+    // q1 best matches d1 (1), q2 best matches d2 (0.5): mean 0.75.
+    assert_eq!(one("RETURN vector.maxSim([[1, 0], [0, 1]], [[1, 0], [0, 0.5]]) AS s"), ResultValue::Float(0.75));
+    assert_eq!(one("RETURN vector.maxSim(vector.embedMulti('x y'), vector.embedMulti('y x x')) AS s"), ResultValue::Float(1.0));
+    assert_eq!(one("RETURN vector.maxSim(null, [[1]]) AS s"), ResultValue::Null);
+    let err = |q: &str| db.execute(q).unwrap_err().to_string();
+    assert!(err("RETURN vector.maxSim([[1, 0]], [[1]])").contains("different dimensions"));
+    assert!(err("RETURN vector.maxSim([], [[1]])").contains("at least one"));
+    assert!(err("RETURN vector.sparseScore({a: 'x'}, {})").contains("finite numbers"));
+    assert!(err("RETURN vector.sparseScore([1], {})").contains("MAP"));
+    assert!(err("RETURN vector.embedSparse('a', null, {dimensions: 4})").contains("single vectors"));
+    // embedBatch with output.
+    let r = db
+        .execute("CALL vector.embedBatch(['a b', null], null, {output: 'sparse'}) YIELD index, vector RETURN index, vector")
+        .unwrap();
+    assert!(matches!(&r.rows[0][1], ResultValue::Map(m) if m.len() == 2));
+    assert_eq!(r.rows[1][1], ResultValue::Null);
+    assert!(err("CALL vector.embedBatch(['a'], null, {output: 'colbert'}) YIELD vector RETURN vector").contains("'dense', 'sparse' or 'multi'"));
+    let r = db.execute("CALL vector.models() YIELD name, sparse, multiVector RETURN sparse, multiVector LIMIT 1").unwrap();
+    assert_eq!(r.rows[0], vec![ResultValue::Bool(true), ResultValue::Bool(true)]);
+
+    // Stored as properties (no maps, no lists of lists): tokens and weights, one flat list.
+    db.execute(
+        "WITH 'graph nodes edges' AS text \
+         WITH text, vector.embedSparse(text) AS w, vector.embedMulti(text) AS m \
+         CREATE (:Doc {text: text, lexTokens: keys(w), lexWeights: [t IN keys(w) | w[t]], \
+                       colbert: reduce(all = [], v IN m | all + v)})",
+    )
+    .unwrap();
+    let r = db
+        .execute(
+            "MATCH (d:Doc) WITH d, vector.embedSparse('graph edges') AS q, vector.embedMulti('graph edges') AS qm \
+             RETURN vector.sparseScore(q, d.lexTokens, d.lexWeights) AS lexical, vector.maxSim(qm, d.colbert) AS colbert, \
+                    vector.maxSim(qm, vector.embedMulti(d.text)) AS nested, size(d.colbert) AS floats",
+        )
+        .unwrap();
+    assert_eq!(r.get(0, "lexical"), Some(&ResultValue::Float(2.0)));
+    assert_eq!(r.get(0, "colbert"), Some(&ResultValue::Float(1.0)));
+    assert_eq!(r.get(0, "colbert"), r.get(0, "nested"));
+    assert_eq!(r.get(0, "floats"), Some(&ResultValue::Int(24)), "3 words of 8 dimensions");
+    assert!(err("RETURN vector.sparseScore({a: 1}, ['a', 'b'], [1.0])").contains("2 tokens but 1 weights"));
+    assert!(err("RETURN vector.maxSim([[1, 0]], [1, 0, 1])").contains("not vectors of the query's 2 dimensions"));
 }

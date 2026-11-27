@@ -36,7 +36,7 @@ use graphbuff::{EmbedOptions, EmbedStats, EmbedTask, Embedder, Error, ModelInfo,
 pub use manifest::{Architecture, Manifest, Matryoshka, Pooling};
 pub use registry::{FeedForward, ModelConfig, ModelSpec, Positions, Registry, Skipped};
 
-use encoder::Encoder;
+use encoder::{Encoder, Heads};
 use cache::ModelCache;
 use tokenize::{TextTokenizer, Tokens};
 
@@ -247,7 +247,8 @@ impl LocalEmbedder {
                 let weights = spec.dir.join(registry::WEIGHTS);
                 let model = accounting::exempt(|| -> std::result::Result<LoadedModel, String> {
                     let tokenizer = TextTokenizer::load(&spec.dir.join(registry::TOKENIZER), spec.max_tokens())?;
-                    let encoder = self.on_pool(|| Encoder::load(&weights, &spec.config, &self.device))?;
+                    let heads = Heads { sparse: spec.manifest.sparse, multi_vector: spec.manifest.multi_vector };
+                    let encoder = self.on_pool(|| Encoder::load(&weights, &spec.config, heads, &self.device))?;
                     Ok(LoadedModel { tokenizer, encoder })
                 })?;
                 let took = started.elapsed();
@@ -329,6 +330,8 @@ impl Embedder for LocalEmbedder {
                 max_tokens: m.max_tokens(),
                 loaded: self.cache.is_loaded(&m.name),
                 matryoshka: m.manifest.matryoshka.is_some(),
+                sparse: m.manifest.sparse,
+                multi_vector: m.manifest.multi_vector,
             })
             .collect()
     }
@@ -359,9 +362,88 @@ impl Embedder for LocalEmbedder {
         options: &EmbedOptions,
         interrupt: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<f32>>> {
-        let started = Instant::now();
         let spec = self.spec(model)?;
         let cut = cut_of(spec, options.dimensions)?;
+        let normalize = spec.manifest.normalize;
+        self.run(spec, texts, options, interrupt, |m, padded| {
+            // A cut vector is normalized after the cut, not before.
+            let full = m.encoder.embed(padded, spec.manifest.pooling, normalize && cut.is_none())?;
+            Ok(match cut {
+                None => full,
+                Some((how, dims)) => full.into_iter().map(|v| how.cut(v, dims, normalize)).collect(),
+            })
+        })
+    }
+
+    fn embed_sparse(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<(String, f32)>>> {
+        let spec = self.spec(model)?;
+        if !spec.manifest.sparse {
+            return Err(Error::Semantic(format!(
+                "embedding model '{}' gives no lexical weights (`sparse = true` in model.toml, for models with \
+                 `sparse_linear` such as bge-m3)",
+                spec.name
+            )));
+        }
+        self.run(spec, texts, options, interrupt, |m, padded| {
+            let specials = m.tokenizer.special_ids();
+            let weights = m.encoder.sparse(padded)?;
+            Ok(weights
+                .into_iter()
+                .enumerate()
+                .map(|(r, w)| {
+                    // Each token once, with its largest weight (as bge-m3 does).
+                    let mut best: std::collections::BTreeMap<u32, f32> = std::collections::BTreeMap::new();
+                    for (&id, &x) in padded.ids[r * padded.width..].iter().zip(&w) {
+                        let id = id as u32;
+                        if x > 0.0 && !specials.contains(&id) {
+                            let e = best.entry(id).or_insert(x);
+                            *e = e.max(x);
+                        }
+                    }
+                    best.into_iter().filter_map(|(id, x)| m.tokenizer.token(id).map(|t| (t, x))).collect()
+                })
+                .collect())
+        })
+    }
+
+    fn embed_multi(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let spec = self.spec(model)?;
+        if !spec.manifest.multi_vector {
+            return Err(Error::Semantic(format!(
+                "embedding model '{}' gives no per-token vectors (`multi_vector = true` in model.toml, for models with \
+                 `colbert_linear` such as bge-m3)",
+                spec.name
+            )));
+        }
+        self.run(spec, texts, options, interrupt, |m, padded| m.encoder.multi(padded, spec.manifest.normalize))
+    }
+}
+
+impl LocalEmbedder {
+    /// `texts` with their prefixes, tokenized, sorted by length into batches, each passed
+    /// to `pass` (on the embedding threads) for one result per row; the results in the
+    /// order of `texts`.
+    fn run<T: Default + Clone + Send>(
+        &self,
+        spec: &ModelSpec,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+        pass: impl Fn(&LoadedModel, &tokenize::Padded) -> std::result::Result<Vec<T>, String> + Sync,
+    ) -> Result<Vec<T>> {
+        let started = Instant::now();
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -374,23 +456,15 @@ impl Embedder for LocalEmbedder {
         // Batches of similar lengths pad less: sort by length, embed, put back in order.
         let mut order: Vec<usize> = (0..tokens.len()).collect();
         order.sort_by_key(|&i| tokens[i].ids.len());
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); tokens.len()];
+        let mut out: Vec<T> = vec![T::default(); tokens.len()];
         for chunk in order.chunks(self.config.batch_size.max(1)) {
             let padded = m.tokenizer.pad(&chunk.iter().map(|&i| &tokens[i]).collect::<Vec<_>>());
             // The pass runs on the pool's threads, whose memory the query's thread does
             // not count: charge its estimate to the query while it runs (and check it).
             let _charge = accounting::charge(m.encoder.activation_bytes(padded.rows, padded.width));
             interrupt()?;
-            let normalize = spec.manifest.normalize;
             let vectors = self
-                .on_pool(|| {
-                    // A cut vector is normalized after the cut, not before.
-                    let full = m.encoder.embed(&padded, spec.manifest.pooling, normalize && cut.is_none())?;
-                    Ok(match cut {
-                        None => full,
-                        Some((how, dims)) => full.into_iter().map(|v| how.cut(v, dims, normalize)).collect(),
-                    })
-                })
+                .on_pool(|| pass(&m, &padded))
                 .map_err(|e| Error::Runtime(format!("embedding model '{}': {e}", spec.name)))?;
             for (&i, v) in chunk.iter().zip(vectors) {
                 out[i] = v;

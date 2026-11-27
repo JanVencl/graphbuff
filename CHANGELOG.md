@@ -23,6 +23,16 @@ the same notes.
   text's own length, so a vector does not depend on its batch. `fetch-model.py` takes
   `--rotary-scaling`. Number values (`1.5`) are now allowed in `model.toml`. See
   [Longer inputs](docs/Embeddings.md#longer-inputs-rotary-scaling).
+- bge-m3's lexical weights and ColBERT vectors: `vector.embedSparse(text, model?,
+  options?)` gives a map of token to weight, `vector.embedMulti(…)` a vector per token,
+  and `vector.sparseScore(a, b)` and `vector.maxSim(query, document)` score them as
+  FlagEmbedding does, also from their stored forms (two lists; one flat list).
+  `vector.embedBatch` takes `{output: 'sparse' | 'multi'}`. For re-ranking: there is no
+  index for them. A model has them with `sparse = true` and `multi_vector = true` in
+  `model.toml`; `vector.models()` yields `sparse` and `multiVector`. `fetch-model.py
+  bge-m3` converts bge-m3's PyTorch weights and heads to one `model.safetensors` (needs
+  torch and safetensors). See
+  [Lexical weights and ColBERT](docs/Embeddings.md#lexical-weights-and-colbert-bge-m3).
 
 ### Changed
 

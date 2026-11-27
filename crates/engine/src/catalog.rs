@@ -144,6 +144,10 @@ pub(crate) const FUNCTIONS: &[Entry] = &[
     ("point.withinBBox", "Spatial", "point.withinBBox(point :: POINT, lowerLeft :: POINT, upperRight :: POINT) :: BOOLEAN", "Whether a point lies within a box."),
     // ---- vectors ----
     ("vector.embed", "Vector", "vector.embed(text :: STRING, model = null :: STRING, options = null :: MAP) :: LIST<FLOAT>", "The embedding of a text, by an installed model (the default one if none is named)."),
+    ("vector.embedSparse", "Vector", "vector.embedSparse(text :: STRING, model = null :: STRING, options = null :: MAP) :: MAP", "The lexical weights of a text (token to weight), by a model that has them (bge-m3)."),
+    ("vector.embedMulti", "Vector", "vector.embedMulti(text :: STRING, model = null :: STRING, options = null :: MAP) :: LIST<LIST<FLOAT>>", "A vector per token of a text (ColBERT), by a model that has them (bge-m3)."),
+    ("vector.sparseScore", "Vector", "vector.sparseScore(a :: MAP, b :: MAP | tokens :: LIST<STRING>, weights = null :: LIST<FLOAT>) :: FLOAT", "The dot product of two lexical weight maps over the tokens they share; the second may be two lists (tokens, weights), as stored."),
+    ("vector.maxSim", "Vector", "vector.maxSim(query :: LIST<LIST<FLOAT>>, document :: LIST<LIST<FLOAT>> | LIST<FLOAT>) :: FLOAT", "ColBERT late interaction: each query vector's best dot product with a document vector, averaged; the document may be one flat list, as stored."),
     ("vector.similarity.cosine", "Vector", "vector.similarity.cosine(a :: LIST<INTEGER | FLOAT>, b :: LIST<INTEGER | FLOAT>) :: FLOAT", "The cosine similarity of two vectors, scaled to [0, 1]."),
     ("vector.similarity.euclidean", "Vector", "vector.similarity.euclidean(a :: LIST<INTEGER | FLOAT>, b :: LIST<INTEGER | FLOAT>) :: FLOAT", "The Euclidean similarity of two vectors, 1 / (1 + d²)."),
     // ---- APOC subset ----

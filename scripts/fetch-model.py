@@ -11,9 +11,14 @@ model.toml, in <dir>/<name>/. Restart graphbuff-server to use the model (built w
 `embed` feature). BERT, XLM-RoBERTa and nomic-bert models with F32, F16 or BF16 safetensors
 weights work; the architecture is read from config.json.
 
+bge-m3 publishes PyTorch files only (pytorch_model.bin and its sparse and ColBERT heads,
+sparse_linear.pt and colbert_linear.pt): they are converted to one model.safetensors,
+which needs torch and safetensors (pip install torch safetensors). They are read with
+torch.load(weights_only=True), which loads tensors and nothing else.
+
 The default folder: the folder this script is in when that is called `model` (the release
 archives ship it there), else ./model. HF_ENDPOINT changes the server (a mirror). Python 3.8+,
-no packages needed.
+no packages needed for the other models.
 """
 
 import argparse
@@ -36,6 +41,11 @@ KNOWN = {
     "multilingual-e5-base": ("intfloat/multilingual-e5-base", "mean", 512, "query: ", "passage: ", None),
     "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", "mean", 2048, "search_query: ", "search_document: ",
                          "layer-norm"),
+    "bge-m3": ("BAAI/bge-m3", "cls", 512, "", "", None),
+}
+# Repositories that publish PyTorch weights only: (weights file, {head file: its key prefix}).
+PYTORCH = {
+    "BAAI/bge-m3": ("pytorch_model.bin", {"sparse_linear.pt": "sparse_linear", "colbert_linear.pt": "colbert_linear"}),
 }
 # config.json's model_type: the architecture in model.toml.
 ARCHITECTURES = {"bert": "bert", "xlm-roberta": "xlm-roberta", "nomic_bert": "nomic-bert"}
@@ -64,6 +74,26 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 def default_dir():
     here = os.path.dirname(os.path.abspath(__file__))
     return here if os.path.basename(here) == "model" else os.path.join(os.getcwd(), "model")
+
+
+def convert_pytorch(work, weights, heads):
+    """Writes <work>/model.safetensors from the PyTorch `weights` file and the `heads` ({file:
+    prefix}) in <work>, and removes them. Returns the prefixes of the heads."""
+    try:
+        import torch
+        from safetensors.torch import save_file
+    except ImportError:
+        raise ValueError("its weights are PyTorch files; converting them needs torch and safetensors "
+                         "(pip install torch safetensors)")
+    state = torch.load(os.path.join(work, weights), map_location="cpu", weights_only=True)
+    for f, prefix in heads.items():
+        for k, v in torch.load(os.path.join(work, f), map_location="cpu", weights_only=True).items():
+            state[f"{prefix}.{k}"] = v
+    # Tied or shared tensors cannot be saved as they are; each gets its own copy.
+    save_file({k: v.detach().clone().contiguous() for k, v in state.items()}, os.path.join(work, "model.safetensors"))
+    for f in [weights, *heads]:
+        os.remove(os.path.join(work, f))
+    return list(heads.values())
 
 
 def toml_str(s):
@@ -135,8 +165,11 @@ def main():
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     os.makedirs(a.dir, exist_ok=True)
     work = tempfile.mkdtemp(prefix=f".{a.name}-", dir=a.dir)
+    pytorch = PYTORCH.get(repo)
+    files = FILES if not pytorch else (*FILES[:-1], pytorch[0], *pytorch[1])
+    heads = []
     try:
-        for f in FILES:
+        for f in files:
             url = f"{endpoint}/{repo}/resolve/{a.revision}/{f}"
             print(f"fetching {url}")
             download(url, os.path.join(work, f))
@@ -144,6 +177,9 @@ def main():
                 # Before the weights: a model graphbuff cannot run is not downloaded.
                 with open(os.path.join(work, f), encoding="utf-8") as c:
                     arch, dims, limit = model_shape(json.load(c), a.rotary_scaling)
+        if pytorch:
+            print("converting the PyTorch weights to model.safetensors")
+            heads = convert_pytorch(work, pytorch[0], pytorch[1])
         max_tokens = min(max_tokens or limit, limit)
         with open(os.path.join(work, "model.toml"), "w", encoding="utf-8") as f:
             f.write(f"# {repo} (revision {a.revision}), fetched by fetch-model.py\n"
@@ -151,7 +187,9 @@ def main():
                     f"pooling = \"{pooling}\"\nnormalize = true\n"
                     f"query_prefix = {toml_str(qp)}\ndoc_prefix = {toml_str(dp)}\n"
                     + (f"matryoshka = \"{mr}\"\n" if mr else "")
-                    + (f"rotary_scaling = {a.rotary_scaling:g}\n" if a.rotary_scaling else ""))
+                    + (f"rotary_scaling = {a.rotary_scaling:g}\n" if a.rotary_scaling else "")
+                    + ("sparse = true\n" if "sparse_linear" in heads else "")
+                    + ("multi_vector = true\n" if "colbert_linear" in heads else ""))
         if os.path.exists(target):
             shutil.rmtree(target)
         os.replace(work, target)
@@ -161,7 +199,7 @@ def main():
         return 1
     except urllib.error.URLError as e:
         shutil.rmtree(work, ignore_errors=True)
-        print(f"cannot fetch {repo}: {e} (is the repository public, with {', '.join(FILES)}?)", file=sys.stderr)
+        print(f"cannot fetch {repo}: {e} (is the repository public, with {', '.join(files)}?)", file=sys.stderr)
         return 1
     except Exception:
         shutil.rmtree(work, ignore_errors=True)

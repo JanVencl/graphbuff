@@ -10,6 +10,8 @@
 //! doc_prefix   = ""       # put before documents (the default task)
 //! matryoshka   = "layer-norm"  # optional: truncate | layer-norm (see below)
 //! rotary_scaling = 2      # optional, nomic-bert: inputs past the trained length
+//! sparse       = false    # the weights have `sparse_linear` (bge-m3's lexical weights)
+//! multi_vector = false    # the weights have `colbert_linear` (bge-m3's ColBERT vectors)
 //! ```
 //!
 //! `matryoshka` says the model was trained so that the start of its vector is a good
@@ -113,6 +115,10 @@ pub struct Manifest {
     pub matryoshka: Option<Matryoshka>,
     /// `None`: as `config.json` says.
     pub rotary_scaling: Option<f64>,
+    /// Lexical weights from `sparse_linear` (`vector.embedSparse`).
+    pub sparse: bool,
+    /// A vector per token from `colbert_linear` (`vector.embedMulti`).
+    pub multi_vector: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,10 +181,19 @@ impl Manifest {
             Some(Toml::Float(f)) if f >= 1.0 && f.is_finite() => Some(f),
             Some(_) => return Err("`rotary_scaling` must be a number of at least 1".into()),
         };
+        let mut flag = |key: &str| match take(key) {
+            None => Ok(false),
+            Some(Toml::Bool(b)) => Ok(b),
+            Some(_) => Err(format!("`{key}` must be true or false")),
+        };
+        let sparse = flag("sparse")?;
+        let multi_vector = flag("multi_vector")?;
         if let Some(key) = values.keys().next() {
             return Err(format!("unknown key `{key}`"));
         }
         Ok(Manifest {
+            sparse,
+            multi_vector,
             architecture,
             dimensions,
             max_tokens,
@@ -324,6 +339,8 @@ mod tests {
             ("architecture = \"nomic-bert\"\ndimensions = 8\nrotary_scaling = 0.5", "`rotary_scaling`"),
             ("architecture = \"nomic-bert\"\ndimensions = 8\nrotary_scaling = \"2\"", "`rotary_scaling`"),
             ("architecture = \"bert\"\ndimensions = 8.5", "positive integer"),
+            ("architecture = \"bert\"\ndimensions = 8\nsparse = 1", "`sparse`"),
+            ("architecture = \"bert\"\ndimensions = 8\nmulti_vector = \"yes\"", "`multi_vector`"),
             ("architecture = \"bert\"\ndimensions = 8\nmatryoshka = \"slice\"", "`matryoshka`"),
             ("architecture = \"bert\"\ndimensions = 8\ndims = 8", "unknown key `dims`"),
             ("architecture = \"bert\"\ndimensions = 8\ndimensions = 9", "set twice"),

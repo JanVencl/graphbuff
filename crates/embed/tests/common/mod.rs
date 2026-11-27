@@ -93,6 +93,35 @@ impl Reference {
             .collect()
     }
 
+    /// Per text a map of token to weight.
+    pub fn weights(&self, key: &str) -> Vec<Vec<(String, f64)>> {
+        self.field(key)
+            .iter()
+            .map(|r| match r {
+                Json::Object(o) => o
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Json::Float(f) => (k.clone(), *f),
+                        Json::Int(i) => (k.clone(), *i as f64),
+                        o => panic!("{o:?}"),
+                    })
+                    .collect(),
+                o => panic!("{o:?}"),
+            })
+            .collect()
+    }
+
+    /// Per text a list of vectors.
+    pub fn multi(&self, key: &str) -> Vec<Vec<Vec<f64>>> {
+        self.field(key)
+            .iter()
+            .map(|r| match r {
+                Json::Array(vs) => Reference(Json::Object([("v".to_string(), Json::Array(vs.clone()))].into_iter().collect())).vectors("v"),
+                o => panic!("{o:?}"),
+            })
+            .collect()
+    }
+
     pub fn vectors(&self, key: &str) -> Vec<Vec<f64>> {
         self.field(key)
             .iter()

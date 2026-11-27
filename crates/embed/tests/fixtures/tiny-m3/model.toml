@@ -1,0 +1,10 @@
+# tiny-xlmr with random bge-m3 heads (scripts/make_m3_fixture.py); not a useful model.
+architecture = "xlm-roberta"
+dimensions = 32
+max_tokens = 24
+pooling = "cls"
+normalize = true
+query_prefix = "query: "
+doc_prefix = ""
+sparse = true
+multi_vector = true

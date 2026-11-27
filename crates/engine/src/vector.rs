@@ -216,12 +216,107 @@ pub fn vector_arg(function: &str, v: &Value) -> Result<Option<Vec<f64>>> {
         .map(Some)
 }
 
-/// `vector.similarity.cosine(a, b)` and `vector.similarity.euclidean(a, b)` (`name`
-/// lowercased); `None` if `name` is not one of them.
+/// `vector.sparseScore(a, b)` or `vector.sparseScore(a, tokens, weights)`: the dot product
+/// of two maps of token to weight over the tokens they share (bge-m3's lexical matching
+/// score). The second as two lists is how it can be stored as properties (a property
+/// cannot hold a map).
+fn sparse_score(args: &[Value]) -> Result<Value> {
+    const NAME: &str = "vector.sparseScore";
+    if !(2..=3).contains(&args.len()) {
+        return Err(Error::Semantic(format!("{NAME}() expects 2 or 3 argument(s), got {}", args.len())));
+    }
+    let weights = |v: &Value| -> Result<Option<std::collections::BTreeMap<String, f64>>> {
+        match v {
+            Value::Null => Ok(None),
+            Value::Map(m) => m
+                .iter()
+                .map(|(k, x)| match x {
+                    Value::Int(i) => Ok((k.clone(), *i as f64)),
+                    Value::Float(f) if f.is_finite() => Ok((k.clone(), *f)),
+                    o => Err(Error::Type(format!("{NAME}(): weights must be finite numbers, not {}", o.type_name()))),
+                })
+                .collect::<Result<_>>()
+                .map(Some),
+            o => Err(Error::Type(format!("{NAME}() needs a MAP of token to weight, not {}", o.type_name()))),
+        }
+    };
+    let b = match args.len() {
+        2 => weights(&args[1])?,
+        _ => match (&args[1], &args[2]) {
+            (Value::Null, _) | (_, Value::Null) => None,
+            (Value::List(t), Value::List(w)) if t.len() == w.len() => {
+                let mut m = std::collections::BTreeMap::new();
+                for (t, w) in t.iter().zip(w) {
+                    let Value::String(t) = t else {
+                        return Err(Error::Type(format!("{NAME}(): tokens must be strings, not {}", t.type_name())));
+                    };
+                    m.insert(t.clone(), w.clone());
+                }
+                weights(&Value::Map(m))?
+            }
+            (Value::List(t), Value::List(w)) => {
+                return Err(Error::Semantic(format!("{NAME}(): {} tokens but {} weights", t.len(), w.len())));
+            }
+            _ => return Err(Error::Type(format!("{NAME}(): tokens and weights must be lists"))),
+        },
+    };
+    let (Some(a), Some(b)) = (weights(&args[0])?, b) else { return Ok(Value::Null) };
+    let (small, large) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    Ok(Value::Float(small.iter().filter_map(|(k, x)| large.get(k).map(|y| x * y)).sum()))
+}
+
+/// `vector.maxSim(query, document)`: for each query vector the largest dot product with a
+/// document vector, averaged over the query vectors (ColBERT's late interaction, as
+/// bge-m3 scores it). The document may also be its vectors one after another in one flat
+/// list, as it can be stored as a property (a property cannot hold a list of lists).
+fn max_sim(args: &[Value]) -> Result<Value> {
+    const NAME: &str = "vector.maxSim";
+    if args.len() != 2 {
+        return Err(Error::Semantic(format!("{NAME}() expects 2 argument(s), got {}", args.len())));
+    }
+    let vectors = |v: &Value| -> Result<Option<Vec<Vec<f64>>>> {
+        match v {
+            Value::Null => Ok(None),
+            Value::List(l) if l.is_empty() => Err(Error::Semantic(format!("{NAME}(): a list of vectors needs at least one"))),
+            Value::List(l) => l.iter().map(|x| vector_arg(NAME, x).map(|v| v.unwrap_or_default())).collect::<Result<_>>().map(Some),
+            o => Err(Error::Type(format!("{NAME}() needs a LIST<LIST<FLOAT>>, not {}", o.type_name()))),
+        }
+    };
+    let Some(q) = vectors(&args[0])? else { return Ok(Value::Null) };
+    let dims = q[0].len();
+    let flat = matches!(&args[1], Value::List(l) if l.first().is_some_and(|x| matches!(x, Value::Int(_) | Value::Float(_))));
+    let d = if flat {
+        let all = vector_arg(NAME, &args[1])?.unwrap_or_default();
+        if !all.len().is_multiple_of(dims) {
+            return Err(Error::Semantic(format!(
+                "{NAME}(): a flat document of {} numbers is not vectors of the query's {dims} dimensions",
+                all.len()
+            )));
+        }
+        all.chunks_exact(dims).map(<[f64]>::to_vec).collect()
+    } else {
+        match vectors(&args[1])? {
+            Some(d) => d,
+            None => return Ok(Value::Null),
+        }
+    };
+    if let Some(v) = q.iter().chain(&d).find(|v| v.len() != dims) {
+        return Err(Error::Semantic(format!("{NAME}(): the vectors have different dimensions ({dims} and {})", v.len())));
+    }
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let total: f64 = q.iter().map(|a| d.iter().map(|b| dot(a, b)).fold(f64::NEG_INFINITY, f64::max)).sum();
+    Ok(Value::Float(total / q.len() as f64))
+}
+
+/// `vector.similarity.cosine(a, b)`, `vector.similarity.euclidean(a, b)`,
+/// `vector.sparseScore(a, b)` and `vector.maxSim(q, d)` (`name` lowercased); `None` if
+/// `name` is not one of them.
 pub fn vector_function(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let (shown, similarity) = match name {
         "vector.similarity.cosine" => ("vector.similarity.cosine", Similarity::Cosine),
         "vector.similarity.euclidean" => ("vector.similarity.euclidean", Similarity::Euclidean),
+        "vector.sparsescore" => return sparse_score(args).map(Some),
+        "vector.maxsim" => return max_sim(args).map(Some),
         n if n.starts_with("vector.") => {
             return Err(Error::Unsupported(format!("function `{name}` is not supported")));
         }
