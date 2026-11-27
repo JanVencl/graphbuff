@@ -71,7 +71,7 @@ fn request(s: &mut BufReader<Tls>, method: &str, path: &str, body: &str) -> (u16
     let mut line = String::new();
     s.read_line(&mut line).unwrap();
     let status = line.split(' ').nth(1).unwrap().parse().unwrap();
-    let mut len = 0;
+    let (mut len, mut chunked) = (0, false);
     loop {
         let mut h = String::new();
         s.read_line(&mut h).unwrap();
@@ -79,14 +79,38 @@ fn request(s: &mut BufReader<Tls>, method: &str, path: &str, body: &str) -> (u16
         if h.is_empty() {
             break;
         }
-        if let Some((n, v)) = h.split_once(':')
-            && n.eq_ignore_ascii_case("content-length")
-        {
-            len = v.trim().parse().unwrap();
+        if let Some((n, v)) = h.split_once(':') {
+            if n.eq_ignore_ascii_case("content-length") {
+                len = v.trim().parse().unwrap();
+            } else if n.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = v.trim().eq_ignore_ascii_case("chunked");
+            }
         }
     }
-    let mut body = vec![0; len];
-    s.read_exact(&mut body).unwrap();
+    if !chunked {
+        let mut body = vec![0; len];
+        s.read_exact(&mut body).unwrap();
+        return (status, String::from_utf8(body).unwrap());
+    }
+    // A large result is streamed: chunks until a zero-length one, then the (empty) trailer.
+    let mut body = Vec::new();
+    loop {
+        let mut size = String::new();
+        s.read_line(&mut size).unwrap();
+        let size = usize::from_str_radix(size.trim_end().split(';').next().unwrap(), 16).unwrap();
+        if size == 0 {
+            let mut end = String::new();
+            s.read_line(&mut end).unwrap();
+            assert_eq!(end, "\r\n", "no trailers");
+            break;
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        s.read_exact(&mut body[start..]).unwrap();
+        let mut crlf = [0; 2];
+        s.read_exact(&mut crlf).unwrap();
+        assert_eq!(&crlf, b"\r\n");
+    }
     (status, String::from_utf8(body).unwrap())
 }
 
@@ -103,8 +127,14 @@ fn https_requests() {
     assert_eq!(status, 200);
     assert!(body.contains("100000"), "{body}");
     let (status, body) = request(&mut s, "POST", "/query", r#"{"query":"UNWIND range(1, 20000) AS i RETURN i"}"#);
+    // Larger than the server keeps in memory: it is streamed, chunked.
     assert_eq!(status, 200);
-    assert!(body.len() > 100_000);
+    assert!(body.len() > 100_000, "{} bytes", body.len());
+    assert!(body.contains("[20000]") && body.trim_end().ends_with('}'), "the whole result");
+    // And the connection is still good after it.
+    let (status, body) = request(&mut s, "POST", "/query", r#"{"query":"RETURN 2 AS x"}"#);
+    assert_eq!(status, 200);
+    assert!(body.contains(r#""rows":[[2]]"#), "{body}");
 
     // By IP address too (the certificate names 127.0.0.1).
     let mut s = BufReader::new(connect(server.local_addr(), "127.0.0.1"));
