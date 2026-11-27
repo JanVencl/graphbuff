@@ -329,6 +329,19 @@ fn rotary_scaling_past_the_trained_length() {
         let j = texts.iter().position(|t| t == short[i]).unwrap();
         assert_close(&format!("short {i} next to long ones"), v, &want[j], 1e-5);
     }
+    // Against Nomic's own model code with rotary_scaling_factor 2, each text alone
+    // (scripts/reference_long.py); here all in one batch.
+    let reference = Reference::read(&fixture_named("tiny-nomic").join("reference-long.json"));
+    let texts = reference.texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    for (i, ids) in reference.ids("ids").iter().enumerate() {
+        assert_eq!(&e.token_ids(None, &texts[i], &opts).unwrap(), ids, "token ids of text {i}");
+    }
+    let got = e.embed(None, &refs, &opts, &no_interrupt).unwrap();
+    for (i, (g, w)) in got.iter().zip(reference.vectors("mean")).enumerate() {
+        assert_close(&format!("Nomic's code, text {i}"), g, &w, 1e-5);
+    }
+
     // Without it the model stops at 24 tokens.
     std::fs::write(to.join("model.toml"), "architecture = \"nomic-bert\"\ndimensions = 32\n").unwrap();
     assert_eq!(embedder_for(&to, "long", 32).models()[0].max_tokens, 24);
