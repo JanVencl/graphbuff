@@ -347,6 +347,93 @@ fn rotary_scaling_past_the_trained_length() {
     assert_eq!(embedder_for(&to, "long", 32).models()[0].max_tokens, 24);
 }
 
+/// bge-m3's three outputs on tiny-m3 (tiny-xlmr with random heads, converted from
+/// PyTorch files by fetch-model.py), against BGE-M3's formulas in torch
+/// (scripts/make_m3_fixture.py).
+#[test]
+fn bge_m3_sparse_and_multi_vector_outputs() {
+    let dir = fixture_named("tiny-m3");
+    let reference = Reference::read(&dir.join("reference.json"));
+    let texts = reference.texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let close_weights = |what: &str, got: &[(String, f32)], want: &[(String, f64)]| {
+        let mut got: Vec<(String, f32)> = got.to_vec();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut want = want.to_vec();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        let keys = |v: &[(String, f64)]| v.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+        assert_eq!(got.iter().map(|x| x.0.clone()).collect::<Vec<_>>(), keys(&want), "{what}: tokens");
+        for ((t, g), (_, w)) in got.iter().zip(&want) {
+            assert!((*g as f64 - w).abs() < 1e-5, "{what}: {t}: {g} vs {w}");
+        }
+    };
+    for batch_size in [1, 3, 32] {
+        let e = embedder_for(&dir, "tiny-m3", batch_size);
+        let info = &e.models()[0];
+        assert!(info.sparse && info.multi_vector);
+        let opts = EmbedOptions::default();
+        for (i, ids) in reference.ids("ids").iter().enumerate() {
+            assert_eq!(&e.token_ids(None, &texts[i], &opts).unwrap(), ids, "token ids of {:?}", texts[i]);
+        }
+        for (i, (g, w)) in e.embed(None, &refs, &opts, &no_interrupt).unwrap().iter().zip(reference.vectors("dense")).enumerate() {
+            assert_close(&format!("dense {i}"), g, &w, 1e-5);
+        }
+        let query = EmbedOptions { task: EmbedTask::Query, ..Default::default() };
+        for (task, o, sparse_key, multi_key) in [("doc", &opts, "sparse", "multi"), ("query", &query, "query_sparse", "query_multi")] {
+            let sparse = e.embed_sparse(None, &refs, o, &no_interrupt).unwrap();
+            for (i, (g, w)) in sparse.iter().zip(reference.weights(sparse_key)).enumerate() {
+                close_weights(&format!("{task} sparse {i}, batch {batch_size}"), g, &w);
+            }
+            let multi = e.embed_multi(None, &refs, o, &no_interrupt).unwrap();
+            for (i, (g, w)) in multi.iter().zip(reference.multi(multi_key)).enumerate() {
+                assert_eq!(g.len(), w.len(), "{task} multi {i}: vectors");
+                for (j, (gv, wv)) in g.iter().zip(&w).enumerate() {
+                    assert_close(&format!("{task} multi {i}.{j}, batch {batch_size}"), gv, wv, 1e-5);
+                }
+            }
+        }
+    }
+    // The empty text: only special tokens, no weights; one vector (its </s>).
+    let e = embedder_for(&dir, "tiny-m3", 8);
+    assert!(e.embed_sparse(None, &[""], &EmbedOptions::default(), &no_interrupt).unwrap()[0].is_empty());
+    assert_eq!(e.embed_multi(None, &[""], &EmbedOptions::default(), &no_interrupt).unwrap()[0].len(), 1);
+
+    // From Cypher.
+    let db = Database::in_memory();
+    db.set_embedder(Arc::new(embedder_for(&dir, "tiny-m3", 8)));
+    let r = db
+        .execute(
+            "WITH vector.embedSparse('graph databases store nodes') AS d, \
+                  vector.embedSparse('graph nodes', null, {task: 'query'}) AS q, \
+                  vector.embedMulti('graph databases store nodes') AS dm, \
+                  vector.embedMulti('graph nodes', null, {task: 'query'}) AS qm \
+             RETURN size(keys(d)) AS terms, vector.sparseScore(q, d) AS lexical, \
+                    size(dm) AS vectors, size(dm[0]) AS dims, vector.maxSim(qm, dm) AS colbert",
+        )
+        .unwrap();
+    assert_eq!(r.get(0, "terms"), Some(&ResultValue::Int(reference.weights("sparse")[0].len() as i64)));
+    assert_eq!(r.get(0, "vectors"), Some(&ResultValue::Int(23)));
+    assert_eq!(r.get(0, "dims"), Some(&ResultValue::Int(32)));
+    assert!(matches!(r.get(0, "lexical"), Some(ResultValue::Float(x)) if *x >= 0.0));
+    assert!(matches!(r.get(0, "colbert"), Some(ResultValue::Float(x)) if (-1.0..=1.0).contains(x)));
+    let r = db
+        .execute("CALL vector.embedBatch(['a', null, 'graph'], null, {output: 'multi'}) YIELD index, vector RETURN index, size(vector) AS n")
+        .unwrap();
+    assert_eq!(r.len(), 3);
+    assert_eq!(r.get(1, "n"), Some(&ResultValue::Null));
+    let r = db.execute("CALL vector.models() YIELD sparse, multiVector RETURN sparse, multiVector").unwrap();
+    assert_eq!((r.get(0, "sparse"), r.get(0, "multiVector")), (Some(&ResultValue::Bool(true)), Some(&ResultValue::Bool(true))));
+    let err = db.execute("RETURN vector.embedMulti('a', null, {dimensions: 8})").unwrap_err().to_string();
+    assert!(err.contains("`dimensions` is for single vectors"), "{err}");
+
+    // A model without the heads says so.
+    let plain = embedder_for(&fixture_named("tiny-xlmr"), "tiny-xlmr", 8);
+    let err = plain.embed_sparse(None, &["a"], &EmbedOptions::default(), &no_interrupt).unwrap_err().to_string();
+    assert!(err.contains("gives no lexical weights"), "{err}");
+    let err = plain.embed_multi(None, &["a"], &EmbedOptions::default(), &no_interrupt).unwrap_err().to_string();
+    assert!(err.contains("gives no per-token vectors"), "{err}");
+}
+
 #[test]
 fn query_prefix_and_truncation() {
     check_query(&fixture(), "tiny-bert", 1e-5);

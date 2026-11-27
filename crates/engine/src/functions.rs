@@ -89,9 +89,15 @@ impl Executor<'_> {
         if let Some(v) = spatial_function(name, &args)? {
             return Ok(v);
         }
-        if name == "vector.embed" {
+        let output = match name {
+            "vector.embed" => Some(crate::embed::Output::Dense),
+            "vector.embedsparse" => Some(crate::embed::Output::Sparse),
+            "vector.embedmulti" => Some(crate::embed::Output::Multi),
+            _ => None,
+        };
+        if let Some(output) = output {
             let interrupt = || self.interrupt.as_ref().map_or(Ok(()), |i| i.check_now());
-            return crate::embed::embed_function(self.embedder.as_ref(), &args, &interrupt);
+            return crate::embed::embed_function(self.embedder.as_ref(), output, &args, &interrupt);
         }
         if let Some(v) = crate::vector::vector_function(name, &args)? {
             return Ok(v);

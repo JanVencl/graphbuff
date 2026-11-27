@@ -48,6 +48,20 @@ impl TextTokenizer {
         Ok(TextTokenizer { inner, max_tokens, specials, pad_id })
     }
 
+    /// The ids of the special tokens (`[CLS]`, `<s>`, `</s>`, `<pad>`, `<unk>` …), which
+    /// lexical weights leave out.
+    pub fn special_ids(&self) -> std::collections::HashSet<u32> {
+        let mut ids: std::collections::HashSet<u32> =
+            self.inner.get_added_tokens_decoder().iter().filter(|(_, t)| t.special).map(|(&id, _)| id).collect();
+        ids.insert(self.pad_id);
+        ids
+    }
+
+    /// The token of `id` as the vocabulary has it (`▁graph`, `##ing`).
+    pub fn token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
     /// The most tokens of text one input holds: `max_tokens` less the special tokens.
     pub fn text_tokens(&self) -> usize {
         self.max_tokens - self.specials

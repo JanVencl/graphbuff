@@ -50,7 +50,10 @@ The vectors are ordinary `LIST<FLOAT>` properties, so they go straight into a
 | `CALL vector.embedBatch(texts, model?, options?) YIELD index, text, vector` | Many texts in batches: one row per text, in order |
 | `CALL vector.chunk(text, model?, options?) YIELD index, text, start, length, tokens` | A long text in pieces that fit the model (see [Long texts](#long-texts-chunks)) |
 | `CALL vector.embedChunks(text, model?, options?) YIELD index, text, start, length, tokens, vector` | The same, each piece embedded |
-| `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka` | The installed models (`matryoshka`: whether it makes shorter vectors too) |
+| `vector.embedSparse(text, model?, options?)` → `MAP` | Lexical weights, token → weight (bge-m3; see [Lexical weights and ColBERT](#lexical-weights-and-colbert-bge-m3)) |
+| `vector.embedMulti(text, model?, options?)` → `LIST<LIST<FLOAT>>` | A vector per token (bge-m3's ColBERT output) |
+| `vector.sparseScore(a, b \| tokens, weights)`, `vector.maxSim(query, document)` → `FLOAT` | Score lexical weights and per-token vectors |
+| `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka, sparse, multiVector` | The installed models (`matryoshka`: whether it makes shorter vectors too; `sparse`, `multiVector`: whether it has those outputs) |
 
 - `model` is the name of a model (its folder). `null` or leaving it out uses the default
   model: `embedding.default_model`, or the only installed model. With several models and
@@ -190,6 +193,58 @@ RETURN d.title, max(score) AS best ORDER BY best DESC LIMIT 5;
 - `embedChunks` embeds all the chunks of a text in one batch. To embed many documents,
   page them as above.
 
+## Lexical weights and ColBERT (bge-m3)
+
+bge-m3 has three outputs from one pass over a text: its vector (`vector.embed`), a weight
+per token (`vector.embedSparse`, a learned BM25) and a vector per token
+(`vector.embedMulti`, ColBERT). The last two rank better together with the vector, and
+are best used to re-score its hits:
+
+```cypher
+// Store all three (fetch-model.py bge-m3 sets sparse and multi_vector). A property holds
+// no maps and no lists of lists: the weights go in two lists, the ColBERT vectors in one.
+MATCH (d:Doc)
+WITH d, vector.embedSparse(d.text, 'bge-m3') AS w, vector.embedMulti(d.text, 'bge-m3') AS m
+SET d.embedding  = vector.embed(d.text, 'bge-m3'),
+    d.lexTokens  = keys(w),
+    d.lexWeights = [t IN keys(w) | w[t]],
+    d.colbert    = reduce(all = [], v IN m | all + v);
+
+// Find with the vector index, re-rank with all three (BGE-M3's weights: 0.4, 0.2, 0.4).
+WITH vector.embed($question, 'bge-m3') AS v,
+     vector.embedSparse($question, 'bge-m3') AS lw,
+     vector.embedMulti($question, 'bge-m3') AS mv
+CALL db.index.vector.queryNodes('doc_embedding', 50, v) YIELD node, score
+RETURN node.text,
+       0.4 * vector.similarity.cosine(node.embedding, v)
+     + 0.2 * vector.sparseScore(lw, node.lexTokens, node.lexWeights)
+     + 0.4 * vector.maxSim(mv, node.colbert) AS score
+ORDER BY score DESC LIMIT 10;
+```
+
+- `vector.embedSparse` gives a map of token (as the vocabulary has it, `▁graph`) to
+  weight: each token of the text once, with its largest weight. Special tokens and tokens
+  weighted 0 are left out. `vector.sparseScore(a, b)` is the sum of `a[t] · b[t]` over the
+  tokens they share; `vector.sparseScore(a, tokens, weights)` takes the second as two
+  lists, as stored.
+- `vector.embedMulti` gives a normalized vector per token after the first (`<s>`), the
+  last `</s>` included. `vector.maxSim(q, d)` takes for each query vector its best dot
+  product with a document vector, and averages them. `d` may be its vectors one after
+  another in one flat list, as stored; it is split by the query's dimensions.
+- These match FlagEmbedding's `BGEM3FlagModel` (lexical weights, ColBERT vectors and
+  their scores). Note that `vector.similarity.cosine` scales to [0, 1], where BGE-M3's
+  dense score is the plain cosine.
+- No index searches them: they re-score what a vector or full-text index found, or a
+  filtered set. A ColBERT list is large (1024 floats per token for bge-m3): store it only
+  where you re-rank.
+- `vector.embedBatch(texts, model, {output: 'sparse' | 'multi'})` gives them in batches.
+  `task` and `truncate` work as for `vector.embed`; `dimensions` does not apply.
+- A model has them when its `model.toml` says `sparse = true` (weights with
+  `sparse_linear`) and `multi_vector = true` (with `colbert_linear`); other models refuse
+  the functions. `fetch-model.py bge-m3` converts bge-m3's PyTorch files (it publishes no
+  safetensors) into one `model.safetensors` with both heads; that needs torch and
+  safetensors (`pip install torch safetensors`).
+
 ## Longer inputs (rotary scaling)
 
 nomic-embed-text was trained on 2048 tokens but takes up to 8192 (`n_positions`) with
@@ -234,6 +289,8 @@ query_prefix = ""       # put before texts embedded with {task: 'query'}
 doc_prefix   = ""       # put before documents
 matryoshka   = "truncate"  # optional: truncate or layer-norm, for Matryoshka models only
 rotary_scaling = 2      # optional, nomic-bert only: inputs past the trained length
+sparse       = false    # optional: has sparse_linear (bge-m3), for vector.embedSparse
+multi_vector = false    # optional: has colbert_linear (bge-m3), for vector.embedMulti
 ```
 
 - The folder's name is the model's name: 1 to 64 of `a-z 0-9 . _ -`.
@@ -247,6 +304,7 @@ rotary_scaling = 2      # optional, nomic-bert only: inputs past the trained len
   | `multilingual-e5-small` | intfloat/multilingual-e5-small | 384 | mean | about 100 languages; `query: ` / `passage: ` |
   | `multilingual-e5-base` | intfloat/multilingual-e5-base | 768 | mean | XLM-RoBERTa, about 100 languages; `query: ` / `passage: ` |
   | `nomic-embed-text` | nomic-ai/nomic-embed-text-v1.5 | 768 | mean | 2048 tokens; `search_query: ` / `search_document: `; Matryoshka (`layer-norm`) |
+  | `bge-m3` | BAAI/bge-m3 | 1024 | cls | XLM-RoBERTa, about 100 languages, 512 tokens (8192 with `--max-tokens`); lexical weights and ColBERT; converted from PyTorch (needs torch) |
 
   For other models use `--repo owner/name --pooling …`; the script reads the
   architecture from `config.json`.
@@ -255,7 +313,7 @@ rotary_scaling = 2      # optional, nomic-bert only: inputs past the trained len
   | `architecture` | `model_type` | Models |
   |---|---|---|
   | `bert` | `bert` | BERT, MiniLM, BGE, E5, GTE (small and base), multilingual-e5-small, paraphrase-multilingual-MiniLM |
-  | `xlm-roberta` | `xlm-roberta` | multilingual-e5-base and -large, bge-m3 (dense vectors) |
+  | `xlm-roberta` | `xlm-roberta` | multilingual-e5-base and -large, bge-m3 (all three outputs) |
   | `nomic-bert` | `nomic_bert` | nomic-embed-text v1 and v1.5 (v1.5 also makes shorter vectors: [Matryoshka](#shorter-vectors-matryoshka)) |
 
   The server refuses a model whose `config.json` names another `model_type` than

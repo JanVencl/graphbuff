@@ -195,6 +195,8 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   scans the label instead
 * **Text embeddings:** `vector.embed(text, model?, options?)` returns the embedding of a text
   by a local model, in a server with models installed ([Text embeddings](Embeddings.md)).
+  bge-m3 also gives lexical weights and a vector per token, `vector.embedSparse` and
+  `vector.embedMulti`, scored with `vector.sparseScore(a, b)` and `vector.maxSim(q, d)`.
 * **Vectors:** a vector is a list of numbers. `vector.similarity.cosine(a, b)` and
   `vector.similarity.euclidean(a, b)` score in [0, 1] as Neo4j does (`(1 + cos) / 2`,
   `1 / (1 + d²)`). ``CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:L) ON n.p OPTIONS

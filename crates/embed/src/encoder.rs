@@ -12,6 +12,10 @@
 //! SwiGLU], add & norm) → pooling (mean over the mask, or the first token) → optional L2
 //! normalization. Matches `transformers` to about 1e-6 (tests/golden.rs).
 //!
+//! Optional heads on the last hidden states (bge-m3): `sparse_linear` (hidden → 1), whose
+//! ReLU is each token's lexical weight, and `colbert_linear` (hidden → n), a vector per
+//! token after the first.
+//!
 //! With rotary scaling (nomic-bert's dynamic NTK), a text longer than the model was
 //! trained on gets a larger rotary base, from its own length: Nomic's code takes the
 //! padded batch's, which would make a vector depend on the texts batched with it. A text
@@ -98,6 +102,18 @@ pub struct Encoder {
     typ: Vec<f32>,
     emb_norm: LayerNorm,
     layers: Vec<Layer>,
+    /// `sparse_linear`: hidden → 1.
+    sparse: Option<Linear>,
+    /// `colbert_linear`: hidden → `colbert_dims`.
+    colbert: Option<Linear>,
+}
+
+/// The heads a model has besides its encoder (model.toml's `sparse` and
+/// `multi_vector`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heads {
+    pub sparse: bool,
+    pub multi_vector: bool,
 }
 
 struct Weights<'a> {
@@ -131,6 +147,15 @@ impl Weights<'_> {
             safetensors::Dtype::BF16 => data.as_chunks::<2>().0.iter().map(|c| bf16::from_le_bytes(*c).to_f32()).collect(),
             other => return Err(format!("`{name}` is {other:?}; only F32, F16 and BF16 weights are supported")),
         })
+    }
+
+    /// The shape of the weights `name`.
+    fn shape(&self, name: &str) -> Result<Vec<usize>, String> {
+        ["", "bert.", "roberta."]
+            .iter()
+            .find_map(|p| self.st.tensor(&format!("{p}{name}")).ok())
+            .map(|v| v.shape().to_vec())
+            .ok_or_else(|| format!("the weights have no `{name}`"))
     }
 
     fn bias(&self, name: &str, size: usize, has: bool) -> Result<Option<Tensor<1>>, String> {
@@ -262,8 +287,8 @@ fn rotate(x: Tensor<4>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<4> {
 }
 
 impl Encoder {
-    /// Loads `model.safetensors` from `file` onto `device`.
-    pub fn load(file: &Path, config: &ModelConfig, device: &Device) -> Result<Encoder, String> {
+    /// Loads `model.safetensors` from `file` onto `device`, with `heads`.
+    pub fn load(file: &Path, config: &ModelConfig, heads: Heads, device: &Device) -> Result<Encoder, String> {
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| format!("{}: {e}", file.display()))?;
         let w = Weights { st, device };
@@ -277,7 +302,20 @@ impl Encoder {
             Positions::Learned { .. } => w.host("embeddings.position_embeddings.weight", [c.max_position_embeddings, h])?,
             Positions::Rotary { .. } => Vec::new(),
         };
+        let sparse = heads.sparse.then(|| w.linear("sparse_linear", h, 1, true)).transpose()?;
+        let colbert = match heads.multi_vector {
+            false => None,
+            true => {
+                let out = match w.shape("colbert_linear.weight")?[..] {
+                    [out, i] if i == h => out,
+                    ref s => return Err(format!("`colbert_linear.weight` has shape {s:?}, expected [n, {h}]")),
+                };
+                Some(w.linear("colbert_linear", h, out, true)?)
+            }
+        };
         Ok(Encoder {
+            sparse,
+            colbert,
             word: w.host("embeddings.word_embeddings.weight", [c.vocab_size, h])?,
             pos,
             typ: w.host("embeddings.token_type_embeddings.weight", [c.type_vocab_size, h])?,
@@ -303,6 +341,67 @@ impl Encoder {
 
     /// The vectors of a padded batch, one per row.
     pub fn embed(&self, batch: &Padded, pooling: Pooling, normalize: bool) -> Result<Vec<Vec<f32>>, String> {
+        let (b, t, h) = (batch.rows, batch.width, self.config.hidden_size);
+        let (x, mask) = self.hidden(batch)?;
+        let pooled = match pooling {
+            Pooling::Mean => {
+                let m = mask.reshape([b, t, 1]);
+                let summed = (x * m.clone()).sum_dim(1).reshape([b, h]);
+                summed / m.sum_dim(1).reshape([b, 1]).clamp_min(1e-9)
+            }
+            Pooling::Cls => x.narrow(1, 0, 1).reshape([b, h]),
+        };
+        let pooled = if normalize {
+            let norm = pooled.clone().powf_scalar(2.0).sum_dim(1).sqrt().clamp_min(1e-12);
+            pooled / norm
+        } else {
+            pooled
+        };
+        let flat: Vec<f32> = pooled.into_data().try_to_vec().map_err(|e| format!("reading the result: {e:?}"))?;
+        Ok(flat.chunks_exact(h).map(<[f32]>::to_vec).collect())
+    }
+
+    /// Whether it has `sparse_linear` and `colbert_linear`.
+    pub fn heads(&self) -> Heads {
+        Heads { sparse: self.sparse.is_some(), multi_vector: self.colbert.is_some() }
+    }
+
+    /// Each token's lexical weight, `relu(sparse_linear(h))`, per row for its tokens
+    /// (padding left out). Fails without the head.
+    pub fn sparse(&self, batch: &Padded) -> Result<Vec<Vec<f32>>, String> {
+        let head = self.sparse.as_ref().ok_or("the model has no sparse head (`sparse_linear`)")?;
+        let (x, _) = self.hidden(batch)?;
+        let w = activation::relu(head.forward(x));
+        let flat: Vec<f32> = w.into_data().try_to_vec().map_err(|e| format!("reading the result: {e:?}"))?;
+        Ok(rows_of(batch, &flat, 1).map(|(_, r)| r.to_vec()).collect())
+    }
+
+    /// A vector per token after the first (`colbert_linear(h[1..])`), up to the row's last
+    /// token, L2-normalized if `normalize`. Fails without the head.
+    pub fn multi(&self, batch: &Padded, normalize: bool) -> Result<Vec<Vec<Vec<f32>>>, String> {
+        let head = self.colbert.as_ref().ok_or("the model has no multi-vector head (`colbert_linear`)")?;
+        let out = head.w.dims()[1];
+        let (x, _) = self.hidden(batch)?;
+        let flat: Vec<f32> = head.forward(x).into_data().try_to_vec().map_err(|e| format!("reading the result: {e:?}"))?;
+        Ok(rows_of(batch, &flat, out)
+            .map(|(_, r)| {
+                r.chunks_exact(out)
+                    .skip(1)
+                    .map(|v| {
+                        let mut v = v.to_vec();
+                        if normalize {
+                            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                            v.iter_mut().for_each(|x| *x /= n);
+                        }
+                        v
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// The last hidden states of a padded batch, `[rows, width, hidden]`, and its mask.
+    fn hidden(&self, batch: &Padded) -> Result<(Tensor<3>, Tensor<2>), String> {
         let (b, t, h) = (batch.rows, batch.width, self.config.hidden_size);
         if t > self.config.max_tokens {
             return Err(format!("{t} tokens is more than the model's {}", self.config.max_tokens));
@@ -361,22 +460,16 @@ impl Encoder {
             let ff = l.ffn.forward(x.clone());
             x = l.out_norm.forward(ff + x);
         }
-
-        let pooled = match pooling {
-            Pooling::Mean => {
-                let m = mask.reshape([b, t, 1]);
-                let summed = (x * m.clone()).sum_dim(1).reshape([b, h]);
-                summed / m.sum_dim(1).reshape([b, 1]).clamp_min(1e-9)
-            }
-            Pooling::Cls => x.narrow(1, 0, 1).reshape([b, h]),
-        };
-        let pooled = if normalize {
-            let norm = pooled.clone().powf_scalar(2.0).sum_dim(1).sqrt().clamp_min(1e-12);
-            pooled / norm
-        } else {
-            pooled
-        };
-        let flat: Vec<f32> = pooled.into_data().try_to_vec().map_err(|e| format!("reading the result: {e:?}"))?;
-        Ok(flat.chunks_exact(h).map(<[f32]>::to_vec).collect())
+        Ok((x, mask))
     }
+}
+
+/// The rows of `flat` (`[rows, width, per]`, as `batch` is padded), each cut to its
+/// tokens: `(row, its tokens × per values)`.
+fn rows_of<'a>(batch: &'a Padded, flat: &'a [f32], per: usize) -> impl Iterator<Item = (usize, &'a [f32])> + 'a {
+    let width = batch.width;
+    (0..batch.rows).map(move |r| {
+        let len = batch.mask[r * width..][..width].iter().filter(|&&m| m > 0.0).count();
+        (r, &flat[r * width * per..][..len * per])
+    })
 }

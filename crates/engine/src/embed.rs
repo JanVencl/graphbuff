@@ -2,6 +2,11 @@
 //! model?, options?)`, `CALL vector.chunk(text, model?, options?)`, `CALL
 //! vector.embedChunks(text, model?, options?)` and `CALL vector.models()`.
 //!
+//! Models with more outputs than one vector (bge-m3) also give lexical weights,
+//! `vector.embedSparse(text, model?, options?)` (a map of token to weight), and one vector
+//! per token, `vector.embedMulti(text, model?, options?)` (ColBERT). `vector.sparseScore`
+//! and `vector.maxSim` score them; there is no index for them.
+//!
 //! The engine does not run models itself. An [`Embedder`] does, set with
 //! [`crate::Database::set_embedder`] or [`crate::DatabaseManager::set_embedder`], much
 //! like the kernel backend. Without one, the functions and procedures fail with
@@ -44,6 +49,10 @@ pub struct ModelInfo {
     /// Whether it makes shorter vectors too (`{dimensions: n}`, `n` up to `dimensions`):
     /// a Matryoshka model.
     pub matryoshka: bool,
+    /// Whether it gives lexical weights ([`Embedder::embed_sparse`]).
+    pub sparse: bool,
+    /// Whether it gives a vector per token ([`Embedder::embed_multi`]).
+    pub multi_vector: bool,
 }
 
 impl ModelInfo {
@@ -239,6 +248,89 @@ pub trait Embedder: Send + Sync {
         let _ = (model, text, task);
         Err(Error::Unsupported("this embedder cannot split text into chunks".into()))
     }
+
+    /// The lexical weights of `texts` (bge-m3's sparse output): per text, each token it
+    /// weighs (special tokens left out) with its weight, larger than 0. As
+    /// [`embed`](Self::embed) otherwise; `options.dimensions` does not apply. Models
+    /// without them fail with `Semantic`, embedders without any with `Unsupported`.
+    fn embed_sparse(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<(String, f32)>>> {
+        let _ = (model, texts, options, interrupt);
+        Err(Error::Unsupported("this embedder gives no lexical weights".into()))
+    }
+
+    /// A vector per token of `texts` (bge-m3's ColBERT output), each normalized. As
+    /// [`embed_sparse`](Self::embed_sparse) otherwise.
+    fn embed_multi(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let _ = (model, texts, options, interrupt);
+        Err(Error::Unsupported("this embedder gives no per-token vectors".into()))
+    }
+}
+
+/// What to embed a text as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// One vector (`LIST<FLOAT>`).
+    Dense,
+    /// Lexical weights (`MAP<STRING, FLOAT>`).
+    Sparse,
+    /// A vector per token (`LIST<LIST<FLOAT>>`).
+    Multi,
+}
+
+impl Output {
+    fn function(self) -> &'static str {
+        match self {
+            Output::Dense => "vector.embed()",
+            Output::Sparse => "vector.embedSparse()",
+            Output::Multi => "vector.embedMulti()",
+        }
+    }
+}
+
+/// `texts` embedded as `output`, one value per text, checked to be one per text.
+fn embed_values(
+    embedder: &dyn Embedder,
+    model: Option<&str>,
+    texts: &[&str],
+    options: &EmbedOptions,
+    output: Output,
+    interrupt: &dyn Fn() -> Result<()>,
+) -> Result<Vec<Value>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if output != Output::Dense && options.dimensions.is_some() {
+        return Err(Error::Semantic(format!("{}: `dimensions` is for single vectors (vector.embed)", output.function())));
+    }
+    let out: Vec<Value> = match output {
+        Output::Dense => return Ok(embed_checked(embedder, model, texts, options, interrupt)?.into_iter().map(vector_value).collect()),
+        Output::Sparse => embedder
+            .embed_sparse(model, texts, options, interrupt)?
+            .into_iter()
+            .map(|w| Value::Map(w.into_iter().map(|(t, x)| (t, Value::Float(x as f64))).collect()))
+            .collect(),
+        Output::Multi => embedder
+            .embed_multi(model, texts, options, interrupt)?
+            .into_iter()
+            .map(|vs| Value::List(vs.into_iter().map(vector_value).collect()))
+            .collect(),
+    };
+    if out.len() != texts.len() {
+        return Err(Error::Runtime(format!("the embedder returned {} results for {} texts", out.len(), texts.len())));
+    }
+    Ok(out)
 }
 
 /// The error when no embedder is set.
@@ -282,16 +374,31 @@ fn model_arg<'v>(what: &str, v: Option<&'v Value>) -> Result<Option<&'v str>> {
     }
 }
 
-/// `vector.embed(text, model?, options?)`: `args` as the query passed them.
+/// `vector.embed`, `vector.embedSparse` or `vector.embedMulti` (by `output`) of `(text,
+/// model?, options?)`: `args` as the query passed them.
 pub(crate) fn embed_function(
     embedder: Option<&Arc<dyn Embedder>>,
+    output: Output,
     args: &[Value],
     interrupt: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
-    const NAME: &str = "vector.embed()";
+    let name = output.function();
     if args.is_empty() || args.len() > 3 {
-        return Err(Error::Semantic(format!("vector.embed() expects 1 to 3 argument(s), got {}", args.len())));
+        return Err(Error::Semantic(format!("{name} expects 1 to 3 argument(s), got {}", args.len())));
     }
+    if output != Output::Dense {
+        let model = model_arg(name, args.get(1))?;
+        let options = EmbedOptions::from_value(name, args.get(2).unwrap_or(&Value::Null))?;
+        let text = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s.as_str(),
+            other => return Err(Error::Type(format!("{name} does not accept {}", other.type_name()))),
+        };
+        let embedder = embedder.ok_or_else(not_available)?;
+        let mut out = embed_values(embedder.as_ref(), model, &[text], &options, output, interrupt)?;
+        return Ok(out.pop().expect("one value per text"));
+    }
+    const NAME: &str = "vector.embed()";
     let model = model_arg(NAME, args.get(1))?;
     let options = EmbedOptions::from_value(NAME, args.get(2).unwrap_or(&Value::Null))?;
     let text = match &args[0] {
@@ -305,7 +412,8 @@ pub(crate) fn embed_function(
 }
 
 /// `CALL vector.embedBatch(texts, model, options) YIELD index, text, vector`: one row per
-/// text, in order; `null` texts give `null` vectors.
+/// text, in order; `null` texts give `null` vectors. `{output: 'sparse' | 'multi'}` gives
+/// lexical weights or per-token vectors instead of vectors (`'dense'`, the default).
 pub(crate) fn embed_batch(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<ProcedureRows> {
     const NAME: &str = "vector.embedBatch";
     let items = match &args[0] {
@@ -314,7 +422,21 @@ pub(crate) fn embed_batch(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<
         other => return Err(Error::Type(format!("{NAME}: `texts` must be a list, not {}", other.type_name()))),
     };
     let model = model_arg(NAME, args.get(1))?;
-    let options = EmbedOptions::from_value(NAME, args.get(2).unwrap_or(&Value::Null))?;
+    let mut opts = args.get(2).cloned().unwrap_or(Value::Null);
+    let output = match &mut opts {
+        Value::Map(m) => match m.remove("output") {
+            None | Some(Value::Null) => Output::Dense,
+            Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "dense" => Output::Dense,
+                "sparse" => Output::Sparse,
+                "multi" => Output::Multi,
+                _ => return Err(Error::Semantic(format!("{NAME}: `output` is 'dense', 'sparse' or 'multi', not '{s}'"))),
+            },
+            Some(other) => return Err(Error::Type(format!("{NAME}: `output` does not accept {}", other.type_name()))),
+        },
+        _ => Output::Dense,
+    };
+    let options = EmbedOptions::from_value(NAME, &opts)?;
     let mut texts = Vec::with_capacity(items.len());
     for v in items {
         match v {
@@ -324,21 +446,22 @@ pub(crate) fn embed_batch(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<
         }
     }
     let embedder = ctx.embedder()?;
-    let mut vectors = embed_checked(embedder, model, &texts, &options, &|| ctx.check_interrupt())?.into_iter();
+    let mut vectors = embed_values(embedder, model, &texts, &options, output, &|| ctx.check_interrupt())?.into_iter();
     Ok(items
         .iter()
         .enumerate()
         .map(|(i, t)| {
             let vector = match t {
                 Value::Null => Value::Null,
-                _ => vector_value(vectors.next().expect("one vector per text")),
+                _ => vectors.next().expect("one value per text"),
             };
             vec![Value::Int(i as i64), t.clone(), vector]
         })
         .collect())
 }
 
-/// `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka`, by name.
+/// `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka, sparse,
+/// multiVector`, by name.
 pub(crate) fn models(ctx: &ProcedureContext<'_>, _args: &[Value]) -> Result<ProcedureRows> {
     let mut models = ctx.embedder()?.models();
     models.sort_by(|a, b| a.name.cmp(&b.name));
@@ -351,6 +474,8 @@ pub(crate) fn models(ctx: &ProcedureContext<'_>, _args: &[Value]) -> Result<Proc
                 Value::Int(m.max_tokens as i64),
                 Value::Bool(m.loaded),
                 Value::Bool(m.matryoshka),
+                Value::Bool(m.sparse),
+                Value::Bool(m.multi_vector),
             ]
         })
         .collect())
@@ -559,7 +684,8 @@ pub(crate) fn embed_chunks(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result
 /// [`EmbedTask::Query`] adds the word `query:`, so queries and documents differ. Each
 /// model has a `max_tokens` of 64 words. The first model is the default. With
 /// [`matryoshka`](Self::matryoshka) its models also make fewer dimensions: the first
-/// ones, normalized again.
+/// ones, normalized again. Its lexical weights are 1 for each distinct word, and its
+/// per-token vectors are each word's own (the vector of a one-word text).
 #[derive(Debug)]
 pub struct HashEmbedder {
     models: Vec<(String, usize)>,
@@ -639,6 +765,8 @@ impl Embedder for HashEmbedder {
                 max_tokens: self.max_tokens,
                 loaded: true,
                 matryoshka: self.matryoshka,
+                sparse: true,
+                multi_vector: true,
             })
             .collect()
     }
@@ -677,6 +805,45 @@ impl Embedder for HashEmbedder {
                 }
                 out.push(v);
             }
+        }
+        Ok(out)
+    }
+
+    fn embed_sparse(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<(String, f32)>>> {
+        self.embed(model, &[], options, interrupt)?; // the model's checks
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            let mut words: Vec<String> = t.to_lowercase().split_whitespace().map(str::to_string).collect();
+            if options.task == EmbedTask::Query {
+                words.insert(0, "query:".into());
+            }
+            words.truncate(self.max_tokens);
+            words.sort();
+            words.dedup();
+            out.push(words.into_iter().map(|w| (w, 1.0)).collect());
+        }
+        Ok(out)
+    }
+
+    fn embed_multi(
+        &self,
+        model: Option<&str>,
+        texts: &[&str],
+        options: &EmbedOptions,
+        interrupt: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            let mut words: Vec<&str> = t.split_whitespace().collect();
+            words.truncate(self.max_tokens);
+            let word_options = EmbedOptions { task: EmbedTask::Document, ..*options };
+            out.push(self.embed(model, &words, &word_options, interrupt)?);
         }
         Ok(out)
     }
