@@ -83,6 +83,9 @@ the same notes.
 
 - A search of an HNSW vector index stops at the query's timeout or when it is cancelled;
   before, only once it was done.
+- Bolt: the operators of `EXPLAIN` and `PROFILE` plans carry their arguments under `args`,
+  the key Neo4j drivers read, so that drivers show each operator's details, estimated
+  rows, and profiled rows and time. Before, they were sent as `arguments` and dropped.
 
 ## 0.5.0 — 2026-11-23
 

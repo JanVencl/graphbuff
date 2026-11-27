@@ -1717,8 +1717,9 @@ fn stats(s: &QueryStats) -> PackValue {
     PackValue::Map(m)
 }
 
-/// A plan as Neo4j's nested map: `operatorType`, `arguments`, `identifiers`, `children`,
-/// and for `PROFILE` the `rows` and `time` (nanoseconds) of each operator.
+/// A plan as Neo4j's nested map: `operatorType`, `args` (`Details`, `EstimatedRows`, and
+/// for `PROFILE` `Rows` and `Time`), `identifiers`, `children`, and for `PROFILE` the
+/// `rows` and `time` (nanoseconds) of each operator.
 fn plan_tree(plan: &PlanDescription) -> PackValue {
     fn node(plan: &PlanDescription, i: &mut usize) -> PackValue {
         let line = &plan.lines[*i];
@@ -1743,7 +1744,7 @@ fn plan_tree(plan: &PlanDescription) -> PackValue {
             args.insert("Rows".to_string(), PackValue::Int(rows));
             args.insert("Time".to_string(), PackValue::Int(time));
         }
-        m.insert("arguments".to_string(), PackValue::Map(args));
+        m.insert("args".to_string(), PackValue::Map(args));
         let mut children = Vec::new();
         while *i < plan.lines.len() && plan.lines[*i].depth == line.depth + 1 {
             children.push(node(plan, i));

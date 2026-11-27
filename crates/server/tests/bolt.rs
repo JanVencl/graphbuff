@@ -644,10 +644,37 @@ fn explain_and_profile_summaries() {
     let PackValue::Map(plan) = get(&meta, "plan") else { panic!() };
     assert!(matches!(get(plan, "operatorType"), PackValue::String(_)));
     assert!(matches!(get(plan, "children"), PackValue::List(c) if !c.is_empty()));
+    // Drivers read the operator arguments under `args`.
+    assert!(!plan.contains_key("arguments"));
+    let PackValue::Map(args) = get(plan, "args") else { panic!() };
+    assert!(!args.contains_key("Rows"));
+    assert!(plan_details(plan).iter().any(|d| d.contains(":N")), "{:?}", plan_details(plan));
     let (rows, meta) = b.query_with("PROFILE MATCH (n:N) WHERE n.i > 2 RETURN n.i", empty());
     assert_eq!(rows.len(), 3);
     let PackValue::Map(profile) = get(&meta, "profile") else { panic!() };
     assert_eq!(get(profile, "rows"), &PackValue::Int(3));
+    let PackValue::Map(args) = get(profile, "args") else { panic!() };
+    assert_eq!(args.get("Rows"), Some(&PackValue::Int(3)));
+    assert!(matches!(args.get("Time"), Some(PackValue::Int(t)) if *t >= 0));
+    assert!(plan_details(profile).iter().any(|d| d.contains(":N")));
+}
+
+/// The `Details` of every operator of a Bolt plan, root first.
+fn plan_details(plan: &BTreeMap<String, PackValue>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(PackValue::Map(args)) = plan.get("args")
+        && let Some(PackValue::String(d)) = args.get("Details")
+    {
+        out.push(d.clone());
+    }
+    if let Some(PackValue::List(children)) = plan.get("children") {
+        for c in children {
+            if let PackValue::Map(c) = c {
+                out.extend(plan_details(c));
+            }
+        }
+    }
+    out
 }
 
 #[test]
