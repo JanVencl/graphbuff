@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use burn::tensor::Device;
 use graphbuff::{EmbedOptions, EmbedStats, EmbedTask, Embedder, Error, ModelInfo, Result, TokenSpans, accounting};
 
-pub use manifest::{Architecture, Manifest, Pooling};
+pub use manifest::{Architecture, Manifest, Matryoshka, Pooling};
 pub use registry::{FeedForward, ModelConfig, ModelSpec, Positions, Registry, Skipped};
 
 use encoder::Encoder;
@@ -284,6 +284,26 @@ fn guarded<T>(f: impl FnOnce() -> std::result::Result<T, String>) -> std::result
     })
 }
 
+/// How to cut the vectors of `spec` to `dimensions`; `None`: full vectors, as asked for
+/// (no `dimensions`, or the model's own). Fewer needs a Matryoshka model.
+fn cut_of(spec: &ModelSpec, dimensions: Option<usize>) -> Result<Option<(Matryoshka, usize)>> {
+    let full = spec.manifest.dimensions;
+    match (dimensions, spec.manifest.matryoshka) {
+        (None, _) => Ok(None),
+        (Some(d), _) if d == full => Ok(None),
+        (Some(d), Some(how)) if (1..full).contains(&d) => Ok(Some((how, d))),
+        (Some(d), Some(_)) => Err(Error::Semantic(format!(
+            "embedding model '{}' makes vectors of {full} dimensions at most, not {d}",
+            spec.name
+        ))),
+        (Some(d), None) => Err(Error::Semantic(format!(
+            "embedding model '{}' makes vectors of {full} dimensions only, not {d} (it is not a Matryoshka model: \
+             set `matryoshka` in its model.toml if it was trained as one)",
+            spec.name
+        ))),
+    }
+}
+
 fn prefix(spec: &ModelSpec, task: EmbedTask) -> &str {
     match task {
         EmbedTask::Query => &spec.manifest.query_prefix,
@@ -308,6 +328,7 @@ impl Embedder for LocalEmbedder {
                 dimensions: m.manifest.dimensions,
                 max_tokens: m.max_tokens(),
                 loaded: self.cache.is_loaded(&m.name),
+                matryoshka: m.manifest.matryoshka.is_some(),
             })
             .collect()
     }
@@ -340,6 +361,7 @@ impl Embedder for LocalEmbedder {
     ) -> Result<Vec<Vec<f32>>> {
         let started = Instant::now();
         let spec = self.spec(model)?;
+        let cut = cut_of(spec, options.dimensions)?;
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -359,8 +381,16 @@ impl Embedder for LocalEmbedder {
             // not count: charge its estimate to the query while it runs (and check it).
             let _charge = accounting::charge(m.encoder.activation_bytes(padded.rows, padded.width));
             interrupt()?;
+            let normalize = spec.manifest.normalize;
             let vectors = self
-                .on_pool(|| m.encoder.embed(&padded, spec.manifest.pooling, spec.manifest.normalize))
+                .on_pool(|| {
+                    // A cut vector is normalized after the cut, not before.
+                    let full = m.encoder.embed(&padded, spec.manifest.pooling, normalize && cut.is_none())?;
+                    Ok(match cut {
+                        None => full,
+                        Some((how, dims)) => full.into_iter().map(|v| how.cut(v, dims, normalize)).collect(),
+                    })
+                })
                 .map_err(|e| Error::Runtime(format!("embedding model '{}': {e}", spec.name)))?;
             for (&i, v) in chunk.iter().zip(vectors) {
                 out[i] = v;

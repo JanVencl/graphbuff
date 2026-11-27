@@ -5,6 +5,18 @@ the same notes.
 
 ## Unreleased
 
+### Added
+
+- Shorter vectors from Matryoshka embedding models: `vector.embed(text, model,
+  {dimensions: 256})` (also `embedBatch` and `embedChunks`) gives the first 256
+  dimensions, cut as the model card says and normalized again. It is optional: without
+  `dimensions` vectors stay full length, and only a model whose `model.toml` sets
+  `matryoshka = "truncate"` or `"layer-norm"` makes fewer. `fetch-model.py` sets it for
+  `nomic-embed-text` (v1.5, `layer-norm`). A vector index's `vector.embedding_model` may
+  name such a model with fewer dimensions; the MCP `search` tool embeds with the index's.
+  `vector.models()` yields `matryoshka`. See
+  [Shorter vectors](docs/Embeddings.md#shorter-vectors-matryoshka).
+
 ### Changed
 
 - The server logs the GPU adapter it uses at startup: `queries: graph kernels on the GPU

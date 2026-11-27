@@ -212,7 +212,7 @@ struct SelfCancelling(CancelHandle);
 
 impl Embedder for SelfCancelling {
     fn models(&self) -> Vec<ModelInfo> {
-        vec![ModelInfo { name: "m".into(), dimensions: 2, max_tokens: 8, loaded: false }]
+        vec![ModelInfo { name: "m".into(), dimensions: 2, max_tokens: 8, loaded: false, matryoshka: false }]
     }
 
     fn embed(&self, _: Option<&str>, texts: &[&str], _: &EmbedOptions, interrupt: &dyn Fn() -> Result<()>) -> Result<Vec<Vec<f32>>> {
@@ -288,6 +288,27 @@ fn a_vector_index_records_its_model() {
     assert!(e.contains("the models are large, small"), "{e}");
     let e = err("CREATE VECTOR INDEX c FOR (d:Doc) ON (d.c) OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 3}}");
     assert!(e.contains("model name"), "{e}");
+    // A Matryoshka model fits indexes of fewer dimensions, not more.
+    let short = Database::in_memory();
+    short.set_embedder(Arc::new(HashEmbedder::new([("m", 8)]).matryoshka()));
+    short
+        .execute("CREATE VECTOR INDEX s FOR (d:Doc) ON (d.e) OPTIONS {indexConfig: {`vector.dimensions`: 4, `vector.embedding_model`: 'm'}}")
+        .unwrap();
+    let e = short
+        .execute("CREATE VECTOR INDEX t FOR (d:Doc) ON (d.f) OPTIONS {indexConfig: {`vector.dimensions`: 16, `vector.embedding_model`: 'm'}}")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("8 dimensions at most, not 16"), "{e}");
+    let r = short.execute("RETURN size(vector.embed('a b c', null, {dimensions: 4})) AS d, size(vector.embed('a b c')) AS full").unwrap();
+    assert_eq!((r.rows[0][0].clone(), r.rows[0][1].clone()), (ResultValue::Int(4), ResultValue::Int(8)));
+    let r = short
+        .execute("CALL vector.embedChunks('one two three four', null, {dimensions: 2}) YIELD vector RETURN size(vector) AS d")
+        .unwrap();
+    assert_eq!(r.rows[0][0], ResultValue::Int(2));
+    let r = short.execute("CALL vector.models() YIELD matryoshka RETURN matryoshka").unwrap();
+    assert_eq!(r.rows[0][0], ResultValue::Bool(true));
+    let e = db.execute("RETURN vector.embed('a', 'small', {dimensions: 4})").unwrap_err().to_string();
+    assert!(e.contains("8 dimensions, not 4"), "{e}");
     // Without models any name is taken.
     let plain = Database::in_memory();
     plain
@@ -352,7 +373,7 @@ fn embed_chunks_embeds_each_chunk() {
     )
     .unwrap();
     assert!(r.len() >= 3);
-    let query = EmbedOptions { task: EmbedTask::Query, truncate: true };
+    let query = EmbedOptions { task: EmbedTask::Query, truncate: true, dimensions: None };
     for (i, chunk) in strings(&r, "text").iter().enumerate() {
         let v = floats(r.get(i, "vector").unwrap());
         assert_eq!(v.len(), 16);

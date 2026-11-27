@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{Reference, TempDir, assert_close, fixture, fixture_named};
 use graphbuff::{Database, EmbedOptions, EmbedTask, Embedder, Error, ResultValue};
-use graphbuff_embed::{EmbedderConfig, LocalEmbedder, ModelSpec, Registry};
+use graphbuff_embed::{EmbedderConfig, LocalEmbedder, Matryoshka, ModelSpec, Registry};
 
 fn embedder_for(dir: &Path, name: &str, batch_size: usize) -> LocalEmbedder {
     let spec = ModelSpec::read(name, dir).unwrap();
@@ -82,7 +82,7 @@ fn check_chunks(dir: &Path, name: &str) {
     let text = base.repeat(4 * max / per + 2);
     let specials = e.token_ids(None, "", &EmbedOptions::default()).unwrap().len();
     for task in ["document", "query"] {
-        let opts = EmbedOptions { task: if task == "query" { EmbedTask::Query } else { EmbedTask::Document }, truncate: false };
+        let opts = EmbedOptions { task: if task == "query" { EmbedTask::Query } else { EmbedTask::Document }, truncate: false, dimensions: None };
         let fit = e.token_spans(None, &text, opts.task).unwrap().fit;
         assert!(fit + specials <= max, "{name}: fit {fit}");
         for (size, overlap) in [(fit, 0), (fit / 2, fit / 8)] {
@@ -215,6 +215,70 @@ fn tiny_xlm_roberta_matches_transformers() {
 fn tiny_nomic_bert_matches_its_model_code() {
     check_model(&fixture_named("tiny-nomic"), "tiny-nomic", 1e-5);
     check_query(&fixture_named("tiny-nomic"), "tiny-nomic", 1e-5);
+}
+
+/// Fewer dimensions from a Matryoshka model: the full vector unchanged, the cut one as
+/// the manifest says (from the same model's unnormalized vector), and no cut for a model
+/// without `matryoshka`.
+#[test]
+fn matryoshka_cuts() {
+    let dir = TempDir::new("matryoshka");
+    let base = "architecture = \"nomic-bert\"\ndimensions = 32\nmax_tokens = 24\nquery_prefix = \"query: \"\n";
+    let copy = |name: &str, extra: &str| {
+        let to = dir.0.join(name);
+        std::fs::create_dir_all(&to).unwrap();
+        for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::copy(fixture_named("tiny-nomic").join(f), to.join(f)).unwrap();
+        }
+        std::fs::write(to.join("model.toml"), format!("{base}{extra}")).unwrap();
+        to
+    };
+    let raw = embedder_for(&copy("raw", "normalize = false\n"), "raw", 8);
+    let texts = Reference::read(&fixture_named("tiny-nomic").join("reference.json")).texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let opts = |d: Option<usize>| EmbedOptions { dimensions: d, ..Default::default() };
+    let pooled = raw.embed(None, &refs, &opts(None), &no_interrupt).unwrap();
+    let reference = Reference::read(&fixture_named("tiny-nomic").join("reference.json"));
+    let want = reference.vectors(if reference.has("mean") { "mean" } else { "vectors" });
+    for (how, name) in [(Matryoshka::LayerNorm, "layer-norm"), (Matryoshka::Truncate, "truncate")] {
+        let e = embedder_for(&copy(name, &format!("matryoshka = \"{name}\"\n")), name, 8);
+        assert!(e.models()[0].matryoshka);
+        let full = e.embed(None, &refs, &opts(None), &no_interrupt).unwrap();
+        let same = e.embed(None, &refs, &opts(Some(32)), &no_interrupt).unwrap();
+        for (i, w) in want.iter().enumerate() {
+            assert_close(&format!("{name}: full {i}"), &full[i], w, 1e-5);
+            assert_close(&format!("{name}: 32 {i}"), &same[i], w, 1e-5);
+        }
+        for dims in [16, 8, 1] {
+            let got = e.embed(None, &refs, &opts(Some(dims)), &no_interrupt).unwrap();
+            for (i, g) in got.iter().enumerate() {
+                let w: Vec<f64> = how.cut(pooled[i].clone(), dims, true).into_iter().map(f64::from).collect();
+                assert_eq!(g.len(), dims);
+                assert_close(&format!("{name}: {dims} {i}"), g, &w, 1e-5);
+                assert!((g.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-5, "normalized again");
+            }
+        }
+        let e33 = e.embed(None, &refs[..1], &opts(Some(33)), &no_interrupt).unwrap_err().to_string();
+        assert!(e33.contains("32 dimensions at most"), "{e33}");
+    }
+    let plain = embedder_for(&copy("plain", ""), "plain", 8);
+    assert!(!plain.models()[0].matryoshka);
+    assert_eq!(plain.embed(None, &refs[..1], &opts(Some(32)), &no_interrupt).unwrap()[0].len(), 32);
+    let e = plain.embed(None, &refs[..1], &opts(Some(16)), &no_interrupt).unwrap_err().to_string();
+    assert!(e.contains("not a Matryoshka model"), "{e}");
+
+    // From Cypher, and an index of the cut length may name the model.
+    let db = Database::in_memory();
+    db.set_embedder(Arc::new(embedder_for(&dir.0.join("layer-norm"), "layer-norm", 8)));
+    let r = db.execute("RETURN size(vector.embed('graph', null, {dimensions: 8})) AS d").unwrap();
+    assert_eq!(r.get(0, "d"), Some(&ResultValue::Int(8)));
+    db.execute("CREATE VECTOR INDEX short FOR (d:Doc) ON d.e OPTIONS {indexConfig: {`vector.dimensions`: 8, `vector.embedding_model`: 'layer-norm'}}")
+        .unwrap();
+    let err = db
+        .execute("CREATE VECTOR INDEX long FOR (d:Doc) ON d.f OPTIONS {indexConfig: {`vector.dimensions`: 64, `vector.embedding_model`: 'layer-norm'}}")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("at most"), "{err}");
 }
 
 #[test]

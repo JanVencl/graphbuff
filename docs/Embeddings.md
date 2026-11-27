@@ -50,7 +50,7 @@ The vectors are ordinary `LIST<FLOAT>` properties, so they go straight into a
 | `CALL vector.embedBatch(texts, model?, options?) YIELD index, text, vector` | Many texts in batches: one row per text, in order |
 | `CALL vector.chunk(text, model?, options?) YIELD index, text, start, length, tokens` | A long text in pieces that fit the model (see [Long texts](#long-texts-chunks)) |
 | `CALL vector.embedChunks(text, model?, options?) YIELD index, text, start, length, tokens, vector` | The same, each piece embedded |
-| `CALL vector.models() YIELD name, dimensions, maxTokens, loaded` | The installed models |
+| `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka` | The installed models (`matryoshka`: whether it makes shorter vectors too) |
 
 - `model` is the name of a model (its folder). `null` or leaving it out uses the default
   model: `embedding.default_model`, or the only installed model. With several models and
@@ -61,11 +61,13 @@ The vectors are ordinary `LIST<FLOAT>` properties, so they go straight into a
     model's `model.toml` sets the prefixes, and `task` picks one.
   - `truncate`: `true` by default, which cuts text longer than the model's `maxTokens`.
     With `false`, such text is an error.
+  - `dimensions`: the length of the vectors. Left out, it is the model's own. Fewer
+    needs a Matryoshka model (see [Shorter vectors](#shorter-vectors-matryoshka)).
 - A `null` text gives a `null` vector. `embedBatch` keeps `null` entries, with a `null`
   vector.
 - Errors:
-  - An unknown model, too-long text with `truncate: false`, or no default model is a
-    client error.
+  - An unknown model, too-long text with `truncate: false`, `dimensions` the model
+    cannot make, or no default model is a client error.
   - So is any call to a server without models: *embedding is not available*.
   - A model that fails to load is a runtime error.
 
@@ -108,6 +110,43 @@ SET d.embedding = vector
 
 Search with the model the documents were embedded with. Vectors of different models
 cannot be compared, even when their lengths happen to match.
+
+## Shorter vectors (Matryoshka)
+
+Some models are trained so that the start of a vector is a good vector by itself
+(Matryoshka representation learning): nomic-embed-text v1.5, mxbai-embed-large,
+arctic-embed v1.5 and others. With such a model, a call can ask for fewer dimensions:
+
+```cypher
+// 256 of nomic-embed-text's 768 dimensions.
+CREATE VECTOR INDEX doc_short IF NOT EXISTS
+FOR (d:Doc) ON d.embedding
+OPTIONS {indexConfig: {`vector.dimensions`: 256, `vector.embedding_model`: 'nomic-embed-text'}};
+
+MATCH (d:Doc) SET d.embedding = vector.embed(d.text, 'nomic-embed-text', {dimensions: 256});
+
+CALL db.index.vector.queryNodes('doc_short', 5,
+  vector.embed($question, 'nomic-embed-text', {task: 'query', dimensions: 256}))
+YIELD node, score
+RETURN node.text, score;
+```
+
+- It is optional. Without `dimensions` every model makes its full vectors, and full
+  vectors are the same with or without Matryoshka.
+- Shorter vectors take less memory and search faster (an HNSW index keeps its vectors in
+  memory), for some recall: worth it with many millions of vectors, or for a first pass
+  whose best hits are scored again with full vectors.
+- The model's `model.toml` says that it is Matryoshka, with `matryoshka`:
+  `"layer-norm"` for nomic-embed-text v1.5 (the pooled vector is normalized to mean 0 and
+  variance 1, then cut), `"truncate"` for most others (the first values are kept). Follow
+  the model card. `fetch-model.py` sets it for the models it knows; `--matryoshka` sets it
+  for others. Cut vectors are L2-normalized again when `normalize` is on.
+- A model without `matryoshka` refuses fewer dimensions: its first values alone are not a
+  good vector. Setting `matryoshka` on such a model gives poor vectors without failing.
+- Embed documents and queries with the same `dimensions`. An index's
+  `vector.embedding_model` may name a Matryoshka model with fewer dimensions than its
+  own, and the MCP `search` tool asks for the index's dimensions.
+- `vector.embedChunks` takes `dimensions` too.
 
 ## Long texts: chunks
 
@@ -169,6 +208,7 @@ pooling      = "mean"   # mean or cls, as the model card says
 normalize    = true     # L2-normalize: what cosine indexes expect
 query_prefix = ""       # put before texts embedded with {task: 'query'}
 doc_prefix   = ""       # put before documents
+matryoshka   = "truncate"  # optional: truncate or layer-norm, for Matryoshka models only
 ```
 
 - The folder's name is the model's name: 1 to 64 of `a-z 0-9 . _ -`.
@@ -181,7 +221,7 @@ doc_prefix   = ""       # put before documents
   | `e5-small` | intfloat/e5-small-v2 | 384 | mean | `query: ` / `passage: ` prefixes |
   | `multilingual-e5-small` | intfloat/multilingual-e5-small | 384 | mean | about 100 languages; `query: ` / `passage: ` |
   | `multilingual-e5-base` | intfloat/multilingual-e5-base | 768 | mean | XLM-RoBERTa, about 100 languages; `query: ` / `passage: ` |
-  | `nomic-embed-text` | nomic-ai/nomic-embed-text-v1.5 | 768 | mean | 2048 tokens; `search_query: ` / `search_document: ` |
+  | `nomic-embed-text` | nomic-ai/nomic-embed-text-v1.5 | 768 | mean | 2048 tokens; `search_query: ` / `search_document: `; Matryoshka (`layer-norm`) |
 
   For other models use `--repo owner/name --pooling …`; the script reads the
   architecture from `config.json`.
@@ -191,7 +231,7 @@ doc_prefix   = ""       # put before documents
   |---|---|---|
   | `bert` | `bert` | BERT, MiniLM, BGE, E5, GTE (small and base), multilingual-e5-small, paraphrase-multilingual-MiniLM |
   | `xlm-roberta` | `xlm-roberta` | multilingual-e5-base and -large, bge-m3 (dense vectors) |
-  | `nomic-bert` | `nomic_bert` | nomic-embed-text v1 and v1.5 (full dimensions; no Matryoshka cut) |
+  | `nomic-bert` | `nomic_bert` | nomic-embed-text v1 and v1.5 (v1.5 also makes shorter vectors: [Matryoshka](#shorter-vectors-matryoshka)) |
 
   The server refuses a model whose `config.json` names another `model_type` than
   `architecture`: an XLM-RoBERTa run as BERT would give wrong vectors without failing.
