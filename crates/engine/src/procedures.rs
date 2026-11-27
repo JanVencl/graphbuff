@@ -802,7 +802,7 @@ fn register_builtins(p: &mut Procedures) {
         crate::embed::embed_chunks,
     );
     add(
-        ProcedureSignature::new("vector.models", NONE, ["name", "dimensions", "maxTokens", "loaded"])
+        ProcedureSignature::new("vector.models", NONE, ["name", "dimensions", "maxTokens", "loaded", "matryoshka"])
             .description("The installed embedding models."),
         crate::embed::models,
     );

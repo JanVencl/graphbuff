@@ -26,15 +26,16 @@ import tempfile
 import urllib.error
 import urllib.request
 
-# name: (repository, pooling, max_tokens, query_prefix, doc_prefix)
+# name: (repository, pooling, max_tokens, query_prefix, doc_prefix, matryoshka)
 KNOWN = {
-    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", "mean", 256, "", ""),
+    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", "mean", 256, "", "", None),
     "bge-small-en": ("BAAI/bge-small-en-v1.5", "cls", 512,
-                     "Represent this sentence for searching relevant passages: ", ""),
-    "e5-small": ("intfloat/e5-small-v2", "mean", 512, "query: ", "passage: "),
-    "multilingual-e5-small": ("intfloat/multilingual-e5-small", "mean", 512, "query: ", "passage: "),
-    "multilingual-e5-base": ("intfloat/multilingual-e5-base", "mean", 512, "query: ", "passage: "),
-    "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", "mean", 2048, "search_query: ", "search_document: "),
+                     "Represent this sentence for searching relevant passages: ", "", None),
+    "e5-small": ("intfloat/e5-small-v2", "mean", 512, "query: ", "passage: ", None),
+    "multilingual-e5-small": ("intfloat/multilingual-e5-small", "mean", 512, "query: ", "passage: ", None),
+    "multilingual-e5-base": ("intfloat/multilingual-e5-base", "mean", 512, "query: ", "passage: ", None),
+    "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", "mean", 2048, "search_query: ", "search_document: ",
+                         "layer-norm"),
 }
 # config.json's model_type: the architecture in model.toml.
 ARCHITECTURES = {"bert": "bert", "xlm-roberta": "xlm-roberta", "nomic_bert": "nomic-bert"}
@@ -92,18 +93,21 @@ def main():
     p.add_argument("--max-tokens", type=int)
     p.add_argument("--query-prefix")
     p.add_argument("--doc-prefix")
+    p.add_argument("--matryoshka", choices=("none", "truncate", "layer-norm"),
+                   help="whether the model makes shorter vectors too, and how (as its model card says)")
     p.add_argument("--force", action="store_true", help="replace an existing model of that name")
     a = p.parse_args()
 
     if a.list:
-        for name, (repo, pooling, max_tokens, qp, _) in KNOWN.items():
-            print(f"{name:22} {repo}  ({pooling} pooling, {max_tokens} tokens{', query prefix' if qp else ''})")
+        for name, (repo, pooling, max_tokens, qp, _, mr) in KNOWN.items():
+            print(f"{name:22} {repo}  ({pooling} pooling, {max_tokens} tokens{', query prefix' if qp else ''}"
+                  f"{', Matryoshka' if mr else ''})")
         return 0
     if not a.name:
         p.error("name a model (see --list)")
     if not NAME.match(a.name):
         p.error("a model name is 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit")
-    repo, pooling, max_tokens, qp, dp = KNOWN.get(a.name, (None, "mean", None, "", ""))
+    repo, pooling, max_tokens, qp, dp, mr = KNOWN.get(a.name, (None, "mean", None, "", "", None))
     repo = a.repo or repo
     if not repo:
         p.error(f"`{a.name}` is not a known model (see --list): give --repo owner/name")
@@ -111,6 +115,7 @@ def main():
     max_tokens = a.max_tokens or max_tokens
     qp = qp if a.query_prefix is None else a.query_prefix
     dp = dp if a.doc_prefix is None else a.doc_prefix
+    mr = mr if a.matryoshka is None else (None if a.matryoshka == "none" else a.matryoshka)
 
     target = os.path.join(a.dir, a.name)
     if os.path.exists(target) and not a.force:
@@ -133,7 +138,8 @@ def main():
             f.write(f"# {repo} (revision {a.revision}), fetched by fetch-model.py\n"
                     f"architecture = \"{arch}\"\ndimensions = {dims}\nmax_tokens = {max_tokens}\n"
                     f"pooling = \"{pooling}\"\nnormalize = true\n"
-                    f"query_prefix = {toml_str(qp)}\ndoc_prefix = {toml_str(dp)}\n")
+                    f"query_prefix = {toml_str(qp)}\ndoc_prefix = {toml_str(dp)}\n"
+                    + (f"matryoshka = \"{mr}\"\n" if mr else ""))
         if os.path.exists(target):
             shutil.rmtree(target)
         os.replace(work, target)

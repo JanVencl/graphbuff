@@ -33,6 +33,7 @@ pooling      = "mean"   # mean or cls, as the model card says
 normalize    = true
 query_prefix = ""       # e.g. "query: " for E5, used with {task: 'query'}
 doc_prefix   = ""       # e.g. "passage: " for E5
+matryoshka   = "truncate"  # only for Matryoshka models: truncate or layer-norm
 ```
 
 See docs/Embeddings.md in the graphbuff repository for details.

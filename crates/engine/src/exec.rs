@@ -670,8 +670,9 @@ impl Executor<'_> {
     }
 
     /// Fails if `model`, named as a vector index's embedding model, is not one of the
-    /// database's models, or makes vectors of other than `dimensions`. Without models
-    /// (no embedder) any name is taken: the store may be used where they are installed.
+    /// database's models, or cannot make vectors of `dimensions` (its own, or fewer for a
+    /// Matryoshka model). Without models (no embedder) any name is taken: the store may be
+    /// used where they are installed.
     fn check_embedding_model(&self, model: &str, dimensions: u32) -> Result<()> {
         let Some(e) = &self.embedder else { return Ok(()) };
         let models = e.models();
@@ -679,7 +680,11 @@ impl Executor<'_> {
             return Ok(());
         }
         match models.iter().find(|m| m.name == model) {
-            Some(m) if m.dimensions == dimensions as usize => Ok(()),
+            Some(m) if m.fits(dimensions as usize) => Ok(()),
+            Some(m) if m.matryoshka => Err(Error::Semantic(format!(
+                "embedding model `{model}` makes vectors of {} dimensions at most, not {dimensions}",
+                m.dimensions
+            ))),
             Some(m) => Err(Error::Semantic(format!(
                 "embedding model `{model}` makes vectors of {} dimensions, not {dimensions}",
                 m.dimensions

@@ -161,8 +161,8 @@ fn filter(filters: &Json, v: &str, allowed: Option<&[String]>, out: &mut BTreeMa
 }
 
 /// The model that embeds the query: `requested`, else the index's, else the default
-/// (`None`). A known model of other dimensions than the index is an error that names the
-/// fitting ones.
+/// (`None`). A known model that cannot make vectors of the index's dimensions is an error
+/// that names the fitting ones.
 fn model(db: &graphbuff::Database<graphbuff::BoxedStore>, index: &IndexDef, requested: Option<String>) -> Result<Option<String>, String> {
     let IndexKind::Vector { dimensions, .. } = index.kind else { return Ok(None) };
     let model = requested.or_else(|| index.embedding_model.clone());
@@ -173,7 +173,7 @@ fn model(db: &graphbuff::Database<graphbuff::BoxedStore>, index: &IndexDef, requ
     };
     let models = embedder.models();
     if let Some(m) = &model {
-        let fitting: Vec<&str> = models.iter().filter(|x| x.dimensions == dimensions as usize).map(|x| x.name.as_str()).collect();
+        let fitting: Vec<&str> = models.iter().filter(|x| x.fits(dimensions as usize)).map(|x| x.name.as_str()).collect();
         match models.iter().find(|x| &x.name == m) {
             None => {
                 return Err(format!(
@@ -182,7 +182,7 @@ fn model(db: &graphbuff::Database<graphbuff::BoxedStore>, index: &IndexDef, requ
                     if fitting.is_empty() { "none".to_string() } else { fitting.join(", ") }
                 ));
             }
-            Some(x) if x.dimensions != dimensions as usize => {
+            Some(x) if !x.fits(dimensions as usize) => {
                 return Err(format!(
                     "model `{m}` makes vectors of {} dimensions, but index `{}` has {dimensions}; the models that fit: {}",
                     x.dimensions,
@@ -257,6 +257,9 @@ pub(crate) fn search(i: &Input) -> Output {
             let m = model(&db, v, c.string("model").map_err(e)?).map_err(e)?;
             let mut ps = params([("text", Value::String(query_text.clone())), ("k", Value::Int(k))]);
             ps.insert("model".into(), m.clone().map_or(Value::Null, Value::String));
+            // The index's length, so that a Matryoshka model cuts its vector to fit.
+            let IndexKind::Vector { dimensions, .. } = v.kind else { unreachable!("a vector index") };
+            ps.insert("dims".into(), Value::Int(i64::from(dimensions)));
             let mut w = String::new();
             if let Some(f) = filters {
                 let cond = filter(f, "n", Some(v.filter_properties()), &mut ps).map_err(e)?;
@@ -265,7 +268,7 @@ pub(crate) fn search(i: &Input) -> Output {
                 }
             }
             let q = format!(
-                "WITH vector.embed($text, $model, {{task: 'query'}}) AS v \
+                "WITH vector.embed($text, $model, {{task: 'query', dimensions: $dims}}) AS v \
                  MATCH (n:{}) SEARCH n IN (VECTOR INDEX {} FOR v{w} LIMIT $k) SCORE AS score \
                  RETURN score, {} AS node",
                 quote(&v.label),

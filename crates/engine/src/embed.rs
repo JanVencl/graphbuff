@@ -8,7 +8,9 @@
 //! `Unsupported`. [`HashEmbedder`] is a model-free embedder for tests.
 //!
 //! The result of an embedding is a plain `LIST<FLOAT>`. It can be stored as a property and
-//! indexed by a vector index whose `vector.dimensions` equal the model's.
+//! indexed by a vector index whose `vector.dimensions` equal the model's. A Matryoshka
+//! model (one trained so that the start of its vector is a good vector too) also makes
+//! shorter vectors on request: `{dimensions: n}` in the options.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -33,12 +35,22 @@ use crate::procedures::{ProcedureContext, ProcedureRows};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
     pub name: String,
-    /// The length of the vectors it returns.
+    /// The length of the vectors it returns (unless asked for fewer).
     pub dimensions: usize,
     /// The longest input it takes, in tokens.
     pub max_tokens: usize,
     /// Whether it is loaded in memory now.
     pub loaded: bool,
+    /// Whether it makes shorter vectors too (`{dimensions: n}`, `n` up to `dimensions`):
+    /// a Matryoshka model.
+    pub matryoshka: bool,
+}
+
+impl ModelInfo {
+    /// Whether it makes vectors of `dimensions`: its own, or fewer if it is Matryoshka.
+    pub fn fits(&self, dimensions: usize) -> bool {
+        dimensions == self.dimensions || (self.matryoshka && (1..self.dimensions).contains(&dimensions))
+    }
 }
 
 /// What the text embedded is: some models put a different prefix before queries and
@@ -53,18 +65,22 @@ pub enum EmbedTask {
 }
 
 /// Per-call options: the third argument of `vector.embed` and `vector.embedBatch`
-/// (`{task: 'query' | 'document', truncate: true | false}`).
+/// (`{task: 'query' | 'document', truncate: true | false, dimensions: n}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmbedOptions {
     pub task: EmbedTask,
     /// Whether text longer than the model's `max_tokens` is cut (`true`, the default)
     /// or fails.
     pub truncate: bool,
+    /// The length of the vectors; `None` (the default): the model's own. Fewer than the
+    /// model's needs a Matryoshka model ([`ModelInfo::matryoshka`]); the model's own
+    /// always works.
+    pub dimensions: Option<usize>,
 }
 
 impl Default for EmbedOptions {
     fn default() -> Self {
-        EmbedOptions { task: EmbedTask::Document, truncate: true }
+        EmbedOptions { task: EmbedTask::Document, truncate: true, dimensions: None }
     }
 }
 
@@ -87,18 +103,27 @@ impl EmbedOptions {
                     }
                 }
                 ("truncate", Value::Bool(b)) => o.truncate = *b,
-                ("task" | "truncate", Value::Null) => {}
-                ("task" | "truncate", other) => {
+                ("dimensions", Value::Int(n)) if *n >= 1 => o.dimensions = Some(*n as usize),
+                ("dimensions", Value::Int(n)) => {
+                    return Err(Error::Semantic(format!("{what}: `dimensions` must be at least 1, not {n}")));
+                }
+                ("task" | "truncate" | "dimensions", Value::Null) => {}
+                ("task" | "truncate" | "dimensions", other) => {
                     return Err(Error::Type(format!("{what}: `{k}` does not accept {}", other.type_name())));
                 }
-                _ => return Err(Error::Semantic(format!("{what}: unknown option `{k}` (known: task, truncate)"))),
+                _ => {
+                    return Err(Error::Semantic(format!(
+                        "{what}: unknown option `{k}` (known: task, truncate, dimensions)"
+                    )));
+                }
             }
         }
         Ok(o)
     }
 }
 
-/// The options of `vector.chunk` and `vector.embedChunks`: `{size, overlap, task}`.
+/// The options of `vector.chunk` and `vector.embedChunks`: `{size, overlap, task,
+/// dimensions}` (`dimensions` as in [`EmbedOptions`], for `embedChunks`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChunkOptions {
     /// Tokens per chunk at most; `None`: as many as fit the model.
@@ -108,6 +133,8 @@ pub struct ChunkOptions {
     pub overlap: usize,
     /// What the chunks will be embedded as: its prefix takes room too.
     pub task: EmbedTask,
+    /// The length of the chunks' vectors; `None`: the model's own.
+    pub dimensions: Option<usize>,
 }
 
 impl ChunkOptions {
@@ -125,14 +152,22 @@ impl ChunkOptions {
         };
         for (k, v) in map {
             match (k.as_str(), v) {
-                (_, Value::Null) if matches!(k.as_str(), "size" | "overlap" | "task") => {}
+                (_, Value::Null) if matches!(k.as_str(), "size" | "overlap" | "task" | "dimensions") => {}
                 ("size", v) => o.size = Some(count(k, v, 1)?),
                 ("overlap", v) => o.overlap = count(k, v, 0)?,
-                ("task", _) => {
+                ("task" | "dimensions", _) => {
                     let single = Value::Map([(k.clone(), v.clone())].into_iter().collect());
-                    o.task = EmbedOptions::from_value(what, &single)?.task;
+                    let e = EmbedOptions::from_value(what, &single)?;
+                    match k.as_str() {
+                        "task" => o.task = e.task,
+                        _ => o.dimensions = e.dimensions,
+                    }
                 }
-                _ => return Err(Error::Semantic(format!("{what}: unknown option `{k}` (known: size, overlap, task)"))),
+                _ => {
+                    return Err(Error::Semantic(format!(
+                        "{what}: unknown option `{k}` (known: size, overlap, task, dimensions)"
+                    )));
+                }
             }
         }
         if let Some(size) = o.size
@@ -187,7 +222,8 @@ pub trait Embedder: Send + Sync {
 
     /// Embeds `texts` with `model` (`None`: the default model), one vector per text and
     /// in order. Long batches call `interrupt` between parts, on the calling thread, and
-    /// stop with its error. An unknown model fails with `Semantic`.
+    /// stop with its error. An unknown model fails with `Semantic`, and so does
+    /// `options.dimensions` that the model does not [fit](ModelInfo::fits).
     fn embed(
         &self,
         model: Option<&str>,
@@ -224,6 +260,11 @@ fn embed_checked(
     let out = embedder.embed(model, texts, options, interrupt)?;
     if out.len() != texts.len() {
         return Err(Error::Runtime(format!("the embedder returned {} vectors for {} texts", out.len(), texts.len())));
+    }
+    if let Some(d) = options.dimensions
+        && let Some(v) = out.iter().find(|v| v.len() != d)
+    {
+        return Err(Error::Runtime(format!("the embedder returned a vector of {} dimensions, not the {d} asked for", v.len())));
     }
     Ok(out)
 }
@@ -297,7 +338,7 @@ pub(crate) fn embed_batch(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result<
         .collect())
 }
 
-/// `CALL vector.models() YIELD name, dimensions, maxTokens, loaded`, by name.
+/// `CALL vector.models() YIELD name, dimensions, maxTokens, loaded, matryoshka`, by name.
 pub(crate) fn models(ctx: &ProcedureContext<'_>, _args: &[Value]) -> Result<ProcedureRows> {
     let mut models = ctx.embedder()?.models();
     models.sort_by(|a, b| a.name.cmp(&b.name));
@@ -309,6 +350,7 @@ pub(crate) fn models(ctx: &ProcedureContext<'_>, _args: &[Value]) -> Result<Proc
                 Value::Int(m.dimensions as i64),
                 Value::Int(m.max_tokens as i64),
                 Value::Bool(m.loaded),
+                Value::Bool(m.matryoshka),
             ]
         })
         .collect())
@@ -498,7 +540,7 @@ pub(crate) fn embed_chunks(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result
         return Ok(Vec::new());
     };
     let pieces: Vec<&str> = chunks.iter().map(|c| &text[c.bytes.clone()]).collect();
-    let embed = EmbedOptions { task: options.task, truncate: true };
+    let embed = EmbedOptions { task: options.task, truncate: true, dimensions: options.dimensions };
     let vectors = embed_checked(embedder, model, &pieces, &embed, &|| ctx.check_interrupt())?;
     Ok(chunk_rows(text, &chunks)
         .into_iter()
@@ -515,11 +557,14 @@ pub(crate) fn embed_chunks(ctx: &ProcedureContext<'_>, args: &[Value]) -> Result
 /// the same words get the same vector, and texts that share words are similar.
 ///
 /// [`EmbedTask::Query`] adds the word `query:`, so queries and documents differ. Each
-/// model has a `max_tokens` of 64 words. The first model is the default.
+/// model has a `max_tokens` of 64 words. The first model is the default. With
+/// [`matryoshka`](Self::matryoshka) its models also make fewer dimensions: the first
+/// ones, normalized again.
 #[derive(Debug)]
 pub struct HashEmbedder {
     models: Vec<(String, usize)>,
     max_tokens: usize,
+    matryoshka: bool,
     calls: AtomicUsize,
 }
 
@@ -533,6 +578,7 @@ impl HashEmbedder {
         HashEmbedder {
             models: models.into_iter().map(|(n, d)| (n.into(), d)).collect(),
             max_tokens: 64,
+            matryoshka: false,
             calls: AtomicUsize::new(0),
         }
     }
@@ -540,6 +586,12 @@ impl HashEmbedder {
     /// The same, with another `max_tokens` (in words).
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// The same, with Matryoshka models (`{dimensions: n}` up to theirs).
+    pub fn matryoshka(mut self) -> Self {
+        self.matryoshka = true;
         self
     }
 
@@ -581,7 +633,13 @@ impl Embedder for HashEmbedder {
     fn models(&self) -> Vec<ModelInfo> {
         self.models
             .iter()
-            .map(|(name, dims)| ModelInfo { name: name.clone(), dimensions: *dims, max_tokens: self.max_tokens, loaded: true })
+            .map(|(name, dims)| ModelInfo {
+                name: name.clone(),
+                dimensions: *dims,
+                max_tokens: self.max_tokens,
+                loaded: true,
+                matryoshka: self.matryoshka,
+            })
             .collect()
     }
 
@@ -600,11 +658,24 @@ impl Embedder for HashEmbedder {
                 Error::Semantic(format!("unknown embedding model '{name}' (installed: {})", known.join(", ")))
             })?,
         };
+        let cut = match options.dimensions {
+            None => dims,
+            Some(d) if d == dims || (self.matryoshka && (1..dims).contains(&d)) => d,
+            Some(d) => return Err(Error::Semantic(format!("the model makes vectors of {dims} dimensions, not {d}"))),
+        };
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(32) {
             interrupt()?;
             for t in chunk {
-                out.push(Self::vector(t, dims, options.task, self.max_tokens, options.truncate)?);
+                let mut v = Self::vector(t, dims, options.task, self.max_tokens, options.truncate)?;
+                if cut < dims {
+                    v.truncate(cut);
+                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        v.iter_mut().for_each(|x| *x /= norm);
+                    }
+                }
+                out.push(v);
             }
         }
         Ok(out)
@@ -637,7 +708,11 @@ mod tests {
     #[test]
     fn options_parse() {
         let o = EmbedOptions::from_value("f", &options(&[("task", "query".into()), ("truncate", Value::Bool(false))])).unwrap();
-        assert_eq!(o, EmbedOptions { task: EmbedTask::Query, truncate: false });
+        assert_eq!(o, EmbedOptions { task: EmbedTask::Query, truncate: false, dimensions: None });
+        let o = EmbedOptions::from_value("f", &options(&[("dimensions", Value::Int(64))])).unwrap();
+        assert_eq!(o.dimensions, Some(64));
+        assert!(EmbedOptions::from_value("f", &options(&[("dimensions", Value::Int(0))])).is_err());
+        assert!(EmbedOptions::from_value("f", &options(&[("dimensions", "x".into())])).is_err());
         assert_eq!(EmbedOptions::from_value("f", &Value::Null).unwrap(), EmbedOptions::default());
         assert!(EmbedOptions::from_value("f", &options(&[("task", "x".into())])).is_err());
         assert!(EmbedOptions::from_value("f", &options(&[("other", Value::Int(1))])).is_err());
@@ -695,7 +770,9 @@ mod tests {
             &options(&[("size", Value::Int(100)), ("overlap", Value::Int(10)), ("task", "query".into())]),
         )
         .unwrap();
-        assert_eq!(o, ChunkOptions { size: Some(100), overlap: 10, task: EmbedTask::Query });
+        assert_eq!(o, ChunkOptions { size: Some(100), overlap: 10, task: EmbedTask::Query, dimensions: None });
+        let o = ChunkOptions::from_value("f", &options(&[("dimensions", Value::Int(8)), ("task", "query".into())])).unwrap();
+        assert_eq!((o.task, o.dimensions), (EmbedTask::Query, Some(8)));
         assert_eq!(ChunkOptions::from_value("f", &Value::Null).unwrap(), ChunkOptions::default());
         for (bad, err) in [
             (options(&[("size", Value::Int(0))]), "at least 1"),
@@ -717,5 +794,11 @@ mod tests {
         assert_eq!(v[0], v[1]);
         assert!((v[0].iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-6);
         assert!(v[2].iter().all(|x| *x == 0.0));
+        let cut = EmbedOptions { dimensions: Some(4), ..Default::default() };
+        assert!(e.embed(None, &["a"], &cut, &|| Ok(())).is_err(), "not Matryoshka");
+        let e = HashEmbedder::new([("m", 16)]).matryoshka();
+        let short = e.embed(None, &["a b c d e f g"], &cut, &|| Ok(())).unwrap();
+        assert_eq!(short[0].len(), 4);
+        assert!(e.embed(None, &["a"], &EmbedOptions { dimensions: Some(17), ..Default::default() }, &|| Ok(())).is_err());
     }
 }

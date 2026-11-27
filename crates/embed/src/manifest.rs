@@ -8,7 +8,17 @@
 //! normalize    = true     # L2-normalize the vectors
 //! query_prefix = ""       # put before texts embedded with {task: 'query'}
 //! doc_prefix   = ""       # put before documents (the default task)
+//! matryoshka   = "layer-norm"  # optional: truncate | layer-norm (see below)
 //! ```
+//!
+//! `matryoshka` says the model was trained so that the start of its vector is a good
+//! vector too (Matryoshka representation learning), and lets a call ask for fewer
+//! dimensions (`{dimensions: n}`). Without it, the model makes only full vectors. How the
+//! vector is cut follows the model's own instructions: `truncate` keeps the first `n`
+//! values (most such models: mxbai-embed-large, arctic-embed v1.5, gte-v1.5);
+//! `layer-norm` first normalizes the pooled vector to mean 0 and variance 1, as
+//! nomic-embed-text v1.5 asks. Either way the cut vector is L2-normalized again if
+//! `normalize` is on. Full vectors are never changed by it.
 //!
 //! The file is a flat list of `key = value` lines (strings, integers, booleans) with `#`
 //! comments; unknown keys are errors, so typos do not go unnoticed.
@@ -51,6 +61,37 @@ pub enum Pooling {
     Cls,
 }
 
+/// How a Matryoshka model's vector is cut to fewer dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matryoshka {
+    /// The first `n` values.
+    Truncate,
+    /// The first `n` values after a layer norm (no weights) of the pooled vector:
+    /// nomic-embed-text v1.5.
+    LayerNorm,
+}
+
+impl Matryoshka {
+    /// The vector `v` (pooled, not normalized) cut to `dims`, L2-normalized if
+    /// `normalize`.
+    pub fn cut(self, mut v: Vec<f32>, dims: usize, normalize: bool) -> Vec<f32> {
+        if self == Matryoshka::LayerNorm && !v.is_empty() {
+            // As torch's layer_norm: biased variance, eps 1e-5, in f32.
+            let n = v.len() as f32;
+            let mean = v.iter().sum::<f32>() / n;
+            let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let scale = 1.0 / (var + 1e-5).sqrt();
+            v.iter_mut().for_each(|x| *x = (*x - mean) * scale);
+        }
+        v.truncate(dims);
+        if normalize {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+}
+
 /// What `model.toml` says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
@@ -62,6 +103,8 @@ pub struct Manifest {
     pub normalize: bool,
     pub query_prefix: String,
     pub doc_prefix: String,
+    /// `None`: full vectors only.
+    pub matryoshka: Option<Matryoshka>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,10 +154,16 @@ impl Manifest {
         };
         let query_prefix = string("query_prefix")?;
         let doc_prefix = string("doc_prefix")?;
+        let matryoshka = match take("matryoshka") {
+            None => None,
+            Some(Toml::Str(s)) if s == "truncate" => Some(Matryoshka::Truncate),
+            Some(Toml::Str(s)) if s == "layer-norm" => Some(Matryoshka::LayerNorm),
+            Some(_) => return Err("`matryoshka` is \"truncate\" or \"layer-norm\"".into()),
+        };
         if let Some(key) = values.keys().next() {
             return Err(format!("unknown key `{key}`"));
         }
-        Ok(Manifest { architecture, dimensions, max_tokens, pooling, normalize, query_prefix, doc_prefix })
+        Ok(Manifest { architecture, dimensions, max_tokens, pooling, normalize, query_prefix, doc_prefix, matryoshka })
     }
 }
 
@@ -208,7 +257,27 @@ mod tests {
         assert_eq!(m.query_prefix, "query: ");
         assert_eq!(m.doc_prefix, "passage: ");
         let m = Manifest::parse("architecture = \"bert\"\ndimensions = 8").unwrap();
-        assert_eq!((m.max_tokens, m.pooling, m.normalize), (None, Pooling::Mean, true));
+        assert_eq!((m.max_tokens, m.pooling, m.normalize, m.matryoshka), (None, Pooling::Mean, true, None));
+        for (text, want) in [("truncate", Matryoshka::Truncate), ("layer-norm", Matryoshka::LayerNorm)] {
+            let m = Manifest::parse(&format!("architecture = \"nomic-bert\"\ndimensions = 8\nmatryoshka = \"{text}\"")).unwrap();
+            assert_eq!(m.matryoshka, Some(want));
+        }
+    }
+
+    #[test]
+    fn matryoshka_cuts() {
+        let v = vec![3.0, 4.0, 12.0, -1.0];
+        assert_eq!(Matryoshka::Truncate.cut(v.clone(), 2, false), [3.0, 4.0]);
+        assert_eq!(Matryoshka::Truncate.cut(v.clone(), 2, true), [0.6, 0.8]);
+        // mean 4.5, variance 22.25.
+        let s = (22.25f32 + 1e-5).sqrt();
+        let got = Matryoshka::LayerNorm.cut(v.clone(), 3, false);
+        for (g, w) in got.iter().zip([-1.5 / s, -0.5 / s, 7.5 / s]) {
+            assert!((g - w).abs() < 1e-6, "{got:?}");
+        }
+        let got = Matryoshka::LayerNorm.cut(v, 2, true);
+        let n = (1.5f32 * 1.5 + 0.5 * 0.5).sqrt();
+        assert!((got[0] + 1.5 / n).abs() < 1e-6 && (got[1] + 0.5 / n).abs() < 1e-6, "{got:?}");
     }
 
     #[test]
@@ -219,6 +288,8 @@ mod tests {
             ("architecture = \"bert\"", "`dimensions` is missing"),
             ("architecture = \"bert\"\ndimensions = 0", "positive"),
             ("architecture = \"bert\"\ndimensions = 8\npooling = \"max\"", "`pooling`"),
+            ("architecture = \"bert\"\ndimensions = 8\nmatryoshka = true", "`matryoshka`"),
+            ("architecture = \"bert\"\ndimensions = 8\nmatryoshka = \"slice\"", "`matryoshka`"),
             ("architecture = \"bert\"\ndimensions = 8\ndims = 8", "unknown key `dims`"),
             ("architecture = \"bert\"\ndimensions = 8\ndimensions = 9", "set twice"),
             ("[model]\narchitecture = \"bert\"", "tables"),
