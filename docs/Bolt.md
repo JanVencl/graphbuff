@@ -23,7 +23,9 @@ with GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "s3cret")) as 
   `TELEMETRY` (5.4), `ROUTE` (this server is the whole cluster, so `neo4j://` URIs work),
   the `db` of a query or transaction, `tx_timeout`, and the 4.4 `utc` patch. Summaries
   carry counters under Neo4j's names, a query type, bookmarks, and `plan`/`profile` for
-  `EXPLAIN`/`PROFILE`.
+  `EXPLAIN`/`PROFILE` (each operator with `operatorType`, `children` and `args`: `Details`,
+  `EstimatedRows`, and for `PROFILE` also `Rows` and `Time`, plus `rows` and `time` on the
+  operator itself; `identifiers` is empty and `dbHits` is 0).
 * **Newer versions:** the manifest handshake (5.7+: the client asks for `00 00 01 FF`
   and picks from the versions listed; HELLO then reports `protocol_version`); GQL status
   objects in summaries (5.6+: `00000` successful completion, `02000` no data, `00001`
