@@ -150,9 +150,10 @@ RETURN node.text, score;
 
 ## Long texts: chunks
 
-A model reads at most `maxTokens` tokens (512 for most, 2048 for nomic-embed-text) and
-`vector.embed` cuts the rest, so the end of a long document never reaches its vector.
-Split such texts into chunks and embed each:
+A model reads at most `maxTokens` tokens (512 for most, 2048 for nomic-embed-text, 8192
+with [rotary scaling](#longer-inputs-rotary-scaling)) and `vector.embed` cuts the rest,
+so the end of a long document never reaches its vector. Split such texts into chunks
+and embed each:
 
 ```cypher
 MATCH (d:Doc) WHERE NOT EXISTS { (d)<-[:PART_OF]-(:Chunk) }
@@ -189,6 +190,29 @@ RETURN d.title, max(score) AS best ORDER BY best DESC LIMIT 5;
 - `embedChunks` embeds all the chunks of a text in one batch. To embed many documents,
   page them as above.
 
+## Longer inputs (rotary scaling)
+
+nomic-embed-text was trained on 2048 tokens but takes up to 8192 (`n_positions`) with
+dynamic NTK rotary scaling, as its model card says. Turn it on in its `model.toml`:
+
+```toml
+rotary_scaling = 2      # the model card's factor; config.json's rotary_scaling_factor
+max_tokens     = 8192   # default with rotary_scaling: n_positions
+```
+
+or with `fetch-model.py nomic-embed-text --rotary-scaling 2`.
+
+- Off by default. Texts up to the trained length embed exactly as without it; a longer
+  text gets a larger rotary base, from its own length.
+- The base comes from each text's own length, so a vector does not depend on the texts
+  batched with it. Nomic's code takes the batch's padded length; a text embedded alone
+  gets the same vector both ways.
+- Memory grows with the square of the length: attention over 8192 tokens takes about
+  6 GB per text for nomic-embed-text (12 heads), against 400 MB at 2048. A batch's
+  memory is charged to the query and counts against `queries.max_memory_mb`; set
+  `max_tokens` lower, or chunk, where that is too much.
+- Only nomic-bert has it; other models refuse `rotary_scaling`.
+
 ## Models
 
 A model is a folder with four files:
@@ -209,6 +233,7 @@ normalize    = true     # L2-normalize: what cosine indexes expect
 query_prefix = ""       # put before texts embedded with {task: 'query'}
 doc_prefix   = ""       # put before documents
 matryoshka   = "truncate"  # optional: truncate or layer-norm, for Matryoshka models only
+rotary_scaling = 2      # optional, nomic-bert only: inputs past the trained length
 ```
 
 - The folder's name is the model's name: 1 to 64 of `a-z 0-9 . _ -`.
@@ -236,7 +261,8 @@ matryoshka   = "truncate"  # optional: truncate or layer-norm, for Matryoshka mo
   The server refuses a model whose `config.json` names another `model_type` than
   `architecture`: an XLM-RoBERTa run as BERT would give wrong vectors without failing.
   nomic-bert models are limited to the length they were trained on
-  (`max_trained_positions`, 2048), as graphbuff does not scale rotary positions.
+  (`max_trained_positions`, 2048) unless `rotary_scaling` is set (see
+  [Longer inputs](#longer-inputs-rotary-scaling)).
   Decoder models (Qwen3-Embedding, gte-Qwen) are not supported.
 - At startup the server checks every folder: manifest, config, files, and that the
   dimensions match. A bad folder is skipped with a warning and the others still load.

@@ -41,13 +41,17 @@ KNOWN = {
 ARCHITECTURES = {"bert": "bert", "xlm-roberta": "xlm-roberta", "nomic_bert": "nomic-bert"}
 
 
-def model_shape(config):
+def model_shape(config, rotary_scaling=None):
     """(architecture, dimensions, the most tokens it takes) from config.json."""
     arch = ARCHITECTURES.get(config.get("model_type"))
     if arch is None:
         raise ValueError(f"model_type {config.get('model_type')!r} is not supported "
                          f"(only {', '.join(ARCHITECTURES)})")
+    if rotary_scaling and arch != "nomic-bert":
+        raise ValueError("--rotary-scaling is for nomic-bert models only")
     if arch == "nomic-bert":
+        if rotary_scaling or config.get("rotary_scaling_factor"):
+            return arch, config["n_embd"], config["n_positions"]
         return arch, config["n_embd"], min(config.get("max_trained_positions", config["n_positions"]), config["n_positions"])
     limit = config["max_position_embeddings"]
     if arch == "xlm-roberta":
@@ -95,6 +99,8 @@ def main():
     p.add_argument("--doc-prefix")
     p.add_argument("--matryoshka", choices=("none", "truncate", "layer-norm"),
                    help="whether the model makes shorter vectors too, and how (as its model card says)")
+    p.add_argument("--rotary-scaling", type=float, metavar="FACTOR",
+                   help="nomic-bert: rotary scaling factor for inputs past the trained length (2 for nomic-embed-text)")
     p.add_argument("--force", action="store_true", help="replace an existing model of that name")
     a = p.parse_args()
 
@@ -116,6 +122,11 @@ def main():
     qp = qp if a.query_prefix is None else a.query_prefix
     dp = dp if a.doc_prefix is None else a.doc_prefix
     mr = mr if a.matryoshka is None else (None if a.matryoshka == "none" else a.matryoshka)
+    if a.rotary_scaling is not None:
+        if a.rotary_scaling < 1:
+            p.error("--rotary-scaling must be at least 1")
+        if a.max_tokens is None:
+            max_tokens = None  # the model's whole n_positions
 
     target = os.path.join(a.dir, a.name)
     if os.path.exists(target) and not a.force:
@@ -132,14 +143,15 @@ def main():
             if f == "config.json":
                 # Before the weights: a model graphbuff cannot run is not downloaded.
                 with open(os.path.join(work, f), encoding="utf-8") as c:
-                    arch, dims, limit = model_shape(json.load(c))
+                    arch, dims, limit = model_shape(json.load(c), a.rotary_scaling)
         max_tokens = min(max_tokens or limit, limit)
         with open(os.path.join(work, "model.toml"), "w", encoding="utf-8") as f:
             f.write(f"# {repo} (revision {a.revision}), fetched by fetch-model.py\n"
                     f"architecture = \"{arch}\"\ndimensions = {dims}\nmax_tokens = {max_tokens}\n"
                     f"pooling = \"{pooling}\"\nnormalize = true\n"
                     f"query_prefix = {toml_str(qp)}\ndoc_prefix = {toml_str(dp)}\n"
-                    + (f"matryoshka = \"{mr}\"\n" if mr else ""))
+                    + (f"matryoshka = \"{mr}\"\n" if mr else "")
+                    + (f"rotary_scaling = {a.rotary_scaling:g}\n" if a.rotary_scaling else ""))
         if os.path.exists(target):
             shutil.rmtree(target)
         os.replace(work, target)

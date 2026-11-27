@@ -33,7 +33,26 @@ pub enum Positions {
     /// (BERT: 0; XLM-RoBERTa: its `pad_token_id + 1`).
     Learned { offset: usize },
     /// Rotary embeddings (RoPE, the halves rotated) on queries and keys, with this base.
-    Rotary { base: f64 },
+    /// The model was trained on `trained` tokens; with `scaling` (Nomic's dynamic NTK
+    /// factor), a longer input gets a larger base (see [`Positions::rotary_base`]).
+    Rotary { base: f64, trained: usize, scaling: Option<f64> },
+}
+
+impl Positions {
+    /// The rotary base for an input of `tokens` tokens with `dims` per head: `base`, or
+    /// past `trained` with `scaling` `f`, nomic-bert's dynamic NTK base
+    /// `base · (f · tokens / trained − (f − 1))^(dims / (dims − 2))`. `None` for learned
+    /// positions.
+    pub fn rotary_base(&self, tokens: usize, dims: usize) -> Option<f64> {
+        match *self {
+            Positions::Learned { .. } => None,
+            Positions::Rotary { base, trained, scaling: Some(f) } if tokens > trained => {
+                let d = dims as f64;
+                Some(base * (f * tokens as f64 / trained as f64 - (f - 1.0)).powf(d / (d - 2.0)))
+            }
+            Positions::Rotary { base, .. } => Some(base),
+        }
+    }
 }
 
 /// The feed-forward block of a layer.
@@ -54,7 +73,8 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub intermediate_size: usize,
-    /// Rows of the learned position table (0 for rotary positions).
+    /// Rows of the learned position table; for rotary positions, the most positions the
+    /// model takes (`n_positions`).
     pub max_position_embeddings: usize,
     /// The longest input in tokens the model takes.
     pub max_tokens: usize,
@@ -168,12 +188,20 @@ impl ModelConfig {
                 if float("rotary_emb_fraction").unwrap_or(1.0) != 1.0 {
                     return Err("only rotary_emb_fraction 1.0 is supported".into());
                 }
-                for key in ["rotary_scaling_factor", "rotary_emb_scale_base", "num_experts"] {
+                for key in ["rotary_emb_scale_base", "num_experts"] {
                     if o.get(key).is_some_and(|v| *v != Json::Null && *v != Json::Int(0)) {
                         return Err(format!("`{key}` is not supported"));
                     }
                 }
+                let scaling = match o.get("rotary_scaling_factor") {
+                    None | Some(Json::Null) => None,
+                    Some(_) => match float("rotary_scaling_factor") {
+                        Some(f) if f >= 1.0 => Some(f),
+                        _ => return Err("`rotary_scaling_factor` must be a number of at least 1".into()),
+                    },
+                };
                 let positions = int("n_positions")?;
+                let trained = int("max_trained_positions").unwrap_or(positions).min(positions);
                 ModelConfig {
                     architecture,
                     vocab_size: int("vocab_size")?,
@@ -182,13 +210,13 @@ impl ModelConfig {
                     num_attention_heads: int("n_head")?,
                     // Its gated MLP rounds the width up to a multiple of 256.
                     intermediate_size: int("n_inner")?.next_multiple_of(256),
-                    max_position_embeddings: 0,
-                    // Without rotary scaling, inputs longer than it was trained on work
-                    // but embed worse.
-                    max_tokens: int("max_trained_positions").unwrap_or(positions).min(positions),
+                    max_position_embeddings: positions,
+                    // Without rotary scaling, inputs longer than it was trained on would
+                    // work but embed worse: they are cut there.
+                    max_tokens: if scaling.is_some() { positions } else { trained },
                     type_vocab_size: int("type_vocab_size").unwrap_or(2),
                     layer_norm_eps: float("layer_norm_epsilon").or(float("layer_norm_eps")).unwrap_or(1e-12),
-                    positions: Positions::Rotary { base: float("rotary_emb_base").unwrap_or(10_000.0) },
+                    positions: Positions::Rotary { base: float("rotary_emb_base").unwrap_or(10_000.0), trained, scaling },
                     feed_forward: FeedForward::SwiGlu,
                     attention_bias: flag("qkv_proj_bias", true)?,
                     ffn_in_bias: flag("mlp_fc1_bias", true)?,
@@ -206,6 +234,19 @@ impl ModelConfig {
             return Err("rotary positions need an even head size".into());
         }
         Ok(c)
+    }
+
+    /// The same with rotary `scaling` (`rotary_scaling` in model.toml): inputs up to
+    /// `n_positions` tokens. Fails for a model without rotary positions.
+    pub fn with_rotary_scaling(mut self, scaling: f64) -> Result<ModelConfig, String> {
+        match &mut self.positions {
+            Positions::Rotary { scaling: s, .. } => *s = Some(scaling),
+            Positions::Learned { .. } => {
+                return Err(format!("`rotary_scaling` is for rotary positions (nomic-bert), not {}", self.architecture.name()));
+            }
+        }
+        self.max_tokens = self.max_position_embeddings;
+        Ok(self)
     }
 }
 
@@ -231,8 +272,11 @@ impl ModelSpec {
         }
         let read = |file: &str| std::fs::read_to_string(dir.join(file)).map_err(|e| format!("{file}: {e}"));
         let manifest = Manifest::parse(&read(MANIFEST)?).map_err(|e| format!("{MANIFEST}: {e}"))?;
-        let config =
+        let mut config =
             ModelConfig::parse(&read(CONFIG)?, manifest.architecture).map_err(|e| format!("{CONFIG}: {e}"))?;
+        if let Some(f) = manifest.rotary_scaling {
+            config = config.with_rotary_scaling(f).map_err(|e| format!("{MANIFEST}: {e}"))?;
+        }
         for file in [TOKENIZER, WEIGHTS] {
             if !dir.join(file).is_file() {
                 return Err(format!("{file} is missing"));
@@ -330,7 +374,7 @@ mod tests {
         let c = ModelConfig::parse(xlmr, Architecture::XlmRoberta).unwrap();
         assert_eq!((c.positions, c.max_tokens, c.type_vocab_size), (Positions::Learned { offset: 2 }, 24, 1));
         let c = ModelConfig::parse(NOMIC, Architecture::NomicBert).unwrap();
-        assert_eq!(c.positions, Positions::Rotary { base: 1000.0 });
+        assert_eq!(c.positions, Positions::Rotary { base: 1000.0, trained: 24, scaling: None });
         assert_eq!((c.hidden_size, c.intermediate_size, c.max_tokens), (32, 256, 24), "the gated MLP's width is rounded up");
         assert!(!c.attention_bias && !c.ffn_in_bias && !c.ffn_out_bias);
         assert_eq!(c.feed_forward, FeedForward::SwiGlu);
@@ -350,12 +394,32 @@ mod tests {
     fn unsupported_nomic_options() {
         for (from, to, err) in [
             (r#""activation_function": "swiglu""#, r#""activation_function": "gelu""#, "swiglu"),
-            (r#""rotary_scaling_factor": null"#, r#""rotary_scaling_factor": 2.0"#, "rotary_scaling_factor"),
+            (r#""rotary_scaling_factor": null"#, r#""rotary_scaling_factor": 0.5"#, "rotary_scaling_factor"),
+            (r#""rotary_scaling_factor": null"#, r#""rotary_scaling_factor": "2""#, "rotary_scaling_factor"),
             (r#""rotary_emb_fraction": 1.0"#, r#""rotary_emb_fraction": 0.5"#, "rotary_emb_fraction"),
             (r#""qkv_proj_bias": false"#, r#""prenorm": true"#, "prenorm"),
         ] {
             let e = ModelConfig::parse(&NOMIC.replace(from, to), Architecture::NomicBert).unwrap_err();
             assert!(e.contains(err), "{to}: {e}");
         }
+    }
+
+    #[test]
+    fn rotary_scaling() {
+        let scaled = NOMIC.replace(r#""rotary_scaling_factor": null"#, r#""rotary_scaling_factor": 2"#);
+        let c = ModelConfig::parse(&scaled, Architecture::NomicBert).unwrap();
+        assert_eq!((c.positions, c.max_tokens), (Positions::Rotary { base: 1000.0, trained: 24, scaling: Some(2.0) }, 64));
+        let plain = ModelConfig::parse(NOMIC, Architecture::NomicBert).unwrap();
+        assert_eq!(plain.clone().with_rotary_scaling(2.0).unwrap(), c, "model.toml sets what config.json may");
+        // Up to the trained length, the base is the model's; past it, it grows.
+        assert_eq!(c.positions.rotary_base(24, 8), Some(1000.0));
+        assert_eq!(plain.positions.rotary_base(48, 8), Some(1000.0), "no scaling");
+        // 1000 · (2 · 48 / 24 − 1)^(8 / 6) = 1000 · 3^(4/3)
+        let b = c.positions.rotary_base(48, 8).unwrap();
+        assert!((b - 1000.0 * 3f64.powf(4.0 / 3.0)).abs() < 1e-9, "{b}");
+        let bert = r#"{"model_type": "bert", "vocab_size": 8, "hidden_size": 8, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "intermediate_size": 8, "max_position_embeddings": 8}"#;
+        let e = ModelConfig::parse(bert, Architecture::Bert).unwrap().with_rotary_scaling(2.0).unwrap_err();
+        assert!(e.contains("rotary positions"), "{e}");
     }
 }

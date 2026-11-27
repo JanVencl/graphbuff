@@ -11,6 +11,11 @@
 //! (self-attention [rotary on queries and keys], add & norm, feed-forward [GELU or
 //! SwiGLU], add & norm) → pooling (mean over the mask, or the first token) → optional L2
 //! normalization. Matches `transformers` to about 1e-6 (tests/golden.rs).
+//!
+//! With rotary scaling (nomic-bert's dynamic NTK), a text longer than the model was
+//! trained on gets a larger rotary base, from its own length: Nomic's code takes the
+//! padded batch's, which would make a vector depend on the texts batched with it. A text
+//! embedded alone gets the same vector either way.
 
 use std::path::Path;
 
@@ -211,22 +216,40 @@ fn nomic_layers(w: &Weights<'_>, c: &ModelConfig) -> Result<Vec<Layer>, String> 
         .collect()
 }
 
-/// `cos` and `sin` of the rotary angles for positions `0..width`, `[1, 1, width, dims]`
-/// with each half repeated (as GPT-NeoX and nomic-bert rotate the halves). In f32, as
-/// PyTorch computes them.
-fn rotary_tables(base: f64, width: usize, dims: usize, device: &Device) -> (Tensor<4>, Tensor<4>) {
+/// `cos` and `sin` of the rotary angles for positions `0..width`, one table per base
+/// (`[bases, 1, width, dims]`), with each half repeated (as GPT-NeoX and nomic-bert rotate
+/// the halves). In f32, as PyTorch computes them.
+fn rotary_tables(bases: &[f64], width: usize, dims: usize, device: &Device) -> (Tensor<4>, Tensor<4>) {
     let half = dims / 2;
-    let inv: Vec<f32> = (0..half).map(|j| 1.0 / (base as f32).powf((2 * j) as f32 / dims as f32)).collect();
-    let (mut cos, mut sin) = (Vec::with_capacity(width * dims), Vec::with_capacity(width * dims));
-    for p in 0..width {
-        for j in 0..dims {
-            let angle = p as f32 * inv[j % half];
-            cos.push(angle.cos());
-            sin.push(angle.sin());
+    let n = bases.len() * width * dims;
+    let (mut cos, mut sin) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for &base in bases {
+        let inv: Vec<f32> = (0..half).map(|j| 1.0 / (base as f32).powf((2 * j) as f32 / dims as f32)).collect();
+        for p in 0..width {
+            for j in 0..dims {
+                let angle = p as f32 * inv[j % half];
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
         }
     }
-    let t = |v: Vec<f32>| Tensor::<4>::from_data(TensorData::new(v, [1, 1, width, dims]), device);
+    let t = |v: Vec<f32>| Tensor::<4>::from_data(TensorData::new(v, [bases.len(), 1, width, dims]), device);
     (t(cos), t(sin))
+}
+
+/// The rotary base of each row of `batch` (from its own length), or one base if they all
+/// have the same; `None` for learned positions.
+fn row_bases(positions: &Positions, batch: &Padded, dims: usize) -> Option<Vec<f64>> {
+    let bases: Vec<f64> = batch
+        .mask
+        .chunks_exact(batch.width.max(1))
+        .map(|row| positions.rotary_base(row.iter().filter(|&&m| m > 0.0).count(), dims))
+        .collect::<Option<_>>()?;
+    match bases.first() {
+        Some(&b) if bases.iter().all(|&x| x == b) => Some(vec![b]),
+        Some(_) => Some(bases),
+        None => positions.rotary_base(0, dims).map(|b| vec![b]),
+    }
 }
 
 /// `x` (`[batch, heads, tokens, dims]`) rotated by the angles of `cos` and `sin`.
@@ -322,10 +345,7 @@ impl Encoder {
         // Added to the attention scores: 0 for tokens, very negative for padding.
         let bias = (mask.clone().neg() + 1.0).mul_scalar(-1e9).reshape([b, 1, 1, t]);
         let scale = 1.0 / (hd as f64).sqrt();
-        let rotary = match self.config.positions {
-            Positions::Rotary { base } => Some(rotary_tables(base, t, hd, dev)),
-            Positions::Learned { .. } => None,
-        };
+        let rotary = row_bases(&self.config.positions, batch, hd).map(|bases| rotary_tables(&bases, t, hd, dev));
         let split = |y: Tensor<3>| y.reshape([b, t, heads, hd]).swap_dims(1, 2);
         for l in &self.layers {
             let mut q = split(l.q.forward(x.clone()));
