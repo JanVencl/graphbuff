@@ -281,6 +281,72 @@ fn matryoshka_cuts() {
     assert!(err.contains("at most"), "{err}");
 }
 
+/// `rotary_scaling` on tiny-nomic (trained on 24 tokens, 64 positions): texts up to 24
+/// tokens embed as without it, longer ones up to 64 tokens are taken, and a long text's
+/// vector does not depend on the texts batched with it.
+#[test]
+fn rotary_scaling_past_the_trained_length() {
+    let dir = TempDir::new("rotary");
+    let to = dir.0.join("long");
+    std::fs::create_dir_all(&to).unwrap();
+    for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+        std::fs::copy(fixture_named("tiny-nomic").join(f), to.join(f)).unwrap();
+    }
+    std::fs::write(
+        to.join("model.toml"),
+        "architecture = \"nomic-bert\"\ndimensions = 32\nrotary_scaling = 2\nquery_prefix = \"query: \"\n",
+    )
+    .unwrap();
+    let e = embedder_for(&to, "long", 32);
+    assert_eq!(e.models()[0].max_tokens, 64, "n_positions");
+    let opts = EmbedOptions::default();
+
+    // Up to the trained length: the reference vectors.
+    let reference = Reference::read(&fixture_named("tiny-nomic").join("reference.json"));
+    let texts = reference.texts();
+    let want = reference.vectors("mean");
+    let short: Vec<&str> = texts.iter().map(String::as_str).filter(|t| e.token_ids(None, t, &opts).unwrap().len() <= 24).collect();
+    assert!(short.len() >= 5);
+    for (i, v) in e.embed(None, &short, &opts, &no_interrupt).unwrap().iter().enumerate() {
+        let j = texts.iter().position(|t| t == short[i]).unwrap();
+        assert_close(&format!("short {i}"), v, &want[j], 1e-5);
+    }
+
+    // Past it: up to 64 tokens, each with its own base.
+    let long: Vec<String> = [6, 10, 20].iter().map(|n| vec!["graph nodes and vectors"; *n].join(" ")).collect();
+    let lens: Vec<usize> = long.iter().map(|t| e.token_ids(None, t, &opts).unwrap().len()).collect();
+    assert!(lens[0] > 24 && lens[1] > lens[0] && lens[2] == 64, "{lens:?}");
+    let alone: Vec<Vec<f32>> = long.iter().map(|t| e.embed(None, &[t], &opts, &no_interrupt).unwrap().remove(0)).collect();
+    let mut mixed: Vec<&str> = long.iter().map(String::as_str).collect();
+    mixed.extend(&short);
+    let together = e.embed(None, &mixed, &opts, &no_interrupt).unwrap();
+    for i in 0..long.len() {
+        let w: Vec<f64> = alone[i].iter().map(|x| *x as f64).collect();
+        assert_close(&format!("long {i} in a batch"), &together[i], &w, 1e-5);
+        assert!((alone[i].iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+    for (i, v) in together[long.len()..].iter().enumerate() {
+        let j = texts.iter().position(|t| t == short[i]).unwrap();
+        assert_close(&format!("short {i} next to long ones"), v, &want[j], 1e-5);
+    }
+    // Against Nomic's own model code with rotary_scaling_factor 2, each text alone
+    // (scripts/reference_long.py); here all in one batch.
+    let reference = Reference::read(&fixture_named("tiny-nomic").join("reference-long.json"));
+    let texts = reference.texts();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    for (i, ids) in reference.ids("ids").iter().enumerate() {
+        assert_eq!(&e.token_ids(None, &texts[i], &opts).unwrap(), ids, "token ids of text {i}");
+    }
+    let got = e.embed(None, &refs, &opts, &no_interrupt).unwrap();
+    for (i, (g, w)) in got.iter().zip(reference.vectors("mean")).enumerate() {
+        assert_close(&format!("Nomic's code, text {i}"), g, &w, 1e-5);
+    }
+
+    // Without it the model stops at 24 tokens.
+    std::fs::write(to.join("model.toml"), "architecture = \"nomic-bert\"\ndimensions = 32\n").unwrap();
+    assert_eq!(embedder_for(&to, "long", 32).models()[0].max_tokens, 24);
+}
+
 #[test]
 fn query_prefix_and_truncation() {
     check_query(&fixture(), "tiny-bert", 1e-5);

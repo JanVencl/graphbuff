@@ -16,6 +16,13 @@ the same notes.
   name such a model with fewer dimensions; the MCP `search` tool embeds with the index's.
   `vector.models()` yields `matryoshka`. See
   [Shorter vectors](docs/Embeddings.md#shorter-vectors-matryoshka).
+- Rotary scaling for nomic-bert models: with `rotary_scaling = 2` in `model.toml` (or
+  `rotary_scaling_factor` in `config.json`), nomic-embed-text takes inputs up to 8192
+  tokens instead of the 2048 it was trained on (Nomic's dynamic NTK scaling). Off by
+  default; texts up to the trained length embed as before. The base comes from each
+  text's own length, so a vector does not depend on its batch. `fetch-model.py` takes
+  `--rotary-scaling`. Number values (`1.5`) are now allowed in `model.toml`. See
+  [Longer inputs](docs/Embeddings.md#longer-inputs-rotary-scaling).
 
 ### Changed
 

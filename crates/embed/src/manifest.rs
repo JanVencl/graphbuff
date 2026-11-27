@@ -9,6 +9,7 @@
 //! query_prefix = ""       # put before texts embedded with {task: 'query'}
 //! doc_prefix   = ""       # put before documents (the default task)
 //! matryoshka   = "layer-norm"  # optional: truncate | layer-norm (see below)
+//! rotary_scaling = 2      # optional, nomic-bert: inputs past the trained length
 //! ```
 //!
 //! `matryoshka` says the model was trained so that the start of its vector is a good
@@ -19,6 +20,11 @@
 //! `layer-norm` first normalizes the pooled vector to mean 0 and variance 1, as
 //! nomic-embed-text v1.5 asks. Either way the cut vector is L2-normalized again if
 //! `normalize` is on. Full vectors are never changed by it.
+//!
+//! `rotary_scaling` is nomic-bert's `rotary_scaling_factor` (dynamic NTK): with it, the
+//! model takes inputs up to its `n_positions` (8192 for nomic-embed-text v1.5) instead of
+//! the 2048 it was trained on, as its model card says (factor 2). Inputs up to the
+//! trained length embed as without it. It overrides the `config.json` value.
 //!
 //! The file is a flat list of `key = value` lines (strings, integers, booleans) with `#`
 //! comments; unknown keys are errors, so typos do not go unnoticed.
@@ -93,7 +99,7 @@ impl Matryoshka {
 }
 
 /// What `model.toml` says.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub architecture: Architecture,
     pub dimensions: usize,
@@ -105,12 +111,15 @@ pub struct Manifest {
     pub doc_prefix: String,
     /// `None`: full vectors only.
     pub matryoshka: Option<Matryoshka>,
+    /// `None`: as `config.json` says.
+    pub rotary_scaling: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Toml {
     Str(String),
     Int(i64),
+    Float(f64),
     Bool(bool),
 }
 
@@ -160,10 +169,26 @@ impl Manifest {
             Some(Toml::Str(s)) if s == "layer-norm" => Some(Matryoshka::LayerNorm),
             Some(_) => return Err("`matryoshka` is \"truncate\" or \"layer-norm\"".into()),
         };
+        let rotary_scaling = match take("rotary_scaling") {
+            None => None,
+            Some(Toml::Int(n)) if n >= 1 => Some(n as f64),
+            Some(Toml::Float(f)) if f >= 1.0 && f.is_finite() => Some(f),
+            Some(_) => return Err("`rotary_scaling` must be a number of at least 1".into()),
+        };
         if let Some(key) = values.keys().next() {
             return Err(format!("unknown key `{key}`"));
         }
-        Ok(Manifest { architecture, dimensions, max_tokens, pooling, normalize, query_prefix, doc_prefix, matryoshka })
+        Ok(Manifest {
+            architecture,
+            dimensions,
+            max_tokens,
+            pooling,
+            normalize,
+            query_prefix,
+            doc_prefix,
+            matryoshka,
+            rotary_scaling,
+        })
     }
 }
 
@@ -235,6 +260,9 @@ fn parse_value(text: &str) -> Result<Toml, String> {
     match text.split('#').next().unwrap_or_default().trim() {
         "true" => Ok(Toml::Bool(true)),
         "false" => Ok(Toml::Bool(false)),
+        w if w.contains(['.', 'e', 'E']) && !w.contains("inf") && !w.contains("nan") => {
+            w.replace('_', "").parse::<f64>().map(Toml::Float).map_err(|_| format!("bad value `{w}`"))
+        }
         w => w.replace('_', "").parse::<i64>().map(Toml::Int).map_err(|_| format!("bad value `{w}`")),
     }
 }
@@ -257,7 +285,11 @@ mod tests {
         assert_eq!(m.query_prefix, "query: ");
         assert_eq!(m.doc_prefix, "passage: ");
         let m = Manifest::parse("architecture = \"bert\"\ndimensions = 8").unwrap();
-        assert_eq!((m.max_tokens, m.pooling, m.normalize, m.matryoshka), (None, Pooling::Mean, true, None));
+        assert_eq!((m.max_tokens, m.pooling, m.normalize, m.matryoshka, m.rotary_scaling), (None, Pooling::Mean, true, None, None));
+        for (text, want) in [("2", 2.0), ("1.5", 1.5), ("4.0", 4.0)] {
+            let m = Manifest::parse(&format!("architecture = \"nomic-bert\"\ndimensions = 8\nrotary_scaling = {text}")).unwrap();
+            assert_eq!(m.rotary_scaling, Some(want));
+        }
         for (text, want) in [("truncate", Matryoshka::Truncate), ("layer-norm", Matryoshka::LayerNorm)] {
             let m = Manifest::parse(&format!("architecture = \"nomic-bert\"\ndimensions = 8\nmatryoshka = \"{text}\"")).unwrap();
             assert_eq!(m.matryoshka, Some(want));
@@ -289,6 +321,9 @@ mod tests {
             ("architecture = \"bert\"\ndimensions = 0", "positive"),
             ("architecture = \"bert\"\ndimensions = 8\npooling = \"max\"", "`pooling`"),
             ("architecture = \"bert\"\ndimensions = 8\nmatryoshka = true", "`matryoshka`"),
+            ("architecture = \"nomic-bert\"\ndimensions = 8\nrotary_scaling = 0.5", "`rotary_scaling`"),
+            ("architecture = \"nomic-bert\"\ndimensions = 8\nrotary_scaling = \"2\"", "`rotary_scaling`"),
+            ("architecture = \"bert\"\ndimensions = 8.5", "positive integer"),
             ("architecture = \"bert\"\ndimensions = 8\nmatryoshka = \"slice\"", "`matryoshka`"),
             ("architecture = \"bert\"\ndimensions = 8\ndims = 8", "unknown key `dims`"),
             ("architecture = \"bert\"\ndimensions = 8\ndimensions = 9", "set twice"),
