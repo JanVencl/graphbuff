@@ -3,10 +3,17 @@
 Notable changes per release. Releases are also tagged (`vX.Y.Z`); the tag messages carry
 the same notes.
 
-## Unreleased
+## 0.6.0 — 2026-11-27
 
 ### Added
 
+- GPU in the release builds: the servers in the macOS (Metal) and Windows (Direct3D 12 or
+  Vulkan) archives are built with the `gpu` feature, and two new Linux archives,
+  `graphbuff-linux-x86_64-gpu.tar.gz` and `graphbuff-linux-aarch64-gpu.tar.gz` (glibc
+  2.35 or newer, Vulkan), have it too. `gpu = true` in `[queries]` runs graph kernels on
+  the GPU, `device = "gpu"` in `[embedding]` the embedding models; both stay off by
+  default. The static Linux archives and the Docker image have no GPU. See
+  [Prebuilt binaries](docs/Install.md#prebuilt-binaries).
 - Filtered vector search: `MATCH (d:Doc) SEARCH d IN (VECTOR INDEX name FOR $vector WHERE
   d.tenant = 5 LIMIT 10) SCORE AS score` finds the nearest entities that match a filter, on
   exact and HNSW indexes, for nodes and relationships. The properties to filter on are

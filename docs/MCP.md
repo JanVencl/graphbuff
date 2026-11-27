@@ -16,7 +16,7 @@ bind = "127.0.0.1:7476"
 Restart the server; it says where the endpoint is:
 
 ```text
-graphbuff-server 0.5.0 listening on http://127.0.0.1:7475, MCP on http://127.0.0.1:7476/mcp (…)
+graphbuff-server 0.6.0 listening on http://127.0.0.1:7475, MCP on http://127.0.0.1:7476/mcp (…)
 ```
 
 Agents log in with an [API token](Users.md), never a password. Create one for the user the
