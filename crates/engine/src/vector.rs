@@ -60,7 +60,17 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
         }
         return Ok(IndexKind::Range);
     }
-    let (mut dimensions, mut similarity) = (None, Similarity::Cosine);
+    let form = match config.get("vector.type") {
+        None | Some(Value::Null) => "dense",
+        Some(Value::String(t)) => match t.to_ascii_lowercase().as_str() {
+            "dense" => "dense",
+            "sparse" => "sparse",
+            "multi" => "multi",
+            _ => return Err(Error::Semantic(format!("`vector.type` is 'dense', 'sparse' or 'multi', not '{t}'"))),
+        },
+        Some(o) => return Err(Error::Type(format!("`vector.type` needs a STRING, not {}", o.type_name()))),
+    };
+    let (mut dimensions, mut similarity, mut similarity_given) = (None, Similarity::Cosine, false);
     let (mut enabled, mut m, mut ef) = (None, None, None);
     let hnsw_int = |k: &str, v: &Value, min: u16, max: u16| -> Result<u16> {
         match v {
@@ -88,6 +98,7 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
                 )));
             }
             ("vector.similarity_function", Value::String(f)) => {
+                similarity_given = true;
                 similarity = Similarity::parse(f).ok_or_else(|| {
                     Error::Semantic(format!(
                         "`vector.similarity_function` is 'cosine' or 'euclidean', not '{f}'"
@@ -98,12 +109,25 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
                 return Err(Error::Type(format!("`vector.similarity_function` does not accept {}", o.type_name())));
             }
             // Recorded on the definition: see `embedding_model`.
-            ("vector.embedding_model", _) => {}
+            ("vector.embedding_model" | "vector.type", _) => {}
             (k, _) if k.starts_with("vector.") => {
                 return Err(Error::Unsupported(format!("vector index setting `{k}` is not supported")));
             }
             _ => return Err(Error::Semantic(format!("unknown index setting `{k}` for a vector index"))),
         }
+    }
+    if form == "sparse" {
+        if dimensions.is_some() || similarity_given || enabled.is_some() || m.is_some() || ef.is_some() {
+            return Err(Error::Semantic(
+                "a sparse vector index takes no `vector.dimensions`, `vector.similarity_function` or `vector.hnsw.*`".into(),
+            ));
+        }
+        return Ok(IndexKind::SparseVector);
+    }
+    if form == "multi" && similarity_given {
+        return Err(Error::Semantic(
+            "a multi-vector index scores by MaxSim (dot products) and takes no `vector.similarity_function`".into(),
+        ));
     }
     let dimensions = dimensions.ok_or_else(|| {
         Error::Semantic("a vector index needs OPTIONS {indexConfig: {`vector.dimensions`: n}}".into())
@@ -121,6 +145,9 @@ pub fn index_kind(kind: IndexType, options: &BTreeMap<String, Value>) -> Result<
             ef_construction: ef.unwrap_or(HnswConfig::DEFAULT.ef_construction),
         }),
     };
+    if form == "multi" {
+        return Ok(IndexKind::MultiVector { dimensions, hnsw });
+    }
     Ok(IndexKind::Vector { dimensions, similarity, hnsw })
 }
 
@@ -155,6 +182,24 @@ pub fn index_row(d: IndexDef) -> Vec<Value> {
             if let Some(h) = hnsw {
                 config.insert("vector.hnsw.m".into(), Value::Int(i64::from(h.m)));
                 config.insert("vector.hnsw.ef_construction".into(), Value::Int(i64::from(h.ef_construction)));
+            }
+            BTreeMap::from([("indexConfig".to_string(), Value::Map(config))])
+        }
+        IndexKind::SparseVector | IndexKind::MultiVector { .. } => {
+            let mut config = BTreeMap::new();
+            if let IndexKind::MultiVector { dimensions, hnsw } = d.kind {
+                config.insert("vector.type".to_string(), Value::String("multi".into()));
+                config.insert("vector.dimensions".to_string(), Value::Int(i64::from(dimensions)));
+                config.insert("vector.hnsw.enabled".to_string(), Value::Bool(hnsw.is_some()));
+                if let Some(h) = hnsw {
+                    config.insert("vector.hnsw.m".into(), Value::Int(i64::from(h.m)));
+                    config.insert("vector.hnsw.ef_construction".into(), Value::Int(i64::from(h.ef_construction)));
+                }
+            } else {
+                config.insert("vector.type".to_string(), Value::String("sparse".into()));
+            }
+            if let Some(m) = &d.embedding_model {
+                config.insert("vector.embedding_model".into(), Value::String(m.clone()));
             }
             BTreeMap::from([("indexConfig".to_string(), Value::Map(config))])
         }
@@ -261,8 +306,21 @@ fn sparse_score(args: &[Value]) -> Result<Value> {
         },
     };
     let (Some(a), Some(b)) = (weights(&args[0])?, b) else { return Ok(Value::Null) };
-    let (small, large) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
-    Ok(Value::Float(small.iter().filter_map(|(k, x)| large.get(k).map(|y| x * y)).sum()))
+    Ok(Value::Float(sparse_dot(&a, &b)))
+}
+
+/// The sum of `a[t] · b[t]` over the tokens `a` and `b` share, as `vector.sparseScore`
+/// adds it.
+pub(crate) fn sparse_dot(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> f64 {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    small.iter().filter_map(|(k, x)| large.get(k).map(|y| x * y)).sum()
+}
+
+/// `vector.maxSim` of query vectors `q` and document vectors `d` (all of `q`'s dimensions).
+pub(crate) fn max_sim_of<'a>(q: &[Vec<f64>], d: impl Iterator<Item = &'a [f64]> + Clone) -> f64 {
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let total: f64 = q.iter().map(|a| d.clone().map(|b| dot(a, b)).fold(f64::NEG_INFINITY, f64::max)).sum();
+    total / q.len() as f64
 }
 
 /// `vector.maxSim(query, document)`: for each query vector the largest dot product with a
@@ -303,9 +361,7 @@ fn max_sim(args: &[Value]) -> Result<Value> {
     if let Some(v) = q.iter().chain(&d).find(|v| v.len() != dims) {
         return Err(Error::Semantic(format!("{NAME}(): the vectors have different dimensions ({dims} and {})", v.len())));
     }
-    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-    let total: f64 = q.iter().map(|a| d.iter().map(|b| dot(a, b)).fold(f64::NEG_INFINITY, f64::max)).sum();
-    Ok(Value::Float(total / q.len() as f64))
+    Ok(Value::Float(max_sim_of(&q, d.iter().map(Vec::as_slice))))
 }
 
 /// `vector.similarity.cosine(a, b)`, `vector.similarity.euclidean(a, b)`,
@@ -365,15 +421,21 @@ fn indexed_vector(value: &Value, dimensions: u32, similarity: Similarity) -> Opt
 fn vector_params(def: &IndexDef) -> (u32, Similarity) {
     match def.kind {
         IndexKind::Vector { dimensions, similarity, .. } => (dimensions, similarity),
-        IndexKind::Range | IndexKind::Fulltext { .. } | IndexKind::Point | IndexKind::Text | IndexKind::Lookup => {
-            unreachable!("a vector index")
+        IndexKind::Range
+        | IndexKind::SparseVector
+        | IndexKind::MultiVector { .. }
+        | IndexKind::Fulltext { .. }
+        | IndexKind::Point
+        | IndexKind::Text
+        | IndexKind::Lookup => {
+            unreachable!("a dense vector index")
         }
     }
 }
 
 /// Calls `f` with the id and indexed property value of every entity `def` covers in
 /// `store` (nodes with the label, or relationships of the type), in id order.
-fn for_each_entity(
+pub(crate) fn for_each_entity(
     store: &dyn GraphStore,
     def: &IndexDef,
     interrupt: &dyn Fn() -> Result<()>,
@@ -438,7 +500,7 @@ impl Entry {
 }
 
 /// Property `key` of entity `id` of `def`.
-fn property(store: &dyn GraphStore, def: &IndexDef, id: u64, key: &str) -> Result<Option<Value>> {
+pub(crate) fn property(store: &dyn GraphStore, def: &IndexDef, id: u64, key: &str) -> Result<Option<Value>> {
     match def.entity {
         IndexEntity::Node => store.node_property(NodeId(id), key),
         IndexEntity::Relationship => store.relationship_property(RelId(id), key),
@@ -446,7 +508,7 @@ fn property(store: &dyn GraphStore, def: &IndexDef, id: u64, key: &str) -> Resul
 }
 
 /// The values entity `id` has for the filter properties of `def`.
-fn read_filters(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Vec<Value>> {
+pub(crate) fn read_filters(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Vec<Value>> {
     def.filter_properties().iter().map(|key| Ok(filter_value(property(store, def, id, key)?))).collect()
 }
 
@@ -463,20 +525,27 @@ fn entries(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Resul
 }
 
 /// Empty columns for the filter properties of `def`.
-fn filter_columns(def: &IndexDef) -> Vec<FilterColumn> {
+pub(crate) fn filter_columns(def: &IndexDef) -> Vec<FilterColumn> {
     def.filter_properties().iter().map(|_| FilterColumn::new()).collect()
 }
 
 /// The values of `row` in `columns`.
-fn filters_at(columns: &[FilterColumn], row: u32) -> Vec<Value> {
+pub(crate) fn filters_at(columns: &[FilterColumn], row: u32) -> Vec<Value> {
     columns.iter().map(|c| c.get(row).clone()).collect()
 }
 
 /// The entry entity `id` has in `store` for index `def`, or `None` if the index skips it
 /// (or it is gone).
 fn current_entry(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Option<Entry>> {
-    let key = &def.properties[0];
-    let value = match def.entity {
+    match covered_value(store, def, id, &def.properties[0])? {
+        Some(v) => Entry::read(store, def, id, &v),
+        None => Ok(None),
+    }
+}
+
+/// Property `key` of entity `id`, if it is (still) one of those index `def` covers.
+pub(crate) fn covered_value(store: &dyn GraphStore, def: &IndexDef, id: u64, key: &str) -> Result<Option<Value>> {
+    Ok(match def.entity {
         IndexEntity::Node => {
             let n = NodeId(id);
             if store.node_exists(n)? && store.node_has_label(n, &def.label)? {
@@ -493,15 +562,11 @@ fn current_entry(store: &dyn GraphStore, def: &IndexDef, id: u64) -> Result<Opti
                 None
             }
         }
-    };
-    match value {
-        Some(v) => Entry::read(store, def, id, &v),
-        None => Ok(None),
-    }
+    })
 }
 
 /// [`Matrix::ids`] of a row not in use.
-const FREE: u64 = u64::MAX;
+pub(crate) const FREE: u64 = u64::MAX;
 
 /// A vector index's vectors in one committed state: one f32 row per indexed entity (unit
 /// length for cosine), in no particular order, plus rows not in use (all zeros), so that
@@ -946,8 +1011,8 @@ const FILTERED_SEARCH_FACTOR: f64 = 8.0;
 /// An exact index scores only the selected rows, on the calling thread, if they are at
 /// most this many or at most one in [`SUBSET_SHARE`]: otherwise all rows, with the
 /// database's kernels.
-const SUBSET_ROWS: usize = 1024;
-const SUBSET_SHARE: usize = 8;
+pub(crate) const SUBSET_ROWS: usize = 1024;
+pub(crate) const SUBSET_SHARE: usize = 8;
 
 /// A saved graph is not used if more than one in this many of its vectors are no longer
 /// those of their entities: the search of a graph suffers from taking out many.
@@ -976,6 +1041,10 @@ pub(crate) enum VectorIndex {
     /// Exact: every vector is scored.
     Flat(Matrix),
     Approximate(Approximate),
+    /// Lexical weights: an inverted index.
+    Sparse(crate::sparse_vector::SparseIndex),
+    /// A vector per token.
+    Multi(crate::multi_vector::MultiIndex),
 }
 
 impl Cached for VectorIndex {
@@ -983,11 +1052,15 @@ impl Cached for VectorIndex {
         match self {
             VectorIndex::Flat(m) => &m.def,
             VectorIndex::Approximate(a) => &a.def,
+            VectorIndex::Sparse(s) => s.def(),
+            VectorIndex::Multi(m) => m.def(),
         }
     }
 
     fn build(store: &dyn GraphStore, def: &IndexDef, interrupt: &dyn Fn() -> Result<()>) -> Result<VectorIndex> {
         Ok(match def.kind {
+            IndexKind::SparseVector => VectorIndex::Sparse(crate::sparse_vector::SparseIndex::build(store, def, interrupt)?),
+            IndexKind::MultiVector { .. } => VectorIndex::Multi(crate::multi_vector::MultiIndex::build(store, def, interrupt)?),
             IndexKind::Vector { hnsw: Some(_), .. } => VectorIndex::Approximate(Approximate::build(store, def, interrupt)?),
             _ => VectorIndex::Flat(Matrix::build(store, def, interrupt)?),
         })
@@ -997,6 +1070,8 @@ impl Cached for VectorIndex {
         match self {
             VectorIndex::Flat(m) => m.apply(store, changes, interrupt),
             VectorIndex::Approximate(a) => a.apply(store, changes, interrupt),
+            VectorIndex::Sparse(s) => s.apply(store, changes, interrupt),
+            VectorIndex::Multi(m) => m.apply(store, changes, interrupt),
         }
     }
 
@@ -1027,20 +1102,20 @@ impl Cached for VectorIndex {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
                 _ => Ok(()),
             },
-            VectorIndex::Flat(_) => Ok(()),
+            VectorIndex::Flat(_) | VectorIndex::Sparse(_) | VectorIndex::Multi(_) => Ok(()),
         }
     }
 
     fn edits(&self) -> u64 {
         match self {
-            VectorIndex::Flat(_) => 0,
+            VectorIndex::Flat(_) | VectorIndex::Sparse(_) | VectorIndex::Multi(_) => 0,
             VectorIndex::Approximate(a) => a.edits,
         }
     }
 
     fn save_due(&self, unsaved: u64) -> bool {
         match self {
-            VectorIndex::Flat(_) => false,
+            VectorIndex::Flat(_) | VectorIndex::Sparse(_) | VectorIndex::Multi(_) => false,
             VectorIndex::Approximate(a) => unsaved >= SAVE_EDITS.max(a.graph.live() as u64 / SAVE_SHARE),
         }
     }
@@ -1052,7 +1127,7 @@ pub(crate) type VectorCache = IndexCache<VectorIndex>;
 /// How many candidates an approximate search for `k` neighbours keeps (`ef`, four times
 /// `k` and at least 200: recall@10 0.99 on clustered 128-dimension vectors): those are
 /// scored exactly, and the best `k` returned.
-fn search_width(k: usize) -> usize {
+pub(crate) fn search_width(k: usize) -> usize {
     k.saturating_mul(4).max(200)
 }
 
@@ -1159,10 +1234,12 @@ pub(crate) enum Method {
     All,
     /// By reading the graph, inside a transaction.
     Store,
+    /// Through the inverted index of a sparse index.
+    Postings,
 }
 
 impl Method {
-    pub const ALL: [Method; 4] = [Method::Graph, Method::Matches, Method::All, Method::Store];
+    pub const ALL: [Method; 5] = [Method::Graph, Method::Matches, Method::All, Method::Store, Method::Postings];
 
     fn text(self) -> &'static str {
         match self {
@@ -1170,6 +1247,7 @@ impl Method {
             Method::Matches => "matching vectors",
             Method::All => "all vectors",
             Method::Store => "scan of the store",
+            Method::Postings => "inverted index",
         }
     }
 }
@@ -1191,9 +1269,31 @@ pub(crate) fn methods_text(searches: [u64; Method::ALL.len()]) -> String {
     }
 }
 
-/// The vector `value` to search index `def` with (`None` for null): of the index's
-/// dimensions, and not zero for cosine. `what` searches, for errors.
-pub(crate) fn query_vector(what: &str, def: &IndexDef, value: &Value) -> Result<Option<Vec<f64>>> {
+/// What a vector index is searched with: a vector (dense), token weights (sparse), or a
+/// vector per token (multi-vector).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum VectorQuery {
+    Dense(Vec<f64>),
+    Sparse(BTreeMap<String, f64>),
+    Multi(Vec<Vec<f64>>),
+}
+
+/// What `value` searches index `def` with (`None` for null). A dense index takes a vector
+/// of its dimensions, not zero for cosine; a sparse one a map of token to weight (as
+/// `vector.embedSparse` makes it); a multi-vector one a list of vectors of its
+/// dimensions (as `vector.embedMulti` makes it). `what` searches, for errors.
+pub(crate) fn query_vector(what: &str, def: &IndexDef, value: &Value) -> Result<Option<VectorQuery>> {
+    match def.kind {
+        IndexKind::SparseVector => crate::sparse_vector::query_weights(what, value).map(|q| q.map(VectorQuery::Sparse)),
+        IndexKind::MultiVector { dimensions, .. } => {
+            crate::multi_vector::query_vectors(what, def, dimensions, value).map(|q| q.map(VectorQuery::Multi))
+        }
+        _ => Ok(dense_query(what, def, value)?.map(VectorQuery::Dense)),
+    }
+}
+
+/// The vector `value` to search dense index `def` with (`None` for null).
+fn dense_query(what: &str, def: &IndexDef, value: &Value) -> Result<Option<Vec<f64>>> {
     let (dimensions, similarity) = vector_params(def);
     let Some(q) = vector_arg(what, value)? else { return Ok(None) };
     if q.len() != dimensions as usize {
@@ -1215,16 +1315,48 @@ pub(crate) fn query_vector(what: &str, def: &IndexDef, value: &Value) -> Result<
 /// fewer. Exact, except for an approximate index on a committed state when its graph is
 /// searched; even then the scores are exact and `k` entities are returned if as many pass
 /// a (non-empty) filter. Also how they were found, if there was anything to search.
+///
+/// A sparse index finds the entities that share a token with `q` (neither weight 0),
+/// scored as `vector.sparseScore`; a multi-vector one scores as `vector.maxSim`.
 pub(crate) fn nearest(
     ctx: &ProcedureContext<'_>,
     def: &IndexDef,
-    q: &[f64],
+    q: &VectorQuery,
     k: usize,
     filter: &[Predicate],
 ) -> Result<Nearest> {
     if k == 0 {
         return Ok((Vec::new(), None));
     }
+    match q {
+        VectorQuery::Dense(q) => nearest_dense(ctx, def, q, k, filter),
+        VectorQuery::Sparse(q) => crate::sparse_vector::nearest(ctx, def, q, k, filter),
+        VectorQuery::Multi(q) => crate::multi_vector::nearest(ctx, def, q, k, filter),
+    }
+}
+
+/// The ids among `approx` (approximate scores) to score exactly so that the best `k` are
+/// among them, when each approximate score is within `tolerance` of the exact one.
+pub(crate) fn near_the_cut(approx: &[(f64, u64)], tolerance: f64, k: usize) -> impl Iterator<Item = u64> + '_ {
+    let cut = if approx.len() <= k {
+        f64::NEG_INFINITY
+    } else {
+        let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
+        let i = sorted.len() - k;
+        *sorted.select_nth_unstable_by(i, f64::total_cmp).1 - tolerance
+    };
+    approx.iter().filter(move |(s, _)| *s >= cut).map(|(_, id)| *id)
+}
+
+/// The best `k` of `found`: best first, equal scores in id order.
+pub(crate) fn best_k(mut found: Vec<(f64, u64)>, k: usize) -> Vec<(f64, u64)> {
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    found.truncate(k);
+    found
+}
+
+/// [`nearest`] of a dense index.
+fn nearest_dense(ctx: &ProcedureContext<'_>, def: &IndexDef, q: &[f64], k: usize, filter: &[Predicate]) -> Result<Nearest> {
     let (dimensions, similarity) = vector_params(def);
     let interrupt = || ctx.check_interrupt();
     let store = ctx.store();
@@ -1245,23 +1377,17 @@ pub(crate) fn nearest(
     // The exact scores of those of `approx` that may be among the best `k`, when each of
     // its scores is within `tolerance` of the exact one.
     let near_the_cut = |(approx, tolerance): (Vec<(f64, u64)>, f64)| -> Result<Vec<(f64, u64)>> {
-        let cut = if approx.len() <= k {
-            f64::NEG_INFINITY
-        } else {
-            let mut sorted: Vec<f64> = approx.iter().map(|a| a.0).collect();
-            let i = sorted.len() - k;
-            *sorted.select_nth_unstable_by(i, f64::total_cmp).1 - tolerance
-        };
-        rescore(&mut approx.iter().filter(|(s, _)| *s >= cut).map(|(_, id)| *id))
+        rescore(&mut near_the_cut(&approx, tolerance, k))
     };
 
-    let (mut best, method) = match ctx.vectors() {
+    let (best, method) = match ctx.vectors() {
         // A committed state: the cached index, then exact scores near the cut.
         Some((cache, snapshot)) => {
             let index = cache.get(snapshot, def, &interrupt)?;
             let columns = match &*index {
                 VectorIndex::Flat(m) => &m.filters,
                 VectorIndex::Approximate(a) => &a.filters,
+                VectorIndex::Sparse(_) | VectorIndex::Multi(_) => unreachable!("a dense index"),
             };
             let selected = match filter {
                 [] => None,
@@ -1295,6 +1421,7 @@ pub(crate) fn nearest(
                         }
                     }
                 }
+                (VectorIndex::Sparse(_) | VectorIndex::Multi(_), _) => unreachable!("a dense index"),
             }
         }
         // Inside a transaction (or writing): every entity, as the query sees it.
@@ -1312,9 +1439,7 @@ pub(crate) fn nearest(
             (out, Method::Store)
         }
     };
-    best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    best.truncate(k);
-    Ok((best, Some(method)))
+    Ok((best_k(best, k), Some(method)))
 }
 
 #[cfg(test)]
@@ -1324,7 +1449,7 @@ mod tests {
     fn flat(e: &VectorIndex) -> &Matrix {
         match e {
             VectorIndex::Flat(m) => m,
-            VectorIndex::Approximate(_) => panic!("an exact index"),
+            _ => panic!("an exact index"),
         }
     }
 
@@ -1338,6 +1463,7 @@ mod tests {
         let (rows, columns) = match &*e {
             VectorIndex::Flat(m) => (&m.row_of, &m.filters),
             VectorIndex::Approximate(a) => (&a.slot_of, &a.filters),
+            _ => panic!("a dense index"),
         };
         let shown = rows
             .iter()
@@ -1463,7 +1589,7 @@ mod tests {
                         }
                     })
                     .collect();
-                let q = vector_arg("test", q)?.expect("a vector");
+                let q = query_vector("test", &def, q)?.expect("a vector");
                 Ok(nearest(ctx, &def, &q, *k as usize, &filter)?
                     .0
                     .into_iter()
@@ -1643,7 +1769,7 @@ mod tests {
         let seen = errors.clone();
         db.register_procedure(crate::ProcedureSignature::new("test.stopped", [""; 0], ["x"]), move |ctx, _| {
             let def = ctx.store().indexes().remove(0);
-            let search = || nearest(ctx, &def, &[1.0, 0.0, 0.0, 0.0], 10, &[]);
+            let search = || nearest(ctx, &def, &VectorQuery::Dense(vec![1.0, 0.0, 0.0, 0.0]), 10, &[]);
             assert_eq!(search()?.1, Some(Method::Graph));
             handle.cancel();
             seen.lock().unwrap().push(search().err());

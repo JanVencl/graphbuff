@@ -9,6 +9,7 @@ models (`vector.embed`): see [Text embeddings](Embeddings.md).
 - [Vector indexes](#vector-indexes)
 - [Querying an index](#querying-an-index)
 - [Filtered search](#filtered-search)
+- [Sparse and multi-vector indexes](#sparse-and-multi-vector-indexes)
 - [What gets indexed](#what-gets-indexed)
 - [How it works](#how-it-works)
 - [Limits](#limits)
@@ -196,7 +197,81 @@ OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.hnsw.enabled`: true}}
   - The file can be deleted at any time (with the database closed). Backups do not have it.
 - Memory: the vectors as for an exact index, plus about `2 × m` links of 4 bytes per vector.
 
+## Sparse and multi-vector indexes
+
+bge-m3's other two outputs, lexical weights (`vector.embedSparse`) and a vector per token
+(`vector.embedMulti`, ColBERT), have indexes of their own (see
+[Lexical weights and ColBERT](Embeddings.md#lexical-weights-and-colbert-bge-m3)). They are
+vector indexes with `vector.type` `'sparse'` or `'multi'` (`'dense'`, the default, is the
+index above), searched with the same procedures and `SEARCH`:
+
+```cypher
+// Lexical weights, stored as two lists (a property holds no map).
+CREATE VECTOR INDEX doc_lexical FOR (d:Doc) ON (d.lexTokens, d.lexWeights)
+OPTIONS {indexConfig: {`vector.type`: 'sparse'}};
+
+// ColBERT vectors, stored one after another in one flat list.
+CREATE VECTOR INDEX doc_colbert FOR (d:Doc) ON d.colbert
+OPTIONS {indexConfig: {`vector.type`: 'multi', `vector.dimensions`: 1024}};
+
+WITH vector.embedSparse($question, 'bge-m3') AS w
+CALL db.index.vector.queryNodes('doc_lexical', 10, w) YIELD node, score
+RETURN node.title, score;
+
+MATCH (d:Doc)
+SEARCH d IN (VECTOR INDEX doc_colbert FOR vector.embedMulti($question, 'bge-m3') WHERE d.year >= 2024 LIMIT 10)
+SCORE AS score
+RETURN d.title, score;
+```
+
+**Sparse** (`ON (n.tokens, n.weights)`: exactly those two properties, in that order):
+
+- Searched with a map of token to weight, as `vector.embedSparse` makes it. Finds the
+  entities that share a token with it, neither weight 0, scored as
+  `vector.sparseScore(query, n.tokens, n.weights)`. The results are **exact**: the same rows,
+  scores and order as `MATCH … WHERE <shares a token> ORDER BY score DESC, id(n) LIMIT k`.
+- Indexed: two lists of the same length, of strings and of finite numbers, with a weight
+  that is not 0. A token repeated takes its last weight, as `vector.sparseScore` reads it.
+- It is an inverted index: for each token, the entities that have it and its weight there
+  (8 bytes each, plus each distinct token). A query reads only the lists of its own tokens.
+- Takes no `vector.dimensions`, `vector.similarity_function` or `vector.hnsw.*`.
+
+**Multi-vector** (`ON n.p`, with `vector.dimensions`, the dimensions of each vector):
+
+- Searched with a list of vectors of those dimensions, as `vector.embedMulti` makes it (or
+  all of them in one flat list). Scored as `vector.maxSim(query, n.p)`: for each query
+  vector its best dot product with one of the entity's, averaged.
+- Indexed: a non-empty list of finite numbers whose length is a multiple of the dimensions.
+- Exact by default: every token vector is scored against every query vector (on the GPU
+  with `queries.gpu = true`), and the results are the same as
+  `ORDER BY vector.maxSim(query, n.p) DESC, id(n) LIMIT k`. Memory: 4 bytes × dimensions ×
+  all token vectors (bge-m3: 4 KiB per token).
+- `vector.hnsw.*` makes it approximate: a graph of all token vectors finds the
+  `max(4 × k, 200)` nearest of each query vector, and the entities they belong to are
+  scored (exactly). An entity whose vectors are each a little less near can be missed. The
+  graph is built on the first query and kept current by commits, but not saved to a file:
+  it is built again after a restart.
+- Takes no `vector.similarity_function`: MaxSim compares by dot products (bge-m3's vectors
+  have unit length, so they are cosines).
+
+**Both:**
+
+- `WITH [n.a, …]` filter properties and `SEARCH … WHERE` work as for dense indexes. So does
+  `vector.embedding_model`; when the server has models, that model must have the output
+  (`sparse` or `multi_vector` in its `model.toml`) and, for multi-vector, the dimensions.
+- A dense, a sparse and a multi-vector index may sit on the same property, but not two of
+  one type.
+- `SHOW INDEXES` lists them with type `VECTOR` and `vector.type` in their options.
+  `PROFILE` shows how a search ran: `by inverted index` (sparse), `by all vectors`,
+  `by matching vectors` (only the entities that pass the filter, when they are few),
+  `by HNSW graph`, or `by scan of the store` (inside a transaction).
+- The MCP `search` tool uses dense indexes only.
+- 0.6 and older cannot open a store with either.
+
 ## What gets indexed
+
+This and the next section are about dense indexes; sparse and multi-vector ones are
+[above](#sparse-and-multi-vector-indexes).
 
 Nodes with the label (or relationships of the type) whose property is a list of exactly
 `vector.dimensions` finite numbers; for cosine, not all zeros. Anything else, such as a
@@ -232,3 +307,5 @@ This is how an exact index works; for HNSW, see above.
 - Building a relationship vector index scans all relationships.
 - The Neo4j 2025 `VECTOR` value type, vector indexes on several labels, and `SEARCH` on
   full-text indexes are not supported.
+- The graph of an approximate multi-vector index is not saved to a file, and there is no
+  token pruning or compression of its vectors (as PLAID has): it keeps every token vector.

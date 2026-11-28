@@ -27,12 +27,20 @@ the same notes.
   options?)` gives a map of token to weight, `vector.embedMulti(…)` a vector per token,
   and `vector.sparseScore(a, b)` and `vector.maxSim(query, document)` score them as
   FlagEmbedding does, also from their stored forms (two lists; one flat list).
-  `vector.embedBatch` takes `{output: 'sparse' | 'multi'}`. For re-ranking: there is no
-  index for them. A model has them with `sparse = true` and `multi_vector = true` in
+  `vector.embedBatch` takes `{output: 'sparse' | 'multi'}`. A model has them with `sparse = true` and `multi_vector = true` in
   `model.toml`; `vector.models()` yields `sparse` and `multiVector`. `fetch-model.py
   bge-m3` converts bge-m3's PyTorch weights and heads to one `model.safetensors` (needs
   torch and safetensors). See
   [Lexical weights and ColBERT](docs/Embeddings.md#lexical-weights-and-colbert-bge-m3).
+- Sparse and multi-vector indexes for them: ``CREATE VECTOR INDEX … ON (d.lexTokens,
+  d.lexWeights) OPTIONS {indexConfig: {`vector.type`: 'sparse'}}`` (an inverted index) and
+  ``… ON d.colbert OPTIONS {indexConfig: {`vector.type`: 'multi', `vector.dimensions`:
+  1024}}``, searched with `db.index.vector.queryNodes` / `queryRelationships` and `SEARCH`
+  (with filter properties) by the output of `vector.embedSparse` / `vector.embedMulti`.
+  Both are exact, the same results as `ORDER BY vector.sparseScore(…)` /
+  `vector.maxSim(…)`; a multi-vector index with `vector.hnsw.*` takes candidates from a
+  graph of all token vectors. 0.6 and older cannot open a store with either. See
+  [Sparse and multi-vector indexes](docs/Vectors.md#sparse-and-multi-vector-indexes).
 
 ### Changed
 

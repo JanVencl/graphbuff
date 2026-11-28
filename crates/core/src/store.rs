@@ -664,6 +664,10 @@ const HNSW_FLAG: u8 = 0x80;
 /// Set in the similarity byte of a vector index that records its embedding model; the
 /// model's name follows the HNSW settings.
 const MODEL_FLAG: u8 = 0x40;
+/// Set in the similarity byte of a sparse vector index ([`IndexKind::SparseVector`]).
+const SPARSE_FLAG: u8 = 0x20;
+/// Set in the similarity byte of a multi-vector index ([`IndexKind::MultiVector`]).
+const MULTI_FLAG: u8 = 0x10;
 
 /// How vectors are compared. Scores are normalized to [0, 1] as Neo4j does, higher
 /// meaning more similar: cosine `(1 + cos) / 2`, euclidean `1 / (1 + d²)`.
@@ -813,6 +817,16 @@ pub enum IndexKind {
         /// Approximate search (HNSW); `None`: exact search over every vector.
         hnsw: Option<HnswConfig>,
     },
+    /// Lexical weights (bge-m3's sparse output): a list of tokens and a list of their
+    /// weights, scored by the dot product over shared tokens with an inverted index.
+    SparseVector,
+    /// A vector per token (bge-m3's ColBERT output), stored one after another in one flat
+    /// list of numbers, scored by MaxSim.
+    MultiVector {
+        dimensions: u32,
+        /// Candidates from a graph of all token vectors (HNSW); `None`: every one is scored.
+        hnsw: Option<HnswConfig>,
+    },
     Fulltext {
         analyzer: Analyzer,
     },
@@ -830,7 +844,7 @@ impl IndexKind {
     pub fn text(self) -> &'static str {
         match self {
             IndexKind::Range => "RANGE",
-            IndexKind::Vector { .. } => "VECTOR",
+            IndexKind::Vector { .. } | IndexKind::SparseVector | IndexKind::MultiVector { .. } => "VECTOR",
             IndexKind::Fulltext { .. } => "FULLTEXT",
             IndexKind::Point => "POINT",
             IndexKind::Text => "TEXT",
@@ -851,7 +865,8 @@ pub struct IndexDef {
     /// Further labels or types of a full-text index; empty for other indexes.
     pub extra_labels: Vec<String>,
     /// One property, or several for a composite index (in order). A vector index has its
-    /// vector property first, then its filter properties.
+    /// vector property first (a sparse one its tokens, then its weights), then its filter
+    /// properties.
     pub properties: Vec<String>,
     pub kind: IndexKind,
     /// The embedding model that made a vector index's vectors (`vector.embedding_model`),
@@ -896,10 +911,40 @@ impl IndexDef {
 
     /// The same vector index, searched approximately with `hnsw`.
     pub fn with_hnsw(mut self, hnsw: HnswConfig) -> IndexDef {
-        if let IndexKind::Vector { hnsw: h, .. } = &mut self.kind {
+        if let IndexKind::Vector { hnsw: h, .. } | IndexKind::MultiVector { hnsw: h, .. } = &mut self.kind {
             *h = Some(hnsw);
         }
         self
+    }
+
+    /// A sparse vector index on the `tokens` and `weights` properties of the nodes with
+    /// `label`, or of the relationships of a type (`entity`).
+    pub fn sparse_vector(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        label: impl Into<String>,
+        tokens: impl Into<String>,
+        weights: impl Into<String>,
+    ) -> IndexDef {
+        IndexDef {
+            properties: vec![tokens.into(), weights.into()],
+            kind: IndexKind::SparseVector,
+            ..IndexDef::vector(name, entity, label, "", 1, VectorSimilarity::Cosine)
+        }
+    }
+
+    /// A multi-vector index on one property: vectors of `dimensions`, one after another.
+    pub fn multi_vector(
+        name: impl Into<String>,
+        entity: IndexEntity,
+        label: impl Into<String>,
+        property: impl Into<String>,
+        dimensions: u32,
+    ) -> IndexDef {
+        IndexDef {
+            kind: IndexKind::MultiVector { dimensions, hnsw: None },
+            ..IndexDef::vector(name, entity, label, property, dimensions, VectorSimilarity::Cosine)
+        }
     }
 
     /// The same vector index, recording `model` as the embedding model of its vectors.
@@ -917,7 +962,11 @@ impl IndexDef {
     /// The filter properties of a vector index: kept next to its vectors, for filters
     /// applied during a search. Empty for other indexes.
     pub fn filter_properties(&self) -> &[String] {
-        if self.is_vector() { self.properties.get(1..).unwrap_or_default() } else { &[] }
+        match self.kind {
+            IndexKind::SparseVector => self.properties.get(2..).unwrap_or_default(),
+            _ if self.is_vector() => self.properties.get(1..).unwrap_or_default(),
+            _ => &[],
+        }
     }
 
     /// The properties that tell indexes of one kind apart: all but the filter properties
@@ -947,7 +996,14 @@ impl IndexDef {
         }
     }
 
+    /// Whether this is a vector index of any form: a vector per entity, lexical weights
+    /// (sparse) or a vector per token (multi-vector).
     pub fn is_vector(&self) -> bool {
+        matches!(self.kind, IndexKind::Vector { .. } | IndexKind::SparseVector | IndexKind::MultiVector { .. })
+    }
+
+    /// Whether this is a vector index of one vector per entity.
+    pub fn is_dense_vector(&self) -> bool {
         matches!(self.kind, IndexKind::Vector { .. })
     }
 
@@ -1090,7 +1146,7 @@ impl IndexDef {
         } else if self.properties.is_empty() {
             return Err(Error::Semantic("an index needs at least one property".into()));
         }
-        if let IndexKind::Vector { dimensions, hnsw, .. } = self.kind {
+        if let IndexKind::Vector { dimensions, hnsw, .. } | IndexKind::MultiVector { dimensions, hnsw } = self.kind {
             if hnsw.is_some_and(|h| !h.is_valid()) {
                 return Err(Error::Semantic(format!(
                     "HNSW needs `vector.hnsw.m` from 2 to {} and `vector.hnsw.ef_construction` from 1 to {}",
@@ -1103,6 +1159,9 @@ impl IndexDef {
                     "a vector index needs 1 to {MAX_VECTOR_DIMENSIONS} dimensions, not {dimensions}"
                 )));
             }
+        }
+        if self.kind == IndexKind::SparseVector && self.properties.len() < 2 {
+            return Err(Error::Semantic("a sparse vector index is on a tokens and a weights property".into()));
         }
         if (self.is_point() || self.is_text()) && self.properties.len() != 1 {
             return Err(Error::Semantic(format!("a {} index is on exactly one property", self.kind.text().to_lowercase())));
@@ -1149,6 +1208,8 @@ impl IndexDef {
                     match self.kind {
                         IndexKind::Range => "an",
                         IndexKind::Vector { .. } => "a vector",
+                        IndexKind::SparseVector => "a sparse vector",
+                        IndexKind::MultiVector { .. } => "a multi-vector",
                         IndexKind::Fulltext { .. } => "a full-text",
                         IndexKind::Point => "a point",
                         IndexKind::Text => "a text",
@@ -1201,17 +1262,24 @@ impl IndexDef {
     /// follows it with `m` and `ef_construction`; one that records its embedding model sets
     /// [`MODEL_FLAG`] and ends with the model's name. Filter properties follow the vector
     /// property in the definition's properties. 0.5 and older refuse an index with filter
-    /// properties or a model.
+    /// properties or a model. A sparse index sets [`SPARSE_FLAG`] (dimensions 0), a
+    /// multi-vector one [`MULTI_FLAG`] (similarity cosine); 0.6 and older refuse both.
     pub(crate) fn encode_vector(&self, e: &mut Encoder) {
-        let IndexKind::Vector { dimensions, similarity, hnsw } = self.kind else {
-            unreachable!("encode_vector of a range index")
+        let (dimensions, code, hnsw) = match self.kind {
+            IndexKind::Vector { dimensions, similarity, hnsw } => (
+                dimensions,
+                match similarity {
+                    VectorSimilarity::Cosine => 1,
+                    VectorSimilarity::Euclidean => 2,
+                },
+                hnsw,
+            ),
+            IndexKind::SparseVector => (0, 1 | SPARSE_FLAG, None),
+            IndexKind::MultiVector { dimensions, hnsw } => (dimensions, 1 | MULTI_FLAG, hnsw),
+            _ => unreachable!("encode_vector of another index"),
         };
         self.encode(e);
         e.u32(dimensions);
-        let code = match similarity {
-            VectorSimilarity::Cosine => 1,
-            VectorSimilarity::Euclidean => 2,
-        };
         let model = if self.embedding_model.is_some() { MODEL_FLAG } else { 0 };
         match hnsw {
             None => e.u8(code | model),
@@ -1230,7 +1298,8 @@ impl IndexDef {
         let mut def = IndexDef::decode(d)?;
         let dimensions = d.u32()?;
         let code = d.u8()?;
-        let similarity = match code & !(HNSW_FLAG | MODEL_FLAG) {
+        let form = code & (SPARSE_FLAG | MULTI_FLAG);
+        let similarity = match code & !(HNSW_FLAG | MODEL_FLAG | SPARSE_FLAG | MULTI_FLAG) {
             1 => VectorSimilarity::Cosine,
             2 => VectorSimilarity::Euclidean,
             t => return Err(d.corrupt(format!("unknown vector similarity {t}"))),
@@ -1248,10 +1317,22 @@ impl IndexDef {
         if code & MODEL_FLAG != 0 {
             def.embedding_model = Some(d.str()?);
         }
+        let bad = |d: &Decoder, def: &IndexDef| d.corrupt(format!("bad vector index `{}`", def.name));
+        def.kind = match form {
+            0 => IndexKind::Vector { dimensions, similarity, hnsw },
+            SPARSE_FLAG => {
+                if dimensions != 0 || hnsw.is_some() || similarity != VectorSimilarity::Cosine || def.properties.len() < 2 {
+                    return Err(bad(d, &def));
+                }
+                def.kind = IndexKind::SparseVector;
+                return Ok(def);
+            }
+            MULTI_FLAG if similarity == VectorSimilarity::Cosine => IndexKind::MultiVector { dimensions, hnsw },
+            _ => return Err(bad(d, &def)),
+        };
         if dimensions == 0 || dimensions > MAX_VECTOR_DIMENSIONS {
-            return Err(d.corrupt(format!("bad vector index `{}`", def.name)));
+            return Err(bad(d, &def));
         }
-        def.kind = IndexKind::Vector { dimensions, similarity, hnsw };
         Ok(def)
     }
 
