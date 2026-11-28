@@ -465,9 +465,6 @@ impl Executor<'_> {
                 kind,
                 options,
             } => {
-                if *kind == IndexType::Vector && properties.len() != 1 {
-                    return Err(Error::Semantic("a vector index is on exactly one property".into()));
-                }
                 let options = match options {
                     Some(e) => {
                         let scope = Scope::default();
@@ -509,8 +506,29 @@ impl Executor<'_> {
                     kind: crate::vector::index_kind(*kind, &options)?,
                     embedding_model: crate::vector::embedding_model(&options)?,
                 };
-                if let (Some(m), graphbuff_core::IndexKind::Vector { dimensions, .. }) = (&def.embedding_model, def.kind) {
-                    self.check_embedding_model(m, dimensions)?;
+                match def.kind {
+                    graphbuff_core::IndexKind::SparseVector if properties.len() != 2 => {
+                        return Err(Error::Semantic(
+                            "a sparse vector index is on two properties, its tokens and their weights: ON (n.tokens, n.weights)".into(),
+                        ));
+                    }
+                    graphbuff_core::IndexKind::Vector { .. } | graphbuff_core::IndexKind::MultiVector { .. }
+                        if properties.len() != 1 =>
+                    {
+                        return Err(Error::Semantic("a vector index is on exactly one property".into()));
+                    }
+                    _ => {}
+                }
+                if let Some(m) = &def.embedding_model {
+                    match def.kind {
+                        graphbuff_core::IndexKind::Vector { dimensions, .. } => self.check_embedding_model(m, dimensions)?,
+                        graphbuff_core::IndexKind::MultiVector { dimensions, .. } => {
+                            self.check_embedding_output(m, "multi_vector", |i| i.multi_vector)?;
+                            self.check_embedding_model(m, dimensions)?;
+                        }
+                        graphbuff_core::IndexKind::SparseVector => self.check_embedding_output(m, "sparse", |i| i.sparse)?,
+                        _ => {}
+                    }
                 }
                 let existing = self.store().indexes();
                 let exists = existing.iter().any(|d| d.name == def.name || d.same_index(&def));
@@ -666,6 +684,22 @@ impl Executor<'_> {
                 }
                 Ok(out)
             }
+        }
+    }
+
+    /// Fails if `model`, named as the embedding model of a sparse or multi-vector index, is
+    /// one of the database's models but lacks that output (`has`; `setting` in its
+    /// `model.toml`), or is not one of them (as [`check_embedding_model`](Self::check_embedding_model)).
+    fn check_embedding_output(&self, model: &str, setting: &str, has: impl Fn(&crate::embed::ModelInfo) -> bool) -> Result<()> {
+        let Some(e) = &self.embedder else { return Ok(()) };
+        match e.models().iter().find(|m| m.name == model) {
+            Some(m) if !has(m) => Err(Error::Semantic(format!(
+                "embedding model `{model}` does not make {} (`{setting}` in its model.toml)",
+                if setting == "sparse" { "lexical weights" } else { "a vector per token" }
+            ))),
+            Some(_) => Ok(()),
+            // Unknown: refused with the list of models, if there are any.
+            None => self.check_embedding_model(model, 1),
         }
     }
 

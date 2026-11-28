@@ -316,6 +316,43 @@ fn a_vector_index_records_its_model() {
         .unwrap();
 }
 
+#[test]
+fn sparse_and_multi_vector_indexes_of_embeddings() {
+    let (db, _) = hash_db();
+    db.execute(
+        "UNWIND ['graph databases store edges', 'vectors find neighbours', 'graph search with vectors', 'cooking pasta'] AS text \
+         CREATE (d:Doc {text: text}) \
+         WITH d, vector.embedSparse(text, 'small') AS w, vector.embedMulti(text, 'small') AS m \
+         SET d.lexTokens = keys(w), d.lexWeights = [t IN keys(w) | w[t]], d.colbert = reduce(all = [], v IN m | all + v)",
+    )
+    .unwrap();
+    db.execute("CREATE VECTOR INDEX lex FOR (d:Doc) ON (d.lexTokens, d.lexWeights) OPTIONS {indexConfig: {`vector.type`: 'sparse', `vector.embedding_model`: 'small'}}")
+        .unwrap();
+    db.execute("CREATE VECTOR INDEX col FOR (d:Doc) ON d.colbert OPTIONS {indexConfig: {`vector.type`: 'multi', `vector.dimensions`: 8, `vector.embedding_model`: 'small'}}")
+        .unwrap();
+    for (index, embed, score) in [
+        ("lex", "vector.embedSparse", "vector.sparseScore(q, d.lexTokens, d.lexWeights)"),
+        ("col", "vector.embedMulti", "vector.maxSim(q, d.colbert)"),
+    ] {
+        let search = format!(
+            "WITH {embed}($t, 'small', {{task: 'query'}}) AS q \
+             CALL db.index.vector.queryNodes('{index}', 2, q) YIELD node, score RETURN node.text AS text, score"
+        );
+        let scan = format!(
+            "WITH {embed}($t, 'small', {{task: 'query'}}) AS q MATCH (d:Doc) WITH d, {score} AS score \
+             WHERE score <> 0 RETURN d.text AS text, score ORDER BY score DESC, id(d) LIMIT 2"
+        );
+        let (a, b) = (with_text(&db, &search, "graph vectors").unwrap(), with_text(&db, &scan, "graph vectors").unwrap());
+        assert_eq!(a.rows, b.rows, "{index}");
+        assert_eq!(a.len(), 2, "{index}");
+    }
+    let err = |q: &str| db.execute(q).unwrap_err().to_string();
+    let e = err("CREATE VECTOR INDEX x FOR (d:Doc) ON (d.a, d.b) OPTIONS {indexConfig: {`vector.type`: 'sparse', `vector.embedding_model`: 'nope'}}");
+    assert!(e.contains("the models are large, small"), "{e}");
+    let e = err("CREATE VECTOR INDEX x FOR (d:Doc) ON d.c OPTIONS {indexConfig: {`vector.type`: 'multi', `vector.dimensions`: 4, `vector.embedding_model`: 'small'}}");
+    assert!(e.contains("8 dimensions, not 4"), "{e}");
+}
+
 fn with_text(db: &Database<MemoryGraph>, q: &str, text: &str) -> Result<QueryResult> {
     let params = [("t".to_string(), graphbuff::Value::String(text.into()))].into_iter().collect();
     db.execute_with_params(q, &params)

@@ -39,7 +39,7 @@ fn names(defs: &[&IndexDef]) -> String {
 /// Picks the indexes: the one named, or the only fitting one (`auto`: a label with both
 /// kinds is searched both ways).
 fn plan(indexes: &[IndexDef], named: Option<&str>, mode: Option<&str>) -> Result<Plan, String> {
-    let vectors: Vec<&IndexDef> = indexes.iter().filter(|d| d.is_vector() && d.entity == IndexEntity::Node).collect();
+    let vectors: Vec<&IndexDef> = indexes.iter().filter(|d| d.is_dense_vector() && d.entity == IndexEntity::Node).collect();
     let texts: Vec<&IndexDef> = indexes.iter().filter(|d| d.is_fulltext() && d.entity == IndexEntity::Node).collect();
     let mode = match mode {
         None | Some("auto") => None,

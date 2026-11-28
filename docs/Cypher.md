@@ -214,7 +214,10 @@ feature are in [`integration-tests/tck`](../integration-tests/tck/README.md).
   200,000 768-dimensional vectors answer in about 6 ms against 43 ms on 4 CPU threads
   (`vecbench`). `MATCH (d:L) SEARCH d IN (VECTOR INDEX name FOR $vector [WHERE filter] LIMIT k)
   [SCORE AS s]` finds the k most similar that pass a filter on the properties the index
-  declares (`… ON n.p WITH [n.a, n.b]`). More in [Vector search](Vectors.md).
+  declares (`… ON n.p WITH [n.a, n.b]`). `vector.type: 'sparse'` (`ON (n.tokens, n.weights)`)
+  and `vector.type: 'multi'` index lexical weights and a vector per token, searched with
+  `vector.embedSparse` / `vector.embedMulti` output and scored as `vector.sparseScore` /
+  `vector.maxSim`. More in [Vector search](Vectors.md).
 * **Full-text:** ``CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR (n:A|B) ON EACH [n.p, n.q]
   [OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}]`` (also `FOR ()-[r:A|B]-()`)
   indexes STRING and LIST<STRING> properties. `CALL db.index.fulltext.queryNodes('name',

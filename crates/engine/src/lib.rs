@@ -57,6 +57,8 @@ mod stream;
 mod transaction;
 mod interrupt;
 mod unicode;
+mod multi_vector;
+mod sparse_vector;
 mod vector;
 #[cfg(test)]
 mod vector_file_tests;

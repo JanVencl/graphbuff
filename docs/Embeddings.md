@@ -197,8 +197,9 @@ RETURN d.title, max(score) AS best ORDER BY best DESC LIMIT 5;
 
 bge-m3 has three outputs from one pass over a text: its vector (`vector.embed`), a weight
 per token (`vector.embedSparse`, a learned BM25) and a vector per token
-(`vector.embedMulti`, ColBERT). The last two rank better together with the vector, and
-are best used to re-score its hits:
+(`vector.embedMulti`, ColBERT). Each can be searched with an index of its own (a sparse or
+a multi-vector index: see [Vector search](Vectors.md#sparse-and-multi-vector-indexes)), and
+they rank better together, for example by re-scoring the hits of one:
 
 ```cypher
 // Store all three (fetch-model.py bge-m3 sets sparse and multi_vector). A property holds
@@ -234,9 +235,11 @@ ORDER BY score DESC LIMIT 10;
 - These match FlagEmbedding's `BGEM3FlagModel` (lexical weights, ColBERT vectors and
   their scores). Note that `vector.similarity.cosine` scales to [0, 1], where BGE-M3's
   dense score is the plain cosine.
-- No index searches them: they re-score what a vector or full-text index found, or a
-  filtered set. A ColBERT list is large (1024 floats per token for bge-m3): store it only
-  where you re-rank.
+- `CREATE VECTOR INDEX … ON (d.lexTokens, d.lexWeights)` with `vector.type: 'sparse'`
+  finds by lexical weights, and `… ON d.colbert` with `vector.type: 'multi'` and
+  `vector.dimensions: 1024` by ColBERT vectors, as `vector.sparseScore` and `vector.maxSim`
+  score them. A ColBERT list is large (1024 floats per token for bge-m3, and an index of
+  them as much again in memory): store it only where you search or re-rank by it.
 - `vector.embedBatch(texts, model, {output: 'sparse' | 'multi'})` gives them in batches.
   `task` and `truncate` work as for `vector.embed`; `dimensions` does not apply.
 - A model has them when its `model.toml` says `sparse = true` (weights with
