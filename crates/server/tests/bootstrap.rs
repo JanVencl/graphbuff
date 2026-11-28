@@ -94,7 +94,7 @@ fn logins_while(data: Option<&str>, env: &[(&str, &str)], checks: &[(&str, &str,
             .and_then(|rest| rest.split_whitespace().next())
             .unwrap_or_else(|| panic!("no address in {listening:?}"));
         for &(user, password, status) in checks {
-            assert_eq!(query(addr, user, password), status, "{user}:{password}");
+            assert_eq!(query(addr, user, password), status, "login as {user}");
         }
     });
     let result = result.and_then(|()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(during)));
