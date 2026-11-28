@@ -468,12 +468,13 @@ impl OAuth {
             return self.redirect_error(&p.redirect_uri, p.state.as_deref(), "access_denied", "the user did not allow access");
         }
         let user = get("user").unwrap_or("").trim().to_string();
-        let password = get("password").unwrap_or("");
+        let password = get("password");
         let Some(users) = ctx.users.as_ref() else {
             return error_page(400, "this server has no user accounts to log in with");
         };
         let login = ctx.throttled_login("oauth", peer, &user, true, || {
-            (!user.is_empty() && users.authenticate(&user, password)).then(|| Principal::User(user.clone()))
+            let ok = !user.is_empty() && password.is_some_and(|pw| users.authenticate(&user, pw));
+            ok.then(|| Principal::User(user.clone()))
         });
         let who = match login {
             Ok(w) => w,
